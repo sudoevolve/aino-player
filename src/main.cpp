@@ -2894,7 +2894,8 @@ static void lyrics_panel(Ctx& c, const Rect& box) {
     const float total = g_lyr_layout.total;
     const float max_scroll = std::max(0.0f, total - area.h + 40.0f);
     float target = g_lyr_scroll;
-    if (disp_cur >= 0) target = g_lyr_layout.top[size_t(disp_cur)] - area.h * 0.34f;
+    // 当前行放**正中间**：之前是 area.h * 0.34（贴上方），看着像没对准。
+    if (disp_cur >= 0) target = g_lyr_layout.top[size_t(disp_cur)] - (area.h - 23.0f) * 0.5f;
     target = std::min(std::max(target, 0.0f), max_scroll);
 
     // 缓动按**时间**算，不按帧数：30fps 和 60fps 下的手感必须一致。
@@ -2918,20 +2919,31 @@ static void lyrics_panel(Ctx& c, const Rect& box) {
 
     c.ui.push_clip(area);
     const float base_y = area.y - g_lyr_scroll;
-    for (int i = 0; i < int(g_lyr_layout.text.size()); ++i) {
+    const int nline = int(g_lyr_layout.text.size());
+    // 点歌词行的按下位置。用"按下与松手落在同一行"判定，而不是 ui.item()：
+    // item 的 widget_id 含矩形位置，歌词每帧都在滚动 → id 每帧都变，
+    // 点击后 active 常常清不掉，表现为"点十次能中一次"。
+    static int press_line = -1;
+    for (int i = 0; i < nline; ++i) {
         const float ty = base_y + g_lyr_layout.top[size_t(i)];
-        if (ty + 24.0f < area.y || ty > area.bottom()) continue;
+        // 行高取到下一行的顶部：整段行距都可点，不用瞄准文字那一条
+        const float next_top = (i + 1 < nline) ? g_lyr_layout.top[size_t(i + 1)] : g_lyr_layout.total;
+        const float row_h = std::max(26.0f, next_top - g_lyr_layout.top[size_t(i)]);
+        if (ty + row_h < area.y || ty > area.bottom()) continue;
+
         const int sline = g_lyr_layout.src[size_t(i)];
         const bool active = (sline == cur_line);
-        const Rect row{area.x + 4, ty - 3.0f, area.w - 8, 22.0f};
+        const Rect row{area.x + 4, ty - 3.0f, area.w - 8, row_h};
         const bool row_hover = row.contains(c.ui.input().mouse.x, c.ui.input().mouse.y);
-        // hover 背景自己画：放在 item 之前，这样底色在下、指针认领在上
         if (row_hover && !active) c.ui.fill_rect(row, c.th.fill3, 7.0f);
-        // 点一行跳到那句（Apple Music 也这样）
-        if (c.ui.item("", "", "", row, Style().corner(6)) && doc->lines[size_t(sline)].ms >= 0) {
+
+        const bool has_time = doc->lines[size_t(sline)].ms >= 0;
+        if (row_hover && c.ui.input().pressed[0]) press_line = i;
+        if (row_hover && c.ui.input().released[0] && press_line == i && has_time) {
             g_player.seek_ms(int(doc->lines[size_t(sline)].ms));
             g_ui.pos_ms = float(doc->lines[size_t(sline)].ms);
             g_lyr_cur = -2;
+            press_line = -1;
         }
         Style s;
         s.font_size = active ? 13.5f : 12.5f;
@@ -2940,6 +2952,7 @@ static void lyrics_panel(Ctx& c, const Rect& box) {
         c.ui.draw_text(g_lyr_layout.text[size_t(i)], {area.x, ty, area.w, 22},
                        active ? c.th.tint : c.th.label2, s);
     }
+    if (c.ui.input().released[0]) press_line = -1;
     c.ui.pop_clip();
 
     // 上下渐隐：滚动时行会被 clip 硬切成半截字，用十几条渐变把边缘化掉。
