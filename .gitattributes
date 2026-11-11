@@ -1,5 +1,4 @@
-# 换行符：Windows 批处理必须是 CRLF，shell 脚本必须是 LF，
-# 否则 clone 到别的机器上 build.bat 会因括号解析出错而中途退出。
+# 换行符：Windows 批处理必须是 CRLF，shell 脚本必须是 LF。
 * text=auto
 *.bat text eol=crlf
 *.sh  text eol=lf

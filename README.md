@@ -16,10 +16,17 @@
 ## 构建
 
 ```bash
-./build.sh          # Git Bash；或双击 build.bat
+# MinGW-w64（GCC 12+，UCRT）
+cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+
+# MSVC
+cmake -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
 ```
 
-MSVC 19.29+ 与 Windows SDK 10（`/utf-8` 必须加）。产物 `build/aino_player.exe`。
+MSVC 19.29+ 或 MinGW-w64 GCC，配 Windows SDK 10 / mingw-w64 头文件。产物 `build/aino_player.exe`（MSVC 为 `build/Release/aino_player.exe`）。
+MinGW 下不链 `WebView2LoaderStatic.lib`，由程序自己从注册表定位 WebView2 运行时并加载。
 
 登录需要 **Edge WebView2 Runtime**（Win11 自带，Win10 多数随 Edge 装好）；没装只有登录不可用。
 
