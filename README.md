@@ -3,7 +3,7 @@
 用 [aino](https://github.com/sudoevolve/aino)（单头文件 C++17 立即模式 UI 库）做界面，
 网易云 / QQ 音乐 / 酷我 三源并发检索与聚合，播放走 Windows 自带的 Media Foundation（IMFMediaEngine）。
 
-一个 exe（约 950 KB），静态链接 CRT 和 WebView2 的 loader，不装运行库；
+一个 exe（约 1 MB），静态链接 CRT 和 WebView2 的 loader，不装运行库；
 除了 WebView2 的头文件和静态库（只用于登录）没有任何第三方依赖，连 JSON 都是自己写的。
 
 ## 功能
