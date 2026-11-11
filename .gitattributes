@@ -1,0 +1,14 @@
+# 换行符：Windows 批处理必须是 CRLF，shell 脚本必须是 LF，
+# 否则 clone 到别的机器上 build.bat 会因括号解析出错而中途退出。
+* text=auto
+*.bat text eol=crlf
+*.sh  text eol=lf
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.h   text eol=lf
+*.md  text eol=lf
+
+# 二进制
+*.lib binary
+*.png binary
+*.bmp binary

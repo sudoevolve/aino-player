@@ -1,0 +1,32 @@
+# ---- 构建产物 ----
+build/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.res
+*.exe
+*.dll
+
+# ---- IDE / 编辑器 ----
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+*.sln.docstates
+
+# ---- 运行期产物 / 抓包取证 ----
+*.log
+*.bmp
+*.tmp
+__pycache__/
+*.pyc
+
+# ---- 系统杂项 ----
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 说明：vendor/webview2 里的头文件与 WebView2LoaderStatic.lib 是构建必需的，
+# 必须提交（体积大，但本机没法重新生成）。
