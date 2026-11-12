@@ -273,6 +273,10 @@ static void cover_art(Ctx& c, const std::string& url, const std::string& seed, c
 }
 
 // ---------- 侧栏 ----------
+static void draw_brand(Ctx& c, const Rect& box) {
+    const auto& icon = brand_icon();
+    if (!icon.rgba.empty()) c.ui.draw_bitmap(box, icon.rgba.data(), icon.w, icon.h);
+}
 static void sidebar(Ctx& c) {
     const float w = kSidebar;
     c.ui.fill_rect({0, 0, w, c.H}, c.th.sidebar_bg);
@@ -281,12 +285,13 @@ static void sidebar(Ctx& c) {
     Style logo;
     logo.font_size = 19.0f;
     logo.font_weight = 700;
-    c.ui.draw_text("aino", {22, 20, 80, 26}, c.th.label, logo);
+    draw_brand(c, {18, 17, 34, 34});
+    c.ui.draw_text("aino", {60, 20, 80, 26}, c.th.label, logo);
     Style sub;
     sub.font_size = 10.5f;
     sub.font_weight = 600;
     const float lw = c.ui.text_width("aino", 19.0f, 700);
-    c.ui.draw_text("PLAYER", {22 + lw + 7, 26, 80, 16}, c.th.label3, sub);
+    c.ui.draw_text("PLAYER", {60 + lw + 7, 26, 80, 16}, c.th.label3, sub);
 
     const char* navs[6] = {"在线搜索", "发现", "正在播放", "歌单", "音源", "设置"};
     const SystemIcon icons[6] = {SystemIcon::Search, SystemIcon::Star, SystemIcon::List,
@@ -1211,15 +1216,40 @@ static void update_settings(Ctx& c, float mx, float mw) {
     c.ui.draw_text(ellipsize(c.ui, update.message.empty() ? "尚未检查更新" : update.message, mw - 40, 12),
         {mx + 20, 160, mw - 40, 22}, update.status == UpdateStatus::Failed ? c.th.destructive : c.th.label, Style().font(12));
     Style check_style = Style().primary().font(11.5f);
-    check_style.disabled = update.status == UpdateStatus::Checking;
+    check_style.disabled = update.status == UpdateStatus::Checking || update.status == UpdateStatus::Downloading || update.status == UpdateStatus::Installing;
     if (c.ui.button(update.status == UpdateStatus::Checking ? "正在检查…" : "检查更新", {mx + 20, 210, 104, 30}, check_style)) check_updates();
     if (c.ui.button("GitHub 发布页", {mx + 138, 210, 120, 30}, Style().font(11.5f))) open_update(false);
     if (update.status == UpdateStatus::Available) {
-        if (c.ui.button("下载新版", {mx + 272, 210, 104, 30}, Style().primary().font(11.5f))) open_update(true);
+        if (c.ui.button(update.installer ? "下载并安装" : "下载新版", {mx + 272, 210, 104, 30}, Style().primary().font(11.5f))) open_update(true);
         c.ui.muted_text("最新版本 " + update.version, {mx + 20, 290, mw - 40, 20}, Style().font(12));
     }
+    if (update.status == UpdateStatus::Downloading)
+        c.ui.muted_text("下载安装包 " + std::to_string(update.progress) + "%", {mx + 20, 290, mw - 40, 20}, Style().font(12));
     Style info = Style().font(11.5f); info.wrap_text();
-    c.ui.draw_text("下载会交给系统默认浏览器。Windows 下载新版 exe 后替换旧程序；Linux 下载 deb 后通过软件安装器升级，原有配置与收藏继续保留。", {mx + 20, 330, mw - 40, 92}, c.th.label3, info);
+    c.ui.draw_text("Windows 安装版会先下载并校验 SHA-256，再保存当前状态、关闭播放器并升级，完成后重新打开。首次从便携版迁移会安装到固定用户目录。Linux 下载 deb 后通过软件安装器升级；配置、收藏和歌单保留。", {mx + 20, 330, mw - 40, 120}, c.th.label3, info);
+}
+
+static void about_settings(Ctx& c, float mx, float mw) {
+    c.ui.heading("关于 Aino", {mx, 20, mw - 120, 30});
+    if (c.ui.button("返回设置", {mx + mw - 104, 21, 104, 28}, Style().font(11.5f))) c.model.ui.about_settings = false;
+    c.ui.scroll({mx, 64, mw, c.bar_y - 76}, 1, 584, [&](int, const Rect& area) {
+        const float y = area.y;
+        draw_brand(c, {mx + 20, y + 12, 70, 70});
+        c.ui.subheading("Aino Player", {mx + 106, y + 18, mw - 126, 28});
+        c.ui.muted_text(std::string("v") + kVersion + " · Minimal, yet powerful", {mx + 106, y + 53, mw - 126, 22}, Style().font(11.5f));
+        Style body = Style().font(12); body.wrap_text();
+        c.ui.draw_text("Aino，一个芬兰女性名字。独立，唯一。以克制的外观，承载强大的多音源音乐体验。", {mx + 20, y + 106, mw - 40, 64}, c.th.label2, body);
+        c.ui.draw_text(std::string("作者  ") + project::author, {mx + 20, y + 184, mw - 40, 24}, c.th.label, Style().font(12));
+        c.ui.draw_text(std::string("开源协议  ") + project::license, {mx + 20, y + 218, mw - 40, 24}, c.th.label, Style().font(12));
+        c.ui.muted_text("GitHub · sudoevolve/aino-player", {mx + 20, y + 252, mw - 40, 24}, Style().font(12));
+        const float width = (mw - 52) / 2;
+        if (c.ui.button("GitHub 项目", {mx + 20, y + 292, width, 32}, Style().font(12))) open_project(ProjectLink::Repository);
+        if (c.ui.button("问题与建议", {mx + 32 + width, y + 292, width, 32}, Style().font(12))) open_project(ProjectLink::Issues);
+        if (c.ui.button("查看 Apache-2.0", {mx + 20, y + 336, width, 32}, Style().font(12))) open_project(ProjectLink::License);
+        if (c.ui.button("第三方许可", {mx + 32 + width, y + 336, width, 32}, Style().font(12))) open_project(ProjectLink::Dependencies);
+        c.ui.draw_text("界面：aino / Apache-2.0\n音频：miniaudio / Public Domain 或 MIT-0\n图片：stb / Public Domain 或 MIT\n内置 FFmpeg / LGPL-2.1-or-later", {mx + 20, y + 398, mw - 40, 106}, c.th.label3, body);
+        c.ui.draw_text("图标：黑白灰几何 A 与播放箭头。单一而鲜明，极简但有力量。", {mx + 20, y + 520, mw - 40, 56}, c.th.label3, body);
+    });
 }
 
 static void tab_settings(Ctx& c) {
@@ -1227,9 +1257,11 @@ static void tab_settings(Ctx& c) {
     const float mw = c.W - mx - 24.0f - (c.model.ui.lyrics_open ? kLyricsWidth : 0.0f);
     if (c.model.ui.storage_settings) { storage_settings(c, mx, mw); return; }
     if (c.model.ui.update_settings) { update_settings(c, mx, mw); return; }
+    if (c.model.ui.about_settings) { about_settings(c, mx, mw); return; }
     c.ui.heading("设置", {mx, 20, mw, 30});
-    if (c.ui.button(c.model.update.status == UpdateStatus::Available ? "发现新版" : "版本更新", {mx + mw - 224, 21, 100, 28}, Style().font(11.5f))) c.model.ui.update_settings = true;
-    if (c.ui.button("数据与缓存", {mx + mw - 112, 21, 112, 28}, Style().font(11.5f))) c.model.ui.storage_settings = true;
+    if (c.ui.button(c.model.update.status == UpdateStatus::Available ? "发现新版" : "版本更新", {mx + mw - 312, 21, 100, 28}, Style().font(11.5f))) c.model.ui.update_settings = true;
+    if (c.ui.button("数据与缓存", {mx + mw - 200, 21, 112, 28}, Style().font(11.5f))) c.model.ui.storage_settings = true;
+    if (c.ui.button("关于", {mx + mw - 76, 21, 76, 28}, Style().font(11.5f))) c.model.ui.about_settings = true;
 
     c.ui.scroll({mx, 60, mw, c.bar_y - 72}, 1, 792, [&](int, const Rect& area) {
     const float dy = area.y - 60;

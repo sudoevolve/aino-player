@@ -14,6 +14,7 @@
 #include "qqapi.hpp"
 #include "sources.hpp"
 #include "tag.hpp"
+#include "../assets/aino_icon.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -41,10 +42,19 @@ enum class ClearAction { None, Cookies, Library, Queue, Cache };
 #define AINO_PLAYER_VERSION "0.0.0"
 #endif
 inline constexpr const char* kVersion = AINO_PLAYER_VERSION;
-enum class UpdateStatus { Idle, Checking, Current, Available, Failed, NoRelease };
+namespace project {
+inline constexpr const char* author = "sudoevolve";
+inline constexpr const char* github = "https://github.com/sudoevolve/aino-player";
+inline constexpr const char* license = "Apache-2.0";
+}
+enum class ProjectLink { Repository, Issues, License, Dependencies };
+enum class UpdateStatus { Idle, Checking, Current, Available, Downloading, Installing, Failed, NoRelease };
 struct UpdateView {
     UpdateStatus status = UpdateStatus::Idle;
-    std::string version, release_url, asset_url, message;
+    std::string version, release_url, asset_url, message, digest;
+    long long asset_size = 0;
+    bool installer = false;
+    int progress = 0;
 };
 
 // 只比较正式版，并只接受本仓库的 HTTPS 发布页面和安装包。
@@ -93,7 +103,14 @@ inline UpdateView parse_release(const net::Response& response, const std::string
         const auto name = asset["name"].str(), url = asset["browser_download_url"].str();
         if (!suffix.empty() && name.size() > suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0 &&
             name.rfind("aino-player", 0) == 0 && name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") == std::string::npos &&
-            url == prefix + name) { view.asset_url = url; break; }
+            url == prefix + name) {
+            const bool installer = name == "aino-player-" + tag + "-setup-windows-x64.exe";
+            if (!view.asset_url.empty() && (!installer || view.installer)) continue;
+            view.asset_url = url; view.installer = installer;
+            view.digest = asset["digest"].str();
+            const double size = asset["size"].num();
+            view.asset_size = std::isfinite(size) && size > 0 && size <= 64 * 1024 * 1024 ? (long long)size : 0;
+        }
     }
     return view;
 }
@@ -158,6 +175,7 @@ struct UiState {
     bool importing_playlist = false;
     bool storage_settings = false;
     bool update_settings = false;
+    bool about_settings = false;
     ClearAction clear_action = ClearAction::None;
     // 发现页当前看的是哪个平台（0=网易云 1=QQ 2=酷我）
     int disc_site = 0;
@@ -259,7 +277,7 @@ inline std::string fmt_size(long long bytes) {
 
 // UI 动作与应用生命周期接口；后台资源和互斥锁留在控制器实现中。
 namespace player {
-struct HostCallbacks { std::function<void()> wake; std::function<void()> activate; };
+struct HostCallbacks { std::function<void()> wake; std::function<void()> activate; std::function<void()> close; };
 ViewModel view_model();
 bool initialize(bool smoke_test);
 void start(HostCallbacks host);
@@ -315,6 +333,8 @@ void begin_login(int site);
 void clear_data(ClearAction action);
 void check_updates(bool notify = true);
 void open_update(bool download);
+void open_project(ProjectLink link);
+const cover::Image& brand_icon();
 std::string default_download_dir();
 } // namespace player
 
@@ -476,6 +496,7 @@ static YouTubeSnap g_youtube;
 static unsigned g_youtube_generation = 0;
 static login::Site login_site(int site) { return site == 2 ? login::Site::YouTube : site == 1 ? login::Site::QQ : login::Site::NetEase; }
 static UpdateView g_update_view;
+static std::atomic<bool> g_update_cancel{false};
 static PlaylistView g_playlist_view;
 static unsigned g_playlist_generation = 0, g_library_revision = 0;
 static std::mutex g_ui_mail_mutex;
@@ -2046,7 +2067,8 @@ void clear_data(ClearAction action) {
 }
 
 void check_updates(bool notify) {
-    if (g_update_view.status == UpdateStatus::Checking) return;
+    if (g_update_view.status == UpdateStatus::Checking || g_update_view.status == UpdateStatus::Downloading ||
+        g_update_view.status == UpdateStatus::Installing) return;
     g_update_view.status = UpdateStatus::Checking;
     g_update_view.message = "正在检查 GitHub 正式版…";
     background::start([notify] {
@@ -2066,9 +2088,72 @@ void check_updates(bool notify) {
     });
 }
 void open_update(bool download) {
+#ifdef _WIN32
+    if (download && g_update_view.installer) {
+        if (g_update_view.status != UpdateStatus::Available) return;
+        const auto release = g_update_view;
+        if (!release.asset_size || release.digest.size() != 71 || release.digest.rfind("sha256:", 0) != 0 ||
+            release.digest.substr(7).find_first_not_of("0123456789abcdef") != std::string::npos) {
+            toast("安装包缺少有效的 SHA-256 信息，请从 GitHub 发布页下载", 6000); return;
+        }
+        g_update_cancel.store(false);
+        g_update_view.status = UpdateStatus::Downloading; g_update_view.progress = 0;
+        g_update_view.message = "正在下载安装包，完成校验后将关闭播放器并升级…";
+        background::start([release] {
+            const auto tag = release.version.front() == 'v' ? release.version : "v" + release.version;
+            const auto path = platform::join(g_temp_dir, "aino-update-" + tag + ".exe");
+            std::string error;
+            bool ok = false;
+            try {
+                int previous = -1;
+                ok = net::download(release.asset_url, path, {}, [&](long long received, long long) {
+                    if (received > release.asset_size) { g_update_cancel.store(true); return; }
+                    const int progress = int(received * 100 / release.asset_size);
+                    if (progress != previous) {
+                        previous = progress;
+                        post_ui([progress] { g_update_view.progress = progress; });
+                    }
+                }, g_update_cancel, error, 60000);
+                if (ok) ok = platform::file_size(path) == release.asset_size &&
+                             platform::sha256_file(path) == release.digest.substr(7);
+                if (!ok && error.empty()) error = "安装包大小或 SHA-256 校验不符";
+            } catch (...) { ok = false; error = "安装包下载失败，请稍后重试"; }
+            if (!ok || g_update_cancel.load()) {
+                platform::remove(path);
+                post_ui([error] { g_update_view.status = UpdateStatus::Available; g_update_view.message = error; toast(error, 7000); });
+                return;
+            }
+            post_ui([path] {
+                if (!g_host.close || !platform::launch_installer(path)) {
+                    g_update_view.status = UpdateStatus::Available; g_update_view.message = "无法启动安装器，请重试或从发布页下载";
+                    platform::remove(path); return;
+                }
+                g_update_view.status = UpdateStatus::Installing;
+                g_update_view.message = "安装器已启动，正在保存配置并退出…";
+                g_host.close();
+            });
+        });
+        return;
+    }
+#endif
     const auto url = download && !g_update_view.asset_url.empty() ? g_update_view.asset_url :
         !g_update_view.release_url.empty() ? g_update_view.release_url : std::string(updates::kReleases);
     if (!platform::open_browser(url)) toast("无法打开默认浏览器，请检查浏览器设置");
+}
+void open_project(ProjectLink link) {
+    std::string url = project::github;
+    if (link == ProjectLink::Issues) url += "/issues";
+    else if (link == ProjectLink::License) url += "/blob/master/LICENSE";
+    else if (link == ProjectLink::Dependencies) url += "/blob/master/vendor/README.md";
+    if (!platform::open_browser(url)) toast("无法打开默认浏览器");
+}
+const cover::Image& brand_icon() {
+    static const cover::Image icon = [] {
+        cover::Image image;
+        cover::detail::decode(std::vector<uint8_t>(std::begin(brand::png), std::end(brand::png)), 64, image);
+        return image;
+    }();
+    return icon;
 }
 
 static std::array<LoginView, 3> g_login_view;
@@ -2327,6 +2412,7 @@ void finish_frame(float frame_ms) {
 }
 void shutdown(bool smoke_test) {
     g_shutdown.store(true);
+    g_update_cancel.store(true);
     g_covers.clear(); // 退出只等待正在下载的封面，不继续处理积压的队列。
     login::shutdown();
     background::stop();

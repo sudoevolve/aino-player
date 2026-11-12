@@ -26,6 +26,19 @@ inline bool codec_file(const std::string& name) {
     const auto suffix = name.substr(23);
     return suffix.empty() || suffix == ".exe" || suffix == ".part" || suffix == ".exe.part";
 }
+inline bool update_file(const std::string& name) {
+    const std::string prefix = "aino-update-v", suffix = ".exe";
+    if (name.rfind(prefix, 0) != 0 || name.size() <= prefix.size() + suffix.size() ||
+        name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) return false;
+    const auto version = name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
+    int dots = 0, digits = 0;
+    for (char c : version) {
+        if (c == '.') { if (!digits) return false; ++dots; digits = 0; }
+        else if (c >= '0' && c <= '9') { if (++digits > 6) return false; }
+        else return false;
+    }
+    return dots == 2 && digits > 0;
+}
 /** @brief 清理指定缓存根目录；调用方须锁住本进程的写入后才允许清理当前目录。 */
 inline Cleanup clear_audio(const std::string& root, uint32_t current_pid, const std::string& keep_prefix,
                            bool clear_current, const std::function<bool(uint32_t)>& alive = platform::process_running) {
@@ -35,9 +48,9 @@ inline Cleanup clear_audio(const std::string& root, uint32_t current_pid, const 
     const auto status = platform::fs::symlink_status(base, ec);
     if (ec == std::errc::no_such_file_or_directory) return result;
     if (ec || !platform::fs::is_directory(status) || platform::fs::is_symlink(status)) { ++result.errors; return result; }
-    auto clean_file = [&](const platform::fs::directory_entry& entry, const std::string& prefix, bool stale_codec = false) {
+    auto clean_file = [&](const platform::fs::directory_entry& entry, const std::string& prefix, bool stale_binary = false) {
         const auto name = entry.path().filename().u8string();
-        if (!audio_file(name) && !(stale_codec && codec_file(name))) return;
+        if (!audio_file(name) && !(stale_binary && (codec_file(name) || update_file(name)))) return;
         std::error_code error;
         const auto type = entry.symlink_status(error);
         if (error || !platform::fs::is_regular_file(type)) { if (error) ++result.errors; return; }

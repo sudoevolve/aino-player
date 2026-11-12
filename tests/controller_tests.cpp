@@ -89,6 +89,22 @@ int main(int argc, char** argv) {
         absent.error = "offline";
         check(updates::parse_release(absent, "1.0.0", "").status == UpdateStatus::Failed, "transport errors reported");
 
+        auto installers = response("v2.0.0", "-windows-x64.exe");
+        js::Value installer_json; check(js::parse(installers.body, installer_json), "release fixture JSON");
+        const std::string setup_name = "aino-player-v2.0.0-setup-windows-x64.exe";
+        const auto setup_url = std::string(updates::kReleases) + "/download/v2.0.0/" + setup_name;
+        const auto extra_asset = ",{\"name\":" + library::quote(setup_name) + ",\"browser_download_url\":" + library::quote(setup_url) +
+            ",\"size\":123456,\"digest\":\"sha256:" + std::string(64, 'a') + "\"}";
+        installers.body.insert(installers.body.rfind(']'), extra_asset);
+        const auto setup = updates::parse_release(installers, "1.0.0", "windows-x64.exe");
+        check(setup.installer && setup.asset_url == setup_url && setup.asset_size == 123456 && setup.digest.size() == 71,
+            "installer preferred to portable with integrity metadata");
+        installers.body = response("v2.0.0", "-setup-windows-x64.exe").body;
+        const auto portable_json = response("v2.0.0", "-windows-x64.exe").body;
+        const auto asset_start = portable_json.find("[{\"") + 1;
+        installers.body.insert(installers.body.rfind(']'), "," + portable_json.substr(asset_start, portable_json.rfind(']') - asset_start));
+        check(updates::parse_release(installers, "1.0.0", "windows-x64.exe").installer, "installer choice independent of API ordering");
+
         music::Track track;
         music::Track part1, part2;
         music::Variant part_variant; part_variant.source = music::Source::Bilibili; part_variant.id = "BV1fixture01";

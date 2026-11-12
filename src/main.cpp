@@ -48,6 +48,9 @@ int main(int argc, char** argv) {
     if (smoke_test) initial_search = false;
     if (initial_search) view.ui.tab = 0;
     if (!initialize(smoke_test)) return 1;
+#ifdef _WIN32
+    SetCurrentProcessExplicitAppUserModelID(L"sudoevolve.AinoPlayer");
+#endif
     aino::WindowConfig cfg;
     cfg.width = 1180;
     cfg.height = 760;
@@ -60,6 +63,28 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "Cannot create aino player window\n");
         return 1;
     }
+#ifdef _WIN32
+    const auto window_handle = static_cast<aino::detail::Win32State*>(win.impl->native)->hwnd;
+    for (const auto size : {ICON_BIG, ICON_SMALL}) {
+        const int metric = size == ICON_BIG ? SM_CXICON : SM_CXSMICON;
+        const auto icon = LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(101), IMAGE_ICON,
+                                    GetSystemMetrics(metric), GetSystemMetrics(metric), LR_SHARED);
+        if (icon) SendMessageW(window_handle, WM_SETICON, size, reinterpret_cast<LPARAM>(icon));
+    }
+#elif defined(AINO_PLATFORM_X11)
+    auto* native = static_cast<aino::detail::X11State*>(win.impl->native);
+    XClassHint class_hint{const_cast<char*>("aino_player"), const_cast<char*>("aino-player")};
+    XSetClassHint(native->dpy, native->win, &class_hint);
+    const auto& icon = brand_icon();
+    if (icon.w > 0 && icon.h > 0) {
+        std::vector<unsigned long> pixels{static_cast<unsigned long>(icon.w), static_cast<unsigned long>(icon.h)};
+        for (size_t i = 0; i < icon.rgba.size(); i += 4)
+            pixels.push_back((static_cast<unsigned long>(icon.rgba[i + 3]) << 24) |
+                (static_cast<unsigned long>(icon.rgba[i]) << 16) | (static_cast<unsigned long>(icon.rgba[i + 1]) << 8) | icon.rgba[i + 2]);
+        XChangeProperty(native->dpy, native->win, XInternAtom(native->dpy, "_NET_WM_ICON", False), XA_CARDINAL,
+                        32, PropModeReplace, reinterpret_cast<unsigned char*>(pixels.data()), int(pixels.size()));
+    }
+#endif
 #ifdef _WIN32
     // 高 DPI 下逻辑尺寸会超屏：创建后按工作区再夹一次，否则底栏会被屏幕边缘截掉
     {
@@ -79,7 +104,7 @@ int main(int argc, char** argv) {
     win.set_theme(theme_dark ? aino::Theme::dark() : aino::Theme::light());
     win.set_anim_fps(60.0f);
 
-    start({[&win] { win.wake(); }, [&win] { win.activate(); }});
+    start({[&win] { win.wake(); }, [&win] { win.activate(); }, [&win] { win.close(); }});
     bool autostart = true;
     win.run([&](aino::Ui& ui) {
         const auto begin = std::chrono::steady_clock::now();

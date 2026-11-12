@@ -1,6 +1,7 @@
 // 平台边界：UTF-8 文件路径、应用目录、时钟与子进程。
 #pragma once
 #include <chrono>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cerrno>
@@ -21,6 +22,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <bcrypt.h>
 #else
 #include <spawn.h>
 #include <sys/wait.h>
@@ -260,6 +262,42 @@ inline bool open_browser(const std::string& url) {
     return run_process({"xdg-open", url}) == 0;
 #endif
 }
+#ifdef _WIN32
+// 流式校验 GitHub 提供的安装包摘要，不把整个安装包读进内存。
+inline std::string sha256_file(const std::string& path) {
+    auto* file = fopen(path, "rb");
+    if (!file) return {};
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    bool ok = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) >= 0 &&
+              BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0) >= 0;
+    std::array<unsigned char, 65536> buffer{};
+    while (ok) {
+        const auto read = std::fread(buffer.data(), 1, buffer.size(), file);
+        if (read && BCryptHashData(hash, buffer.data(), ULONG(read), 0) < 0) { ok = false; break; }
+        if (read < buffer.size()) { ok = !std::ferror(file); break; }
+    }
+    std::array<unsigned char, 32> digest{};
+    if (ok) ok = BCryptFinishHash(hash, digest.data(), ULONG(digest.size()), 0) >= 0;
+    if (hash) BCryptDestroyHash(hash);
+    if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
+    std::fclose(file);
+    if (!ok) return {};
+    std::string result;
+    for (const auto byte : digest) { result += "0123456789abcdef"[byte >> 4]; result += "0123456789abcdef"[byte & 15]; }
+    return result;
+}
+inline bool launch_installer(const std::string& path) {
+    const auto file = widen(path);
+    SHELLEXECUTEINFOW info{}; info.cbSize = sizeof info; info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = L"open"; info.lpFile = file.c_str();
+    info.lpParameters = L"/SILENT /NORESTART /CLOSEAPPLICATIONS /AINORESTART=1";
+    info.nShow = SW_SHOWNORMAL;
+    const bool launched = ShellExecuteExW(&info) != FALSE;
+    if (info.hProcess) CloseHandle(info.hProcess);
+    return launched;
+}
+#endif
 inline bool open_folder(const std::string& path) {
     std::error_code ec;
     if (!fs::is_directory(fs::u8path(path), ec) || ec) return false;

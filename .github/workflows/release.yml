@@ -50,6 +50,8 @@ jobs:
           pathlib.Path("dist").mkdir(exist_ok=True)
           shutil.copy2("build/Release/aino_player.exe", f"dist/aino-player-{tag}-windows-x64.exe")
           shutil.copy2("build/codec/FFmpeg-BUILD.txt", "dist/FFmpeg-BUILD-windows.txt")
+      - name: Build compressed per-user Windows installer
+        run: python tools/build_installer.py --exe build/Release/aino_player.exe --output dist
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: windows-exe

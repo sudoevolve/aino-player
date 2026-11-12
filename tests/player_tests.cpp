@@ -273,12 +273,17 @@ int main(int argc, char** argv) {
             check(handle != nullptr, "cache fixture file"); std::fputs("fixture", handle); std::fclose(handle);
         };
         for (const auto& relative : {"track-1.mp3", "7/track-2.m4a", "7/track-2.m4a.pcm.wav", "7/track-3.mp3", "8/track-4.flac", "9/track-5.wav", "outside/keep.txt", "library.json",
-                                    "7/ffmpeg-0123456789abcdef.exe", "8/ffmpeg-0123456789abcdef.exe.part", "9/ffmpeg-0123456789abcdef.exe"}) fixture(relative);
+                                    "7/ffmpeg-0123456789abcdef.exe", "8/ffmpeg-0123456789abcdef.exe.part", "9/ffmpeg-0123456789abcdef.exe",
+                                    "7/aino-update-v2.0.0.exe", "8/aino-update-v2.0.0.exe", "9/aino-update-v2.0.0.exe", "8/unrelated.exe"}) fixture(relative);
         const auto cleaned = cache::clear_audio(cache_root, 7, "track-2.", true, [](uint32_t pid) { return pid == 9; });
-        check(cleaned.files == 4 && cleaned.errors == 0, "cache cleanup removes legacy, stale audio and abandoned decoder");
+        check(cleaned.files == 5 && cleaned.errors == 0, "cache cleanup removes legacy, stale audio and abandoned decoder/installer");
         for (const auto& relative : {"7/ffmpeg-0123456789abcdef.exe", "9/ffmpeg-0123456789abcdef.exe"})
             check(platform::exists(platform::join(cache_root, relative)), "cache cleanup preserves live decoder executables");
         check(!cache::codec_file("ffmpeg-unrelated.exe") && !cache::codec_file("ffmpeg-0123456789abcdef.txt"), "codec cleanup recognizes only owned names");
+        check(cache::update_file("aino-update-v2.0.0.exe") && !cache::update_file("aino-update-v2..0.exe") &&
+              !cache::update_file("aino-update-v2.0.0.exe.extra"), "installer cleanup recognizes only owned names");
+        for (const auto& relative : {"7/aino-update-v2.0.0.exe", "9/aino-update-v2.0.0.exe", "8/unrelated.exe"})
+            check(platform::exists(platform::join(cache_root, relative)), "installer cleanup preserves live instances and unknown files");
         for (const auto& relative : {"7/track-2.m4a", "7/track-2.m4a.pcm.wav", "9/track-5.wav", "outside/keep.txt", "library.json"})
             check(platform::exists(platform::join(cache_root, relative)), "cache cleanup preserves active playback, other processes and unrelated data");
         fixture("7/track-6.mp3");
