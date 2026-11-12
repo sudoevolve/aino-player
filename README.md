@@ -97,7 +97,7 @@ AINO_SCALE=1.5 aino_player
 aino_player --diagnostics
 ```
 
-本轮将 FreeType face 改为按字体文件和索引共享，字形位图缓存限制为 4 MiB / 16384 项；封面最多两个后台下载/解码任务、32 个待处理请求，完成与失败条目均参与缓存回收。Linux 的 RSS、共享文件页和 Windows 的工作集统计不可直接等同；目前没有本机 Linux 实测，不能保证从反馈的 150 MB 降到 17 MB。XWayland 的混合 DPI、多显示器与合成器二次缩放仍需实机检查，本轮不宣称原生 Wayland 支持。
+本轮将 FreeType face 改为按字体文件和索引共享，字形位图缓存限制为 4 MiB / 16384 项；封面最多两个后台下载/解码任务、32 个待处理请求，完成与失败条目均参与缓存回收。Ubuntu 24.04 / Xvfb CI 已通过 8 项测试，覆盖动态 DPI、鼠标坐标、字体共享和内置解码。空资料库、未播放且无封面时的首帧诊断 RSS 为 31032 kB（约 30.3 MiB，倍率 1），其中匿名页 8208 kB、文件页 22824 kB；不是原反馈机器的前后对照，也不代表播放与封面加载后的占用。不能保证从反馈的 150 MB 降到 17 MB。XWayland 的混合 DPI、多显示器与合成器二次缩放仍需实机检查，本轮不宣称原生 Wayland 支持。
 
 MP3、FLAC、WAV 由 miniaudio 直接解码。**AAC/M4A、Ogg/Opus、WebM 使用内置精简 FFmpeg**：后台解码成缓存目录中的 PCM WAV，再交给 miniaudio 播放。Windows 精简解码器约 2.97 MiB；不包含网络、视频解码或额外外部库，不依赖 Windows Media Foundation。播放器仍先缓存、后解码，不做边下边播。
 
