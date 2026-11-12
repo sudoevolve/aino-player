@@ -12,6 +12,8 @@ jobs:
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DAINO_TEST_BROWSER=/usr/bin/google-chrome
       - run: cmake --build build --parallel 2
       - run: ctest --test-dir build --output-on-failure
+      - name: Report Linux DPI and resident memory
+        run: xvfb-run -a build/aino_player --diagnostics
   windows:
     runs-on: windows-latest
     steps:
