@@ -2,27 +2,40 @@ name: release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build and publish
+        required: true
+        type: string
 permissions:
   contents: read
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 jobs:
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
       - run: cmake -S . -B build -A x64 -DBUILD_TESTING=ON
       - run: cmake --build build --config Release --parallel 2
       - run: ctest --test-dir build -C Release --output-on-failure
       - name: Prepare Windows executable
-        shell: pwsh
+        shell: python
         run: |
-          $expected = "aino player $($env:GITHUB_REF_NAME.TrimStart('v'))"
-          $actual = & .\build\Release\aino_player.exe --version
-          if ($actual.Trim() -ne $expected) { throw "Version mismatch: $actual / $expected" }
-          New-Item -ItemType Directory -Path dist -Force | Out-Null
-          Copy-Item build/Release/aino_player.exe "dist/aino-player-$($env:GITHUB_REF_NAME)-windows-x64.exe"
+          import os, pathlib, shutil, subprocess
+          tag = os.environ["RELEASE_TAG"]
+          assert tag.startswith("v"), f"Expected a version tag: {tag}"
+          expected = "aino player " + tag[1:]
+          actual = subprocess.check_output(["build/Release/aino_player.exe", "--version"], text=True).strip()
+          assert actual == expected, f"Version mismatch: {actual} / {expected}"
+          pathlib.Path("dist").mkdir(exist_ok=True)
+          shutil.copy2("build/Release/aino_player.exe", f"dist/aino-player-{tag}-windows-x64.exe")
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: windows-exe
@@ -32,6 +45,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
       - run: sudo apt-get update && sudo apt-get install -y libx11-dev libcurl4-openssl-dev libfreetype6 libfontconfig1 fonts-noto-cjk libasound2 xvfb ffmpeg xdg-utils dpkg-dev
       # 只调整临时 CI 虚拟机的 userns 策略，不给浏览器添加 --no-sandbox。
       - run: if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; fi
@@ -41,11 +56,11 @@ jobs:
       - name: Build and verify Debian package
         shell: bash
         run: |
-          test "$(build/aino_player --version)" = "aino player ${GITHUB_REF_NAME#v}"
+          test "$(build/aino_player --version)" = "aino player ${RELEASE_TAG#v}"
           cpack --config build/CPackConfig.cmake -G DEB -B dist
           dpkg-deb --info dist/*.deb
           sudo apt-get install -y ./dist/*.deb
-          test "$(/usr/bin/aino_player --version)" = "aino player ${GITHUB_REF_NAME#v}"
+          test "$(/usr/bin/aino_player --version)" = "aino player ${RELEASE_TAG#v}"
           xvfb-run -a /usr/bin/aino_player --smoke-test
       - uses: actions/upload-artifact@v7.0.2
         with:
@@ -59,6 +74,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
       - uses: actions/download-artifact@v8.0.2
         with:
           path: dist
@@ -71,4 +88,4 @@ jobs:
           cd dist
           sha256sum *.exe *.deb > SHA256SUMS.txt
           cd ..
-          gh release create "$GITHUB_REF_NAME" dist/*.exe dist/*.deb dist/SHA256SUMS.txt --verify-tag --title "aino player $GITHUB_REF_NAME" --notes-file docs/RELEASE_NOTES.md --latest
+          gh release create "$RELEASE_TAG" dist/*.exe dist/*.deb dist/SHA256SUMS.txt --verify-tag --title "aino player $RELEASE_TAG" --notes-file docs/RELEASE_NOTES.md --latest
