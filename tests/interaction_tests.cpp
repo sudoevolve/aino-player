@@ -277,6 +277,17 @@ static void ime_backend_checks() {
     check(detail::win_proc(state->hwnd,WM_IME_REQUEST,0x0006,reinterpret_cast<LPARAM>(&position)) == TRUE,"IME cursor position request handled");
     POINT expected{48,32}; ClientToScreen(state->hwnd,&expected);
     check(position.point.x==expected.x && position.point.y==expected.y && position.height==22,"IME receives screen coordinates and caret height");
+    ui->ime_comp = "pending"; state->text_in.clear();
+    SendMessageW(state->hwnd, WM_IME_STARTCOMPOSITION, 0, 0);
+    check(ui->ime_comp.empty() && state->text_in.empty(), "inline composition starts without committing text");
+    SendMessageW(state->hwnd, WM_IME_COMPOSITION, 0, detail::AINO_GCS_COMPSTR);
+    check(state->text_in.empty(), "preedit updates never append committed characters");
+    SendMessageW(state->hwnd, WM_IME_COMPOSITION, 0, detail::AINO_GCS_RESULTSTR);
+    SendMessageW(state->hwnd, WM_CHAR, L'\u6c34', 1);
+    check(state->text_in == "\xe6\xb0\xb4", "WM_CHAR delivery after a result notification appends once");
+    ui->ime_comp = "pending";
+    SendMessageW(state->hwnd, WM_IME_ENDCOMPOSITION, 0, 0);
+    check(ui->ime_comp.empty() && state->text_in == "\xe6\xb0\xb4", "composition end clears only preedit");
     bool drawn=false;
     window.impl->frame_cb_ptr = [&] { drawn=true; };
     ui->frame_open=true; window.render(); ui->frame_open=false;

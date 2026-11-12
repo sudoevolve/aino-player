@@ -10627,8 +10627,8 @@ inline LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     // ---- IME 组字串（拼音）----
     // 只靠 WM_CHAR 的话，拼音全在系统那个悬空的组合窗里，输入框看着是空的
     // （"没有预先填充"）。这里把 GCS_COMPSTR 抓下来存进 ui->ime_comp，由
-    // input / textarea 画在光标处。上屏字符仍然走 WM_CHAR —— 所以这几个 case
-    // 一律 break（交给 DefWindowProc），绝不自己插入 RESULTSTR：两条路都插就是双份。
+    // input / textarea 画在光标处。自绘预编辑时不能再把组字显示交给默认过程；
+    // 只有 RESULTSTR 继续走默认提交 → WM_CHAR，避免手动插入造成重复上屏。
     case WM_IME_SETCONTEXT:
         // 只屏蔽自绘的组合串，候选窗口的所有显示位原样交给系统。
         // 不按窗口类名隐藏/透明化 IME 窗口，组合窗和候选窗可能共享可见性。
@@ -10654,6 +10654,7 @@ inline LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_IME_STARTCOMPOSITION:
         s->owner->ui.impl->ime_comp.clear();
         s->owner->need_frame = true;
+        if (s->owner->ui.impl->ime_owner) return 0;
         break;
 
     case WM_IME_COMPOSITION: {
@@ -10662,13 +10663,9 @@ inline LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (commit) ui->ime_comp.clear();  // 上屏：草稿消失，正文随后由 WM_CHAR 送到
 
         // TSF 经 CUAS 转发时，消息可能不含 GCS_COMPSTR 位，但 IMM 仍有组字串。
-        // 除纯上屏消息外都查询 IMM，避免漏掉预编辑内容。
-        if (!commit) {
+        // 部分上屏可同时带下一段预编辑；两种状态必须分别处理。
+        if (!commit || (l & AINO_GCS_COMPSTR)) {
             static ImmApi api;
-            // ⚠️ 别用 lParam 那个 HIMC。CUAS（TSF 输入法给老式窗口做的 IMM 转发层）
-            // 塞过来的句柄调 ImmGetCompositionString 一律返回 0，可同一个串用
-            // ImmGetContext(hwnd) 拿到的上下文读就有 —— 实测 w=0x73 那条消息里
-            // lParam 是 0x1b8/0x1c00，读出来 0 字节；换成 get_ctx(hwnd) 立刻是 2/6/10/14。
             HIMC himc = api.ok ? api.get_ctx(s->hwnd) : nullptr;
             // lParam 是组字标志，不是 HIMC；只使用当前窗口的真实上下文。
             LONG bytes = himc && api.ok ? api.get_str(himc, AINO_GCS_COMPSTR, nullptr, 0) : 0;
@@ -10682,12 +10679,18 @@ inline LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (himc) api.rel_ctx(s->hwnd, himc);
         }
         s->owner->need_frame = true;
+        if (ui->ime_owner) {
+            if (!commit) return 0;
+            // 默认过程只提交结果，不再向系统组合窗转发已自绘的预编辑标志。
+            l = AINO_GCS_RESULTSTR;
+        }
         break;
     }
 
     case WM_IME_ENDCOMPOSITION:
         s->owner->ui.impl->ime_comp.clear();
         s->owner->need_frame = true;
+        if (s->owner->ui.impl->ime_owner) return 0;
         break;
 
     case WM_CHAR: {

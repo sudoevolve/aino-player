@@ -229,3 +229,11 @@ FFmpeg 仍为固定来源和摘要校验的 LGPL 构建，仅补 file/pipe、PCM
 播放反馈所示网易云《乌克丽丽 (Live)》的只读 JSON 诊断为 HTTP 200、服务 code 200、歌曲 code -110 且 url 为空。此路径在 resolve 阶段失败，未进入 Stream::open；不推测拒绝码具体对应会员、版权或其他限制，也不将其代表所有曲目的播放状态。修复已有的标准音质跳过账号取流问题，抽出响应解析以保留真实拒绝码，区分缺失数据、网络失败和有效地址但未知码率；保留免费外链回退并去掉业务层无条件填 Cookie 的尾注。流式管道与完整文件恢复机制未改动，尚不能确认用户反馈是否还包含独立的流式故障。
 
 审查范围为窗口所有权、滑条提交顺序、账号取流和错误传播，未新增依赖或应用模块。Windows MSVC Release 播放器、player_tests、interaction_tests 和上游 ime_comp_probe 已编译通过；网易云解析用例补入现有 player_tests，未执行。播放器输出至 build/fixes/Release，避免覆盖正在运行的 build/portable/Release 实例。按用户要求不运行 CTest、音频/窗口/浏览器回归、不触发 CI 或发布。尚待实际输入法候选框和播放反馈确认，编译通过不等于实机验证。
+
+### 2026-11-12 未发布：消除双份预编辑
+
+用户后续确认播放失败仅限网易云部分会员歌曲，播放问题已排除；新截图显示候选框已出现，但输入框内和候选框上方各有一份拼音。删除原生窗口隐藏逻辑后，仍把已自绘的 WM_IME_STARTCOMPOSITION / COMPOSITION 转交给 DefWindowProc，默认 IME 窗口也收到组字显示通知。上次修复未完整处理这一消息所有权。
+
+两份 aino.hpp 同步调整：有内联预编辑 owner 时自行消费开始、预编辑更新和结束消息；提交仍经默认 RESULTSTR → WM_CHAR 路径，不手动再次插字。同时含 RESULTSTR / COMPSTR 的部分上屏先读取下一段预编辑，仅向默认过程传递 RESULTSTR 标志。未接管输入的消息保留默认处理，WM_IME_NOTIFY 候选通知和候选显示标志不变；不操作系统窗口可见性、透明度或样式，不改字体、布局与播放代码。
+
+代码审查检查纯预编辑、提交、混合标志和未接管路径；无新依赖或模块。既有 interaction_tests 和上游 capture_probe 补入预编辑不写正文、结果通知后 WM_CHAR 单次写入、结束仅清预编辑的消息检查，不等同于真实输入法候选 UI 验证。Windows MSVC Release 播放器、interaction_tests、上游 capture_probe 与 ime_comp_probe 均已编译通过，git diff --check 和两份头文件修改一致性静态检查通过。仅编译，未运行探针、回归、截图或 CI；真实微软拼音显示仍待用户确认。新 exe 位于 build/ime-inline/Release，保留正在运行的 build/fixes/Release 实例。
