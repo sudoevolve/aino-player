@@ -12,7 +12,7 @@ namespace det {
 
 constexpr float kSidebar = 216.0f;
 constexpr float kBarHeight = 88.0f;
-constexpr float kLyricsWidth = 320.0f;
+constexpr float kPanelWidth = 320.0f;
 constexpr float kRowHeight = 64.0f;
 
 inline aino::Color hue_color(float h, float s, float l) {
@@ -185,6 +185,9 @@ struct Ctx {
     const Snapshot& s;
     ViewModel& model;
 };
+static float right_panel_width(const Ctx& c) {
+    return c.model.ui.lyrics_open || c.model.ui.queue_open ? kPanelWidth : 0;
+}
 
 struct SongMenuState {
     bool active = false;
@@ -332,24 +335,25 @@ static void sidebar(Ctx& c) {
     const float lw = c.ui.text_width("aino", 19.0f, 700);
     c.ui.draw_text("PLAYER", {60 + lw + 7, 26, 80, 16}, c.th.label3, sub);
 
-    const char* navs[6] = {"在线搜索", "发现", "正在播放", "歌单", "音源", "设置"};
-    const SystemIcon icons[6] = {SystemIcon::Search, SystemIcon::Star, SystemIcon::List,
+    const char* navs[5] = {"发现", "在线搜索", "歌单", "音源", "设置"};
+    const int tabs[5] = {1, 0, 3, 4, 5};
+    const SystemIcon icons[5] = {SystemIcon::Star, SystemIcon::Search,
                                  SystemIcon::People, SystemIcon::Network, SystemIcon::Settings};
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 5; ++i) {
         const Rect box{12, 66.0f + float(i) * 32.0f, w - 24, 30};
-        if (c.ui.nav_item(navs[i], c.model.ui.tab == i, box, Style().padded(34, 0))) c.model.ui.tab = i;
-        c.ui.system_icon(icons[i], {box.x + 11, box.y + 7, 16, 16}, c.model.ui.tab == i ? c.th.tint : c.th.label2);
+        if (c.ui.nav_item(navs[i], c.model.ui.tab == tabs[i], box, Style().padded(34, 0))) c.model.ui.tab = tabs[i];
+        c.ui.system_icon(icons[i], {box.x + 11, box.y + 7, 16, 16}, c.model.ui.tab == tabs[i] ? c.th.tint : c.th.label2);
     }
 
-    c.ui.fill_rect({20, 270, w - 40, 1}, c.th.separator);
+    c.ui.fill_rect({20, 244, w - 40, 1}, c.th.separator);
 
     Style sec;
     sec.font_size = 10.5f;
     sec.font_weight = 600;
-    c.ui.draw_text("音源状态", {22, 286, 120, 16}, c.th.label2, sec);
+    c.ui.draw_text("音源状态", {22, 260, 120, 16}, c.th.label2, sec);
 
     for (int i = 0; i < music::kSourceCount; ++i) {
-        const float y = 308.0f + float(i) * 26.0f;
+        const float y = 282.0f + float(i) * 26.0f;
         const bool on = (c.model.ui.src_mask >> i) & 1u;
         c.ui.fill_circle(26, y + 8, 3.5f, on ? source_color(music::Source(i)) : c.th.label4);
 
@@ -706,7 +710,7 @@ static void discover_card_row(Ctx& c, int index, const Rect& box) {
 
 static void tab_discover(Ctx& c) {
     const float mx = kSidebar + 24.0f;
-    const float mw = c.W - mx - 24.0f - (c.model.ui.lyrics_open ? kLyricsWidth : 0.0f);
+    const float mw = c.W - mx - 24.0f - right_panel_width(c);
 
     c.ui.heading("发现", {mx, 20, mw, 30});
     int site = c.model.ui.disc_site;
@@ -753,104 +757,46 @@ static void tab_discover(Ctx& c) {
     c.ui.scroll(list, n, 60.0f, [&](int i, const Rect& row) { discover_card_row(c, i, row); });
 }
 
-static void queue_row(Ctx& c, const music::Track& t, int index, const Rect& box, bool is_playing) {
-    const float rm_w = 26.0f;
-    const float dur_w = 48.0f;
+static void queue_row(Ctx& c, const music::Track& track, int index, const Rect& box, bool current) {
     const bool hover = box.contains(c.ui.input().mouse.x, c.ui.input().mouse.y);
-
-    // 行内按钮先认领按压（aino 的 press 只归第一个包含指针的控件）
-    const Rect rm{box.right() - rm_w - 8, box.y + box.h * 0.5f - 11, 22, 22};
-    const Rect favorite{rm.x - 27, rm.y, 22, 22};
-    const bool favorite_clicked = c.ui.item("", "", "", favorite, Style().corner(6));
-    const bool saved = c.model.library.contains(t);
-    bool rm_clicked = false;
-    if (hover && c.ui.item("", "", "", rm, Style().corner(6))) rm_clicked = true;
-
-    if (is_playing) c.ui.fill_rect(box, c.th.tint.scaled_alpha(0.10f), 7.0f);
-    else if (hover) c.ui.fill_rect(box, c.th.fill3.scaled_alpha(0.55f), 7.0f);
-    const bool clicked = c.ui.item("", "", "", box, Style().corner(7));
-
-    Style idx_s;
-    idx_s.font_size = 11.0f;
-    idx_s.align = Align::Right;
-    idx_s.valign = VAlign::Middle;
-    const Rect idx_box{box.x + 6, box.y, 22, box.h};
-    if (is_playing) {
-        draw_playing_bars(c.ui, {idx_box.x + 6, box.y + box.h * 0.5f - 5, 10, 10}, c.th.tint);
-    } else {
-        c.ui.draw_text(std::to_string(index + 1), idx_box, c.th.label4, idx_s);
-    }
-
-    const Rect cov{box.x + 34, box.y + (box.h - 38.0f) * 0.5f, 38, 38};
-    cover_art(c, t.cover_url, t.title, cov, 6.0f);
-
-    const float tx = cov.right() + 11;
-    const float tw = box.right() - tx - dur_w - rm_w - 45;
-    Style ns;
-    ns.font_size = 13.0f;
-    ns.font_weight = 600;
-    c.ui.draw_text(ellipsize(c.ui, t.title, tw, 13.0f, 600), {tx, box.y + 9, tw, 17},
-                   is_playing ? c.th.tint : c.th.label, ns);
-    Style ms;
-    ms.font_size = 10.5f;
-    std::string sub = t.artist;
-    if (!t.variants.empty()) sub += " · " + std::string(music::source_name(t.current().source));
-    c.ui.draw_text(ellipsize(c.ui, sub, tw, 10.5f), {tx, box.y + 29, tw, 15}, c.th.label3, ms);
-
-    Style ds;
-    ds.font_size = 11.0f;
-    ds.align = Align::Right;
-    ds.valign = VAlign::Middle;
-    c.ui.draw_text(fmt_time(t.duration_ms), {box.right() - dur_w - rm_w - 37, box.y, dur_w, box.h}, c.th.label3, ds);
-    c.ui.system_icon(SystemIcon::Star, favorite.center(13, 13), saved ? c.th.tint : c.th.label3);
-
-    // hover 时才出现的移除键：给个底，否则深色下 25% 的细线图标等于看不见
-    if (hover) {
-        c.ui.fill_rect(rm, c.th.fill3, 6.0f);
-        c.ui.system_icon(SystemIcon::Close, rm.center(12, 12), c.th.label2);
-    }
-
-    c.ui.fill_rect({box.x + 34, box.bottom() - 1, box.w - 42, 1}, c.th.separator.scaled_alpha(0.5f));
-
-    if (favorite_clicked) favorite_toggle(t);
-    else if (rm_clicked) queue_remove(index);
+    const Rect remove{box.right() - 28, box.y + 19, 22, 22};
+    const Rect favorite{remove.x - 26, remove.y, 22, 22};
+    const bool saved = c.model.library.contains(track);
+    const bool save_clicked = c.ui.icon_button("", favorite, Style().ghost());
+    const bool remove_clicked = hover && c.ui.icon_button("", remove, Style().ghost());
+    const bool clicked = c.ui.item("", "", "", box, Style().corner(6));
+    if (current) c.ui.fill_rect(box, c.th.tint.scaled_alpha(0.08f), 6);
+    const Rect cover{box.x + 8, box.y + 10, 40, 40};
+    cover_art(c, track.cover_url, track.title, cover, 5);
+    const float x = cover.right() + 10, width = std::max(1.0f, favorite.x - x - 6);
+    c.ui.draw_text(ellipsize(c.ui, track.title, width, 12, 600), {x, box.y + 10, width, 19}, current ? c.th.tint : c.th.label, Style().font(12).weight(600));
+    const auto detail = track.artist + (track.duration_ms > 0 ? " · " + fmt_time(track.duration_ms) : "");
+    c.ui.muted_text(ellipsize(c.ui, detail, width, 10.5f), {x, box.y + 33, width, 17}, Style().font(10.5f));
+    if (saved || hover) c.ui.system_icon(SystemIcon::Star, favorite.center(13, 13), saved ? c.th.tint : c.th.label3);
+    if (hover) c.ui.system_icon(SystemIcon::Close, remove.center(10, 10), c.th.label3);
+    if (save_clicked) favorite_toggle(track);
+    else if (remove_clicked) queue_remove(index);
     else if (clicked) start_play(index);
 }
-
-static void tab_queue(Ctx& c) {
-    const float mx = kSidebar + 24.0f;
-    const float mw = c.W - mx - 24.0f - (c.model.ui.lyrics_open ? kLyricsWidth : 0.0f);
-    const int n = int(c.s.tracks.size());
-
-    c.ui.heading("正在播放", {mx, 20, mw, 30});
-
-    std::string info = std::to_string(n) + " 首";
-    for (int i = 0; i < n; ++i) if (track_uid(c.s.tracks[size_t(i)]) == c.s.now_uid) {
-        info += " · 当前第 " + std::to_string(i + 1) + " 首"; break;
-    }
-    Style is;
-    is.font_size = 11.0f;
-    c.ui.draw_text(info, {mx, 54, 260, 18}, c.th.label3, is);
-
-    c.ui.muted_text(play_mode_name(c.model.ui.play_mode), {mx + mw - 186, 53, 84, 20}, Style().font(11));
-    if (c.ui.button("清空", {mx + mw - 92, 48, 92, 28}, Style().font(11.5f))) {
-        if (n > 0) queue_clear();
-    }
-
-    if (n == 0) {
-        c.ui.empty_state("队列是空的", std::string(), {mx, 110, mw, 120});
+static void queue_panel(Ctx& c, const Rect& box) {
+    const int count = int(c.s.tracks.size());
+    c.ui.muted_text(std::to_string(count) + " 首 · " + play_mode_name(c.model.ui.play_mode), {box.x + 16, box.y + 8, box.w - 92, 22}, Style().font(10.5f));
+    Style clear = Style().ghost().font(10.5f); clear.disabled = count == 0;
+    if (c.ui.button("清空", {box.right() - 68, box.y + 5, 52, 26}, clear)) queue_clear();
+    if (!count) {
+        c.ui.draw_text("待播清单为空", {box.x + 24, box.y + 98, box.w - 48, 24}, c.th.label2, Style().font(13).weight(600).center());
+        c.ui.muted_text("右键歌曲可选择下一首播放\n或添加到播放列表", {box.x + 24, box.y + 132, box.w - 48, 56}, Style().font(11).center().wrap_text());
         return;
     }
-
-    const float top = 92.0f;
-    const Rect list{mx, top, mw, c.H - kBarHeight - top - 10};
-    if (list.h < 50) return;
-    c.ui.scroll(list, n, 56.0f,
-                [&](int i, const Rect& row) {
-                    capture_song_menu(c, c.s.tracks[size_t(i)], row, list);
-                    queue_row(c, c.s.tracks[size_t(i)], i, row, track_uid(c.s.tracks[size_t(i)]) == c.s.now_uid);
-                });
+    const Rect list{box.x + 8, box.y + 42, box.w - 16, box.h - 50};
+    if (list.h < 30) return;
+    c.ui.scroll(list, count, 60, [&](int index, const Rect& row) {
+        const auto& track = c.s.tracks[size_t(index)];
+        capture_song_menu(c, track, row, list);
+        queue_row(c, track, index, row, track_uid(track) == c.s.now_uid);
+    });
 }
+
 
 static void local_playlist_row(Ctx& c, int index, const Rect& box) {
     // 点击按钮后只在本帧末更新容器，避免绘制引用在替换资料库时失效。
@@ -881,7 +827,7 @@ static void local_playlist_row(Ctx& c, int index, const Rect& box) {
 
 static void playlist_detail(Ctx& c) {
     const float mx = kSidebar + 24.0f;
-    const float mw = c.W - mx - 24.0f - (c.model.ui.lyrics_open ? kLyricsWidth : 0.0f);
+    const float mw = c.W - mx - 24.0f - right_panel_width(c);
     const auto& view = c.model.playlist;
     const auto& playlist = view.playlist;
     const char* back = view.return_tab == 0 ? "返回搜索" : view.return_tab == 1 ? "返回发现" : view.return_tab == 2 ? "返回队列" : "返回歌单";
@@ -910,7 +856,7 @@ static void playlist_detail(Ctx& c) {
 static void tab_playlists(Ctx& c) {
     if (c.model.playlist.open) { playlist_detail(c); return; }
     const float mx = kSidebar + 24.0f;
-    const float mw = c.W - mx - 24.0f - (c.model.ui.lyrics_open ? kLyricsWidth : 0.0f);
+    const float mw = c.W - mx - 24.0f - right_panel_width(c);
 
     c.ui.heading("歌单", {mx, 20, mw, 30});
     int site = c.model.ui.pl_site;
@@ -1006,7 +952,7 @@ static void tab_playlists(Ctx& c) {
 static void tab_search(Ctx& c) {
     const float mx = kSidebar + 24.0f;
     // 歌词面板是从右边盖过来的，列表得让出位置，否则标题会被压在面板底下
-    const float right_pad = 24.0f + (c.model.ui.lyrics_open ? kLyricsWidth : 0.0f);
+    const float right_pad = 24.0f + right_panel_width(c);
     const float mw = c.W - mx - right_pad;
 
     const Rect field{mx, 20, mw - 100.0f, 32};
@@ -1078,7 +1024,7 @@ static void tab_search(Ctx& c) {
 // ---------- 音源页 ----------
 static void tab_sources(Ctx& c) {
     const float mx = kSidebar + 24.0f;
-    const float mw = c.W - mx - 24.0f;
+    const float mw = c.W - mx - 24.0f - right_panel_width(c);
     c.ui.heading("音源", {mx, 20, mw, 30});
 
     const char* cookie_hints[music::kSourceCount] = {"MUSIC_U=...", "qm_keyst=...", "", "SAPISID=...; __Secure-3PSID=..."};
@@ -1155,78 +1101,68 @@ static void tab_sources(Ctx& c) {
 }
 
 // ---------- 设置页 ----------
-
-// 账号卡：site 0 = 网易云，1 = QQ
-static void account_card(Ctx& c, int site, const Rect& box) {
-    const bool qq_side = (site == 1);
-    const bool yt_side = site == 2;
-    c.ui.panel(box, Style().corner(12));
-    c.ui.subheading(yt_side ? "YouTube Music" : qq_side ? "QQ 音乐" : "网易云音乐", {box.x + 20, box.y + 12, 240, 22});
-
-    std::string note;
-    const bool connecting = c.model.login[size_t(site)].connecting;
-    note = c.model.login[size_t(site)].note;
-
-    const bool logged = yt_side ? c.model.youtube.logged : qq_side ? c.model.qq.logged : c.model.netease.logged;
-    const std::string nickname = yt_side ? c.model.youtube.nickname : qq_side ? c.model.qq.nickname : c.model.netease.nickname;
-    const std::string uid = yt_side ? "" : qq_side ? c.model.ui.qq_uin : c.model.ui.ne_uid;
-    const std::string err = yt_side ? c.model.youtube.err : qq_side ? c.model.qq.err : c.model.netease.err;
-    const int count = int(yt_side ? c.model.youtube.playlists.size() : qq_side ? c.model.qq.playlists.size() : c.model.netease.playlists.size());
-
-    if (logged) {
-        Style nm;
-        nm.font_size = 13.5f;
-        nm.font_weight = 600;
-        c.ui.draw_text(nickname.empty() ? "已登录" : nickname, {box.x + 20, box.y + 40, 300, 20}, c.th.label, nm);
-        c.ui.muted_text((yt_side ? "YouTube Music" : (qq_side ? "QQ " : "uid ") + uid) + " · " + std::to_string(count) + " 个歌单",
-                        {box.x + 20, box.y + 62, 300, 18}, Style().font(10.5f));
-        if (c.ui.button("刷新歌单", {box.right() - 200, box.y + 38, 84, 28}, Style().font(11.0f))) {
-            if (yt_side) youtube_refresh();
-            else if (qq_side) qq_refresh();
-            else ne_refresh();
-        }
-        if (c.ui.button(connecting ? "取消连接" : "重新登录", {box.right() - 108, box.y + 38, 88, 28}, Style().font(11.0f))) {
-            if (connecting) cancel_login(site); else begin_login(site);
-        }
-    } else {
-        c.ui.muted_text("未登录", {box.x + 20, box.y + 44, 200, 18}, Style().font(11.0f));
-        if (c.ui.button(connecting ? "取消连接" : "官网登录", {box.right() - 108, box.y + 38, 88, 28}, Style().primary().font(11.5f))) {
-            if (connecting) cancel_login(site); else begin_login(site);
-        }
-    }
-
-    if (!err.empty()) c.ui.muted_text(err, {box.x + 20, box.y + 84, box.w - 240, 18}, Style().font(10.0f));
-    else if (!note.empty()) c.ui.muted_text(note, {box.x + 20, box.y + 84, box.w - 240, 18}, Style().font(10.0f));
+static void settings_group(Ctx& c, const char* title, const Rect& box) {
+    c.ui.draw_text(title, {box.x + 2, box.y - 28, box.w - 4, 20}, c.th.label2, Style().font(11.5f).weight(600));
+    c.ui.fill_rect(box, c.th.fill3.scaled_alpha(0.5f), 10);
 }
-
-static void storage_settings(Ctx& c, float mx, float mw) {
-    c.ui.heading("数据与缓存", {mx, 20, mw - 120, 30});
-    if (c.ui.button("返回设置", {mx + mw - 104, 21, 104, 28}, Style().font(11.5f))) c.model.ui.storage_settings = false;
-    const auto config = c.model.paths.config;
-    const auto cache_root = c.model.paths.cache;
-    auto path_card = [&](const char* title, const std::string& path, float y) {
-        const Rect box{mx, y, mw, 60};
-        c.ui.panel(box, Style().corner(12));
-        c.ui.draw_text(title, {mx + 20, y + 10, mw - 150, 18}, c.th.label, Style().font(12.0f));
-        c.ui.muted_text(ellipsize(c.ui, path.empty() ? "目录不可用" : path, mw - 150, 10.5f), {mx + 20, y + 33, mw - 150, 16}, Style().font(10.5f));
-        if (c.ui.button("打开目录", {box.right() - 112, y + 17, 92, 28}, Style().font(11.0f)))
-            open_data_directory(path);
+static void settings_rule(Ctx& c, const Rect& box, float y) {
+    c.ui.fill_rect({box.x + 16, y, box.w - 32, 1}, c.th.separator.scaled_alpha(0.7f));
+}
+static void settings_label(Ctx& c, const char* text, const Rect& row) {
+    c.ui.draw_text(text, {row.x + 16, row.y, row.w - 32, row.h}, c.th.label, Style().font(12));
+}
+static void account_card(Ctx& c, int site, const Rect& box) {
+    const bool qq = site == 1, youtube = site == 2;
+    const bool logged = youtube ? c.model.youtube.logged : qq ? c.model.qq.logged : c.model.netease.logged;
+    const bool connecting = c.model.login[size_t(site)].connecting;
+    const auto& nickname = youtube ? c.model.youtube.nickname : qq ? c.model.qq.nickname : c.model.netease.nickname;
+    const auto& error = youtube ? c.model.youtube.err : qq ? c.model.qq.err : c.model.netease.err;
+    const auto& note = c.model.login[size_t(site)].note;
+    const int count = int(youtube ? c.model.youtube.playlists.size() : qq ? c.model.qq.playlists.size() : c.model.netease.playlists.size());
+    const Rect icon{box.x + 16, box.y + 22, 34, 34};
+    const auto color = source_color(youtube ? music::Source::YouTube : qq ? music::Source::QQ : music::Source::Netease);
+    c.ui.fill_rect(icon, color.scaled_alpha(0.12f), 8);
+    c.ui.draw_text(youtube ? "Y" : qq ? "Q" : "N", icon, color, Style().font(16).weight(600).center());
+    const float text_x = icon.right() + 12;
+    const float action_w = logged ? 126.0f : 82.0f;
+    const float text_w = std::max(1.0f, box.right() - action_w - text_x - 12);
+    c.ui.draw_text(youtube ? "YouTube Music" : qq ? "QQ 音乐" : "网易云音乐",
+        {text_x, box.y + 17, text_w, 20}, c.th.label, Style().font(12.5f).weight(600));
+    const auto status = connecting ? "正在连接…" : logged ? (nickname.empty() ? "已登录" : nickname) + " · " + std::to_string(count) + " 个歌单" : "未登录";
+    c.ui.muted_text(ellipsize(c.ui, status, text_w, 11), {text_x, box.y + 40, text_w, 18}, Style().font(11));
+    if (logged && c.ui.button("刷新", {box.right() - 138, box.y + 27, 48, 26}, Style().ghost().font(11))) {
+        if (youtube) youtube_refresh(); else if (qq) qq_refresh(); else ne_refresh();
+    }
+    if (c.ui.button(connecting ? "取消" : logged ? "重新登录" : "登录", {box.right() - 86, box.y + 27, 70, 26}, Style().font(11))) {
+        if (connecting) cancel_login(site); else begin_login(site);
+    }
+    if (!error.empty() || !note.empty()) c.ui.draw_text(ellipsize(c.ui, error.empty() ? note : error, box.w - 32, 10.5f),
+        {box.x + 16, box.y + 66, box.w - 32, 16}, error.empty() ? c.th.label3 : c.th.destructive, Style().font(10.5f));
+}
+static void storage_settings(Ctx& c, float x, float w, float y) {
+    const Rect paths{x, y + 28, w, 144};
+    settings_group(c, "存储位置", paths);
+    auto path_row = [&](const char* name, const std::string& path, float top) {
+        c.ui.draw_text(name, {x + 16, top + 12, w - 112, 20}, c.th.label, Style().font(12));
+        c.ui.muted_text(ellipsize(c.ui, path, w - 112, 10.5f), {x + 16, top + 37, w - 112, 18}, Style().font(10.5f));
+        if (c.ui.button("打开", {x + w - 76, top + 22, 60, 26}, Style().font(11))) open_data_directory(path);
     };
-    path_card("配置、收藏与歌单目录", config, 60);
-    path_card("临时音频缓存目录", cache_root, 132);
-    c.ui.muted_text("以下操作仅影响本机播放器，已下载的音乐文件会保留。", {mx, 204, mw, 18}, Style().font(11.0f));
-    auto action_row = [&](const char* title, const char* detail, const char* button, ClearAction action, float y) {
-        const Rect box{mx, y, mw, 64};
-        c.ui.panel(box, Style().corner(12));
-        const float width = std::max(1.0f, mw - 180);
-        c.ui.draw_text(title, {mx + 20, y + 10, width, 20}, c.th.label, Style().font(12.0f));
-        c.ui.muted_text(ellipsize(c.ui, detail, width, 10.5f), {mx + 20, y + 36, width, 16}, Style().font(10.5f));
-        if (c.ui.button(button, {box.right() - 136, y + 18, 116, 28}, Style().destructive().font(11.0f))) c.model.ui.clear_action = action;
-    };
-    action_row("账号登录信息", "config.ini 中的 Cookie 与账号 ID；其他设置保留", "清除登录信息", ClearAction::Cookies, 232);
-    action_row("本地收藏与保存的歌单", "library.json；包括本地收藏、命名歌单及在线歌单快照", "清除本地歌单", ClearAction::Library, 308);
-    action_row("当前播放列表", "queue.txt；清除重启恢复的列表，当前歌曲可继续播放", "清空当前列表", ClearAction::Queue, 384);
-    action_row("播放与封面缓存", "保留播放中、正在写入及其他运行实例使用的缓存", "清除缓存", ClearAction::Cache, 460);
+    path_row("配置、收藏与歌单", c.model.paths.config, paths.y);
+    settings_rule(c, paths, paths.y + 72);
+    path_row("播放缓存", c.model.paths.cache, paths.y + 72);
+    const Rect data{x, y + 220, w, 264};
+    settings_group(c, "管理数据", data);
+    const char* names[] = {"账号登录信息", "本地收藏与歌单", "当前播放队列", "播放与封面缓存"};
+    const char* details[] = {"退出账号，清除本机保存的 Cookie", "收藏、命名歌单与在线歌单快照", "清除队列及其恢复记录", "保留播放中和其他运行实例的文件"};
+    const ClearAction actions[] = {ClearAction::Cookies, ClearAction::Library, ClearAction::Queue, ClearAction::Cache};
+    for (int i = 0; i < 4; ++i) {
+        const float top = data.y + i * 66;
+        c.ui.draw_text(names[i], {x + 16, top + 10, w - 112, 20}, c.th.label, Style().font(12));
+        c.ui.muted_text(ellipsize(c.ui, details[i], w - 112, 10.5f), {x + 16, top + 34, w - 112, 18}, Style().font(10.5f));
+        if (c.ui.button("清除…", {x + w - 80, top + 20, 64, 26}, Style().ghost().font(11).color(c.th.destructive))) c.model.ui.clear_action = actions[i];
+        if (i < 3) settings_rule(c, data, top + 66);
+    }
+    c.ui.muted_text("清除前会再次确认。已下载的音乐和本地音频文件会保留。", {x + 2, data.bottom() + 12, w - 4, 36}, Style().font(10.5f).wrap_text());
 }
 
 static void clear_data_dialog(Ctx& c) {
@@ -1243,134 +1179,117 @@ static void clear_data_dialog(Ctx& c) {
     if (!open) c.model.ui.clear_action = ClearAction::None;
 }
 
-static void update_settings(Ctx& c, float mx, float mw) {
-    c.ui.heading("版本更新", {mx, 20, mw - 120, 30});
-    if (c.ui.button("返回设置", {mx + mw - 104, 21, 104, 28}, Style().font(11.5f))) c.model.ui.update_settings = false;
-    const Rect card{mx, 70, mw, 202};
-    c.ui.panel(card, Style().corner(12));
-    c.ui.subheading(std::string("aino player v") + kVersion, {mx + 20, 88, mw - 40, 24});
-    c.ui.muted_text("启动时自动检查 GitHub 的最新正式版", {mx + 20, 124, mw - 40, 20}, Style().font(11.5f));
+static void update_settings(Ctx& c, float x, float w, float y) {
+    if (c.ui.button("返回通用", {x, y, 88, 28}, Style().ghost().font(11))) c.model.ui.update_settings = false;
+    const Rect card{x, y + 48, w, 208};
+    c.ui.fill_rect(card, c.th.fill3.scaled_alpha(0.5f), 10);
+    draw_brand(c, {x + 20, card.y + 20, 44, 44});
+    c.ui.draw_text("Aino Player", {x + 78, card.y + 20, w - 98, 24}, c.th.label, Style().font(15).weight(600));
+    c.ui.muted_text(std::string("版本 ") + kVersion, {x + 78, card.y + 47, w - 98, 18}, Style().font(11));
     const auto& update = c.model.update;
-    c.ui.draw_text(ellipsize(c.ui, update.message.empty() ? "尚未检查更新" : update.message, mw - 40, 12),
-        {mx + 20, 160, mw - 40, 22}, update.status == UpdateStatus::Failed ? c.th.destructive : c.th.label, Style().font(12));
-    Style check_style = Style().primary().font(11.5f);
-    check_style.disabled = update.status == UpdateStatus::Checking || update.status == UpdateStatus::Downloading || update.status == UpdateStatus::Installing;
-    if (c.ui.button(update.status == UpdateStatus::Checking ? "正在检查…" : "检查更新", {mx + 20, 210, 104, 30}, check_style)) check_updates();
-    if (c.ui.button("GitHub 发布页", {mx + 138, 210, 120, 30}, Style().font(11.5f))) open_update(false);
-    if (update.status == UpdateStatus::Available) {
-        if (c.ui.button(update.installer ? "下载并安装" : "下载新版", {mx + 272, 210, 104, 30}, Style().primary().font(11.5f))) open_update(true);
-        c.ui.muted_text("最新版本 " + update.version, {mx + 20, 290, mw - 40, 20}, Style().font(12));
-    }
-    if (update.status == UpdateStatus::Downloading)
-        c.ui.muted_text("下载安装包 " + std::to_string(update.progress) + "%", {mx + 20, 290, mw - 40, 20}, Style().font(12));
-    Style info = Style().font(11.5f); info.wrap_text();
-    c.ui.draw_text("Windows 安装版会先下载并校验 SHA-256，再保存当前状态、关闭播放器并升级，完成后重新打开。首次从便携版迁移会安装到固定用户目录。Linux 下载 deb 后通过软件安装器升级；配置、收藏和歌单保留。", {mx + 20, 330, mw - 40, 120}, c.th.label3, info);
+    c.ui.draw_text(update.message.empty() ? "启动时自动检查 GitHub 正式版" : update.message,
+        {x + 20, card.y + 87, w - 40, 48}, update.status == UpdateStatus::Failed ? c.th.destructive : c.th.label2, Style().font(11.5f).wrap_text());
+    Style check = Style().font(11);
+    check.disabled = update.status == UpdateStatus::Checking || update.status == UpdateStatus::Downloading || update.status == UpdateStatus::Installing;
+    if (c.ui.button(update.status == UpdateStatus::Checking ? "正在检查…" : "检查更新", {x + 20, card.y + 154, 88, 28}, check)) check_updates();
+    if (c.ui.button("发布页", {x + 118, card.y + 154, 72, 28}, Style().ghost().font(11))) open_update(false);
+    if (update.status == UpdateStatus::Available && c.ui.button(update.installer ? "下载并安装" : "下载新版", {x + w - 116, card.y + 154, 96, 28}, Style().primary().font(11))) open_update(true);
+    if (update.status == UpdateStatus::Downloading) c.ui.muted_text("下载 " + std::to_string(update.progress) + "%", {x + 20, card.bottom() + 14, w - 40, 20}, Style().font(11));
+    c.ui.muted_text("Windows 使用安装器覆盖升级；Linux 下载 deb 安装。更新保留配置、收藏和歌单。", {x + 2, card.bottom() + 48, w - 4, 64}, Style().font(11).wrap_text());
 }
-
-static void about_settings(Ctx& c, float mx, float mw) {
-    c.ui.heading("关于 Aino", {mx, 20, mw - 120, 30});
-    if (c.ui.button("返回设置", {mx + mw - 104, 21, 104, 28}, Style().font(11.5f))) c.model.ui.about_settings = false;
-    c.ui.scroll({mx, 64, mw, c.bar_y - 76}, 1, 584, [&](int, const Rect& area) {
-        const float y = area.y;
-        draw_brand(c, {mx + 20, y + 12, 70, 70});
-        c.ui.subheading("Aino Player", {mx + 106, y + 18, mw - 126, 28});
-        c.ui.muted_text(std::string("v") + kVersion + " · Minimal, yet powerful", {mx + 106, y + 53, mw - 126, 22}, Style().font(11.5f));
-        Style body = Style().font(12); body.wrap_text();
-        c.ui.draw_text("Aino，一个芬兰女性名字。独立，唯一。以克制的外观，承载强大的多音源音乐体验。", {mx + 20, y + 106, mw - 40, 64}, c.th.label2, body);
-        c.ui.draw_text(std::string("作者  ") + project::author, {mx + 20, y + 184, mw - 40, 24}, c.th.label, Style().font(12));
-        c.ui.draw_text(std::string("开源协议  ") + project::license, {mx + 20, y + 218, mw - 40, 24}, c.th.label, Style().font(12));
-        c.ui.muted_text("GitHub · sudoevolve/aino-player", {mx + 20, y + 252, mw - 40, 24}, Style().font(12));
-        const float width = (mw - 52) / 2;
-        if (c.ui.button("GitHub 项目", {mx + 20, y + 292, width, 32}, Style().font(12))) open_project(ProjectLink::Repository);
-        if (c.ui.button("问题与建议", {mx + 32 + width, y + 292, width, 32}, Style().font(12))) open_project(ProjectLink::Issues);
-        if (c.ui.button("查看 Apache-2.0", {mx + 20, y + 336, width, 32}, Style().font(12))) open_project(ProjectLink::License);
-        if (c.ui.button("第三方许可", {mx + 32 + width, y + 336, width, 32}, Style().font(12))) open_project(ProjectLink::Dependencies);
-        c.ui.draw_text("界面：aino / Apache-2.0\n音频：miniaudio / Public Domain 或 MIT-0\n图片：stb / Public Domain 或 MIT\n内置 FFmpeg / LGPL-2.1-or-later", {mx + 20, y + 398, mw - 40, 106}, c.th.label3, body);
-        c.ui.draw_text("图标：黑白灰几何 A 与播放箭头。单一而鲜明，极简但有力量。", {mx + 20, y + 520, mw - 40, 56}, c.th.label3, body);
-    });
+static void about_settings(Ctx& c, float x, float w, float y) {
+    draw_brand(c, {x + w / 2 - 32, y + 6, 64, 64});
+    c.ui.draw_text("Aino Player", {x, y + 82, w, 28}, c.th.label, Style().font(21).weight(600).center());
+    c.ui.muted_text(std::string("版本 ") + kVersion, {x, y + 116, w, 20}, Style().font(11.5f).center());
+    const Rect info{x, y + 172, w, 168};
+    settings_group(c, "项目信息", info);
+    settings_label(c, "作者", {x, info.y, w, 56});
+    c.ui.draw_text(project::author, {x + 90, info.y, w - 106, 56}, c.th.label2, Style().font(12).right());
+    settings_rule(c, info, info.y + 56);
+    settings_label(c, "开源协议", {x, info.y + 56, w, 56});
+    if (c.ui.button(project::license, {x + w - 130, info.y + 70, 114, 28}, Style().ghost().font(11))) open_project(ProjectLink::License);
+    settings_rule(c, info, info.y + 112);
+    settings_label(c, "GitHub", {x, info.y + 112, w, 56});
+    if (c.ui.button("sudoevolve/aino-player", {x + w - 208, info.y + 126, 192, 28}, Style().ghost().font(11))) open_project(ProjectLink::Repository);
+    if (c.ui.button("反馈问题", {x + 4, info.bottom() + 18, 88, 28}, Style().ghost().font(11))) open_project(ProjectLink::Issues);
+    if (c.ui.button("第三方许可", {x + 100, info.bottom() + 18, 100, 28}, Style().ghost().font(11))) open_project(ProjectLink::Dependencies);
+    c.ui.muted_text("aino · Apache-2.0\nminiaudio · Public Domain / MIT-0\nstb · Public Domain / MIT\nFFmpeg · LGPL-2.1-or-later", {x + 4, info.bottom() + 64, w - 8, 96}, Style().font(10.5f).wrap_text());
 }
-
 static void tab_settings(Ctx& c) {
-    const float mx = kSidebar + 24.0f;
-    const float mw = c.W - mx - 24.0f - (c.model.ui.lyrics_open ? kLyricsWidth : 0.0f);
-    if (c.model.ui.storage_settings) { storage_settings(c, mx, mw); return; }
-    if (c.model.ui.update_settings) { update_settings(c, mx, mw); return; }
-    if (c.model.ui.about_settings) { about_settings(c, mx, mw); return; }
-    c.ui.heading("设置", {mx, 20, mw, 30});
-    if (c.ui.button(c.model.update.status == UpdateStatus::Available ? "发现新版" : "版本更新", {mx + mw - 312, 21, 100, 28}, Style().font(11.5f))) c.model.ui.update_settings = true;
-    if (c.ui.button("数据与缓存", {mx + mw - 200, 21, 112, 28}, Style().font(11.5f))) c.model.ui.storage_settings = true;
-    if (c.ui.button("关于", {mx + mw - 76, 21, 76, 28}, Style().font(11.5f))) c.model.ui.about_settings = true;
-
-    c.ui.scroll({mx, 60, mw, c.bar_y - 72}, 1, 792, [&](int, const Rect& area) {
-    const float dy = area.y - 60;
-    account_card(c, 0, {mx, 60 + dy, mw, 110});
-    account_card(c, 1, {mx, 182 + dy, mw, 110});
-    account_card(c, 2, {mx, 304 + dy, mw, 110});
-
-    // ---------------- 外观 ----------------
-    const Rect look{mx, 426 + dy, mw, 56};
-    c.ui.panel(look, Style().corner(12));
-    Style lbl;
-    lbl.font_size = 11.5f;
-    lbl.valign = VAlign::Middle;
-    c.ui.draw_text("深色模式", {look.x + 20, look.y + 18, 160, 20}, c.th.label2, lbl);
-    bool dark = c.model.ui.dark;
-    if (c.ui.toggle(&dark, {look.right() - 60, look.y + 17, 40, 22})) {
-        c.model.ui.dark = dark;
-        c.model.ui.config_dirty = true;
-    }
-
-    // ---------------- 音质 ----------------
-    const Rect qcard{mx, 494 + dy, mw, 56};
-    c.ui.panel(qcard, Style().corner(12));
-    c.ui.draw_text("默认音质", {qcard.x + 20, qcard.y + 18, 120, 20}, c.th.label2, lbl);
-    int q = c.model.ui.settings.quality;
-    if (c.ui.segmented({"标准", "高", "无损"}, &q, {qcard.right() - 232, qcard.y + 15, 212, 26},
-                       Style().font(11.0f))) {
-        c.model.ui.settings.quality = q;
-        c.model.ui.config_dirty = true;
-    }
-
-    // ---------------- 播放 ----------------
-    const Rect card{mx, 562 + dy, mw, 84};
-    c.ui.panel(card, Style().corner(12));
-    c.ui.draw_text("默认音量", {card.x + 20, card.y + 12, 120, 16}, c.th.label2, Style().font(11.5f));
-    static SeekBar set_vol_bar;
-    float vol_to = 0.0f;
-    if (seek_bar(c, c.model.ui.volume, 100.0f, {card.x + 20, card.y + 34, card.w - 90, 20}, &set_vol_bar, &vol_to))
-        set_volume(vol_to);
-    c.ui.draw_text(std::to_string(int(c.model.ui.volume)), {card.right() - 64, card.y + 34, 44, 20}, c.th.label2,
-                   Style().font(11.0f).right());
-    char buf[256];
-    std::snprintf(buf, sizeof buf, "缓存目录  %s", c.model.paths.current_cache.c_str());
-    c.ui.muted_text(buf, {card.x + 20, card.y + 60, card.w - 40, 16}, Style().font(10.0f));
-
-    // ---------------- 下载 ----------------
-    const Rect dlcard{mx, 658 + dy, mw, 110};
-    c.ui.panel(dlcard, Style().corner(12));
-    c.ui.draw_text("下载目录", {dlcard.x + 20, dlcard.y + 10, 160, 16}, c.th.label2, Style().font(11.5f));
-    if (c.ui.input(&c.model.ui.download_dir, {dlcard.x + 20, dlcard.y + 30, dlcard.w - 40, 28},
-                   Style().hint(default_download_dir()).font(11.5f)))
-        c.model.ui.config_dirty = true;
-
-    // 内嵌：默认都关（会改写文件，得让用户自己决定）
-    bool emb_cover = c.model.ui.settings.embed_cover;
-    c.ui.draw_text("内嵌封面", {dlcard.x + 20, dlcard.y + 68, 80, 20}, c.th.label2, lbl);
-    if (c.ui.toggle(&emb_cover, {dlcard.x + 104, dlcard.y + 67, 40, 22})) {
-        c.model.ui.settings.embed_cover = emb_cover;
-        c.model.ui.config_dirty = true;
-    }
-    bool emb_lyric = c.model.ui.settings.embed_lyrics;
-    c.ui.draw_text("内嵌歌词", {dlcard.x + 176, dlcard.y + 68, 80, 20}, c.th.label2, lbl);
-    if (c.ui.toggle(&emb_lyric, {dlcard.x + 260, dlcard.y + 67, 40, 22})) {
-        c.model.ui.settings.embed_lyrics = emb_lyric;
-        c.model.ui.config_dirty = true;
-    }
-    c.ui.muted_text("音频解码：" + audio::decoder_info(), {mx + 20, 788 + dy, mw - 40, 20}, Style().font(10.5f));
+    const float available = c.W - kSidebar - right_panel_width(c);
+    const float w = std::min(680.0f, available - 48);
+    const float x = kSidebar + (available - w) * 0.5f;
+    c.ui.draw_text("设置", {x, 26, w, 34}, c.th.label, Style().font(25).weight(700));
+    auto& selected = c.model.ui.settings_tab;
+    const bool changed = c.ui.segmented({"通用", "账号", "播放", "下载", "数据", "关于"}, &selected, {x, 78, w, 32}, Style().font(11.5f));
+    if (changed) c.model.ui.update_settings = false;
+    const float content_height = selected == 4 ? 550.0f : selected == 5 ? 510.0f : selected == 3 ? 350.0f : selected == 2 ? 370.0f : selected == 1 ? 360.0f : c.model.ui.update_settings ? 410.0f : 300.0f;
+    const Rect viewport{x, 132, w, c.bar_y - 148};
+    if (changed) c.ui.scroll_to_index(viewport, 0, content_height, 1);
+    c.ui.scroll(viewport, 1, content_height, [&](int, const Rect& area) {
+        const float y = area.y;
+        if (selected == 4) { storage_settings(c, x, w, y); return; }
+        if (selected == 5) { about_settings(c, x, w, y); return; }
+        if (selected == 1) {
+            const Rect group{x, y + 28, w, 276};
+            settings_group(c, "音乐账户", group);
+            for (int i = 0; i < 3; ++i) {
+                account_card(c, i, {x, group.y + i * 92, w, 92});
+                if (i < 2) settings_rule(c, group, group.y + (i + 1) * 92);
+            }
+            c.ui.muted_text("在系统默认浏览器中完成官网登录。", {x + 2, group.bottom() + 14, w - 4, 20}, Style().font(11));
+            return;
+        }
+        if (selected == 3) {
+            const Rect directory{x, y + 28, w, 104};
+            settings_group(c, "存储位置", directory);
+            settings_label(c, "下载目录", {x, directory.y + 4, w, 36});
+            if (c.ui.input(&c.model.ui.download_dir, {x + 16, directory.y + 48, w - 32, 32}, Style().hint(default_download_dir()).font(11))) c.model.ui.config_dirty = true;
+            const Rect metadata{x, y + 180, w, 124};
+            settings_group(c, "写入音乐文件", metadata);
+            settings_label(c, "内嵌封面", {x, metadata.y, w, 62});
+            if (c.ui.toggle(&c.model.ui.settings.embed_cover, {x + w - 54, metadata.y + 20, 38, 22})) c.model.ui.config_dirty = true;
+            settings_rule(c, metadata, metadata.y + 62);
+            settings_label(c, "内嵌歌词", {x, metadata.y + 62, w, 62});
+            if (c.ui.toggle(&c.model.ui.settings.embed_lyrics, {x + w - 54, metadata.y + 82, 38, 22})) c.model.ui.config_dirty = true;
+            return;
+        }
+        if (selected == 2) {
+            const Rect group{x, y + 28, w, 192};
+            settings_group(c, "播放", group);
+            const bool compact = w < 450;
+            settings_label(c, "音质", {x, group.y, w, 64});
+            if (c.ui.segmented({"标准", "高", "无损"}, &c.model.ui.settings.quality, {x + w - 196, group.y + 18, 180, 28}, Style().font(11))) c.model.ui.config_dirty = true;
+            settings_rule(c, group, group.y + 64);
+            settings_label(c, "音量", {x, group.y + 64, w, 64});
+            const float slider_w = compact ? 140.0f : 200.0f;
+            static SeekBar volume;
+            float value = 0;
+            if (seek_bar(c, c.model.ui.volume, 100, {x + w - slider_w - 56, group.y + 86, slider_w, 20}, &volume, &value)) set_volume(value);
+            c.ui.draw_text(std::to_string(int(c.model.ui.volume)), {x + w - 46, group.y + 64, 30, 64}, c.th.label2, Style().font(11).right());
+            settings_rule(c, group, group.y + 128);
+            settings_label(c, "播放模式", {x, group.y + 128, w, 64});
+            int mode = -1;
+            if (c.ui.menu(play_mode_name(c.model.ui.play_mode), {"顺序播放", "随机播放", "列表循环", "单曲循环"}, &mode, {x + w - 130, group.y + 146, 114, 28}, Style().font(11))) set_play_mode(PlayMode(mode));
+            c.ui.draw_text("音频解码", {x + 2, group.bottom() + 28, w - 4, 20}, c.th.label2, Style().font(11.5f).weight(600));
+            c.ui.muted_text(audio::decoder_info(), {x + 2, group.bottom() + 56, w - 4, 80}, Style().font(10.5f).wrap_text());
+            return;
+        }
+        if (c.model.ui.update_settings) { update_settings(c, x, w, y); return; }
+        const Rect appearance{x, y + 28, w, 62};
+        settings_group(c, "外观", appearance);
+        settings_label(c, "深色外观", appearance);
+        if (c.ui.toggle(&c.model.ui.dark, {x + w - 54, appearance.y + 20, 38, 22})) c.model.ui.config_dirty = true;
+        const Rect version{x, y + 138, w, 72};
+        settings_group(c, "软件更新", version);
+        c.ui.draw_text("Aino Player", {x + 16, version.y + 13, w - 140, 20}, c.th.label, Style().font(12));
+        c.ui.muted_text(std::string("版本 ") + kVersion, {x + 16, version.y + 38, w - 140, 18}, Style().font(11));
+        if (c.ui.button(c.model.update.status == UpdateStatus::Available ? "发现新版" : "检查更新", {x + w - 104, version.y + 22, 88, 28}, Style().font(11))) c.model.ui.update_settings = true;
+        c.ui.muted_text("启动时自动检查新版本。", {x + 2, version.bottom() + 14, w - 4, 20}, Style().font(10.5f));
     });
 }
 
-// 歌词图标：三条递减的横线（像一段排版好的歌词）
+
 static void draw_lyric_icon(aino::Ui& ui, const aino::Rect& box, const aino::Color& col) {
     const float h = 2.0f;
     const float gaps[3] = {1.0f, 0.78f, 0.55f};
@@ -1380,194 +1299,138 @@ static void draw_lyric_icon(aino::Ui& ui, const aino::Rect& box, const aino::Col
     }
 }
 
-// ---------- 底部播放条（Apple Music 版式） ----------
-// 结构：左「封面 + 两行信息」｜中「控制键 + 进度条」固定宽度块｜右「收藏 / 歌词 / 下载 / 音量」
-//
-// 和上一版的关键差别：中间那块是**固定 420 宽、整体居中**，不是通栏进度条。
-// 通栏的问题不在实现，而在版式 —— 窗口一宽，进度条会变成一条横贯全窗的细线，
-// 时间和音量被甩到两个角上，视线没有落点。Apple Music 的做法是：所有控件挤在
-// 屏幕中央一小块，两侧留白，眼睛一眼就能看全。
-static void player_bar(Ctx& c) {
-    const float y = c.bar_y;
-    c.ui.fill_rect({0, y, c.W, kBarHeight}, c.th.control_bg);
-    c.ui.fill_rect({0, y, c.W, 1}, c.th.separator);
-
-    const float pad = 20.0f;
-    const float cx = c.W * 0.5f;
-    const float block_w = 420.0f;
-    const float block_x = cx - block_w * 0.5f;
-
-    const bool playing = (c.s.ps == PlayState::Playing);
-    const bool busy = (c.s.ps == PlayState::Resolving || c.s.ps == PlayState::Buffering);
-    const float ctrl_cy = y + 31.0f;   // 控制键中线
-    const float prog_cy = y + 59.0f;   // 进度条中线
-
-    // ---------------- 左：封面 + 曲目 ----------------
-    const Rect cov{pad, y + 18.0f, 52.0f, 52.0f};
-    if (!c.s.now_title.empty()) {
-        cover_art(c, c.s.now_cover, c.s.now_title, cov, 8.0f);
+static void draw_mode_icon(Ctx& c, const Rect& box, PlayMode mode, const Color& color) {
+    auto line = [&](float x0, float y0, float x1, float y1) {
+        c.ui.draw_line(box.x + x0, box.y + y0, box.x + x1, box.y + y1, color, 1.5f);
+    };
+    if (mode == PlayMode::Shuffle) {
+        line(1, 4, 5, 4); line(5, 4, 15, 16); line(15, 16, 19, 16);
+        line(1, 16, 5, 16); line(5, 16, 15, 4); line(15, 4, 19, 4);
+        line(16, 1, 19, 4); line(16, 7, 19, 4);
+        line(16, 13, 19, 16); line(16, 19, 19, 16);
+    } else if (mode == PlayMode::Sequential) {
+        line(2, 4, 17, 4); line(2, 10, 12, 10); line(2, 16, 12, 16);
+        line(17, 9, 17, 18); line(14, 15, 17, 18); line(20, 15, 17, 18);
     } else {
-        c.ui.fill_rect(cov, c.th.fill3, 8.0f);
-        c.ui.system_icon(SystemIcon::Star, cov.center(20, 20), c.th.label3);
+        line(3, 8, 3, 5); line(3, 5, 17, 5); line(14, 2, 17, 5); line(14, 8, 17, 5);
+        line(17, 12, 17, 15); line(17, 15, 3, 15); line(6, 12, 3, 15); line(6, 18, 3, 15);
+        if (mode == PlayMode::RepeatOne) c.ui.draw_text("1", {box.x + 7, box.y + 5, 6, 10}, color, Style().font(8).weight(600).center());
     }
-
-    const float text_x = cov.right() + 12.0f;
-    const float text_w = std::max(90.0f, std::min(280.0f, block_x - 40.0f - text_x));
-    const float title_y = y + 24.0f;
-
-    Style ts;
-    ts.font_size = 13.0f;
-    ts.font_weight = 600;
-    c.ui.draw_text(ellipsize(c.ui, c.s.now_title.empty() ? "未在播放" : c.s.now_title, text_w, 13.0f, 600),
-                   {text_x, title_y, text_w, 18}, c.s.now_title.empty() ? c.th.label3 : c.th.label, ts);
-
-    // 副行：艺人 · 音质（音质放这里，省掉原来第三行，底栏才能只有 88 高）
-    std::string sub;
-    if (c.s.now_title.empty()) {
-        sub = "从下面的列表里挑一首";
-    } else {
-        sub = c.s.now_artist;
-        if (!c.s.now_short.empty()) sub += (sub.empty() ? "" : " · ") + c.s.now_short;
+}
+static void draw_clock_icon(Ctx& c, const Rect& box, const Color& color) {
+    const float radius = 7;
+    for (int i = 0; i < 24; ++i) {
+        const float a = float(i) * 6.2831853f / 24, b = float(i + 1) * 6.2831853f / 24;
+        c.ui.draw_line(box.cx() + std::cos(a) * radius, box.cy() + std::sin(a) * radius,
+            box.cx() + std::cos(b) * radius, box.cy() + std::sin(b) * radius, color, 1.4f);
     }
-    if (busy) {
-        sub = c.s.ps == PlayState::Buffering
-                  ? "缓冲 " + std::to_string(int(c.s.buffer * 100)) + "% · " + c.s.now_artist
-                  : "解析中 · " + c.s.now_artist;
+    c.ui.draw_line(box.cx(), box.cy(), box.cx(), box.cy() - 4, color, 1.4f);
+    c.ui.draw_line(box.cx(), box.cy(), box.cx() + 3, box.cy() + 2, color, 1.4f);
+}
+static void draw_skip_icon(Ctx& c, const Rect& box, bool previous, const Color& color) {
+    const float half = box.w * 0.5f;
+    for (int triangle = 0; triangle < 2; ++triangle) for (int row = 0; row < 20; ++row) {
+        const float t = (row + 0.5f) / 20;
+        const float width = half * (1 - std::fabs(2 * t - 1));
+        const float x = box.x + triangle * half + (previous ? half - width : 0);
+        c.ui.fill_rect({x, box.y + row * box.h / 20, width, box.h / 20 + 0.5f}, color);
     }
-    Style as;
-    as.font_size = 11.0f;
-    c.ui.draw_text(ellipsize(c.ui, sub, text_w, 11.0f), {text_x, title_y + 20.0f, text_w, 16}, c.th.label2, as);
-
-    // ---------------- 中：控制键 ----------------
-    const Rect prev{cx - 54.0f, ctrl_cy - 14.0f, 28.0f, 28.0f};
-    const Rect play{cx - 17.0f, ctrl_cy - 17.0f, 34.0f, 34.0f};
-    const Rect next{cx + 26.0f, ctrl_cy - 14.0f, 28.0f, 28.0f};
-
-    int mode = -1;
-    if (c.ui.menu(play_mode_name(c.model.ui.play_mode), {"顺序播放", "随机播放", "列表循环", "单曲循环"},
-                  &mode, {cx - 164, ctrl_cy - 14, 98, 28}, Style().font(10.5f))) set_play_mode(PlayMode(mode));
-    int timer = -1;
-    const auto seconds = c.model.ui.sleep_remaining_seconds;
-    const auto timer_label = c.model.ui.sleep_after_track ? std::string("本首结束") : seconds ?
-        std::to_string(seconds / 60) + ":" + (seconds % 60 < 10 ? "0" : "") + std::to_string(seconds % 60) : "定时停止";
-    if (c.ui.menu(timer_label, {"15 分钟后停止", "30 分钟后停止", "60 分钟后停止", "90 分钟后停止", "播完当前歌曲", "取消定时"},
-                  &timer, {cx + 70, ctrl_cy - 14, 98, 28}, Style().font(10.5f))) {
-        constexpr int minutes[] = {15, 30, 60, 90, 0, 0};
-        if (timer >= 0 && timer < 6) set_sleep_timer(minutes[timer], timer == 4);
-    }
-
-    if (c.ui.icon_button("", prev, Style().ghost())) play_step(-1);
-    c.ui.system_icon(SystemIcon::Prev, prev.center(13, 13), c.th.label);
-    if (c.ui.icon_button("", next, Style().ghost())) play_step(1);
-    c.ui.system_icon(SystemIcon::Next, next.center(13, 13), c.th.label);
-
-    // 播放键用纯图标 + hover 圆底（Apple Music 就是这样，没有实心蓝圆）
-    if (c.ui.icon_button("", play, Style().ghost().corner(17))) toggle_pause();
-    if (busy) {
-        c.ui.spinner(play.center(18, 18), Style());
-    } else if (playing) {
-        draw_pause_bars(c.ui, play.center(12, 14), c.th.label);
-    } else {
-        draw_play_triangle(c.ui, play.center(12, 14).offset(1.0f, 0), c.th.label);
-    }
-
-    // ---------------- 中：进度 ----------------
-    float dur = c.model.ui.dur_ms > 0 ? c.model.ui.dur_ms : 1.0f;
-    static SeekBar prog_bar;
-    float seek_to = 0.0f;
-    const Rect prog_box{cx - 166.0f, prog_cy - 10.0f, 332.0f, 20.0f};
-    if (seek_bar(c, std::min(c.model.ui.pos_ms, dur), dur, prog_box, &prog_bar, &seek_to)) {
-        seek_playback(int(seek_to));
-        c.model.ui.pos_ms = seek_to;
-    }
-    Style tm;
-    tm.font_size = 10.0f;
-    tm.valign = VAlign::Middle;
-    tm.align = Align::Right;
-    c.ui.draw_text(fmt_time((long long)c.model.ui.pos_ms), {cx - 210.0f, prog_cy - 8.0f, 36.0f, 16}, c.th.label3, tm);
-    Style tm2 = tm;
-    tm2.align = Align::Left;
-    c.ui.draw_text(fmt_time((long long)c.model.ui.dur_ms), {cx + 174.0f, prog_cy - 8.0f, 36.0f, 16}, c.th.label3, tm2);
-
-    // ---------------- 右：收藏 / 歌词 / 下载 / 音量 ----------------
-    const float num_w = 24.0f, slider_w = 80.0f, spk_w = 18.0f;
-    float x = c.W - pad;
-
-    Style vn;
-    vn.font_size = 10.5f;
-    vn.valign = VAlign::Middle;
-    vn.align = Align::Right;
-    c.ui.draw_text(std::to_string(int(c.model.ui.volume)), {x - num_w, ctrl_cy - 8.0f, num_w, 16}, c.th.label3, vn);
-    x -= num_w + 6.0f;
-
-    static SeekBar vol_bar;
-    float vol_to = 0.0f;
-    if (seek_bar(c, c.model.ui.volume, 100.0f, {x - slider_w, ctrl_cy - 10.0f, slider_w, 20.0f}, &vol_bar, &vol_to))
-        set_volume(vol_to);
-    x -= slider_w + 8.0f;
-
-    draw_speaker(c.ui, {x - spk_w, ctrl_cy - 9.0f, spk_w, 18}, c.th.label2, c.model.ui.volume);
-    x -= spk_w + 18.0f;
-
-    // 下载当前曲目
-    const auto& in = c.ui.input();
-    const Rect dl_btn{x - 28.0f, ctrl_cy - 14.0f, 28.0f, 28.0f};
-    const bool dl_hover = dl_btn.contains(in.mouse.x, in.mouse.y);
-    if (dl_hover) c.ui.fill_rect(dl_btn, c.th.fill3, 6.0f);
-    if (dl_hover && in.released[0]) {
-        if (c.s.now_uid.empty()) {
-            toast("先播一首，再点下载");
-        } else {
-            download_current();
-        }
-    }
-    // 底栏的下载按钮：正在下载显示进度数字，完成显示对勾
-    {
-        int pct = -1;
-        bool done = false, failed = false;
-        if (auto it = c.model.downloads.find(c.s.now_uid); it != c.model.downloads.end()) {
-            pct = it->second.percent;
-            done = it->second.done;
-            failed = it->second.failed;
-        }
-        if (done) {
-            c.ui.system_icon(SystemIcon::Check, dl_btn.center(14, 14), c.th.tint);
-        } else if (failed) {
-            c.ui.system_icon(SystemIcon::Warning, dl_btn.center(14, 14), c.th.destructive);
-        } else if (pct >= 0) {
-            Style ps;
-            ps.font_size = 9.0f;
-            ps.align = Align::Center;
-            ps.valign = VAlign::Middle;
-            c.ui.draw_text(std::to_string(pct), {dl_btn.x, dl_btn.y, dl_btn.w, dl_btn.h}, c.th.tint, ps);
-        } else {
-            c.ui.system_icon(SystemIcon::Download, dl_btn.center(14, 14), c.th.label2);
-        }
-    }
-    x -= 28.0f + 8.0f;
-
-    // 歌词面板开关
-    const Rect lyr_btn{x - 28.0f, ctrl_cy - 14.0f, 28.0f, 28.0f};
-    if (c.ui.icon_button("", lyr_btn, Style().ghost())) {
-        c.model.ui.lyrics_open = !c.model.ui.lyrics_open;
-        if (c.model.ui.lyrics_open) request_current_lyrics();
-    }
-    draw_lyric_icon(c.ui, lyr_btn.center(15, 13), c.model.ui.lyrics_open ? c.th.tint : c.th.label2);
-
-    // 独立保存当前曲目的快照，避免搜索结果变化后收藏到别的歌曲。
-    const Rect fav_btn{lyr_btn.x - 36.0f, lyr_btn.y, 28.0f, 28.0f};
-    const bool can_favorite = !c.s.now_uid.empty() && !c.s.now_track.variants.empty();
-    const bool saved = can_favorite && c.model.library.contains(c.s.now_track);
-    Style favorite_style = Style().ghost();
-    favorite_style.disabled = !can_favorite;
-    if (c.ui.icon_button("", fav_btn, favorite_style)) favorite_toggle(c.s.now_track);
-    if (saved) c.ui.fill_rect(fav_btn, c.th.tint.scaled_alpha(0.12f), 6);
-    c.ui.system_icon(SystemIcon::Star, fav_btn.center(16, 16), saved ? c.th.tint : (can_favorite ? c.th.label2 : c.th.label4));
 }
 
-// ---------- Toast：一次性提示（下载完成 / 取流失败 / 歌单操作） ----------
-// 底栏不再承载长错误文本 —— 那句"取流失败 — 网易云 会员曲…"以前挤在右下角，
-// 一长就压到别的控件上。这些消息现在浮在底栏上方，几秒后自己消失。
+// 三组互不重叠：播放控制、曲目信息与进度、音量及侧栏工具。
+static void player_bar(Ctx& c) {
+    const float y = c.bar_y, cy = y + 40;
+    c.ui.fill_rect({0, y, c.W, kBarHeight}, c.th.control_bg);
+    c.ui.fill_rect({0, y, c.W, 1}, c.th.separator.scaled_alpha(0.7f));
+    const bool playing = c.s.ps == PlayState::Playing;
+    const bool busy = c.s.ps == PlayState::Resolving || c.s.ps == PlayState::Buffering;
+    const Rect mode{26, cy - 15, 30, 30}, prev{70, cy - 16, 32, 32};
+    const Rect play{111, cy - 20, 40, 40}, next{160, cy - 16, 32, 32}, timer{204, cy - 15, 30, 30};
+    int selection = -1;
+    // 触发器只显示自绘图标；菜单项继续使用原生 menu 的正常文字颜色。
+    const Style icon_menu = Style().ghost().font(11.5f).color(Color(0, 0, 0, 0));
+    if (c.ui.menu("", {"顺序播放", "随机播放", "列表循环", "单曲循环"}, &selection, mode, icon_menu)) set_play_mode(PlayMode(selection));
+    draw_mode_icon(c, mode.center(20, 20), c.model.ui.play_mode, c.model.ui.play_mode == PlayMode::Sequential ? c.th.label3 : c.th.tint);
+    c.ui.tooltip(mode, play_mode_name(c.model.ui.play_mode));
+    if (c.ui.icon_button("", prev, Style().ghost())) play_step(-1);
+    draw_skip_icon(c, prev.center(17, 13), true, c.th.label2);
+    if (c.ui.icon_button("", play, Style().ghost().corner(20))) toggle_pause();
+    if (busy) c.ui.spinner(play.center(19, 19));
+    else if (playing) draw_pause_bars(c.ui, play.center(14, 18), c.th.label);
+    else draw_play_triangle(c.ui, play.center(16, 19).offset(1, 0), c.th.label);
+    if (c.ui.icon_button("", next, Style().ghost())) play_step(1);
+    draw_skip_icon(c, next.center(17, 13), false, c.th.label2);
+    c.ui.tooltip(prev, "上一首"); c.ui.tooltip(play, playing ? "暂停" : "播放"); c.ui.tooltip(next, "下一首");
+    selection = -1;
+    const bool timed = c.model.ui.sleep_after_track || c.model.ui.sleep_deadline;
+    if (c.ui.menu("", {"15 分钟后停止", "30 分钟后停止", "60 分钟后停止", "90 分钟后停止", "播完当前歌曲", "取消定时"}, &selection, timer, icon_menu)) {
+        constexpr int minutes[] = {15, 30, 60, 90, 0, 0};
+        if (selection >= 0 && selection < 6) set_sleep_timer(minutes[selection], selection == 4);
+    }
+    draw_clock_icon(c, timer.center(20, 20), timed ? c.th.tint : c.th.label3);
+    c.ui.tooltip(timer, "睡眠定时器");
+    if (timed) {
+        const auto seconds = c.model.ui.sleep_remaining_seconds;
+        const auto label = c.model.ui.sleep_after_track ? std::string("本首结束") : std::to_string(seconds / 60) + ":" + (seconds % 60 < 10 ? "0" : "") + std::to_string(seconds % 60);
+        c.ui.draw_text(label, {timer.cx() - 32, y + 65, 64, 14}, c.th.tint, Style().font(9).center());
+    }
+
+    const float width = std::min(560.0f, c.W - 560.0f), x = (c.W - width) * 0.5f;
+    const Rect song{x, y + 9, width, 70};
+    c.ui.fill_rect(song, c.th.fill3.scaled_alpha(0.45f), 8);
+    const Rect cover{x + 12, y + 20, 44, 44};
+    if (!c.s.now_title.empty()) cover_art(c, c.s.now_cover, c.s.now_title, cover, 5);
+    else draw_brand(c, cover);
+    const float tx = cover.right() + 12, tw = song.right() - tx - 16;
+    const auto title = c.s.now_title.empty() ? "Aino Player" : c.s.now_title;
+    c.ui.draw_text(ellipsize(c.ui, title, tw, 12.5f, 600), {tx, y + 14, tw, 19}, c.s.now_title.empty() ? c.th.label2 : c.th.label, Style().font(12.5f).weight(600));
+    std::string detail = c.s.now_artist;
+    if (busy) detail = c.s.ps == PlayState::Buffering ? "缓冲 " + std::to_string(int(c.s.buffer * 100)) + "%" : "正在解析…";
+    else if (!c.s.now_short.empty()) detail += (detail.empty() ? "" : " · ") + c.s.now_short;
+    if (detail.empty()) detail = "选择一首歌曲开始播放";
+    c.ui.muted_text(ellipsize(c.ui, detail, tw, 10.5f), {tx, y + 35, tw, 16}, Style().font(10.5f));
+    const float duration = std::max(1.0f, c.model.ui.dur_ms);
+    const Rect progress{tx + 39, y + 54, std::max(1.0f, tw - 78), 18};
+    static SeekBar seek;
+    float value = 0;
+    if (seek_bar(c, std::min(c.model.ui.pos_ms, duration), c.model.ui.dur_ms, progress, &seek, &value)) { seek_playback(int(value)); c.model.ui.pos_ms = value; }
+    c.ui.draw_text(fmt_time((long long)c.model.ui.pos_ms), {tx, y + 55, 32, 16}, c.th.label3, Style().font(9.5f));
+    c.ui.draw_text(fmt_time((long long)c.model.ui.dur_ms), {song.right() - 48, y + 55, 32, 16}, c.th.label3, Style().font(9.5f).right());
+
+    const float tools = c.W - 272;
+    const Rect speaker{tools, cy - 12, 20, 24};
+    draw_speaker(c.ui, speaker, c.th.label2, c.model.ui.volume);
+    c.ui.tooltip(speaker, "音量 " + std::to_string(int(c.model.ui.volume)) + "%");
+    static SeekBar volume;
+    if (seek_bar(c, c.model.ui.volume, 100, {tools + 26, cy - 10, 72, 20}, &volume, &value)) set_volume(value);
+    c.ui.fill_rect({tools + 111, cy - 10, 1, 20}, c.th.separator.scaled_alpha(0.7f));
+    const Rect download{tools + 124, cy - 14, 28, 28}, favorite{tools + 156, cy - 14, 28, 28};
+    const Rect lyrics{tools + 188, cy - 14, 28, 28}, queue{tools + 220, cy - 14, 28, 28};
+    Style track_action = Style().ghost(); track_action.disabled = c.s.now_uid.empty();
+    if (c.ui.icon_button("", download, track_action)) download_current();
+    const auto dl = c.model.downloads.find(c.s.now_uid);
+    if (dl != c.model.downloads.end() && !dl->second.done && !dl->second.failed)
+        c.ui.draw_text(std::to_string(dl->second.percent), download, c.th.tint, Style().font(9).center());
+    else c.ui.system_icon(dl != c.model.downloads.end() && dl->second.done ? SystemIcon::Check : dl != c.model.downloads.end() && dl->second.failed ? SystemIcon::Warning : SystemIcon::Download,
+        download.center(15, 15), dl != c.model.downloads.end() && dl->second.failed ? c.th.destructive : c.th.label2);
+    const bool saved = !c.s.now_track.variants.empty() && c.model.library.contains(c.s.now_track);
+    if (c.ui.icon_button("", favorite, track_action)) favorite_toggle(c.s.now_track);
+    if (saved) c.ui.fill_rect(favorite, c.th.tint.scaled_alpha(0.1f), 6);
+    c.ui.system_icon(SystemIcon::Star, favorite.center(16, 16), saved ? c.th.tint : c.th.label2);
+    if (c.ui.icon_button("", lyrics, Style().ghost())) {
+        c.model.ui.lyrics_open = !c.model.ui.lyrics_open; c.model.ui.queue_open = false;
+        if (c.model.ui.lyrics_open) request_current_lyrics();
+    }
+    if (c.model.ui.lyrics_open) c.ui.fill_rect(lyrics, c.th.tint.scaled_alpha(0.1f), 6);
+    draw_lyric_icon(c.ui, lyrics.center(16, 13), c.model.ui.lyrics_open ? c.th.tint : c.th.label2);
+    if (c.ui.icon_button("", queue, Style().ghost())) { c.model.ui.queue_open = !c.model.ui.queue_open; c.model.ui.lyrics_open = false; }
+    if (c.model.ui.queue_open) c.ui.fill_rect(queue, c.th.tint.scaled_alpha(0.1f), 6);
+    c.ui.system_icon(SystemIcon::List, queue.center(17, 17), c.model.ui.queue_open ? c.th.tint : c.th.label2);
+    c.ui.tooltip(download, "下载当前歌曲"); c.ui.tooltip(favorite, saved ? "取消收藏" : "收藏歌曲");
+    c.ui.tooltip(lyrics, "歌词"); c.ui.tooltip(queue, "待播清单");
+}
+
+
 static void draw_toast(Ctx& c) {
     if (c.model.ui.toast.empty()) return;
     const unsigned long long now = ui_ticks();
@@ -1659,23 +1522,11 @@ static void build_lyric_layout(aino::Ui& ui, const lyr::Doc& doc, float width) {
 }
 
 static void lyrics_panel(Ctx& c, const Rect& box) {
-    c.ui.fill_rect(box, c.th.control_bg);
-    c.ui.fill_rect({box.x, box.y, 1, box.h}, c.th.separator);
-
-    Style h;
-    h.font_size = 13.0f;
-    h.font_weight = 600;
-    c.ui.draw_text("歌词", {box.x + 20, box.y + 15, 120, 22}, c.th.label, h);
-
-    const Rect close{box.right() - 38, box.y + 14, 24, 24};
-    if (c.ui.icon_button("", close, Style().ghost())) c.model.ui.lyrics_open = false;
-    c.ui.system_icon(SystemIcon::Close, close.center(11, 11), c.th.label3);
-
     const auto& doc = c.model.lyrics.doc;
     const auto& uid = c.model.lyrics.uid;
     const bool loading = c.model.lyrics.loading;
 
-    const Rect area{box.x + 8, box.y + 46, box.w - 16, box.h - 60};
+    const Rect area{box.x + 8, box.y + 4, box.w - 16, box.h - 36};
 
     // 歌词属于"当前正在播的这首"才算数；切歌瞬间新旧对不上时先显示加载态
     const bool usable = doc && !uid.empty() && uid == c.s.now_uid;
@@ -1798,20 +1649,35 @@ static void lyrics_panel(Ctx& c, const Rect& box) {
                    {box.x + 20, box.bottom() - 26, box.w - 40, 16}, c.th.label4, f);
 }
 
+static void listening_panel(Ctx& c, const Rect& box) {
+    c.ui.fill_rect(box, c.th.control_bg);
+    c.ui.fill_rect({box.x, box.y, 1, box.h}, c.th.separator.scaled_alpha(0.7f));
+    int selected = c.model.ui.lyrics_open ? 1 : 0;
+    if (c.ui.segmented({"待播清单", "歌词"}, &selected, {box.x + 16, box.y + 16, box.w - 68, 30}, Style().font(11.5f))) {
+        c.model.ui.lyrics_open = selected == 1; c.model.ui.queue_open = selected == 0;
+        if (selected == 1) request_current_lyrics();
+    }
+    const Rect close{box.right() - 40, box.y + 18, 24, 26};
+    if (c.ui.icon_button("", close, Style().ghost())) { c.model.ui.lyrics_open = false; c.model.ui.queue_open = false; }
+    c.ui.system_icon(SystemIcon::Close, close.center(10, 10), c.th.label3);
+    const Rect content{box.x, box.y + 62, box.w, box.h - 62};
+    if (selected == 1) lyrics_panel(c, content); else queue_panel(c, content);
+}
+
 static void compose(aino::Ui& ui, Ctx& c) {
+    if (c.model.ui.tab == 2) { c.model.ui.tab = 1; c.model.ui.queue_open = true; c.model.ui.lyrics_open = false; }
     ui.fill_rect({0, 0, c.W, c.H}, c.th.window_bg);
     sidebar(c);
 
     switch (c.model.ui.tab) {
         case 0: tab_search(c); break;
         case 1: tab_discover(c); break;
-        case 2: tab_queue(c); break;
         case 3: tab_playlists(c); break;
         case 4: tab_sources(c); break;
         default: tab_settings(c); break;
     }
-    if (c.model.ui.lyrics_open) {
-        lyrics_panel(c, {c.W - kLyricsWidth, 0, kLyricsWidth, c.bar_y});
+    if (right_panel_width(c) > 0) {
+        listening_panel(c, {c.W - kPanelWidth, 0, kPanelWidth, c.bar_y});
     }
     player_bar(c);
     draw_song_menu(c);

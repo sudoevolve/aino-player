@@ -172,6 +172,7 @@ struct UiState {
     bool dark = false;
     // 歌词面板（Apple Music 那种右侧抽屉）
     bool lyrics_open = false;
+    bool queue_open = false;
     // 账号登录态（cookie 存在 settings 里，uin/uid 单独存）
     std::string qq_uin;
     std::string ne_uid;
@@ -183,9 +184,8 @@ struct UiState {
     std::string local_folder;
     bool scan_recursive = true;
     bool importing_playlist = false;
-    bool storage_settings = false;
+    int settings_tab = 0;
     bool update_settings = false;
-    bool about_settings = false;
     ClearAction clear_action = ClearAction::None;
     // 发现页当前看的是哪个平台（0=网易云 1=QQ 2=酷我）
     int disc_site = 0;
