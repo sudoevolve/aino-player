@@ -1,6 +1,7 @@
 """Build the small, local-file-only FFmpeg helper, or embed it for CMake."""
 import argparse
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -81,15 +82,27 @@ def build(output, jobs):
         flags += ["--target-os=mingw32", "--arch=x86_64", "--disable-pthreads", "--enable-w32threads"]
     # configure preserves the given source path; relative paths also work in native mingw32-make.
     configure = "../ffmpeg-" + VERSION + "/configure"
-    print(f"Configuring FFmpeg {VERSION} in {directory}", flush=True)
-    subprocess.run([bash, configure, *flags], cwd=directory, check=True, env=environment)
-    if windows and "mingw32-make" in Path(make).name.lower():
+    compiler = shutil.which("gcc")
+    fingerprint = json.dumps({"source": ARCHIVE_SHA256, "flags": flags, "compiler": compiler,
+        "compiler_version": subprocess.check_output([compiler, "--version"], env=environment).decode("utf-8", "replace"),
+        "bash": str(bash), "make": make}, sort_keys=True)
+    stamp = directory / "aino-config.json"
+    reconfigure = not (stamp.exists() and stamp.read_text(encoding="utf-8") == fingerprint and
+                       (directory / "ffbuild/config.mak").exists() and (directory / "config.h").exists())
+    if reconfigure:
+        print(f"Configuring FFmpeg {VERSION} in {directory}", flush=True)
+        subprocess.run([bash, configure, *flags], cwd=directory, check=True, env=environment)
+    else:
+        print("Reusing FFmpeg configuration; checking incremental build", flush=True)
+    if reconfigure and windows and "mingw32-make" in Path(make).name.lower():
         source_windows = source.resolve().as_posix()
         source_msys = "/" + source_windows[0].lower() + source_windows[2:]
         for name in ("makefile", "ffbuild/config.mak"):
             path = directory / name
             text = path.read_text(encoding="utf-8").replace(source_msys, "../ffmpeg-" + VERSION)
             path.write_text(text, encoding="utf-8", newline="\n")
+    if reconfigure:
+        stamp.write_text(fingerprint, encoding="utf-8")
     helper = "ffmpeg.exe" if windows else "ffmpeg"
     make_args = [make, f"-j{jobs}", helper]
     if windows:
@@ -105,7 +118,9 @@ def build(output, jobs):
     build_info = subprocess.check_output([str(built), "-version"], text=True, encoding="utf-8", errors="replace")
     print(build_info, flush=True)
     output.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(built, output)
+    # 保留未变化产物的时间戳，避免触发 CMake 重新编译音频和链接播放器。
+    if not output.exists() or built.read_bytes() != output.read_bytes():
+        shutil.copy2(built, output)
     shutil.copy2(source / "COPYING.LGPLv2.1", output.parent / "LICENSE.FFmpeg.txt")
     (output.parent / "FFmpeg-BUILD.txt").write_text(
         f"FFmpeg source: https://ffmpeg.org/releases/ffmpeg-{VERSION}.tar.xz\nSHA-256: {ARCHIVE_SHA256}\n\n" + build_info,

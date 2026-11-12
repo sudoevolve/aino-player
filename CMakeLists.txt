@@ -94,6 +94,7 @@ foreach(target player_audio player_login aino_player)
   endif()
 endforeach()
 
+option(BUILD_TESTING "Build the player regression executables" OFF)
 include(CTest)
 if(BUILD_TESTING)
   add_executable(interaction_tests tests/interaction_tests.cpp)
