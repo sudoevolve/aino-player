@@ -219,3 +219,13 @@ FFmpeg 仍为固定来源和摘要校验的 LGPL 构建，仅补 file/pipe、PCM
 覆盖补入现有 controller_tests、player_tests、interaction_tests 与音频格式脚本。本次按用户要求不运行 CTest、音频/浏览器/窗口回归、截图检查或 CI，不发版；必要编译与静态审查不能替代 Windows 输入法实际候选窗、网络中断/seek、Ubuntu XIM/XWayland 和真实音频设备验证。没有实测内存节省数字。
 
 实际检查：Windows MSVC Release 的播放器、controller_tests、player_tests、interaction_tests 以及上游 capture_probe 已编译通过；Python 脚本语法和 git diff --check 通过，未执行这些产物。审查补齐下载发布状态：磁盘发布移出下载状态锁，提交阶段禁止重试替换令牌，取消仅跳过后续标签并保留已发布文件；读取失败的 HTTP 响应清除半段成功内容。流式时长缺失时回退曲目时长。没有 Linux 编译或实机环境。
+
+### 2026-11-12 未发布：Windows 候选框、滑条松手帧与取流错误
+
+用户确认 Windows 汉字可正常上屏，但没有候选框。上轮 caret 和 IMM 定位补丁仍保留了按 `MSCTFIME Composition` 类名枚举系统窗口、设置 alpha=0 / SW_HIDE 并每 20 ms 重复隐藏的旧逻辑。两份 aino.hpp 同步移除该逻辑和相关计时器，仅在 WM_IME_SETCONTEXT 清除自绘组合串的显示标志，候选显示位原样交给系统。组合窗位置不再减去隐藏窗口高度；WM_CHAR 提交和内联预编辑保留。上游既有 IME 探针改为检查原生窗口可见性和样式未被修改，模拟消息也将标志正确放入 lParam。
+
+音量和进度条松手后先结束 dragging，再绘制旧的入参 value，业务写回发生在绘制之后；空闲时缺少下一帧请求，导致视觉回弹。修复为松手帧继续显示 drag_pos，提交后通过既有 request_animation_frame 补绘一次；没有真实 released 事件的捕获丢失不提交。无需更改滑条样式、布局或播放/歌词帧率。
+
+播放反馈所示网易云《乌克丽丽 (Live)》的只读 JSON 诊断为 HTTP 200、服务 code 200、歌曲 code -110 且 url 为空。此路径在 resolve 阶段失败，未进入 Stream::open；不推测拒绝码具体对应会员、版权或其他限制，也不将其代表所有曲目的播放状态。修复已有的标准音质跳过账号取流问题，抽出响应解析以保留真实拒绝码，区分缺失数据、网络失败和有效地址但未知码率；保留免费外链回退并去掉业务层无条件填 Cookie 的尾注。流式管道与完整文件恢复机制未改动，尚不能确认用户反馈是否还包含独立的流式故障。
+
+审查范围为窗口所有权、滑条提交顺序、账号取流和错误传播，未新增依赖或应用模块。Windows MSVC Release 播放器、player_tests、interaction_tests 和上游 ime_comp_probe 已编译通过；网易云解析用例补入现有 player_tests，未执行。播放器输出至 build/fixes/Release，避免覆盖正在运行的 build/portable/Release 实例。按用户要求不运行 CTest、音频/窗口/浏览器回归、不触发 CI 或发布。尚待实际输入法候选框和播放反馈确认，编译通过不等于实机验证。
