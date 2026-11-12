@@ -113,23 +113,6 @@ inline std::string ellipsize(aino::Ui& ui, const std::string& text, float max_w,
     return out;
 }
 
-// 播放三角用横线堆出来，不依赖字体里有没有 U+25B6
-inline void draw_play_triangle(aino::Ui& ui, const aino::Rect& box, const aino::Color& c) {
-    const int steps = std::max(12, int(box.h * 1.5f));
-    const float row_h = box.h / float(steps);
-    for (int i = 0; i < steps; ++i) {
-        const float t = (float(i) + 0.5f) / float(steps);
-        const float k = 1.0f - std::fabs(2.0f * t - 1.0f);
-        ui.fill_rect({box.x, box.y + float(i) * row_h, box.w * k, row_h + 0.6f}, c);
-    }
-}
-
-inline void draw_pause_bars(aino::Ui& ui, const aino::Rect& box, const aino::Color& c) {
-    const float bar_w = box.w * 0.3f;
-    ui.fill_rect({box.x, box.y, bar_w, box.h}, c, 1.5f);
-    ui.fill_rect({box.x + box.w - bar_w, box.y, bar_w, box.h}, c, 1.5f);
-}
-
 // 使用同一组矢量线条绘制轮廓和弧形声波，跨平台不依赖符号字体。
 inline void draw_speaker(aino::Ui& ui, const aino::Rect& box, const aino::Color& c, float volume) {
     const float scale = std::min(box.w, box.h) / 24.0f;
@@ -1207,13 +1190,14 @@ static void about_settings(Ctx& c, float x, float w, float y) {
     c.ui.draw_text(project::author, {x + 90, info.y, w - 106, 56}, c.th.label2, Style().font(12).right());
     settings_rule(c, info, info.y + 56);
     settings_label(c, "开源协议", {x, info.y + 56, w, 56});
-    if (c.ui.button(project::license, {x + w - 130, info.y + 70, 114, 28}, Style().ghost().font(11))) open_project(ProjectLink::License);
+    if (c.ui.button(project::license, {x + w - 130, info.y + 70, 114, 28}, Style().ghost().font(11).right())) open_project(ProjectLink::License);
     settings_rule(c, info, info.y + 112);
     settings_label(c, "GitHub", {x, info.y + 112, w, 56});
-    if (c.ui.button("sudoevolve/aino-player", {x + w - 208, info.y + 126, 192, 28}, Style().ghost().font(11))) open_project(ProjectLink::Repository);
-    if (c.ui.button("反馈问题", {x + 4, info.bottom() + 18, 88, 28}, Style().ghost().font(11))) open_project(ProjectLink::Issues);
-    if (c.ui.button("第三方许可", {x + 100, info.bottom() + 18, 100, 28}, Style().ghost().font(11))) open_project(ProjectLink::Dependencies);
-    c.ui.muted_text("aino · Apache-2.0\nminiaudio · Public Domain / MIT-0\nstb · Public Domain / MIT\nFFmpeg · LGPL-2.1-or-later", {x + 4, info.bottom() + 64, w - 8, 96}, Style().font(10.5f).wrap_text());
+    if (c.ui.button("sudoevolve/aino-player", {x + w - 208, info.y + 126, 192, 28}, Style().ghost().font(11).right())) open_project(ProjectLink::Repository);
+    const float actions_x = x + (w - 200) * 0.5f;
+    if (c.ui.button("反馈问题", {actions_x, info.bottom() + 18, 88, 28}, Style().ghost().font(11))) open_project(ProjectLink::Issues);
+    if (c.ui.button("第三方许可", {actions_x + 100, info.bottom() + 18, 100, 28}, Style().ghost().font(11))) open_project(ProjectLink::Dependencies);
+    c.ui.muted_text("aino · Apache-2.0\nminiaudio · Public Domain / MIT-0\nstb · Public Domain / MIT\nFFmpeg · LGPL-2.1-or-later", {x + 4, info.bottom() + 64, w - 8, 96}, Style().font(10.5f).center().wrap_text());
 }
 static void tab_settings(Ctx& c) {
     const float available = c.W - kSidebar - right_panel_width(c);
@@ -1269,8 +1253,8 @@ static void tab_settings(Ctx& c) {
             c.ui.draw_text(std::to_string(int(c.model.ui.volume)), {x + w - 46, group.y + 64, 30, 64}, c.th.label2, Style().font(11).right());
             settings_rule(c, group, group.y + 128);
             settings_label(c, "播放模式", {x, group.y + 128, w, 64});
-            int mode = -1;
-            if (c.ui.menu(play_mode_name(c.model.ui.play_mode), {"顺序播放", "随机播放", "列表循环", "单曲循环"}, &mode, {x + w - 130, group.y + 146, 114, 28}, Style().font(11))) set_play_mode(PlayMode(mode));
+            int mode = int(c.model.ui.play_mode);
+            if (c.ui.select({"顺序播放", "随机播放", "列表循环", "单曲循环"}, &mode, {x + w - 130, group.y + 146, 114, 28}, Style().font(11))) set_play_mode(PlayMode(mode));
             c.ui.draw_text("音频解码", {x + 2, group.bottom() + 28, w - 4, 20}, c.th.label2, Style().font(11.5f).weight(600));
             c.ui.muted_text(audio::decoder_info(), {x + 2, group.bottom() + 56, w - 4, 80}, Style().font(10.5f).wrap_text());
             return;
@@ -1299,42 +1283,76 @@ static void draw_lyric_icon(aino::Ui& ui, const aino::Rect& box, const aino::Col
     }
 }
 
-static void draw_mode_icon(Ctx& c, const Rect& box, PlayMode mode, const Color& color) {
-    auto line = [&](float x0, float y0, float x1, float y1) {
-        c.ui.draw_line(box.x + x0, box.y + y0, box.x + x1, box.y + y1, color, 1.5f);
-    };
-    if (mode == PlayMode::Shuffle) {
-        line(1, 4, 5, 4); line(5, 4, 15, 16); line(15, 16, 19, 16);
-        line(1, 16, 5, 16); line(5, 16, 15, 4); line(15, 4, 19, 4);
-        line(16, 1, 19, 4); line(16, 7, 19, 4);
-        line(16, 13, 19, 16); line(16, 19, 19, 16);
-    } else if (mode == PlayMode::Sequential) {
-        line(2, 4, 17, 4); line(2, 10, 12, 10); line(2, 16, 12, 16);
-        line(17, 9, 17, 18); line(14, 15, 17, 18); line(20, 15, 17, 18);
-    } else {
-        line(3, 8, 3, 5); line(3, 5, 17, 5); line(14, 2, 17, 5); line(14, 8, 17, 5);
-        line(17, 12, 17, 15); line(17, 15, 3, 15); line(6, 12, 3, 15); line(6, 18, 3, 15);
-        if (mode == PlayMode::RepeatOne) c.ui.draw_text("1", {box.x + 7, box.y + 5, 6, 10}, color, Style().font(8).weight(600).center());
+static SystemIcon play_mode_icon(PlayMode mode) {
+    switch (mode) {
+        case PlayMode::Shuffle: return SystemIcon::Shuffle;
+        case PlayMode::RepeatAll: return SystemIcon::RepeatAll;
+        case PlayMode::RepeatOne: return SystemIcon::RepeatOne;
+        default: return SystemIcon::List;
     }
 }
-static void draw_clock_icon(Ctx& c, const Rect& box, const Color& color) {
-    const float radius = 7;
-    for (int i = 0; i < 24; ++i) {
-        const float a = float(i) * 6.2831853f / 24, b = float(i + 1) * 6.2831853f / 24;
-        c.ui.draw_line(box.cx() + std::cos(a) * radius, box.cy() + std::sin(a) * radius,
-            box.cx() + std::cos(b) * radius, box.cy() + std::sin(b) * radius, color, 1.4f);
-    }
-    c.ui.draw_line(box.cx(), box.cy(), box.cx(), box.cy() - 4, color, 1.4f);
-    c.ui.draw_line(box.cx(), box.cy(), box.cx() + 3, box.cy() + 2, color, 1.4f);
+
+static std::string sleep_timer_status(const UiState& state) {
+    if (state.sleep_after_track) return "当前歌曲结束后停止";
+    if (state.sleep_deadline) return "剩余 " + fmt_time(static_cast<long long>(state.sleep_remaining_seconds) * 1000);
+    return "未启用";
 }
-static void draw_skip_icon(Ctx& c, const Rect& box, bool previous, const Color& color) {
-    const float half = box.w * 0.5f;
-    for (int triangle = 0; triangle < 2; ++triangle) for (int row = 0; row < 20; ++row) {
-        const float t = (row + 0.5f) / 20;
-        const float width = half * (1 - std::fabs(2 * t - 1));
-        const float x = box.x + triangle * half + (previous ? half - width : 0);
-        c.ui.fill_rect({x, box.y + row * box.h / 20, width, box.h / 20 + 0.5f}, color);
-    }
+
+static void playback_options(Ctx& c, const Rect& mode, const Rect& timer) {
+    auto* ui = &c.ui;
+    auto* state = &c.model.ui;
+    // 弹层在帧末绘制，仅捕获生命周期稳定的 Ui 和 UiState，不引用帧内 Ctx。
+    const Style trigger = Style().ghost().indicator(false);
+    c.ui.popover("", &state->play_mode_menu_open, mode, {196, 180}, [ui, state](const Rect& box) {
+        const auto& theme = ui->theme();
+        ui->draw_text("播放模式", {box.x, box.y, box.w, 24}, theme.label, Style().font(13).weight(600));
+        for (int i = 0; i < 4; ++i) {
+            const auto value = PlayMode(i);
+            const bool selected = state->play_mode == value;
+            const Rect row{box.x - 8, box.y + 36 + i * 34, box.w + 16, 32};
+            if (ui->item("", "", "", row, Style().corner(6))) {
+                set_play_mode(value); state->play_mode_menu_open = false; ui->request_animation_frame();
+            }
+            ui->system_icon(play_mode_icon(value), {row.x + 10, row.y + 7, 18, 18}, theme.label2);
+            ui->draw_text(play_mode_name(value), {row.x + 40, row.y, row.w - 72, row.h}, theme.label, Style().font(12));
+            if (selected) ui->system_icon(SystemIcon::Check, {row.right() - 24, row.y + 9, 14, 14}, theme.tint);
+        }
+    }, trigger);
+    if (state->play_mode_menu_open) state->sleep_timer_menu_open = false;
+
+    const bool timed = state->sleep_after_track || state->sleep_deadline;
+    c.ui.popover("", &state->sleep_timer_menu_open, timer, {216, 302}, [ui, state](const Rect& box) {
+        const auto& theme = ui->theme();
+        ui->draw_text("睡眠定时", {box.x, box.y, box.w, 24}, theme.label, Style().font(13).weight(600));
+        ui->muted_text(sleep_timer_status(*state), {box.x, box.y + 28, box.w, 22}, Style().font(11));
+        constexpr int minutes[] = {15, 30, 60, 90};
+        for (int i = 0; i < 4; ++i) {
+            const Rect row{box.x - 8, box.y + 62 + i * 32, box.w + 16, 30};
+            if (ui->item("", "", "", row, Style().corner(6))) {
+                set_sleep_timer(minutes[i]); state->sleep_timer_menu_open = false; ui->request_animation_frame();
+            }
+            ui->draw_text(std::to_string(minutes[i]) + " 分钟后停止", row.inset(10, 0), theme.label, Style().font(12));
+        }
+        ui->fill_rect({box.x, box.y + 198, box.w, 1}, theme.separator);
+        const Rect after{box.x - 8, box.y + 209, box.w + 16, 32};
+        if (ui->item("", "", "", after, Style().corner(6))) {
+            set_sleep_timer(0, true); state->sleep_timer_menu_open = false; ui->request_animation_frame();
+        }
+        ui->draw_text("当前歌曲结束后停止", {after.x + 10, after.y, after.w - 38, after.h}, theme.label, Style().font(12));
+        if (state->sleep_after_track) ui->system_icon(SystemIcon::Check, {after.right() - 24, after.y + 9, 14, 14}, theme.tint);
+        Style cancel = Style().ghost().font(12).color(theme.destructive);
+        cancel.disabled = !state->sleep_after_track && !state->sleep_deadline;
+        if (ui->button("取消定时", {box.x - 8, box.y + 260, box.w + 16, 32}, cancel)) {
+            set_sleep_timer(0); state->sleep_timer_menu_open = false; ui->request_animation_frame();
+        }
+    }, trigger);
+    if (state->sleep_timer_menu_open) state->play_mode_menu_open = false;
+
+    c.ui.system_icon(play_mode_icon(state->play_mode), mode.center(20, 20),
+        state->play_mode == PlayMode::Sequential ? c.th.label2 : c.th.tint);
+    c.ui.system_icon(SystemIcon::Timer, timer.center(20, 20), timed ? c.th.tint : c.th.label2);
+    c.ui.tooltip(mode, std::string("播放模式：") + play_mode_name(state->play_mode));
+    c.ui.tooltip(timer, "睡眠定时：" + sleep_timer_status(*state));
 }
 
 // 三组互不重叠：播放控制、曲目信息与进度、音量及侧栏工具。
@@ -1346,29 +1364,16 @@ static void player_bar(Ctx& c) {
     const bool busy = c.s.ps == PlayState::Resolving || c.s.ps == PlayState::Buffering;
     const Rect mode{26, cy - 15, 30, 30}, prev{70, cy - 16, 32, 32};
     const Rect play{111, cy - 20, 40, 40}, next{160, cy - 16, 32, 32}, timer{204, cy - 15, 30, 30};
-    int selection = -1;
-    // 触发器只显示自绘图标；菜单项继续使用原生 menu 的正常文字颜色。
-    const Style icon_menu = Style().ghost().font(11.5f).color(Color(0, 0, 0, 0));
-    if (c.ui.menu("", {"顺序播放", "随机播放", "列表循环", "单曲循环"}, &selection, mode, icon_menu)) set_play_mode(PlayMode(selection));
-    draw_mode_icon(c, mode.center(20, 20), c.model.ui.play_mode, c.model.ui.play_mode == PlayMode::Sequential ? c.th.label3 : c.th.tint);
-    c.ui.tooltip(mode, play_mode_name(c.model.ui.play_mode));
+    playback_options(c, mode, timer);
     if (c.ui.icon_button("", prev, Style().ghost())) play_step(-1);
-    draw_skip_icon(c, prev.center(17, 13), true, c.th.label2);
+    c.ui.system_icon(SystemIcon::PreviousTrack, prev.center(20, 20), c.th.label2);
     if (c.ui.icon_button("", play, Style().ghost().corner(20))) toggle_pause();
     if (busy) c.ui.spinner(play.center(19, 19));
-    else if (playing) draw_pause_bars(c.ui, play.center(14, 18), c.th.label);
-    else draw_play_triangle(c.ui, play.center(16, 19).offset(1, 0), c.th.label);
+    else c.ui.system_icon(playing ? SystemIcon::Pause : SystemIcon::Play, play.center(23, 23), c.th.label);
     if (c.ui.icon_button("", next, Style().ghost())) play_step(1);
-    draw_skip_icon(c, next.center(17, 13), false, c.th.label2);
+    c.ui.system_icon(SystemIcon::NextTrack, next.center(20, 20), c.th.label2);
     c.ui.tooltip(prev, "上一首"); c.ui.tooltip(play, playing ? "暂停" : "播放"); c.ui.tooltip(next, "下一首");
-    selection = -1;
     const bool timed = c.model.ui.sleep_after_track || c.model.ui.sleep_deadline;
-    if (c.ui.menu("", {"15 分钟后停止", "30 分钟后停止", "60 分钟后停止", "90 分钟后停止", "播完当前歌曲", "取消定时"}, &selection, timer, icon_menu)) {
-        constexpr int minutes[] = {15, 30, 60, 90, 0, 0};
-        if (selection >= 0 && selection < 6) set_sleep_timer(minutes[selection], selection == 4);
-    }
-    draw_clock_icon(c, timer.center(20, 20), timed ? c.th.tint : c.th.label3);
-    c.ui.tooltip(timer, "睡眠定时器");
     if (timed) {
         const auto seconds = c.model.ui.sleep_remaining_seconds;
         const auto label = c.model.ui.sleep_after_track ? std::string("本首结束") : std::to_string(seconds / 60) + ":" + (seconds % 60 < 10 ? "0" : "") + std::to_string(seconds % 60);

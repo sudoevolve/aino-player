@@ -173,6 +173,8 @@ struct UiState {
     // 歌词面板（Apple Music 那种右侧抽屉）
     bool lyrics_open = false;
     bool queue_open = false;
+    bool play_mode_menu_open = false;
+    bool sleep_timer_menu_open = false;
     // 账号登录态（cookie 存在 settings 里，uin/uid 单独存）
     std::string qq_uin;
     std::string ne_uid;

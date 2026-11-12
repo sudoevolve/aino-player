@@ -221,7 +221,8 @@ enum class SystemIcon {
     Pointer, Text, Toggle, Slider, Segment, Menu, Calendar, Palette, Bell, Table,
     Chart, Loader, Card, Navigation, List, Copy, Star, More, Upload, Download,
     Edit, Trash, Prev, Next, Moon, Sun, Auto, Close, Eye, Plus, Folder,
-    Search, ChevronDown, ChevronUp, Check, Minus, Settings, Network, Image, Info, Warning, People, Count
+    Search, ChevronDown, ChevronUp, Check, Minus, Settings, Network, Image, Info, Warning, People,
+    Play, Pause, PreviousTrack, NextTrack, Shuffle, RepeatOne, RepeatAll, Timer, Count
 };
 
 // 键盘修饰键 / 常用键位（与平台无关的抽象码）
@@ -457,6 +458,8 @@ struct Style {
     bool  italic  = false;
     bool  password = false;      // 单行输入以圆点显示，编辑值保持原文
     bool  disabled = false;
+    /** @brief menu/select/popover 是否显示下拉指示箭头；纯图标触发器可关闭。 */
+    bool  show_indicator = true;
 
     // --- 组件语义变体 ---
     enum Variant { Default, Secondary, Outline, Ghost, Destructive, Link, Standard };
@@ -514,6 +517,8 @@ struct Style {
     Style& muted_text() { muted = true; return *this; }
     Style& hint(const std::string& h) { placeholder = h; return *this; }
     Style& off() { disabled = true; return *this; }
+    /** @brief 显式控制下拉指示箭头，不影响触发器命中、焦点或弹层行为。 */
+    Style& indicator(bool show) { show_indicator = show; return *this; }
     Style& secret(bool on = true) { password = on; return *this; }
     Style& scale_on_press(float s) { press_scale = s; return *this; }
     Style& wrap_text(bool v = true) { wrap = v; return *this; }
@@ -6646,7 +6651,7 @@ inline bool Ui::select(const std::vector<std::string>& items, int* index, const 
 
     // 右侧是**上下两个小三角**（NSPopUpButton 的经典标记）。单个向下箭头是
     // Web 的 <select>；mac 的下拉按钮从上世纪到现在都是"上下"两个箭头。
-    detail::paint_popup_chevrons(*this, box, pad, th.label2);
+    if (st.show_indicator) detail::paint_popup_chevrons(*this, box, pad, th.label2);
 
     if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, box, rad, th.ring);
 
@@ -7895,7 +7900,7 @@ inline bool Ui::menu(const std::string& label, const std::vector<std::string>& i
     Color fg = sk.fg;
     if (st.disabled) fg.a = uint8_t(float(fg.a) * 0.45f);
     draw_text(label, Rect(box.x + pad, box.y, std::max(box.w - pad * 2.0f - 18.0f, 1.0f), box.h), fg, ts);
-    system_icon(SystemIcon::ChevronDown,
+    if (st.show_indicator) system_icon(SystemIcon::ChevronDown,
                 Rect::centered(box.right() - pad - 5, box.cy(), 12, 12), fg);
     if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, box, rad, th.ring);
     if (in.pressed) detail::grab_focus(impl, id);
@@ -9058,7 +9063,7 @@ inline bool Ui::popover(const std::string& label, bool* open, const Rect& box,
     Color fg = sk.fg;
     if (st.disabled) fg.a = uint8_t(float(fg.a) * 0.45f);
     draw_text(label, Rect(box.x + pad, box.y, std::max(box.w - pad * 2.0f - 18.0f, 1.0f), box.h), fg, ts);
-    system_icon(SystemIcon::ChevronDown,
+    if (st.show_indicator) system_icon(SystemIcon::ChevronDown,
                 Rect::centered(box.right() - pad - 5, box.cy(), 12, 12), fg);
     if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, box, rad, th.ring);
 
@@ -13156,8 +13161,10 @@ inline SystemIconMask load_system_icon(SystemIcon icon, int size) {
         0xEA8F, 0xE8A9, 0xE9D9, 0xE895, 0xE7C3, 0xE99C, 0xE8FD, 0xE8C8,
         0xE734, 0xE712, 0xE898, 0xE896, 0xE70F, 0xE74D, 0xE76B, 0xE76C,
         0xE708, 0xE706, 0xE7F4, 0xE711, 0xE890, 0xE710, 0xE8B7, 0xE721,
-        0xE70D, 0xE70E, 0xE73E, 0xE738, 0xE713, 0xE701, 0xEB9F, 0xE946, 0xE7BA, 0xE716
+        0xE70D, 0xE70E, 0xE73E, 0xE738, 0xE713, 0xE701, 0xEB9F, 0xE946, 0xE7BA, 0xE716,
+        0xE768, 0xE769, 0xE892, 0xE893, 0xE8B1, 0xE8ED, 0xE8EE, 0xE916
     };
+    static_assert(sizeof(codes) / sizeof(codes[0]) == size_t(SystemIcon::Count));
     const size_t index = size_t(icon);
     if (index >= sizeof(codes) / sizeof(codes[0])) return mask;
     static const wchar_t* family = font_face_installed(L"Segoe Fluent Icons")
@@ -13204,8 +13211,10 @@ inline SystemIconMask load_system_icon(SystemIcon icon, int size) {
         "star", "ellipsis", "square.and.arrow.up", "square.and.arrow.down", "pencil", "trash",
         "chevron.left", "chevron.right", "moon", "sun.max", "desktopcomputer", "xmark",
         "eye", "plus", "folder", "magnifyingglass", "chevron.down", "chevron.up", "checkmark", "minus",
-        "gearshape", "wifi", "photo", "info.circle", "exclamationmark.triangle", "person.2"
+        "gearshape", "wifi", "photo", "info.circle", "exclamationmark.triangle", "person.2",
+        "play.fill", "pause.fill", "backward.end.fill", "forward.end.fill", "shuffle", "repeat.1", "repeat", "timer"
     };
+    static_assert(sizeof(names) / sizeof(names[0]) == size_t(SystemIcon::Count));
     const size_t index = size_t(icon);
     if (index >= sizeof(names) / sizeof(names[0])) return mask;
     const auto image_class = objc_getClass("NSImage");
@@ -13271,7 +13280,9 @@ inline bool Ui::system_icon(SystemIcon icon, const Rect& box, const Color& color
     // X11 没有统一的系统图标 API，使用系统字体的 Unicode 符号回退。
     static const char* symbols[] = {"↖", "T", "◉", "☷", "▥", "☰", "▦", "◌", "♧", "▦",
         "▥", "↻", "▭", "◧", "☷", "⧉", "☆", "…", "↑", "↓", "✎", "⌫", "‹", "›",
-        "☾", "☼", "▣", "×", "◉", "+", "▱", "⌕", "⌄", "⌃", "✓", "−", "⚙", "⌁", "▧", "ⓘ", "⚠", "♙"};
+        "☾", "☼", "▣", "×", "◉", "+", "▱", "⌕", "⌄", "⌃", "✓", "−", "⚙", "⌁", "▧", "ⓘ", "⚠", "♙",
+        "▶", "Ⅱ", "⏮", "⏭", "⇄", "↻₁", "↻", "⏱"};
+    static_assert(sizeof(symbols) / sizeof(symbols[0]) == size_t(SystemIcon::Count));
     if (size_t(icon) >= sizeof(symbols) / sizeof(symbols[0])) return false;
     draw_text(symbols[size_t(icon)], box, color,
               Style().font(std::min(box.w, box.h)).center());
