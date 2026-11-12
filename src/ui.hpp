@@ -266,12 +266,13 @@ static bool seek_bar(Ctx& c, float value, float max_value, const Rect& box, Seek
         if (in.down[0]) {
             st->drag_pos = max_value * t_at_mouse();
         } else {
-            commit = true;
+            commit = in.released[0];
             st->dragging = false;
         }
     }
 
-    const float shown = std::min(max_value, std::max(0.0f, st->dragging ? st->drag_pos : value));
+    // 松手这一帧调用方尚未写回 value，必须显示刚提交的位置，不能画回旧值。
+    const float shown = std::min(max_value, std::max(0.0f, st->dragging || commit ? st->drag_pos : value));
     const float t = enabled ? shown / max_value : 0.0f;
 
     const float track_h = 4.0f;
@@ -285,7 +286,10 @@ static bool seek_bar(Ctx& c, float value, float max_value, const Rect& box, Seek
     c.ui.drop_shadow(knob, knob.h * 0.5f, 3.0f, Color(0, 0, 0, 60), 0.5f);
     c.ui.fill_circle(knob.cx(), knob.cy(), knob.w * 0.5f, Color(255, 255, 255));
 
-    if (commit && committed) *committed = st->drag_pos;
+    if (commit) {
+        if (committed) *committed = st->drag_pos;
+        c.ui.request_animation_frame(); // 补绘一次，显示调用方更新后的音量文字、图标和位置。
+    }
     return commit;
 }
 
