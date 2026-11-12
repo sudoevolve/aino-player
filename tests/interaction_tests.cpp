@@ -42,6 +42,9 @@ static void linux_backend_checks() {
         XGetWMNormalHints(state->dpy, state->win, &hints, &supplied);
         check(hints.min_width == 240 && hints.min_height == 180, "scaled minimum dimensions");
         XEvent motion{}; motion.type = MotionNotify; motion.xmotion.x = 40; motion.xmotion.y = 60;
+        // 与 XNextEvent 返回的事件一致：XIM 的 XFilterEvent 会读取 display 和 window。
+        motion.xmotion.display = state->dpy; motion.xmotion.window = state->win;
+        motion.xmotion.root = DefaultRootWindow(state->dpy); motion.xmotion.same_screen = True;
         detail::x11_handle(state, motion); detail::x11_feed_input(state);
         check(window.impl->ui.impl->input.mouse.x == 20 && window.impl->ui.impl->input.mouse.y == 30, "scaled input coordinates");
         publish(144, 1);

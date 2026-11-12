@@ -255,3 +255,5 @@ FFmpeg 仍为固定来源和摘要校验的 LGPL 构建，仅补 file/pipe、PCM
 本项仅供本地确认，未提交或推送。Windows MSVC Release 播放器已编译通过，输出至 build/ime-search/Release；git diff --check 及静态生命周期审查通过。未运行回归、窗口探针或 CI，未启动播放器或覆盖正在运行的旧版；编译结果不能代替真实 Windows 输入法候选框验证。
 
 后续确认（2026-11-12）：用户运行本地排查版后明确反馈“现在正常了”，并要求发布新版本 player。此前等待实机确认的提交限制已满足；将该播放器 COM 生命周期修复提交，随后按独立版本提交和标签启动 Windows/Linux 发布回归及打包。用户确认限于其 Windows 播放器输入场景，不扩大为所有系统与输入法验证通过。
+
+发布门禁发现的测试问题（2026-11-12）：v0.2.2 的 Linux 发布构建通过，前七项 CTest 通过，但 linux_dpi_and_font_cache 在模拟鼠标事件时崩溃。该测试直接调用 x11_handle，构造的 XEvent 未填写 display/window；接入 XIM 过滤后，XFilterEvent 会读取 ev->xany.display 的 im_filters，空 display 导致段错误。对照 Xlib 的 FilterEv.c 确认此路径，仅为测试补齐实际原生事件具有的 display/window/root/same_screen，不跳过 XIM 或删除检查，不修改已确认的 Windows 输入实现。v0.2.2 未发布，保留失败标签，修正后的发布使用 v0.2.3。
