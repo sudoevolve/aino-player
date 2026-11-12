@@ -25,7 +25,7 @@
 - **关于**：「设置 → 关于」包含版本、作者 sudoevolve、Apache-2.0 协议、项目地址及第三方许可；使用黑白灰的几何 A / 播放箭头图标
 - 深色模式；音量使用统一矢量图标，区分静音、低音量和高音量
 - 设置按通用、账号、播放、下载、数据和关于分类；底栏采用播放控制、居中曲目信息与进度、音量及工具三个区域
-- 底栏播放控制使用系统图标接口：Windows 使用系统 Segoe Fluent Icons / MDL2 Assets；播放模式弹层显示四种模式及当前勾选项。Linux 沿用系统字体符号回退
+- 底栏播放控制使用系统图标接口：Windows 使用系统 Segoe Fluent Icons / MDL2 Assets；播放模式弹层显示四种模式及当前勾选项。Linux 读取桌面系统图标主题，按主题继承回退到 Adwaita / hicolor，不再依赖字体是否含有播放符号
 
 本地收藏和保存歌单不要求登录播放器账号，但平台可能要求登录才能读取某些在线歌单。在线歌单保存曲目元数据和歌单引用，播放仍需联网；文件夹歌单只保存本地音频路径，可以离线播放。公开链接示例：
 
@@ -83,7 +83,7 @@ cmake -S . -B build -A x64
 cmake --build build --config Release
 
 # Ubuntu / Debian（Linux 使用 X11，Wayland 桌面需 XWayland）
-sudo apt-get install build-essential python3 cmake libx11-dev libcurl4-openssl-dev libfreetype6 libfontconfig1 fonts-noto-cjk xdg-utils
+sudo apt-get install build-essential python3 cmake libx11-dev libcurl4-openssl-dev libfreetype6 libfontconfig1 libgdk-pixbuf-2.0-0 librsvg2-common adwaita-icon-theme fonts-noto-cjk xdg-utils
 python3 tools/build_ffmpeg.py
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
@@ -114,11 +114,15 @@ Linux 仍使用 X11/XWayland 后端，自动读取 XSETTINGS 的 DPI/窗口倍�
 ```bash
 # 桌面没有正确传递 X11 DPI 时，可手动覆盖（支持 1.25/1.5 等）
 AINO_SCALE=1.5 aino_player
-# 离线绘制一帧，输出倍率、物理/逻辑尺寸、字体缓存及进程 RSS 后退出
+# 离线绘制一帧，输出倍率、尺寸、字体缓存、RSS、PSS 及 Private 页后退出
 aino_player --diagnostics
 ```
 
-本轮将 FreeType face 改为按字体文件和索引共享，字形位图缓存限制为 4 MiB / 16384 项；封面最多两个后台下载/解码任务、32 个待处理请求，完成与失败条目均参与缓存回收。Ubuntu 24.04 / Xvfb CI 已通过 8 项测试，覆盖动态 DPI、鼠标坐标、字体共享和内置解码。空资料库、未播放且无封面时的首帧诊断 RSS 为 31032 kB（约 30.3 MiB，倍率 1），其中匿名页 8208 kB、文件页 22824 kB；不是原反馈机器的前后对照，也不代表播放与封面加载后的占用。不能保证从反馈的 150 MB 降到 17 MB。XWayland 的混合 DPI、多显示器与合成器二次缩放仍需实机检查，本轮不宣称原生 Wayland 支持。
+此前已将 FreeType face 改为按字体文件和索引共享，字形位图缓存限制为 4 MiB / 16384 项；封面最多两个后台下载/解码任务、32 个待处理请求，完成与失败条目均参与缓存回收。此前 Ubuntu 24.04 / Xvfb CI 通过 8 项测试，空资料库、未播放且无封面时的首帧诊断 RSS 为 31032 kB（约 30.3 MiB，倍率 1），其中匿名页 8208 kB、文件页 22824 kB。这不是反馈机器的前后对照，也不代表播放与封面加载后的占用。XWayland 的混合 DPI、多显示器与合成器二次缩放仍需实机检查，不宣称原生 Wayland 支持。
+
+针对相同歌词画面的后续修复保留布局、字号、字体选择、歌词动画与 60 fps 策略：查 Fontconfig 字符覆盖集合后再打开字体，避免缺字加载整条回退链；队列和搜索结果按版本原地保留，避免逐帧复制；本地歌单绘制只读引用。Linux JPEG/PNG 封面优先用 GdkPixbuf 在解码阶段请求目标尺寸，JPEG 可降采样，PNG 仍可能分配完整中间图；失败回退 stb，保持原有格式和尺寸上限。图标同样使用系统 GdkPixbuf/SVG loader，不初始化 GTK。
+
+这批修复仅做编译、静态检查与代码审查，尚未在反馈者 Ubuntu 的相同播放场景复测，不能承诺降至 Windows 的 20 MB。`--diagnostics` 的 Private/PSS/RSS 仅为首帧数据；比较播放内存需在相同画面、窗口大小和曲目状态下读取运行进程，不能用首帧数据代替。
 
 MP3、FLAC、WAV 由 miniaudio 直接解码。**AAC/M4A、Ogg/Opus、WebM 使用内置精简 FFmpeg**：后台解码成缓存目录中的 PCM WAV，再交给 miniaudio 播放。Windows 精简解码器约 2.97 MiB；不包含网络、视频解码或额外外部库，不依赖 Windows Media Foundation。播放器仍先缓存、后解码，不做边下边播。
 

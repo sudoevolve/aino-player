@@ -1394,6 +1394,8 @@ namespace icons {
 #include <cstdarg>
 #include <algorithm>
 #include <unordered_map>
+#include <memory>
+#include <fstream>
 
 namespace aino {
 namespace detail {
@@ -11301,7 +11303,7 @@ inline std::string Window::clipboard() const {
 // =============================================================================
 namespace detail {
 // XSETTINGS 的整数使用属性自身的字节序；截断或无效属性不采用部分解析结果。
-struct DesktopScaleSettings { double dpi = 0; int factor = 0; };
+struct DesktopScaleSettings { double dpi = 0; int factor = 0; std::string icon_theme; };
 inline DesktopScaleSettings parse_xsettings_scale(const unsigned char* bytes, size_t length) {
     DesktopScaleSettings result;
     if (!bytes || length < 12 || length > 1024u * 1024u || bytes[0] > 1) return result;
@@ -11327,7 +11329,13 @@ inline DesktopScaleSettings parse_xsettings_scale(const unsigned char* bytes, si
             const auto value = read(4);
             if (name == "Xft/DPI" && value >= 48u * 1024u && value <= 384u * 1024u) result.dpi = double(value) / 1024.0;
             if (name == "Gdk/WindowScalingFactor" && value >= 1 && value <= 4) result.factor = int(value);
-        } else if (type == 1) { const auto size = read(4); skip(size); align(); }
+        } else if (type == 1) {
+            const auto size = read(4);
+            if (!ok || size > length - pos) return {};
+            if (name == "Net/IconThemeName" && size <= 256)
+                result.icon_theme.assign(reinterpret_cast<const char*>(bytes + pos), size);
+            skip(size); align();
+        }
         else if (type == 2) skip(8);
         else return {};
     }
@@ -11361,6 +11369,8 @@ inline float desktop_scale(const char* override_scale, const char* gdk_scale,
 #if defined(AINO_PLATFORM_X11)
 
 namespace detail {
+
+inline std::string& x11_icon_theme() { static thread_local std::string theme; return theme; }
 
 // 诊断开关：AINO_X11_TRACE=1 时把 X11 文本路径的每一步打到 stderr。
 // 为什么必须 fflush：崩溃（free(): invalid pointer / abort）时管道里的 stderr
@@ -11510,6 +11520,8 @@ struct FcApi {
     // 少了它们就只能靠「排序表前 N 条里碰运气」，见 build() 里的注释。
     int  (*get_charset)(void*, const char*, int, void**) = nullptr;
     int  (*charset_has)(const void*, unsigned int) = nullptr;
+    void* (*charset_copy)(void*) = nullptr;
+    void (*charset_destroy)(void*) = nullptr;
 
     bool load() {
         if (lib) return true;
@@ -11540,6 +11552,8 @@ struct FcApi {
         get_integer       = reinterpret_cast<decltype(get_integer)>(dlsym(lib, "FcPatternGetInteger"));
         get_charset       = reinterpret_cast<decltype(get_charset)>(dlsym(lib, "FcPatternGetCharSet"));
         charset_has       = reinterpret_cast<decltype(charset_has)>(dlsym(lib, "FcCharSetHasChar"));
+        charset_copy      = reinterpret_cast<decltype(charset_copy)>(dlsym(lib, "FcCharSetCopy"));
+        charset_destroy   = reinterpret_cast<decltype(charset_destroy)>(dlsym(lib, "FcCharSetDestroy"));
         if (!init || !pattern_create || !pattern_destroy || !add_string || !add_double
             || !add_integer || !add_bool || !config_substitute || !default_substitute
             || !font_match || !font_sort || !font_set_destroy || !get_string || !get_integer) {
@@ -11702,6 +11716,7 @@ private:
         int asc = 0, desc = 0;
         std::vector<std::string> files;   // 兜底链：文件路径
         std::vector<long> indices;
+        std::vector<std::shared_ptr<void>> charsets; // Fontconfig 的覆盖集合；查询缺字不打开字体文件。
         std::unordered_map<unsigned long, Glyph> glyphs;
         int hit = 0;                      // 上次命中的字体下标
     };
@@ -11746,6 +11761,7 @@ private:
             // FcFontSort 包含同一家族的多个 style；按 charset 选择覆盖 U+4E2D 的字体并置于主字体之后，避免截断回退链时遗漏 CJK。
             const int cap = x11_chain_cap();
             std::string cjk_file;
+            std::shared_ptr<void> cjk_charset;
             long cjk_index = 0;
             bool cjk_found = false;
             int  cjk_pos   = -1;      // 已在收集范围内时的位置
@@ -11754,15 +11770,16 @@ private:
                 int index = 0;
                 if (fc.get_string(set->fonts[i], "file", 0, &file) != 0 || !file) continue;
                 if (fc.get_integer(set->fonts[i], "index", 0, &index) != 0) index = 0;
-                bool has_cjk = false;
-                if (!cjk_found && fc.get_charset && fc.charset_has) {
-                    void* cs = nullptr;
-                    if (fc.get_charset(set->fonts[i], "charset", 0, &cs) == 0 && cs)
-                        has_cjk = fc.charset_has(cs, 0x4E2Du) != 0;
-                }
+                void* cs = nullptr;
+                std::shared_ptr<void> charset;
+                if (fc.get_charset) fc.get_charset(set->fonts[i], "charset", 0, &cs);
+                if (cs && fc.charset_copy && fc.charset_destroy)
+                    charset = std::shared_ptr<void>(fc.charset_copy(cs), fc.charset_destroy);
+                const bool has_cjk = !cjk_found && cs && fc.charset_has && fc.charset_has(cs, 0x4E2Du);
                 if (has_cjk) {
                     cjk_found = true;
                     cjk_file = reinterpret_cast<const char*>(file);
+                    cjk_charset = charset;
                     cjk_index = long(index);
                 }
                 if (int(f.files.size()) >= cap) {
@@ -11772,11 +11789,13 @@ private:
                 if (has_cjk) cjk_pos = int(f.files.size());
                 f.files.push_back(reinterpret_cast<const char*>(file));
                 f.indices.push_back(long(index));
+                f.charsets.push_back(std::move(charset));
             }
             // 第一条覆盖汉字的字体没进前 cap 条 → 手动插到主字体后面。
             if (cjk_found && cjk_pos < 0) {
                 f.files.insert(f.files.begin() + (f.files.empty() ? 0 : 1), cjk_file);
                 f.indices.insert(f.indices.begin() + (f.indices.empty() ? 0 : 1), cjk_index);
+                f.charsets.insert(f.charsets.begin() + (f.charsets.empty() ? 0 : 1), cjk_charset);
                 cjk_pos = f.files.empty() ? 0 : 1;
             }
             fc.font_set_destroy(sort);
@@ -11841,6 +11860,13 @@ private:
         return shared.face;
     }
 
+    bool covers(const Font& f, size_t index, unsigned long cp) const {
+        if (index >= f.files.size()) return false;
+        const auto& fc = fc_api();
+        return index >= f.charsets.size() || !f.charsets[index] || !fc.charset_has ||
+               fc.charset_has(f.charsets[index].get(), unsigned(cp)) != 0;
+    }
+
     // 取一个码位的字形：先试上次命中的字体，再沿兜底链找第一个覆盖它的。
     // 一个都没有就只占半格宽度、不画墨 —— 宁可空白也不吐豆腐方块。
     const Glyph& glyph(Font& f, unsigned long cp) {
@@ -11851,17 +11877,19 @@ private:
         Glyph g;
         int hit = -1;
         // 优先查询主字体，再查询最近命中的回退字体，避免 CJK 缓存改变西文字形来源。
-        if (void* primary = open_face(f, 0)) {
-            if (ft.char_index(primary, cp)) hit = 0;
+        if (covers(f, 0, cp)) {
+            if (void* primary = open_face(f, 0)) {
+                if (ft.char_index(primary, cp)) hit = 0;
+            }
         }
-        if (hit < 0 && f.hit != 0) {
+        if (hit < 0 && f.hit != 0 && covers(f, size_t(f.hit), cp)) {
             if (void* face = open_face(f, size_t(f.hit))) {
                 if (ft.char_index(face, cp)) hit = f.hit;
             }
         }
         if (hit < 0) {
             for (size_t i = 1; i < f.files.size(); ++i) {
-                if (int(i) == f.hit) continue;
+                if (int(i) == f.hit || !covers(f, i, cp)) continue;
                 void* cand = open_face(f, i);
                 if (!cand) continue;
                 if (ft.char_index(cand, cp)) { hit = int(i); break; }
@@ -12284,6 +12312,7 @@ inline float x11_desktop_scale(X11State* s) {
     XUngrabServer(s->dpy);
     XFlush(s->dpy);
     const auto settings = parse_xsettings_scale(bytes.data(), bytes.size());
+    x11_icon_theme() = settings.icon_theme;
     const auto resource = x11_property(s->dpy, root, s->resource_manager, XA_STRING);
     double dpi = 0;
     if (!resource.empty()) {
@@ -13203,6 +13232,191 @@ struct SystemIconMask {
     std::vector<uint8_t> alpha;
 };
 
+#if defined(AINO_PLATFORM_X11)
+// 只使用 GdkPixbuf 的图像加载，不初始化 GTK 或创建额外窗口。
+struct X11IconPixels {
+    void* lib = nullptr;
+    void* (*load)(const char*, int, int, int, void**) = nullptr;
+    int (*width)(const void*) = nullptr;
+    int (*height)(const void*) = nullptr;
+    int (*stride)(const void*) = nullptr;
+    int (*channels)(const void*) = nullptr;
+    int (*has_alpha)(const void*) = nullptr;
+    unsigned char* (*pixels)(const void*) = nullptr;
+    void (*unref)(void*) = nullptr;
+    X11IconPixels() {
+        lib = dlopen("libgdk_pixbuf-2.0.so.0", RTLD_LAZY | RTLD_LOCAL);
+        if (!lib) return;
+        load = reinterpret_cast<decltype(load)>(dlsym(lib, "gdk_pixbuf_new_from_file_at_scale"));
+        width = reinterpret_cast<decltype(width)>(dlsym(lib, "gdk_pixbuf_get_width"));
+        height = reinterpret_cast<decltype(height)>(dlsym(lib, "gdk_pixbuf_get_height"));
+        stride = reinterpret_cast<decltype(stride)>(dlsym(lib, "gdk_pixbuf_get_rowstride"));
+        channels = reinterpret_cast<decltype(channels)>(dlsym(lib, "gdk_pixbuf_get_n_channels"));
+        has_alpha = reinterpret_cast<decltype(has_alpha)>(dlsym(lib, "gdk_pixbuf_get_has_alpha"));
+        pixels = reinterpret_cast<decltype(pixels)>(dlsym(lib, "gdk_pixbuf_get_pixels"));
+        unref = reinterpret_cast<decltype(unref)>(dlsym(lib, "g_object_unref"));
+        if (!load || !width || !height || !stride || !channels || !has_alpha || !pixels || !unref) {
+            dlclose(lib); lib = nullptr;
+        }
+    }
+};
+inline std::string x11_icon_trim(std::string value) {
+    const auto begin = value.find_first_not_of(" \t\r\n\"'");
+    return begin == std::string::npos ? std::string() : value.substr(begin, value.find_last_not_of(" \t\r\n\"'") - begin + 1);
+}
+inline void x11_icon_split(const std::string& value, char separator, std::vector<std::string>& out) {
+    size_t start = 0;
+    while (start < value.size()) {
+        const auto end = value.find(separator, start);
+        const auto part = x11_icon_trim(value.substr(start, end - start));
+        if (!part.empty() && std::find(out.begin(), out.end(), part) == out.end()) out.push_back(part);
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+}
+inline bool x11_icon_relative(const std::string& name) {
+    return !name.empty() && name.front() != '/' && name.find("..") == std::string::npos && name.find('\\') == std::string::npos;
+}
+inline std::string x11_effective_icon_theme() {
+    if (!x11_icon_theme().empty()) return x11_icon_theme();
+    static const std::string fallback = [] {
+        const char* home = std::getenv("HOME");
+        const char* config = std::getenv("XDG_CONFIG_HOME");
+        const std::string base = config && *config ? config : home ? std::string(home) + "/.config" : std::string();
+        for (const auto& file : {base + "/gtk-3.0/settings.ini", base + "/gtk-4.0/settings.ini", std::string("/etc/gtk-3.0/settings.ini")}) {
+            std::ifstream input(file); std::string line;
+            while (std::getline(input, line)) {
+                const auto equal = line.find('=');
+                if (equal != std::string::npos && x11_icon_trim(line.substr(0, equal)) == "gtk-icon-theme-name") {
+                    const auto theme = x11_icon_trim(line.substr(equal + 1));
+                    if (x11_icon_relative(theme) && theme.find('/') == std::string::npos) return theme;
+                }
+            }
+        }
+        const char* desktop = std::getenv("XDG_CURRENT_DESKTOP");
+        return desktop && std::string(desktop).find("ubuntu") != std::string::npos ? std::string("Yaru") : std::string("Adwaita");
+    }();
+    return fallback;
+}
+struct X11IconTheme {
+    std::vector<std::string> dirs, parents;
+};
+struct X11IconLookup {
+    std::string active;
+    std::vector<std::string> roots;
+    std::map<std::string, X11IconTheme> themes;
+    std::map<std::string, std::string> files;
+    X11IconLookup() {
+        const char* home = std::getenv("HOME");
+        const char* data = std::getenv("XDG_DATA_HOME");
+        if (data && *data) roots.push_back(std::string(data) + "/icons");
+        else if (home) roots.push_back(std::string(home) + "/.local/share/icons");
+        if (home) roots.push_back(std::string(home) + "/.icons");
+        std::vector<std::string> bases;
+        const char* dirs = std::getenv("XDG_DATA_DIRS");
+        x11_icon_split(dirs && *dirs ? dirs : "/usr/local/share:/usr/share", ':', bases);
+        for (const auto& base : bases) roots.push_back(base + "/icons");
+    }
+    const X11IconTheme& theme(const std::string& name) {
+        auto found = themes.find(name);
+        if (found != themes.end()) return found->second;
+        X11IconTheme value;
+        if (x11_icon_relative(name) && name.find('/') == std::string::npos) for (const auto& root : roots) {
+            std::ifstream input(root + "/" + name + "/index.theme");
+            std::string line; bool header = false;
+            while (std::getline(input, line)) {
+                line = x11_icon_trim(line);
+                if (line.empty() || line[0] == '#') continue;
+                if (line[0] == '[') { header = line == "[Icon Theme]"; continue; }
+                if (!header) continue;
+                const auto equal = line.find('=');
+                if (equal == std::string::npos) continue;
+                const auto key = x11_icon_trim(line.substr(0, equal));
+                if (key == "Directories" || key == "ScaledDirectories") x11_icon_split(line.substr(equal + 1), ',', value.dirs);
+                else if (key == "Inherits") x11_icon_split(line.substr(equal + 1), ',', value.parents);
+            }
+        }
+        // Symbolic/scalable 源优先，系统按请求像素尺寸栅格化，不依赖字体字形。
+        std::stable_sort(value.dirs.begin(), value.dirs.end(), [](const std::string& a, const std::string& b) {
+            auto rank = [](const std::string& v) { return v.find("symbolic") != std::string::npos ? 0 : v.find("scalable") != std::string::npos ? 1 : 2; };
+            return rank(a) < rank(b);
+        });
+        return themes.emplace(name, std::move(value)).first->second;
+    }
+    std::string find_in(const std::string& name, const std::string& icon, std::vector<std::string>& visited) {
+        if (visited.size() >= 32 || std::find(visited.begin(), visited.end(), name) != visited.end()) return {};
+        visited.push_back(name);
+        const auto& entry = theme(name);
+        for (const auto& dir : entry.dirs) {
+            if (!x11_icon_relative(dir)) continue;
+            for (const auto& root : roots) for (const auto* suffix : {".svg", ".png"}) {
+                const auto file = root + "/" + name + "/" + dir + "/" + icon + suffix;
+                if (auto* input = std::fopen(file.c_str(), "rb")) { std::fclose(input); return file; }
+            }
+        }
+        for (const auto& parent : entry.parents) {
+            const auto file = find_in(parent, icon, visited);
+            if (!file.empty()) return file;
+        }
+        return {};
+    }
+    std::string find(const std::string& icon) {
+        const auto current = x11_effective_icon_theme();
+        if (active != current) { active = current; themes.clear(); files.clear(); }
+        const auto cached = files.find(icon);
+        if (cached != files.end()) return cached->second;
+        std::vector<std::string> visited;
+        std::string file;
+        for (const auto& name : {active, std::string("Adwaita"), std::string("hicolor")}) {
+            file = find_in(name, icon, visited);
+            if (!file.empty()) break;
+        }
+        files[icon] = file;
+        return file;
+    }
+};
+inline SystemIconMask x11_load_system_icon(SystemIcon icon, int size) {
+    static const char* names[] = {
+        "input-mouse", "insert-text", "object-select", "preferences-system", "view-list", "open-menu",
+        "x-office-calendar", "applications-graphics", "preferences-system-notifications", "view-grid",
+        "utilities-system-monitor", "view-refresh", "view-app-grid", "sidebar-show", "view-list", "edit-copy",
+        "starred", "view-more", "go-up", "go-down", "document-edit", "user-trash", "go-previous", "go-next",
+        "weather-clear-night", "weather-clear", "preferences-desktop-display", "window-close", "view-reveal",
+        "list-add", "folder", "system-search", "pan-down", "pan-up", "object-select", "list-remove",
+        "emblem-system", "network-wireless", "image-x-generic", "dialog-information", "dialog-warning", "system-users",
+        "media-playback-start", "media-playback-pause", "media-skip-backward", "media-skip-forward",
+        "media-playlist-shuffle", "media-playlist-repeat-song", "media-playlist-repeat", "alarm"
+    };
+    static_assert(sizeof(names) / sizeof(names[0]) == size_t(SystemIcon::Count));
+    SystemIconMask mask;
+    if (size <= 0 || size > 512 || size_t(icon) >= size_t(SystemIcon::Count)) return mask;
+    static X11IconPixels api;
+    static thread_local X11IconLookup lookup;
+    if (!api.lib) return mask;
+    std::string file = lookup.find(std::string(names[size_t(icon)]) + "-symbolic");
+    if (file.empty()) file = lookup.find(names[size_t(icon)]);
+    if (file.empty() && icon == SystemIcon::RepeatOne) file = lookup.find("media-playlist-repeat-symbolic");
+    if (file.empty() && icon == SystemIcon::Timer) file = lookup.find("preferences-system-time-symbolic");
+    if (file.empty()) { x11_trace("system icon unavailable: %s", names[size_t(icon)]); return mask; }
+    void* image = api.load(file.c_str(), size, size, 1, nullptr);
+    if (!image) return mask;
+    const int w = api.width(image), h = api.height(image), stride = api.stride(image), channels = api.channels(image);
+    const auto* pixels = api.pixels(image);
+    if (pixels && w > 0 && h > 0 && w <= size && h <= size &&
+        (channels == 3 || channels == 4) && stride >= w * channels) {
+        const bool alpha = api.has_alpha(image) && channels == 4;
+        mask.width = w; mask.height = h; mask.alpha.resize(size_t(w) * h);
+        for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
+            const auto* pixel = pixels + size_t(y) * stride + x * channels;
+            mask.alpha[size_t(y) * w + x] = alpha ? pixel[3] :
+                uint8_t(255 - (299 * pixel[0] + 587 * pixel[1] + 114 * pixel[2]) / 1000);
+        }
+    }
+    api.unref(image);
+    return mask;
+}
+#endif
+
 inline SystemIconMask load_system_icon(SystemIcon icon, int size) {
     SystemIconMask mask;
 #if defined(AINO_PLATFORM_WINDOWS)
@@ -13295,6 +13509,8 @@ inline SystemIconMask load_system_icon(SystemIcon icon, int size) {
     }
     if (name) CFRelease(name);
     oc_send<void>(pool, sel_registerName("drain"));
+#elif defined(AINO_PLATFORM_X11)
+    return x11_load_system_icon(icon, size);
 #else
     (void)icon; (void)size;
 #endif
@@ -13305,12 +13521,17 @@ inline SystemIconMask load_system_icon(SystemIcon icon, int size) {
 inline bool Ui::system_icon(SystemIcon icon, const Rect& box, const Color& color) {
     if (impl->measure_on) { impl->measure_add(box); return true; }
     if (!impl->canvas || box.empty() || color.a == 0) return false;
-#if defined(AINO_PLATFORM_WINDOWS) || defined(AINO_PLATFORM_MACOS)
+#if defined(AINO_PLATFORM_WINDOWS) || defined(AINO_PLATFORM_MACOS) || defined(AINO_PLATFORM_X11)
     const Rect physical = impl->xf_phys(box);
     const int size = std::max(1, int(std::floor(std::min(physical.w, physical.h))));
     const uint64_t key = uint64_t(icon) << 32 | uint32_t(size);
     // 按线程缓存栅格化结果，复用时只混合像素；尺寸变化不保留系统 DC、字体或 NSImage。
     static thread_local std::unordered_map<uint64_t, detail::SystemIconMask> masks;
+#ifdef AINO_PLATFORM_X11
+    static thread_local std::string last_theme;
+    const auto current_theme = detail::x11_effective_icon_theme();
+    if (last_theme != current_theme) { masks.clear(); last_theme = current_theme; }
+#endif
     auto found = masks.find(key);
     if (found == masks.end()) {
         if (masks.size() >= 512) masks.clear();
@@ -13328,16 +13549,7 @@ inline bool Ui::system_icon(SystemIcon icon, const Rect& box, const Color& color
     pop_clip();
     return true;
 #else
-    // X11 没有统一的系统图标 API，使用系统字体的 Unicode 符号回退。
-    static const char* symbols[] = {"↖", "T", "◉", "☷", "▥", "☰", "▦", "◌", "♧", "▦",
-        "▥", "↻", "▭", "◧", "☷", "⧉", "☆", "…", "↑", "↓", "✎", "⌫", "‹", "›",
-        "☾", "☼", "▣", "×", "◉", "+", "▱", "⌕", "⌄", "⌃", "✓", "−", "⚙", "⌁", "▧", "ⓘ", "⚠", "♙",
-        "▶", "Ⅱ", "⏮", "⏭", "⇄", "↻₁", "↻", "⏱"};
-    static_assert(sizeof(symbols) / sizeof(symbols[0]) == size_t(SystemIcon::Count));
-    if (size_t(icon) >= sizeof(symbols) / sizeof(symbols[0])) return false;
-    draw_text(symbols[size_t(icon)], box, color,
-              Style().font(std::min(box.w, box.h)).center());
-    return true;
+    return false;
 #endif
 }
 

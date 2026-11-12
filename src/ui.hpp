@@ -784,8 +784,8 @@ static void queue_panel(Ctx& c, const Rect& box) {
 
 
 static void local_playlist_row(Ctx& c, int index, const Rect& box) {
-    // 点击按钮后只在本帧末更新容器，避免绘制引用在替换资料库时失效。
-    const auto playlist = c.model.library.playlists[size_t(index)];
+    // 先完成绘制再执行动作；动作可能替换资料库，此后不再访问 playlist。
+    const auto& playlist = c.model.library.playlists[size_t(index)];
     const Rect remove{box.right() - 36, box.y + 19, 24, 24};
     const Rect refresh{remove.x - 62, box.y + 17, 54, 28};
     bool remove_clicked = false, refresh_clicked = false;

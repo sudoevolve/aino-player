@@ -106,6 +106,26 @@ int main(int argc, char** argv) {
         check(updates::parse_release(installers, "1.0.0", "windows-x64.exe").installer, "installer choice independent of API ordering");
 
         {
+            const auto old_tracks = g_as.tracks, old_results = g_as.results;
+            const int old_tracks_version = g_as.tracks_version, old_results_version = g_as.results_version;
+            music::Track item; item.title = "unchanged";
+            g_as.tracks = {item}; g_as.results = {item};
+            ++g_as.tracks_version; ++g_as.results_version;
+            Snapshot cached; refresh_snapshot(cached);
+            const auto* queue_data = cached.tracks.data();
+            const auto* result_data = cached.results.data();
+            g_as.tracks[0].title = g_as.results[0].title = "changed";
+            refresh_snapshot(cached);
+            check(cached.tracks.data() == queue_data && cached.results.data() == result_data &&
+                  cached.tracks[0].title == "unchanged" && cached.results[0].title == "unchanged",
+                  "unchanged playback revisions retain vector storage and contents");
+            ++g_as.tracks_version; ++g_as.results_version; refresh_snapshot(cached);
+            check(cached.tracks[0].title == "changed" && cached.results[0].title == "changed",
+                  "changed playback revisions publish updated queue and search results");
+            g_as.tracks = old_tracks; g_as.results = old_results;
+            g_as.tracks_version = old_tracks_version; g_as.results_version = old_results_version;
+        }
+        {
             { std::lock_guard<std::mutex> lock(g_qq.m); g_qq.playlists.resize(1); g_qq.playlists[0].name = "first"; ++g_qq.playlists_revision; }
             qq_snapshot();
             { std::lock_guard<std::mutex> lock(g_qq.m); g_qq.playlists[0].name = "changed"; }

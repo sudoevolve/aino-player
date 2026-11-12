@@ -75,6 +75,16 @@ static void linux_backend_checks() {
     check(renderer.cache_stats().glyph_bytes <= 4u * 1024u * 1024u, "glyph bitmap cache remains bounded");
     std::cout << "Linux fonts=" << shared.fonts << " shared_faces=" << shared.faces << " glyph_bytes=" << renderer.cache_stats().glyph_bytes << '\n';
     renderer.release(); check(renderer.cache_stats().faces == 0, "shared font faces released once");
+    renderer.init(1, "sans", "monospace"); renderer.measure("A", 14, 400);
+    const auto before_missing = renderer.cache_stats().faces;
+    renderer.measure("\xf4\x8f\xbf\xbf", 14, 400);
+    check(renderer.cache_stats().faces == before_missing, "missing glyph does not open unrelated fallback fonts");
+    renderer.release();
+    for (const auto icon : {SystemIcon::Play, SystemIcon::Pause, SystemIcon::PreviousTrack, SystemIcon::NextTrack,
+                           SystemIcon::Shuffle, SystemIcon::RepeatOne, SystemIcon::RepeatAll, SystemIcon::Timer}) {
+        const auto mask = detail::load_system_icon(icon, 16);
+        check(mask.width > 0 && mask.height > 0 && !mask.alpha.empty(), "Linux media icons load from system themes");
+    }
 }
 #endif
 // 自绘输入与原生组件共享浮层闸门；关闭回调不得留下下一帧闸门。

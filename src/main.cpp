@@ -126,6 +126,11 @@ int main(int argc, char** argv) {
             while (std::getline(status, line))
                 if (line.rfind("VmRSS:", 0) == 0 || line.rfind("VmHWM:", 0) == 0 ||
                     line.rfind("RssAnon:", 0) == 0 || line.rfind("RssFile:", 0) == 0) std::printf("%s\n", line.c_str());
+            std::ifstream mappings("/proc/self/smaps_rollup");
+            while (std::getline(mappings, line))
+                if (line.rfind("Pss:", 0) == 0 || line.rfind("Private_Clean:", 0) == 0 ||
+                    line.rfind("Private_Dirty:", 0) == 0 || line.rfind("Private_Hugetlb:", 0) == 0)
+                    std::printf("%s\n", line.c_str());
         }
 #endif
         if (smoke_test) win.close();

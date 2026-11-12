@@ -185,3 +185,14 @@ QQ/网易云歌单按 revision 更新快照；普通播放 10 fps，歌词展开
 这些修复同步至 aino 上游，不引入应用层弹窗特判或新的依赖。
 
 覆盖补入现有 interaction_tests 与上游 capture_probe，只做必要编译、静态检查和代码审查；按项目规则，本次不执行回归、不触发 CI、不发版。
+
+### 2026-11-12：同画面下的 Linux 资源修复
+
+用户确认 Windows 与 Ubuntu 使用相同歌词画面；本次保留布局、字号、字体选择、歌词动画和 60 fps 策略。内存差异不能归因于歌词展开。
+
+- aino 在打开 FreeType face 前查询 Fontconfig 字符覆盖集合，仅跳过确定缺字的字体，原字体顺序与 metrics 保留。覆盖集合用 FcCharSetCopy 持有并按字体缓存生命周期释放；缺少可选 API 时保留旧行为。
+- Linux SystemIcon 从 XSETTINGS/桌面配置读取系统图标主题，按 XDG 目录、主题继承和 Adwaita/hicolor 回退查找，缓存路径与 alpha mask；主题变化时失效。不再通过 Unicode 缺字回退寻找图标。新增媒体图标枚举在既有值后追加。
+- 图标和 Linux 封面动态使用系统 GdkPixbuf，不初始化 GTK。deb 安装声明图像库、SVG loader 和 Adwaita 主题依赖。封面保留 JPEG/PNG 与 8192 像素尺寸上限，通过 size-prepared 请求最长边 192 的目标尺寸；JPEG 可在解码阶段降采样，PNG 不承诺低峰值；原生加载失败仍回退 stb。
+- 业务快照原地更新，曲目/搜索容器只在版本变化时复制，状态文本仍及时刷新；本地歌单行避免复制全部曲目。恢复队列清理搜索报告时同步推进结果版本。
+
+覆盖补入现有 controller_tests、interaction_tests 和上游 capture_probe，留待用户要求发版时执行；本次只编译、静态检查和代码审查。`--diagnostics` 新增 PSS 与 Private 页输出，仅代表首帧。尚无反馈者 Ubuntu 同场景复测结果，不声称占用已达到 Windows 水平。

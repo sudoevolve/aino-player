@@ -1841,6 +1841,7 @@ static void queue_load() {
             break;
         }
         g_as.reports.clear();
+        ++g_as.results_version;
         g_as.elapsed_ms = 0;
         g_as.searching = false;
         ++g_as.tracks_version;
@@ -2041,8 +2042,7 @@ void set_volume(float v) {
 }
 
 // 主线程每帧的"抄快照"
-static Snapshot take_snapshot(Snapshot& cached) {
-    Snapshot snap;
+static void refresh_snapshot(Snapshot& snap) {
     std::lock_guard<std::mutex> lk(g_mu);
     snap.searching = g_as.searching;
     snap.elapsed_ms = g_as.elapsed_ms;
@@ -2062,14 +2062,16 @@ static Snapshot take_snapshot(Snapshot& cached) {
     snap.pending_path = g_as.pending_path;
     snap.pending_duration_ms = g_as.pending_duration_ms;
     snap.gen = g_as.gen;
-    snap.tracks_version = g_as.tracks_version;
-    snap.results_version = g_as.results_version;
-    snap.results = cached.results_version == snap.results_version ? cached.results : g_as.results;
-    snap.reports = g_as.reports;  // 很小，直接拷
-    // 曲目列表只在新检索后变，按版本号缓存，避免每帧拷几十条字符串
-    if (cached.tracks_version == snap.tracks_version) snap.tracks = cached.tracks;
-    else snap.tracks = g_as.tracks;
-    return snap;
+    // 原地保留未变化的容器，版本相同时不再复制整个队列和搜索结果。
+    if (snap.results_version != g_as.results_version) {
+        snap.results = g_as.results;
+        snap.reports = g_as.reports;
+        snap.results_version = g_as.results_version;
+    }
+    if (snap.tracks_version != g_as.tracks_version) {
+        snap.tracks = g_as.tracks;
+        snap.tracks_version = g_as.tracks_version;
+    }
 }
 
 // =============================================================================
@@ -2611,7 +2613,7 @@ void tick() {
             for (const auto& playlist : g_library.playlists) if (playlist.key == key) { g_playlist_view.playlist = playlist; break; }
             g_playlist_view.library_revision = g_library_revision;
         }
-        g_snapshot = take_snapshot(g_snapshot);
+        refresh_snapshot(g_snapshot);
         auto& snap = g_snapshot;
         {
             // 下载表：几十条小结构，直接整份拷给界面读，省得绘制时持锁
@@ -2743,7 +2745,7 @@ void tick() {
                     g_ui.sleep_after_track = false;
                     stop_playback(); toast("当前歌曲播放结束，已定时停止");
                 } else play_step(1, true);
-                g_snapshot = take_snapshot(g_snapshot);
+                refresh_snapshot(g_snapshot);
             }
         }
 
