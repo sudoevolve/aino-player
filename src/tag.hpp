@@ -18,6 +18,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <functional>
+#include <algorithm>
 
 namespace tag {
 
@@ -118,6 +120,252 @@ inline bool read_file_w(const std::wstring& wpath, std::string& out) {
     const size_t got = std::fread(&out[0], 1, size_t(n), f);
     std::fclose(f);
     return got == size_t(n);
+}
+
+// 只读取有界标签块，扫描不把整首音频或 mdat 载入内存。
+struct Metadata { std::string title, artist, album, cover; long long duration_ms = 0; };
+inline uint32_t le32(const std::string& bytes, size_t at) {
+    if (at > bytes.size() || bytes.size() - at < 4) return 0;
+    return uint32_t(uint8_t(bytes[at])) | uint32_t(uint8_t(bytes[at+1])) << 8 |
+        uint32_t(uint8_t(bytes[at+2])) << 16 | uint32_t(uint8_t(bytes[at+3])) << 24;
+}
+inline std::string metadata_text(const std::string& bytes, unsigned encoding) {
+    if (bytes.size() > 32768) return {};
+    std::string out;
+    if (encoding == 0) {
+        for (unsigned char c : bytes) {
+            if (!c) break;
+            if (c < 128) out += char(c); else { out += char(0xc0 | (c >> 6)); out += char(0x80 | (c & 63)); }
+        }
+    } else if (encoding == 3) out = bytes.substr(0, bytes.find('\0'));
+    else {
+        size_t at = 0; bool little = encoding == 1;
+        if (bytes.size() >= 2 && (uint8_t(bytes[0]) == 0xff || uint8_t(bytes[0]) == 0xfe)) {
+            little = uint8_t(bytes[0]) == 0xff; at = 2;
+        }
+        std::u16string text;
+        for (; at + 1 < bytes.size(); at += 2) {
+            const auto c = char16_t(little ? uint8_t(bytes[at]) | uint16_t(uint8_t(bytes[at+1])) << 8 :
+                uint16_t(uint8_t(bytes[at])) << 8 | uint8_t(bytes[at+1]));
+            if (!c) break;
+            text += c;
+        }
+        try { out = std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t>{}.to_bytes(text); } catch (...) {}
+    }
+    return out.size() <= 16384 ? out : std::string();
+}
+inline std::string metadata_base64(const std::string& text) {
+    if (text.size() > 12u*1024*1024) return {};
+    std::string out; uint32_t value = 0; int bits = 0;
+    for (unsigned char c : text) {
+        if (c == '=') break;
+        const int digit = c >= 'A' && c <= 'Z' ? c-'A' : c >= 'a' && c <= 'z' ? c-'a'+26 :
+            c >= '0' && c <= '9' ? c-'0'+52 : c == '+' ? 62 : c == '/' ? 63 : -1;
+        if (digit < 0) { if (c == ' ' || c == '\r' || c == '\n') continue; return {}; }
+        value = (value << 6) | uint32_t(digit); bits += 6;
+        if (bits >= 8) { bits -= 8; out += char(value >> bits); }
+        if (out.size() > 8u*1024*1024) return {};
+    }
+    return out;
+}
+inline void metadata_picture(const std::string& data, Metadata& out) {
+    if (data.size() < 12) return;
+    const auto type = rd32(data, 0);
+    if (!out.cover.empty() && type != 3) return;
+    size_t at = 4;
+    for (int i = 0; i < 2; ++i) {
+        if (data.size() - at < 4) return;
+        const auto size = rd32(data, at); at += 4;
+        if (size > data.size() - at) return;
+        at += size;
+    }
+    if (data.size() - at < 20) return;
+    at += 16; const auto size = rd32(data, at); at += 4;
+    if (size <= data.size() - at && size <= 8u*1024*1024) out.cover = data.substr(at, size);
+}
+inline void metadata_comments(const std::string& bytes, size_t at, Metadata& out, bool read_cover = true) {
+    if (at > bytes.size() || bytes.size() - at < 4) return;
+    const auto vendor = le32(bytes, at); at += 4;
+    if (vendor > bytes.size() - at) return;
+    at += vendor;
+    if (bytes.size() - at < 4) return;
+    const auto count = le32(bytes, at); at += 4;
+    for (uint32_t i = 0; i < std::min(count, 65536u) && bytes.size() - at >= 4; ++i) {
+        const auto n = le32(bytes, at); at += 4;
+        if (n > bytes.size() - at) return;
+        const auto item = bytes.substr(at, n); at += n;
+        const auto equal = item.find('=');
+        if (equal == std::string::npos) continue;
+        auto key = item.substr(0, equal);
+        for (auto& c : key) if (c >= 'a' && c <= 'z') c = char(c - 'a' + 'A');
+        const bool bounded = item.size() - equal - 1 <= 16384;
+        if (key == "TITLE" && bounded) out.title = item.substr(equal+1);
+        else if (key == "ARTIST" && bounded) out.artist = item.substr(equal+1);
+        else if (key == "ALBUM" && bounded) out.album = item.substr(equal+1);
+        else if (read_cover && key == "METADATA_BLOCK_PICTURE") metadata_picture(metadata_base64(item.substr(equal+1)), out);
+    }
+}
+inline Metadata read_metadata(const std::string& path, bool read_cover = true) {
+    Metadata out;
+    auto* file = platform::fopen(path, "rb");
+    if (!file) return out;
+    struct Close { std::FILE* file; ~Close() { std::fclose(file); } } close{file};
+    auto read = [&](size_t n) { std::string bytes(std::min<size_t>(n, 16u*1024*1024), '\0'); bytes.resize(std::fread(bytes.data(), 1, bytes.size(), file)); return bytes; };
+    auto seek = [&](uint64_t at) {
+#ifdef _WIN32
+        return _fseeki64(file, static_cast<__int64>(at), SEEK_SET) == 0;
+#else
+        return fseeko(file, static_cast<off_t>(at), SEEK_SET) == 0;
+#endif
+    };
+    const auto head = read(12);
+    if (head.size() < 12) return out;
+    if (head.compare(0, 3, "ID3") == 0 && uint8_t(head[3]) >= 2 && uint8_t(head[3]) <= 4) {
+        const unsigned version = uint8_t(head[3]);
+        const size_t length = size_t(uint8_t(head[6]) & 127) << 21 | size_t(uint8_t(head[7]) & 127) << 14 |
+            size_t(uint8_t(head[8]) & 127) << 7 | size_t(uint8_t(head[9]) & 127);
+        if (length > 16u*1024*1024 || !seek(10)) return out;
+        auto bytes = read(length);
+        const bool tag_unsync = (uint8_t(head[5]) & 0x80) != 0;
+        auto desync = [](std::string& data) {
+            size_t write = 0;
+            for (size_t read = 0; read < data.size(); ++read) {
+                data[write++] = data[read];
+                if (uint8_t(data[read]) == 0xff && read + 1 < data.size() && data[read+1] == 0) ++read;
+            }
+            data.resize(write);
+        };
+        if (tag_unsync && version < 4) desync(bytes);
+        size_t at = 0;
+        if ((uint8_t(head[5]) & 0x40) && version >= 3 && bytes.size() >= 4) {
+            const auto extended = rd32(bytes, 0);
+            at = version == 3 ? size_t(extended) + 4 : size_t((extended & 0x7f) | (extended >> 1 & 0x3f80) | (extended >> 2 & 0x1fc000) | (extended >> 3 & 0xfe00000));
+        }
+        const size_t header = version == 2 ? 6 : 10;
+        while (at <= bytes.size() && bytes.size() - at >= header) {
+            const auto id = bytes.substr(at, version == 2 ? 3 : 4);
+            if (id[0] == 0) break;
+            size_t n = version == 2 ? size_t(uint8_t(bytes[at+3])) << 16 | size_t(uint8_t(bytes[at+4])) << 8 | uint8_t(bytes[at+5]) : rd32(bytes, at+4);
+            if (version == 4) n = (n & 0x7f) | (n >> 1 & 0x3f80) | (n >> 2 & 0x1fc000) | (n >> 3 & 0xfe00000);
+            const auto flags = version >= 3 ? uint8_t(bytes[at+9]) : 0;
+            const bool encoded = flags & (version == 3 ? 0xe0 : 0x4d);
+            at += header;
+            if (n > bytes.size() - at || !n) break;
+            auto data = bytes.substr(at, n); at += n;
+            if (encoded) continue;
+            if (version == 4 && (tag_unsync || (flags & 2))) desync(data);
+            const unsigned encoding = uint8_t(data[0]);
+            if (id == "TIT2" || id == "TT2") out.title = metadata_text(data.substr(1), encoding);
+            else if (id == "TPE1" || id == "TP1") out.artist = metadata_text(data.substr(1), encoding);
+            else if (id == "TALB" || id == "TAL") out.album = metadata_text(data.substr(1), encoding);
+            else if (read_cover && (id == "APIC" || id == "PIC")) {
+                size_t image = version == 2 ? 4 : data.find('\0', 1);
+                if (image == std::string::npos) continue;
+                image += version == 2 ? 1 : 2;
+                if (encoding == 1 || encoding == 2) { while (image+1 < data.size() && (data[image] || data[image+1])) image += 2; image += 2; }
+                else { const auto end = data.find('\0', image); image = end == std::string::npos ? data.size() : end+1; }
+                if (image < data.size() && data.size() - image <= 8u*1024*1024) out.cover = data.substr(image);
+            }
+        }
+    } else if (head.compare(0,4,"fLaC") == 0) {
+        uint64_t at = 4;
+        for (int i = 0; i < 512 && seek(at); ++i) {
+            const auto h = read(4); if (h.size() != 4) break;
+            const auto type = uint8_t(h[0]) & 127;
+            const size_t n = size_t(uint8_t(h[1])) << 16 | size_t(uint8_t(h[2])) << 8 | uint8_t(h[3]);
+            if (n > 16u*1024*1024) break;
+            if (type == 0 || type == 4 || (type == 6 && read_cover)) {
+                const auto data = read(n);
+                if (type == 0 && data.size() >= 18) {
+                    uint64_t packed = 0; for (int j = 10; j < 18; ++j) packed = packed << 8 | uint8_t(data[size_t(j)]);
+                    const auto rate = packed >> 44; if (rate) out.duration_ms = (packed & 0xfffffffffull) * 1000 / rate;
+                } else if (type == 4) metadata_comments(data, 0, out, read_cover);
+                else if (type == 6) metadata_picture(data, out);
+            }
+            at += 4 + n;
+            if (uint8_t(h[0]) & 128) break;
+        }
+    } else if (head.compare(4,4,"ftyp") == 0) {
+        const auto total = platform::file_size(path);
+        for (uint64_t at=0; at+8 <= uint64_t(std::max(0LL,total)) && seek(at);) {
+            const auto h=read(16); if (h.size()<8) break;
+            uint64_t n=rd32(h,0); size_t header=8;
+            if (n==1) { if(h.size()<16) break; n=uint64_t(rd32(h,8))<<32 | rd32(h,12); header=16; }
+            if (!n) n=uint64_t(total)-at;
+            if (n<header || n>uint64_t(total)-at) break;
+            if (h.compare(4,4,"moov")==0 && n<=16u*1024*1024 && seek(at+header)) {
+                const auto data=read(size_t(n)-header);
+                std::function<void(size_t,size_t,int)> walk = [&](size_t begin,size_t end,int depth) {
+                    if (depth>8) return;
+                    for(size_t p=begin;p+8<=end;) {
+                        const size_t size=rd32(data,p); if(size<8 || size>end-p) break;
+                        const auto type=data.substr(p+4,4); const size_t content=p+8, finish=p+size;
+                        if(type=="udta" || type=="ilst") walk(content,finish,depth+1);
+                        else if(type=="meta" && finish-content>=4) walk(content+4,finish,depth+1);
+                        else if(type==std::string("\xa9" "nam",4) || type==std::string("\xa9" "ART",4) || type=="aART" || type==std::string("\xa9" "alb",4) || (type=="covr" && read_cover)) {
+                            for(size_t q=content;q+16<=finish;) {
+                                const size_t length=rd32(data,q); if(length<16 || length>finish-q) break;
+                                if(data.compare(q+4,4,"data")==0) {
+                                    const auto value=data.substr(q+16,length-16);
+                                    if(type=="covr") { if(value.size()<=8u*1024*1024) out.cover=value; }
+                                    else if(value.size()>16384) {}
+                                    else if(type==std::string("\xa9" "nam",4)) out.title=value;
+                                    else if(type==std::string("\xa9" "alb",4)) out.album=value;
+                                    else if(out.artist.empty()) out.artist=value;
+                                }
+                                q+=length;
+                            }
+                        }
+                        p+=size;
+                    }
+                }; walk(0,data.size(),0); break;
+            }
+            at+=n;
+        }
+    } else if (head.compare(0,4,"OggS")==0) {
+        if (!seek(0)) return out;
+        std::string packet; uint32_t serial = 0; bool have_serial = false;
+        size_t processed = 0;
+        for (int page = 0; page < 512 && processed < 16u*1024*1024; ++page) {
+            const auto header = read(27);
+            if (header.size() != 27 || header.compare(0,4,"OggS") != 0 || header[4] != 0) break;
+            const auto lacing = read(uint8_t(header[26]));
+            if (lacing.size() != uint8_t(header[26])) break;
+            size_t total = 0; for (unsigned char n : lacing) total += n;
+            const auto payload = read(total); if (payload.size() != total) break;
+            processed += 27 + lacing.size() + total;
+            const auto page_serial = le32(header,14);
+            if (!have_serial) { serial = page_serial; have_serial = true; }
+            if (page_serial != serial) continue;
+            if (!(uint8_t(header[5]) & 1) && !packet.empty()) break;
+            size_t at = 0;
+            for (unsigned char n : lacing) {
+                if (packet.size() + n > 16u*1024*1024) return out;
+                packet.append(payload,at,n); at += n;
+                if (n == 255) continue;
+                if (packet.compare(0,8,"OpusTags") == 0) { metadata_comments(packet,8,out,read_cover); return out; }
+                if (packet.compare(0,7,std::string("\x03" "vorbis",7)) == 0) { metadata_comments(packet,7,out,read_cover); return out; }
+                packet.clear();
+            }
+        }
+    } else if (head.compare(0,4,"RIFF")==0 && head.compare(8,4,"WAVE")==0) {
+        const auto total=platform::file_size(path);
+        for(uint64_t at=12;at+8<=uint64_t(std::max(0LL,total)) && seek(at);) {
+            const auto h=read(8); if(h.size()<8) break; const auto n=le32(h,4);
+            if(n>uint64_t(total)-at-8) break;
+            if(h.compare(0,4,"LIST")==0 && n<=1024u*1024) {
+                const auto data=read(n);
+                if(data.compare(0,4,"INFO")==0) for(size_t p=4;p+8<=data.size();) {
+                    const auto size=le32(data,p+4); if(size>data.size()-p-8) break;
+                    const auto value=data.substr(p+8,size); const auto text=metadata_text(value,3);
+                    if(data.compare(p,4,"INAM")==0) out.title=text; else if(data.compare(p,4,"IART")==0) out.artist=text; else if(data.compare(p,4,"IPRD")==0) out.album=text;
+                    p+=8+size+(size&1);
+                }
+            }
+            at+=8+n+(n&1);
+        }
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------- mp3 / ID3v2.3

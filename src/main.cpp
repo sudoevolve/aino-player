@@ -28,7 +28,7 @@ int main(int argc, char** argv) {
     // 后台任务调用 wake() 前，必须先初始化 Xlib 的线程支持。
     if (!XInitThreads()) { std::fprintf(stderr, "Xlib thread initialization failed\n"); return 1; }
 #endif
-    auto view = view_model();
+    auto& startup_ui = view_model().ui;
     bool initial_search = argc > 1;
     bool smoke_test = argc > 1 && std::string(argv[1]) == "--smoke-test";
 #ifdef AINO_PLATFORM_X11
@@ -39,14 +39,14 @@ int main(int argc, char** argv) {
     int count = 0;
     if (auto args = CommandLineToArgvW(GetCommandLineW(), &count)) {
         initial_search = count > 1;
-        if (initial_search) view.ui.query = net::narrow(args[1]);
+        if (initial_search) startup_ui.query = net::narrow(args[1]);
         LocalFree(args);
     }
 #else
-    if (initial_search) view.ui.query = argv[1];
+    if (initial_search) startup_ui.query = argv[1];
 #endif
     if (smoke_test) initial_search = false;
-    if (initial_search) view.ui.tab = 0;
+    if (initial_search) startup_ui.tab = 0;
     if (!initialize(smoke_test)) return 1;
 #ifdef _WIN32
     SetCurrentProcessExplicitAppUserModelID(L"sudoevolve.AinoPlayer");
@@ -100,11 +100,17 @@ int main(int argc, char** argv) {
         }
     }
 #endif
-    bool theme_dark = view.ui.dark;
+    bool theme_dark = startup_ui.dark;
     win.set_theme(theme_dark ? aino::Theme::dark() : aino::Theme::light());
     win.set_anim_fps(60.0f);
 
-    start({[&win] { win.wake(); }, [&win] { win.activate(); }, [&win] { win.close(); }});
+    start({[&win] { win.wake(); }, [&win] { win.activate(); }, [&win] { win.close(); }, [&win]() -> void* {
+#ifdef _WIN32
+        return static_cast<aino::detail::Win32State*>(win.impl->native)->hwnd;
+#else
+        return nullptr;
+#endif
+    }});
     bool autostart = true;
     win.run([&](aino::Ui& ui) {
         const auto begin = std::chrono::steady_clock::now();

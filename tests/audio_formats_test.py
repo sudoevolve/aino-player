@@ -45,6 +45,7 @@ def run(args):
             mode = "--audio-decode" if args.decode_only else "--audio-device"
             subprocess.run([binary, mode, str(file), str(cache / (key + ".pcm.wav"))],
                            check=True, timeout=30, env=environment, cwd=root)
+            subprocess.run([binary, "--audio-stream", str(file)], check=True, timeout=30, env=environment, cwd=root)
             assert hashlib.sha256(file.read_bytes()).hexdigest() == original, "original music must not change"
             assert not file.with_name(file.name + ".pcm.wav").exists(), "conversion must not write beside original music"
             assert not list(temporary.glob("**/ffmpeg-*")), "embedded executable must be removed on exit"

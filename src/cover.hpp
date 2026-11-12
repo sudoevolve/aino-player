@@ -29,6 +29,7 @@
 
 #include "net.hpp"
 #include "background.hpp"
+#include "tag.hpp"
 
 namespace cover {
 
@@ -159,13 +160,20 @@ private:
     };
 
     void load(const std::string& url, unsigned generation) {
+        net::CancelScope cancellation([this, generation] { std::lock_guard<std::mutex> lock(m_); return generation != generation_; });
         auto img = std::make_shared<Image>();
         bool ok = false;
+        if (url.rfind("local-cover:", 0) == 0) {
+            const auto metadata = tag::read_metadata(url.substr(12));
+            const std::vector<uint8_t> bytes(metadata.cover.begin(), metadata.cover.end());
+            ok = !bytes.empty() && detail::decode(bytes, 192, *img);
+        } else {
         const net::Response r = net::get(url, {"User-Agent: Mozilla/5.0", "Referer: https://music.163.com/"},
                                          12000);
         if (r.status == 200 && r.body.size() > 256) {
             std::vector<uint8_t> bytes(r.body.begin(), r.body.end());
             ok = detail::decode(bytes, 192, *img);
+        }
         }
         {
             std::lock_guard<std::mutex> lk(m_);

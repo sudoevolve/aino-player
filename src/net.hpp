@@ -20,7 +20,20 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <functional>
+#include <atomic>
+#include <algorithm>
 namespace net {
+inline const std::atomic<bool>* shutdown_signal = nullptr;
+inline thread_local std::function<bool()> cancel_current;
+inline bool cancelled() { return (shutdown_signal && shutdown_signal->load()) || (cancel_current && cancel_current()); }
+struct CancelScope {
+    std::function<bool()> previous;
+    explicit CancelScope(std::function<bool()> signal) : previous(std::move(cancel_current)) { cancel_current = std::move(signal); }
+    CancelScope(const CancelScope&) = delete;
+    CancelScope& operator=(const CancelScope&) = delete;
+    ~CancelScope() { cancel_current = std::move(previous); }
+};
 // YouTube 请求签名和本机 WebSocket 握手共用 SHA-1；不用于密码存储。
 inline std::array<unsigned char, 20> sha1(std::string input) {
     const uint64_t bits = uint64_t(input.size()) * 8;
@@ -70,6 +83,10 @@ inline bool audio_prefix(const char* bytes, size_t size) {
 #include <winhttp.h>
 
 #include <atomic>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -131,6 +148,79 @@ struct Request {
 };
 
 namespace detail {
+// WinHTTP 只由所属线程发起操作和关闭；回调只交付完成事件。
+// 等到 HANDLE_CLOSING 才释放请求上下文和读写缓冲，取消不会遗留悬空回调。
+struct RequestControl {
+    HINTERNET request = nullptr;
+    RequestControl* previous = nullptr;
+    std::mutex mutex;
+    std::condition_variable cv;
+    DWORD completed = 0, value = 0, failure = 0;
+    bool closing = false;
+    RequestControl();
+    ~RequestControl();
+    static void CALLBACK callback(HINTERNET, DWORD_PTR context, DWORD status, void* data, DWORD size) {
+        auto* self = reinterpret_cast<RequestControl*>(context);
+        if (!self) return;
+        std::lock_guard<std::mutex> lock(self->mutex);
+        if (status == WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING) self->closing = true;
+        else if (status == WINHTTP_CALLBACK_STATUS_REQUEST_ERROR && size >= sizeof(WINHTTP_ASYNC_RESULT))
+            self->failure = static_cast<WINHTTP_ASYNC_RESULT*>(data)->dwError;
+        else if (status == WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE || status == WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE ||
+                 status == WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE || status == WINHTTP_CALLBACK_STATUS_READ_COMPLETE) {
+            self->completed = status;
+            if (status == WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE && size >= sizeof(DWORD)) self->value = *static_cast<DWORD*>(data);
+            else if (status == WINHTTP_CALLBACK_STATUS_READ_COMPLETE) self->value = size;
+        }
+        self->cv.notify_all();
+    }
+    bool bind(HINTERNET handle) {
+        request = handle;
+        DWORD_PTR context = reinterpret_cast<DWORD_PTR>(this);
+        if (!WinHttpSetOption(handle, WINHTTP_OPTION_CONTEXT_VALUE, &context, sizeof context) ||
+            WinHttpSetStatusCallback(handle, callback, WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS | WINHTTP_CALLBACK_FLAG_HANDLES, 0) == WINHTTP_INVALID_STATUS_CALLBACK) {
+            WinHttpCloseHandle(request); request = nullptr; return false;
+        }
+        return true;
+    }
+    void close() {
+        if (!request) return;
+        WinHttpCloseHandle(request); request = nullptr;
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait(lock, [&] { return closing; });
+    }
+    template<class F> bool run(F operation, DWORD expected, DWORD* amount = nullptr) {
+        if (net::cancelled()) { SetLastError(ERROR_OPERATION_ABORTED); return false; }
+        { std::lock_guard<std::mutex> lock(mutex); completed = value = failure = 0; }
+        if (!operation() && GetLastError() != ERROR_IO_PENDING) return false;
+        std::unique_lock<std::mutex> lock(mutex);
+        while (completed != expected && !failure) {
+            cv.wait_for(lock, std::chrono::milliseconds(20));
+            if (net::cancelled()) {
+                lock.unlock(); close(); SetLastError(ERROR_OPERATION_ABORTED); return false;
+            }
+        }
+        if (failure) { SetLastError(failure); return false; }
+        if (amount) *amount = value;
+        return true;
+    }
+};
+inline thread_local RequestControl* active_request = nullptr;
+inline RequestControl::RequestControl() : previous(active_request) { active_request = this; }
+inline RequestControl::~RequestControl() { close(); active_request = previous; }
+inline void close_request(HINTERNET handle) {
+    if (active_request) active_request->close(); else if (handle) WinHttpCloseHandle(handle);
+}
+inline bool receive(HINTERNET handle) {
+    return active_request->run([&] { return WinHttpReceiveResponse(handle, nullptr); }, WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE);
+}
+inline bool available(HINTERNET handle, DWORD* amount) {
+    return active_request->run([&] { return WinHttpQueryDataAvailable(handle, nullptr); }, WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE, amount);
+}
+inline bool read(HINTERNET handle, void* data, DWORD size, DWORD* amount) {
+    return active_request->run([&] { return WinHttpReadData(handle, data, size, nullptr); }, WINHTTP_CALLBACK_STATUS_READ_COMPLETE, amount);
+}
+
 
 struct Session {
     HINTERNET h = nullptr;
@@ -140,10 +230,10 @@ struct Session {
 inline bool open_session(Session& s) {
     s.h = WinHttpOpen(L"aino-player/1.0 (Windows NT; WinHTTP)",
                       WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
-                      WINHTTP_NO_PROXY_BYPASS, 0);
+                      WINHTTP_NO_PROXY_BYPASS, WINHTTP_FLAG_ASYNC);
     if (!s.h)
         s.h = WinHttpOpen(L"aino-player/1.0 (Windows NT; WinHTTP)", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, WINHTTP_FLAG_ASYNC);
     return s.h != nullptr;
 }
 
@@ -187,13 +277,17 @@ inline HINTERNET send(HINTERNET session, const Request& req, const wchar_t* verb
         return nullptr;
     }
 
+    if (active_request && !active_request->bind(hreq)) {
+        err = "已取消"; WinHttpCloseHandle(conn); return nullptr;
+    }
+
     DWORD redirect = req.follow_redirects ? WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS
                                           : WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
     WinHttpSetOption(hreq, WINHTTP_OPTION_REDIRECT_POLICY, &redirect, sizeof redirect);
 
     // 超时：解析/连接/发送/接收四段分别设，接收超时是"卡死"的主要防线
     const int t = req.timeout_ms;
-    WinHttpSetTimeouts(session, t, t, t, t);
+    WinHttpSetTimeouts(hreq, t, t, t, t);
 
     std::wstring header_block;
     for (const auto& h : req.headers) {
@@ -201,12 +295,13 @@ inline HINTERNET send(HINTERNET session, const Request& req, const wchar_t* verb
         header_block += L"\r\n";
     }
 
-    const BOOL sent = WinHttpSendRequest(
+    const bool sent = active_request->run([&] { return WinHttpSendRequest(
         hreq, header_block.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : header_block.c_str(),
-        header_block.empty() ? 0 : (DWORD)-1L, const_cast<void*>(body), body_len, body_len, 0);
+        header_block.empty() ? 0 : (DWORD)-1L, const_cast<void*>(body), body_len, body_len,
+        reinterpret_cast<DWORD_PTR>(active_request)); }, WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE);
     if (!sent) {
         err = last_error_text("WinHttpSendRequest");
-        WinHttpCloseHandle(hreq);
+        detail::close_request(hreq);
         WinHttpCloseHandle(conn);
         return nullptr;
     }
@@ -241,6 +336,7 @@ inline std::string final_url_of(HINTERNET hreq) {
 
 // 通用请求：整段读进内存（接口 JSON 用）
 inline Response execute(const Request& req) {
+    detail::RequestControl cancellation;
     Response out;
     detail::Session s;
     if (!detail::open_session(s)) {
@@ -253,9 +349,9 @@ inline Response execute(const Request& req) {
                                   DWORD(req.body.size()), out.error);
     if (!hreq) return out;
 
-    if (!WinHttpReceiveResponse(hreq, nullptr)) {
+    if (!detail::receive(hreq)) {
         out.error = detail::last_error_text("WinHttpReceiveResponse");
-        WinHttpCloseHandle(hreq);
+        detail::close_request(hreq);
         WinHttpCloseHandle(conn);
         return out;
     }
@@ -278,15 +374,20 @@ inline Response execute(const Request& req) {
 
     for (;;) {
         DWORD avail = 0;
-        if (!WinHttpQueryDataAvailable(hreq, &avail) || avail == 0) break;
+        if (!detail::available(hreq, &avail)) { out.error = detail::last_error_text("读取响应"); break; }
+        if (!avail) break;
+        avail = std::min<DWORD>(avail, 65536);
         std::vector<char> buf(avail);
         DWORD read = 0;
-        if (!WinHttpReadData(hreq, buf.data(), avail, &read) || read == 0) break;
+        if (!detail::read(hreq, buf.data(), avail, &read)) { out.error = detail::last_error_text("读取响应"); break; }
+        if (!read) break;
         out.body.append(buf.data(), read);
-        if (out.body.size() > 8u * 1024 * 1024) break;  // 接口响应不可能这么大
+        if (out.body.size() > 8u * 1024 * 1024) { out.error = "接口响应过大"; break; }  // 接口响应不可能这么大
     }
-    WinHttpCloseHandle(hreq);
+    detail::close_request(hreq);
     WinHttpCloseHandle(conn);
+    if (net::cancelled()) out.error = "已取消";
+    if (!out.error.empty()) { out.status = 0; out.body.clear(); }
     return out;
 }
 
@@ -321,6 +422,7 @@ struct AudioProbe {
 // 小范围读取容器头，既拒绝 HTML/JSON，也支持 MP3/FLAC/WAV/M4A/Ogg/WebM。
 inline AudioProbe probe_audio(const std::string& url, const std::vector<std::string>& headers,
                               int timeout_ms = 6000) {
+    detail::RequestControl cancellation;
     AudioProbe out;
     detail::Session s;
     if (!detail::open_session(s)) {
@@ -341,10 +443,10 @@ inline AudioProbe probe_audio(const std::string& url, const std::vector<std::str
         out.status = -1;
         return out;
     }
-    if (!WinHttpReceiveResponse(hreq, nullptr)) {
+    if (!detail::receive(hreq)) {
         out.reason = detail::last_error_text("WinHttpReceiveResponse");
         out.status = -1;
-        WinHttpCloseHandle(hreq);
+        detail::close_request(hreq);
         WinHttpCloseHandle(conn);
         return out;
     }
@@ -366,10 +468,10 @@ inline AudioProbe probe_audio(const std::string& url, const std::vector<std::str
     DWORD read = 0;
     while (read < sizeof head) {
         DWORD received = 0;
-        if (!WinHttpReadData(hreq, head + read, DWORD(sizeof head) - read, &received) || !received) break;
+        if (!detail::read(hreq, head + read, DWORD(sizeof head) - read, &received) || !received) break;
         read += received;
     }
-    WinHttpCloseHandle(hreq);
+    detail::close_request(hreq);
     WinHttpCloseHandle(conn);
 
     const bool looks_audio = audio_prefix(head, read);
@@ -393,7 +495,11 @@ inline AudioProbe probe_audio(const std::string& url, const std::vector<std::str
 inline bool download(const std::string& url, const std::string& path,
                      const std::vector<std::string>& headers,
                      const std::function<void(long long, long long)>& progress,
-                     const std::atomic<bool>& cancel, std::string& err, int timeout_ms = 20000) {
+                     const std::atomic<bool>& cancel, std::string& err, int timeout_ms = 20000,
+                     const std::function<bool(const char*, size_t)>& sink = {}) {
+    const auto parent = cancel_current;
+    CancelScope signal([&cancel, parent] { return cancel.load() || (parent && parent()); });
+    detail::RequestControl cancellation;
     detail::Session s;
     if (!detail::open_session(s)) {
         err = detail::last_error_text("WinHttpOpen");
@@ -407,9 +513,9 @@ inline bool download(const std::string& url, const std::string& path,
     HINTERNET conn = nullptr;
     HINTERNET hreq = detail::send(s.h, req, L"GET", &conn, nullptr, 0, err);
     if (!hreq) return false;
-    if (!WinHttpReceiveResponse(hreq, nullptr)) {
+    if (!detail::receive(hreq)) {
         err = detail::last_error_text("WinHttpReceiveResponse");
-        WinHttpCloseHandle(hreq);
+        detail::close_request(hreq);
         WinHttpCloseHandle(conn);
         return false;
     }
@@ -423,17 +529,17 @@ inline bool download(const std::string& url, const std::string& path,
     }
     if (status != 200 && status != 206) {
         err = "下载失败 HTTP " + std::to_string(status);
-        WinHttpCloseHandle(hreq);
+        detail::close_request(hreq);
         WinHttpCloseHandle(conn);
         return false;
     }
 
     // 必须用 _wfopen：fopen 按 ANSI(GBK) 解释路径，而 path 是 UTF-8，
     // 中文文件名（"周杰伦 - 屋顶.mp3"）会直接开不出来，报"无法创建临时文件"。
-    std::FILE* f = _wfopen(widen(path).c_str(), L"wb");
-    if (!f) {
+    std::FILE* f = sink ? nullptr : _wfopen(widen(path).c_str(), L"wb");
+    if (!sink && !f) {
         err = "无法创建临时文件";
-        WinHttpCloseHandle(hreq);
+        detail::close_request(hreq);
         WinHttpCloseHandle(conn);
         return false;
     }
@@ -441,23 +547,26 @@ inline bool download(const std::string& url, const std::string& path,
     bool ok = true;
     std::vector<char> buf(64 * 1024);
     for (;;) {
-        if (cancel.load(std::memory_order_relaxed)) {
+        if (net::cancelled()) {
             ok = false;
             err = "已取消";
             break;
         }
         DWORD avail = 0;
-        if (!WinHttpQueryDataAvailable(hreq, &avail) || avail == 0) break;
+        if (!detail::available(hreq, &avail)) { ok = false; err = net::cancelled() ? "已取消" : detail::last_error_text("读取音频"); break; }
+        if (avail == 0) break;
         const DWORD want = avail > buf.size() ? DWORD(buf.size()) : avail;
         DWORD read = 0;
-        if (!WinHttpReadData(hreq, buf.data(), want, &read) || read == 0) break;
-        std::fwrite(buf.data(), 1, read, f);
+        if (!detail::read(hreq, buf.data(), want, &read)) { ok = false; err = net::cancelled() ? "已取消" : detail::last_error_text("读取音频"); break; }
+        if (read == 0) break;
+        if (sink ? !sink(buf.data(), read) : std::fwrite(buf.data(), 1, read, f) != read) { ok = false; err = sink ? "音频流已停止" : "文件写入失败"; break; }
         got += read;
         if (progress) progress(got, total);
     }
-    std::fclose(f);
-    WinHttpCloseHandle(hreq);
+    if (f && std::fclose(f) != 0) { ok = false; err = "文件写入失败"; }
+    detail::close_request(hreq);
     WinHttpCloseHandle(conn);
+    if (net::cancelled() || (total >= 0 && got != total)) { ok = false; err = net::cancelled() ? "已取消" : "下载未完成"; }
     if (ok && got == 0) {
         err = "响应为空";
         return false;

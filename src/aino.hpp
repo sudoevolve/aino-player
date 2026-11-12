@@ -10047,6 +10047,11 @@ namespace detail {
 struct Win32State;   // 定义在下面（win_proc 之前）—— 构造函数只用它的指针，声明就够
 inline void win_set_ime_pos(Win32State* s, float caret_x, float top, float bottom);
 } // namespace detail
+#elif defined(AINO_PLATFORM_X11)
+namespace detail {
+struct X11State;
+inline void x11_set_ime_pos(X11State* s, float caret_x, float top, float bottom);
+} // namespace detail
 #endif
 
 inline Window::Window(int w, int h, const std::string& title)
@@ -10077,6 +10082,11 @@ inline Window::Window(const WindowConfig& cfg) : impl(new Impl()) {
     impl->ui.impl->ime_pos = [this](float x, float top, float bottom) {
         impl->ui.impl->ime_owner = true;   // 本帧有输入框接管 IME（组字串自己画）
         detail::win_set_ime_pos(reinterpret_cast<detail::Win32State*>(impl->native), x, top, bottom);
+    };
+#elif defined(AINO_PLATFORM_X11)
+    impl->ui.impl->ime_pos = [this](float x, float top, float bottom) {
+        impl->ui.impl->ime_owner = true;
+        detail::x11_set_ime_pos(static_cast<detail::X11State*>(impl->native), x, top, bottom);
     };
 #endif
     // 剪贴板：input / textarea 的 Ctrl+C / X / V 从这里读写系统剪贴板。
@@ -10204,6 +10214,8 @@ struct Win32State {
     // 整体上移它自己的高度，让它的**底边**落在框底（反正它已经被我们涂透明了）。
     HWND ime_ghost = nullptr;
     int  ime_ghost_h = 0;
+    RECT ime_caret{};
+    bool native_caret = false;
 
     // 待消费的输入
     float mx = 0.0f, my = 0.0f;
@@ -10447,8 +10459,17 @@ struct ImmApi {
 // caret_x / top / bottom 都是**物理客户区**像素。
 // 组合串贴着输入框下沿开始（不遮挡正在编辑的内容），候选框再往下一点。
 inline void win_set_ime_pos(Win32State* s, float caret_x, float top, float bottom) {
-    (void)top;
     if (!s || !s->hwnd) return;
+    const int height = std::max(1, int(bottom - top));
+    // 隐藏的系统 caret 供 TSF 查询位置，实际光标仍由现有输入框绘制。
+    if (GetFocus() == s->hwnd) {
+        if (!s->native_caret || s->ime_caret.bottom - s->ime_caret.top != height) {
+            if (s->native_caret) DestroyCaret();
+            s->native_caret = CreateCaret(s->hwnd, nullptr, 1, height) != 0;
+        }
+        if (s->native_caret) SetCaretPos(int(caret_x), int(top));
+    }
+    s->ime_caret = RECT{LONG(caret_x), LONG(top), LONG(caret_x) + 1, LONG(top) + height};
     static ImmApi api;
     if (!api.ok) return;
     HIMC himc = api.get_ctx(s->hwnd);
@@ -10679,6 +10700,22 @@ inline LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         l &= ~AINO_ISC_SHOWUICOMPOSITIONWINDOW;
         break;
 
+    case WM_IME_REQUEST:
+        // IMR_QUERYCHARPOSITION：首字符位置使用屏幕坐标，不能回报客户区原点。
+        if (w == 0x0006 && l && s->owner->ui.impl->ime_owner) {
+            struct CharPosition { DWORD size, index; POINT point; UINT line_height; RECT document; };
+            auto* position = reinterpret_cast<CharPosition*>(l);
+            if (position->size >= sizeof(CharPosition) && position->index == 0) {
+                position->point = POINT{s->ime_caret.left, s->ime_caret.top};
+                ClientToScreen(h, &position->point);
+                position->line_height = UINT(std::max(1L, s->ime_caret.bottom - s->ime_caret.top));
+                GetClientRect(h, &position->document);
+                MapWindowPoints(h, nullptr, reinterpret_cast<POINT*>(&position->document), 2);
+                return TRUE;
+            }
+        }
+        break;
+
     case WM_IME_STARTCOMPOSITION:
         s->owner->ui.impl->ime_comp.clear();
         s->owner->need_frame = true;
@@ -10686,7 +10723,7 @@ inline LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
     case WM_IME_COMPOSITION: {
         Ui::Impl* ui = s->owner->ui.impl;
-        const bool commit = (w & AINO_GCS_RESULTSTR) != 0;
+        const bool commit = (l & AINO_GCS_RESULTSTR) != 0;
         if (commit) ui->ime_comp.clear();  // 上屏：草稿消失，正文随后由 WM_CHAR 送到
 
         // TSF 经 CUAS 转发时，消息可能不含 GCS_COMPSTR 位，但 IMM 仍有组字串。
@@ -10698,8 +10735,8 @@ inline LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
             // ImmGetContext(hwnd) 拿到的上下文读就有 —— 实测 w=0x73 那条消息里
             // lParam 是 0x1b8/0x1c00，读出来 0 字节；换成 get_ctx(hwnd) 立刻是 2/6/10/14。
             HIMC himc = api.ok ? api.get_ctx(s->hwnd) : nullptr;
-            if (!himc) himc = reinterpret_cast<HIMC>(l);
-            LONG bytes = himc ? api.get_str(himc, AINO_GCS_COMPSTR, nullptr, 0) : 0;
+            // lParam 是组字标志，不是 HIMC；只使用当前窗口的真实上下文。
+            LONG bytes = himc && api.ok ? api.get_str(himc, AINO_GCS_COMPSTR, nullptr, 0) : 0;
             if (bytes > 0) {
                 std::wstring buf(size_t(bytes) / sizeof(wchar_t) + 1, L'\0');
                 api.get_str(himc, AINO_GCS_COMPSTR, &buf[0], bytes);
@@ -10707,7 +10744,7 @@ inline LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
             } else {
                 ui->ime_comp.clear();      // 删光了拼音 / 首次进入组字
             }
-            if (himc && himc != reinterpret_cast<HIMC>(l)) api.rel_ctx(s->hwnd, himc);
+            if (himc) api.rel_ctx(s->hwnd, himc);
         }
         s->owner->need_frame = true;
         break;
@@ -10767,6 +10804,8 @@ inline LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
 
     case WM_KILLFOCUS:
+        if (s->native_caret) { DestroyCaret(); s->native_caret = false; }
+        s->owner->ui.impl->ime_comp.clear();
         for (int i = 0; i < 3; ++i) s->btn_down[i] = s->btn_pressed[i] = s->btn_released[i] = false;
         s->owner->ui.impl->active = 0;
         for (int i = 0; i < KEY_COUNT; ++i) s->key_down[i] = false;
@@ -11094,6 +11133,8 @@ inline void Window::render() {
     Window::Impl* o = impl;
     detail::Win32State* s = reinterpret_cast<detail::Win32State*>(o->native);
     if (!s || !s->has_backbuffer) return;
+    // 原生模态消息泵可能重入 WM_PAINT，不能在未结束的帧里再次构建 Ui。
+    if (o->ui.impl->frame_open) { o->need_frame = true; return; }
 
     // 帧间隔基准必须是**每个窗口自己的**。写成函数内 static 时，两个窗口在同一
     // 进程里会轮流改写它：A 画完置为 t，B 紧接着画 → dt ≈ 0；再下一次 A 的 dt
@@ -11116,6 +11157,7 @@ inline void Window::render() {
     Ui& ui = o->ui;
     ui.begin_frame(float(s->pw) / o->scale, float(s->ph) / o->scale, dt, o->scale);
     if (o->frame_cb_ptr) o->frame_cb_ptr();
+    if (!ui.impl->ime_owner && s->native_caret) { DestroyCaret(); s->native_caret = false; }
     // 组字期间开一个 20 ms 的低频计时器压住输入法的浮动组合窗。
     // 不能只靠"每帧压一次"：光标闪烁的 38% 相位不请求重绘，帧会停，
     // 停住之后输入法再把窗口亮出来就没人压了（实测多行 textarea 上就这么漏的）。
@@ -12172,6 +12214,9 @@ struct X11State {
     Atom wm_delete = 0;
     XIM im = nullptr;
     XIC ic = nullptr;
+    XFontSet im_font = nullptr;
+    bool im_position = false, im_focused = false, window_focused = false;
+    XPoint im_spot{-1, -1};
     int pw = 0, ph = 0;
     ::Window settings_owner = 0;
     Atom settings_selection = 0, settings_property = 0, resource_manager = 0, manager = 0;
@@ -12190,6 +12235,22 @@ struct X11State {
     bool  key_shift[KEY_COUNT] = {};
     bool  key_alt[KEY_COUNT]   = {};
 };
+
+// 输入法坐标始终是物理客户区坐标，随输入框滚动和 DPI 更新。
+inline void x11_set_ime_pos(X11State* s, float caret_x, float top, float bottom) {
+    (void)top;
+    if (!s || !s->ic) return;
+    if (s->window_focused && !s->im_focused) { XSetICFocus(s->ic); s->im_focused = true; }
+    const XPoint spot{short(std::max(-32768.0f, std::min(32767.0f, caret_x))),
+                      short(std::max(-32768.0f, std::min(32767.0f, bottom)))};
+    if (s->im_position && (spot.x != s->im_spot.x || spot.y != s->im_spot.y)) {
+        auto attrs = XVaCreateNestedList(0, XNSpotLocation, &spot, nullptr);
+        if (attrs) {
+            XSetICValues(s->ic, XNPreeditAttributes, attrs, nullptr);
+            XFree(attrs); s->im_spot = spot; XFlush(s->dpy);
+        }
+    }
+}
 
 inline int x11_map_keysym(KeySym ks) {
     if (ks >= XK_a && ks <= XK_z) return int('A' + (ks - XK_a));
@@ -12369,6 +12430,8 @@ inline void x11_refresh_scale(X11State* s) {
 
 inline bool x11_handle(X11State* s, XEvent& e) {
     Window::Impl* o = s->owner;
+    // XIM 先消费组字按键及协议事件，避免拼音同时落入正文和快捷键。
+    if (XFilterEvent(&e, None)) { o->need_frame = true; return true; }
     switch (e.type) {
     case Expose:
         o->need_frame = true;
@@ -12417,10 +12480,16 @@ inline bool x11_handle(X11State* s, XEvent& e) {
             char buf[64];
             Status st = 0;
             KeySym dummy;
-            int n = Xutf8LookupString(s->ic, &e.xkey, buf, sizeof(buf) - 1, &dummy, &st);
+            int n = Xutf8LookupString(s->ic, &e.xkey, buf, sizeof(buf), &dummy, &st);
+            std::vector<char> overflow;
+            const char* text = buf;
+            if (st == XBufferOverflow && n > 0 && n <= 65536) {
+                overflow.resize(size_t(n));
+                n = Xutf8LookupString(s->ic, &e.xkey, overflow.data(), n, &dummy, &st);
+                text = overflow.data();
+            }
             if (n > 0 && (st == XLookupChars || st == XLookupBoth)) {
-                buf[n] = 0;
-                for (int i = 0; i < n; ++i) if (uint8_t(buf[i]) >= 32 || buf[i] == '\t') s->text_in.push_back(buf[i]);
+                for (int i = 0; i < n; ++i) if (uint8_t(text[i]) >= 32 || text[i] == '\t') s->text_in.push_back(text[i]);
             }
         } else {
             char buf[16];
@@ -12455,7 +12524,14 @@ inline bool x11_handle(X11State* s, XEvent& e) {
         s->mx = -1e6f; s->my = -1e6f;
         o->need_frame = true;
         break;
+    case FocusIn:
+        s->window_focused = true;
+        if (s->ic && o->ui.impl->ime_owner && !s->im_focused) { XSetICFocus(s->ic); s->im_focused = true; }
+        o->need_frame = true;
+        break;
     case FocusOut:
+        s->window_focused = false;
+        if (s->ic && s->im_focused) { XUnsetICFocus(s->ic); s->im_focused = false; }
         for (int i = 0; i < 3; ++i) s->btn_down[i] = s->btn_pressed[i] = s->btn_released[i] = false;
         for (int i = 0; i < KEY_COUNT; ++i) s->key_down[i] = false;
         o->ui.impl->active = 0;
@@ -12566,9 +12642,40 @@ inline void x11_create(Window* self, const WindowConfig& cfg) {
     if (XSetLocaleModifiers("") != nullptr) {
         s->im = XOpenIM(s->dpy, nullptr, nullptr, nullptr);
         if (s->im) {
-            s->ic = XCreateIC(s->im, XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
-                              XNClientWindow, s->win, XNFocusWindow, s->win, nullptr);
-            if (s->ic) XSetICFocus(s->ic);
+            XIMStyles* styles = nullptr;
+            XGetIMValues(s->im, XNQueryInputStyle, &styles, nullptr);
+            if (styles) {
+                for (unsigned i = 0; i < styles->count_styles; ++i)
+                    if (styles->supported_styles[i] == (XIMPreeditPosition | XIMStatusNothing)) s->im_position = true;
+                XFree(styles);
+            }
+            if (s->im_position) {
+                char** missing = nullptr; int count = 0; char* fallback = nullptr;
+                s->im_font = XCreateFontSet(s->dpy, "fixed", &missing, &count, &fallback);
+                if (missing) XFreeStringList(missing);
+                if (s->im_font) {
+                    XPoint spot{0, 0};
+                    auto attrs = XVaCreateNestedList(0, XNSpotLocation, &spot, XNFontSet, s->im_font, nullptr);
+                    if (attrs) {
+                        s->ic = XCreateIC(s->im, XNInputStyle, XIMPreeditPosition | XIMStatusNothing,
+                            XNClientWindow, s->win, XNFocusWindow, s->win, XNPreeditAttributes, attrs, nullptr);
+                        XFree(attrs);
+                    }
+                }
+            }
+            if (!s->ic) {
+                s->im_position = false;
+                if (s->im_font) { XFreeFontSet(s->dpy, s->im_font); s->im_font = nullptr; }
+                s->ic = XCreateIC(s->im, XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
+                    XNClientWindow, s->win, XNFocusWindow, s->win, nullptr);
+            }
+            if (s->ic) {
+                long filter = 0;
+                XGetICValues(s->ic, XNFilterEvents, &filter, nullptr);
+                XWindowAttributes attributes{};
+                if (XGetWindowAttributes(s->dpy, s->win, &attributes))
+                    XSelectInput(s->dpy, s->win, attributes.your_event_mask | filter);
+            }
         }
     }
 
@@ -12595,6 +12702,7 @@ inline void x11_destroy(Window* self) {
     if (s->img) { s->img->data = nullptr; XDestroyImage(s->img); s->img = nullptr; }
     if (s->ic) { XDestroyIC(s->ic); s->ic = nullptr; }
     if (s->im) { XCloseIM(s->im); s->im = nullptr; }
+    if (s->im_font) { XFreeFontSet(s->dpy, s->im_font); s->im_font = nullptr; }
     if (s->gc) { XFreeGC(s->dpy, s->gc); s->gc = nullptr; }
     if (s->win) XDestroyWindow(s->dpy, s->win);
     if (s->dpy) XCloseDisplay(s->dpy);
@@ -12641,6 +12749,7 @@ inline void Window::render() {
     ui.begin_frame(float(s->pw) / o->scale, float(s->ph) / o->scale, dt, o->scale);
     if (o->frame_cb_ptr) o->frame_cb_ptr();
     ui.end_frame();
+    if (!ui.impl->ime_owner && s->ic && s->im_focused) { XUnsetICFocus(s->ic); s->im_focused = false; }
     o->cursor = ui.cursor();
     detail::x11_present(s);
     detail::x11_apply_cursor(s);

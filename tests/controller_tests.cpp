@@ -17,6 +17,17 @@ int main(int argc, char** argv) {
         static_assert(std::is_const_v<std::remove_reference_t<decltype(ViewModel::playback)>>);
         check(initialize(false), "initialize isolated business state");
         auto model = view_model();
+        auto wait_library = [&] {
+            const auto deadline = platform::ticks() + 4000;
+            for (;;) {
+                tick();
+                bool busy;
+                { std::lock_guard<std::mutex> lock(g_library_write_mutex); busy = g_library_writer || !g_library_edits.empty(); }
+                if (!busy) { tick(); return; }
+                check(platform::ticks() < deadline, "library writer finishes accepted edits");
+                platform::sleep_ms(5);
+            }
+        };
         check(model.ui.tab == 1 && model.playback.tracks.empty(), "default Discover and empty list");
         static std::atomic<int> wakes{0}, activations{0};
         start({[&] { ++wakes; }, [&] { ++activations; }});
@@ -216,13 +227,15 @@ int main(int argc, char** argv) {
         choose_source(0, 1, false);
         tick();
         check(model.playback.tracks.size() == 1 && model.playback.tracks[0].chosen == 1, "source selection publishes a new snapshot");
-        favorite_toggle(track);
-        check(model.library.contains(track), "favorite action updates library");
+        const auto old_library = view_model().library_storage;
+        favorite_toggle(track); wait_library();
+        check(!old_library->contains(track), "published library snapshot remains immutable");
+        check(view_model().library.contains(track), "favorite action updates library");
         model.ui.local_name = "测试快照";
-        library_save_current();
-        check(model.library.playlists.size() == 2, "save named playlist action");
-        library_remove(1);
-        check(model.library.playlists.size() == 1 && model.library.contains(track), "remove playlist preserves favorites");
+        library_save_current(); wait_library();
+        check(view_model().library.playlists.size() == 2, "save named playlist action");
+        library_remove(1); wait_library();
+        check(view_model().library.playlists.size() == 1 && view_model().library.contains(track), "remove playlist preserves favorites");
 
         const auto music_folder = platform::join(model.paths.config, "music 中文");
         platform::make_dirs(platform::join(music_folder, "disc"));
@@ -299,8 +312,26 @@ int main(int argc, char** argv) {
         library_import_folder(music_folder, true);
         const auto scan_deadline = platform::ticks() + 3000;
         while (model.ui.importing_playlist && platform::ticks() < scan_deadline) { tick(); platform::sleep_ms(10); }
-        check(!model.ui.importing_playlist && model.library.playlists.size() == 2, "asynchronous folder import");
-        check(model.library.playlists[1].tracks.size() == 2 && !model.library.playlists[1].local_folder.empty(), "recursive folder playlist");
+        wait_library();
+        check(!model.ui.importing_playlist && view_model().library.playlists.size() == 2, "asynchronous folder import");
+        check(view_model().library.playlists[1].tracks.size() == 2 && !view_model().library.playlists[1].local_folder.empty(), "recursive folder playlist");
+        library_open(1); tick();
+        model.ui.playlist_filter = "歌名"; playlist_filter_rows();
+        check(!model.playlist.rows.empty(), "playlist title filtering preserves original row indices");
+        model.ui.playlist_rename = "重命名歌单"; playlist_rename_local(); wait_library();
+        check(view_model().library.playlists[1].name == "重命名歌单", "rename persists through asynchronous writer");
+        model.ui.playlist_filter.clear(); playlist_filter_rows();
+        model.ui.library_transfer_path = platform::join(model.paths.config, "backup.json");
+        library_export(false);
+        const auto export_deadline = platform::ticks() + 4000;
+        while (!platform::exists(model.ui.library_transfer_path) && platform::ticks() < export_deadline) { tick(); platform::sleep_ms(5); }
+        library::Library backup; std::string backup_error;
+        check(backup.load(model.ui.library_transfer_path, backup_error) && backup.playlists.size() == 2, "backup has favorites and local playlist");
+        const auto backup_size = platform::file_size(model.ui.library_transfer_path);
+        library_export(false); tick();
+        check(platform::file_size(model.ui.library_transfer_path) == backup_size, "existing backup cannot be overwritten");
+        favorite_toggle(track); favorite_toggle(track); wait_library();
+        check(view_model().library.contains(track), "coalesced edits apply in order without dropping toggles");
         model.ui.query = "独立的在线搜索词";
         { std::lock_guard<std::mutex> lock(g_mu); g_as.results = {track}; ++g_as.results_version; }
         tick();
@@ -322,7 +353,7 @@ int main(int argc, char** argv) {
                   "busy search retains only the latest new request");
             g_search_worker = false; g_pending_search = {};
         }
-        do_search(g_win, "older", offline_search, obsolete_search);
+        { SearchRequest request; request.keyword = "older"; request.settings = offline_search; request.generation = obsolete_search; do_search(g_win, std::move(request)); }
         check(g_as.searching, "obsolete search cannot clear latest request status");
         model.ui.query = "独立的在线搜索词"; start_search();
         const auto search_deadline = platform::ticks() + 3000;
@@ -334,13 +365,13 @@ int main(int argc, char** argv) {
         check(!searching, "latest offline search completes on the bounded worker");
         model.ui.src_mask = saved_mask;
         const int search_generation = ++g_search_gen;
-        do_search(g_win, "fixture", offline_search, search_generation); tick();
+        { SearchRequest request; request.keyword = "fixture"; request.settings = offline_search; request.generation = search_generation; do_search(g_win, std::move(request)); } tick();
         check(model.playback.tracks.size() == 1 && model.playback.results.empty() && model.playlist.playlist.tracks.size() == 2,
             "online search does not overwrite the playing queue or playlist detail");
         playlist_close();
         check(!model.playlist.open && model.ui.tab == 3 && model.ui.query == "独立的在线搜索词", "return from playlist keeps search state");
         queue_clear();
-        for (const auto& local : model.library.playlists[1].tracks) queue_push(local);
+        for (const auto& local : view_model().library.playlists[1].tracks) queue_push(local);
         tick();
         const auto queued_local_id = model.playback.tracks[0].current().id;
         check(queue_save(), "local queue save");
@@ -404,17 +435,17 @@ int main(int argc, char** argv) {
         check(restored.settings.netease_cookie.empty() && restored.settings.qq_cookie.empty() && restored.qq_uin.empty() && restored.ne_uid.empty(), "logout persists cleared credentials");
         check(restored.volume == 43 && restored.dark && restored.download_dir == model.ui.download_dir, "logout preserves unrelated settings");
         check(restored.play_mode == PlayMode::Shuffle && !restored.sleep_deadline && !restored.sleep_after_track, "play mode persists without restoring a timer");
-        check(model.library.contains(track), "logout preserves local library");
+        check(view_model().library.contains(track), "logout preserves local library");
         clear_data(ClearAction::Queue);
         tick();
         check(model.playback.tracks.empty() && model.playback.results.size() == 1, "clear queue preserves independent search results");
-        check(model.library.contains(track), "clear queue preserves favorites");
+        check(view_model().library.contains(track), "clear queue preserves favorites");
         const auto cached = platform::join(model.paths.current_cache, "track-99.mp3");
         file = platform::fopen(cached, "wb");
         check(file != nullptr, "cache fixture"); std::fputs("remove", file); std::fclose(file);
         clear_data(ClearAction::Cache);
         check(!platform::exists(cached) && platform::exists(downloaded) && platform::exists(original), "cache clear preserves downloaded songs");
-        clear_data(ClearAction::Library);
+        clear_data(ClearAction::Library); wait_library();
         library::Library library;
         std::string error;
         check(library.load(platform::join(model.paths.config, "library.json"), error) && library.playlists.size() == 1 && library.playlists[0].tracks.empty(), "cleared library persists");

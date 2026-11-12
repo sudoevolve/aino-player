@@ -1,4 +1,4 @@
-// 不创建窗口，直接重现控件消失、坐标变化和失去鼠标捕获后的输入生命周期。
+// 默认不创建窗口；平台窗口检查通过 --linux-backend / --ime-backend 显式启用。
 #define AINO_IMPLEMENTATION
 #include "../src/aino.hpp"
 #include <iostream>
@@ -264,6 +264,25 @@ static void menu_checks() {
         check(!ui.impl->gate_on && choice == -1, "Escape dismisses menu and releases overlay gate");
     }
 }
+#ifdef _WIN32
+static void ime_backend_checks() {
+    using namespace aino;
+    Window window(320,200,"IME candidate position"); check(window.ok(),"IME probe window");
+    auto* state = static_cast<detail::Win32State*>(window.impl->native);
+    auto* ui = window.impl->ui.impl;
+    ui->ime_owner = true;
+    detail::win_set_ime_pos(state,48,32,54);
+    struct Position { DWORD size,index; POINT point; UINT height; RECT document; } position{};
+    position.size=sizeof position;
+    check(detail::win_proc(state->hwnd,WM_IME_REQUEST,0x0006,reinterpret_cast<LPARAM>(&position)) == TRUE,"IME cursor position request handled");
+    POINT expected{48,32}; ClientToScreen(state->hwnd,&expected);
+    check(position.point.x==expected.x && position.point.y==expected.y && position.height==22,"IME receives screen coordinates and caret height");
+    bool drawn=false;
+    window.impl->frame_cb_ptr = [&] { drawn=true; };
+    ui->frame_open=true; window.render(); ui->frame_open=false;
+    check(!drawn && window.impl->need_frame,"native nested render defers drawing until the open frame ends");
+}
+#endif
 int main(int argc, char** argv) {
     try {
         using namespace aino::detail;
@@ -280,6 +299,9 @@ int main(int argc, char** argv) {
         check(desktop_scale(nullptr, nullptr, {}, 0) == 1 && parse_scale_number("1,5") == 0, "safe default and locale independent scale");
 #ifdef AINO_PLATFORM_X11
         if (argc > 1 && std::string(argv[1]) == "--linux-backend") linux_backend_checks();
+#endif
+#ifdef _WIN32
+        if (argc > 1 && std::string(argv[1]) == "--ime-backend") ime_backend_checks();
 #endif
         aino::Ui ui;
         auto& input = ui.impl->input;

@@ -196,3 +196,26 @@ QQ/网易云歌单按 revision 更新快照；普通播放 10 fps，歌词展开
 - 业务快照原地更新，曲目/搜索容器只在版本变化时复制，状态文本仍及时刷新；本地歌单行避免复制全部曲目。恢复队列清理搜索报告时同步推进结果版本。
 
 覆盖补入现有 controller_tests、interaction_tests 和上游 capture_probe，留待用户要求发版时执行；本次只编译、静态检查和代码审查。`--diagnostics` 新增 PSS 与 Private 页输出，仅代表首帧。尚无反馈者 Ubuntu 同场景复测结果，不声称占用已达到 Windows 水平。
+
+
+### 2026-11-12 未发布：异步资料库、可取消管线和本地管理
+
+继续沿用 main/business/ui 与现有平台、音频文件，不新增运行依赖，不改歌词画面、字体、字号或 60 fps 策略。此前按版本保留列表的优化继续生效。
+
+Windows 文件夹选择由独立 STA 任务创建 IFileOpenDialog，使用原生窗口 owner，重复点击去重，定时检查退出取消；原先从帧回调打开同步模态选择器会让嵌套消息进入绘制。aino 的 Windows render 增加 open-frame 重入保护；输入法提交标志改读 lParam，移除错误的 HIMC 兜底，建立隐藏系统 caret 并响应 IMR_QUERYCHARPOSITION。X11 协商 XIMPreeditPosition、上报物理光标位置、合并过滤事件并处理 UTF-8 lookup overflow；不可用时回退 Nothing 样式。两份 aino.hpp 同步修正。
+
+资料库发布为 shared_ptr 只读快照，ViewModel 持有寿命；修改命令在单个后台 writer 按顺序合并，每批只复制一次并保存，80 ms 合并连续修改。只有原子保存成功后才发布新快照，失败保留磁盘和已发布数据并报告。清理与编辑串行，通过 epoch 拒绝旧导入；退出排空已接受写入。备份导出先临时保存后排他移动，拒绝覆盖；恢复合并收藏并按 key 更新歌单。
+
+WinHTTP 使用异步 session 和完成回调，但维持现有同步式业务 API。所属线程每 20 ms 检查取消，关闭请求并等 HANDLE_CLOSING 后才释放上下文/缓冲，避免同步请求被另一线程关闭的竞态；libcurl 使用 progress/sink 取消。下载由最多两个 worker 和 32 个等待项执行，每次尝试使用身份令牌，旧取消任务不能覆盖重试；最终发布仍排他保留同名文件。文件转码使用可取消的单槽等待，切歌先取消预加载；系统工具和解码进程均可终止并回收。
+
+搜索工作任务分批交付已完成音源，保留用户选择的变体和补齐封面；每音源分别记录页码、本页输入 token 和下一页 token，失败重试不会跳页。搜索 threads 都有归属并在取消后 join，不遗留 detach 请求；UI 的列表末尾加载更多，音源页单独重试。YouTube 不做实网验证。
+
+流式音频通过 HTTP sink → FFmpeg stdin → stdout PCM → miniaudio data source。固定 48 kHz 双声道 s16 PCM，三秒 SPSC ring、约 250 ms 预缓冲；音频回调无锁、不分配、不读网络/管道，只读写原子索引。断流暂时静音，不推进曲目位置；结束与错误分离，起播后失败恢复完整文件。网络 seek 重建管道，从头解码丢弃到目标，保留暂停，不能流式 seek 的容器回退完整文件；不承诺快速 Range seek或无缝。取消先终止子进程唤醒阻塞 I/O，随后回收网络、解码和监视线程，解绑音频源后才销毁。子进程标准句柄限制继承，Linux 管道 close-on-exec，SIGPIPE 仅在写入线程屏蔽和清理。
+
+FFmpeg 仍为固定来源和摘要校验的 LGPL 构建，仅补 file/pipe、PCM muxer 及 MP3/WAV/FLAC 输入；禁用网络和视频 decoder。配置名称使用 pcm_s16le muxer，运行参数使用 s16le 格式名；嵌入时检查构建选项，防止旧 decoder 被误用于流式代码。普通构建保留 fingerprint/增量产物策略。
+
+本地标签有块容量和封面容量上限，支持 ID3v2 文本/APIC、FLAC comments/PICTURE、跨页 Ogg comment packet、MP4 ilst/covr 和 WAV INFO；不支持的字段安静回退。封面沿用原192尺寸解码。歌单管理默认折叠，支持筛选、排序、重命名、多选移除和导出；不删除原音乐，播放队列按当前筛选排序建立；队列行首系统图标支持拖动重排与边缘滚动。
+
+覆盖补入现有 controller_tests、player_tests、interaction_tests 与音频格式脚本。本次按用户要求不运行 CTest、音频/浏览器/窗口回归、截图检查或 CI，不发版；必要编译与静态审查不能替代 Windows 输入法实际候选窗、网络中断/seek、Ubuntu XIM/XWayland 和真实音频设备验证。没有实测内存节省数字。
+
+实际检查：Windows MSVC Release 的播放器、controller_tests、player_tests、interaction_tests 以及上游 capture_probe 已编译通过；Python 脚本语法和 git diff --check 通过，未执行这些产物。审查补齐下载发布状态：磁盘发布移出下载状态锁，提交阶段禁止重试替换令牌，取消仅跳过后续标签并保留已发布文件；读取失败的 HTTP 响应清除半段成功内容。流式时长缺失时回退曲目时长。没有 Linux 编译或实机环境。

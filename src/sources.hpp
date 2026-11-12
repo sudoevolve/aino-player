@@ -105,6 +105,7 @@ struct Track {  // 合并后的"同一首歌"
 struct SourceReport {
     Source source = Source::Netease;
     bool ok = false;
+    bool pending = false, has_more = false;
     int count = 0;
     int ms = 0;
     std::string err;
@@ -115,6 +116,7 @@ struct SearchResult {
     std::vector<Track> tracks;
     std::vector<SourceReport> reports;
     int elapsed_ms = 0;
+    std::array<std::string, kSourceCount> continuation;
 };
 
 struct Settings {
@@ -161,8 +163,8 @@ struct ResolveResult {
     std::string detail;                // 人话补充
 };
 
-inline std::vector<Variant> search_bilibili(const std::string&, int, int, std::string&);
-inline std::vector<Variant> search_youtube(const std::string&, int, int, std::string&, const Settings& = {});
+inline std::vector<Variant> search_bilibili(const std::string&, int, int, std::string&, int = 0);
+inline std::vector<Variant> search_youtube(const std::string&, int, int, std::string&, const Settings& = {}, const std::string& = {}, std::string* = nullptr);
 
 // ---------------------------------------------------------------- 小工具
 
@@ -381,10 +383,10 @@ inline bool same_song(const Track& t, const Variant& v) {
 // ---------------------------------------------------------------- 适配器：网易云
 
 inline std::vector<Variant> search_netease(const std::string& keyword, int limit, int timeout_ms,
-                                           std::string& err, const Settings& st) {
+                                           std::string& err, const Settings& st, int page = 0) {
     std::vector<Variant> out;
     const std::string url = "http://music.163.com/api/search/get/web?s=" + net::url_encode(keyword) +
-                            "&type=1&limit=" + std::to_string(limit) + "&offset=0";
+                            "&type=1&limit=" + std::to_string(limit) + "&offset=" + std::to_string(std::max(0, page) * limit);
     std::vector<std::string> headers = {"Referer: https://music.163.com/",
                                         "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
                                         "Cookie: appver=2.0.2; os=pc" +
@@ -486,11 +488,11 @@ inline ResolveResult resolve_netease(const Variant& v, const Settings& st) {
 // ---------------------------------------------------------------- 适配器：酷我
 
 inline std::vector<Variant> search_kuwo(const std::string& keyword, int limit, int timeout_ms,
-                                        std::string& err) {
+                                        std::string& err, int page = 0) {
     std::vector<Variant> out;
     const std::string url =
         "https://search.kuwo.cn/r.s?all=" + net::url_encode(keyword) +
-        "&ft=music&itemset=web_2013&client=kt&pn=0&rn=" + std::to_string(limit) +
+        "&ft=music&itemset=web_2013&client=kt&pn=" + std::to_string(std::max(0, page)) + "&rn=" + std::to_string(limit) +
         "&rformat=json&encoding=utf8&vipver=1&show_copyright_off=1&newver=1";
     const net::Response r =
         net::get(url, {"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout_ms);
@@ -559,7 +561,7 @@ inline ResolveResult resolve_kuwo(const Variant& v) {
 // ---------------------------------------------------------------- 适配器：QQ
 
 inline std::vector<Variant> search_qq(const std::string& keyword, int limit, int timeout_ms,
-                                      std::string& err, const Settings& st) {
+                                      std::string& err, const Settings& st, int page = 0) {
     std::vector<Variant> out;
     // QQ 搜索的请求体是 musicu.fcg 的固定信封
     std::string q;
@@ -572,7 +574,7 @@ inline std::vector<Variant> search_qq(const std::string& keyword, int limit, int
         std::string("{\"comm\":{\"ct\":\"19\",\"cv\":\"1859\",\"uin\":\"0\"},") +
         "\"req\":{\"method\":\"DoSearchForQQMusicDesktop\",\"module\":\"music.search.SearchCgiService\"," +
         "\"param\":{\"grp\":1,\"num_per_page\":" + std::to_string(limit) +
-        ",\"page_num\":1,\"query\":\"" + q + "\",\"search_type\":0}}}";
+        ",\"page_num\":" + std::to_string(std::max(0, page) + 1) + ",\"query\":\"" + q + "\",\"search_type\":0}}}";
     std::vector<std::string> headers = {"Content-Type: application/json",
                                         "Referer: https://y.qq.com/",
                                         "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)"};
@@ -880,81 +882,52 @@ struct Job {
     std::vector<char> finished;
     std::vector<std::vector<Variant>> per_source;
     std::vector<SourceReport> reports;
-    bool cancelled = false;
 };
 
 // 并发检索：每个源一个线程，9 秒软超时；超时/失败的源降级成 SourceReport 里的红字
 inline SearchResult run_search(const std::string& keyword, const Settings& st, int limit_per_source = 12,
-                               int soft_timeout_ms = 9000) {
+                               int soft_timeout_ms = 9000, int page = 0,
+                               const std::array<std::string, kSourceCount>& continuations = {},
+                                const std::function<void(const SearchResult&)>& publish = {},
+                                const std::array<int, kSourceCount>* pages = nullptr) {
     using clock = std::chrono::steady_clock;
-    SearchResult result;
-    result.keyword = keyword;
     const auto t_start = clock::now();
-
     auto job = std::make_shared<Job>();
-    job->per_source.resize(kSourceCount);
-    job->reports.resize(kSourceCount);
-    job->finished.assign(kSourceCount, 0);
-    for (int s = 0; s < kSourceCount; ++s) {
-        job->reports[size_t(s)].source = Source(s);
-        job->reports[size_t(s)].ok = false;
-        job->reports[size_t(s)].err = st.enable[s] ? "" : "已关闭";
+    job->per_source.resize(kSourceCount); job->reports.resize(kSourceCount); job->finished.assign(kSourceCount, 0);
+    std::array<std::string, kSourceCount> next;
+    std::vector<std::thread> workers;
+    std::atomic<bool> stopped{false};
+    for (int i = 0; i < kSourceCount; ++i) {
+        job->reports[size_t(i)].source = Source(i);
+        job->reports[size_t(i)].pending = st.enable[i];
+        job->reports[size_t(i)].err = st.enable[i] ? "检索中" : "已关闭";
+        if (!st.enable[i]) continue;
+        workers.emplace_back([&, i] {
+            net::CancelScope cancellation([&] { return stopped.load() || (st.cancelled && st.cancelled()); });
+            std::string error, cursor;
+            std::vector<Variant> got;
+            const int source_page = pages ? (*pages)[size_t(i)] : page;
+            const auto began = clock::now();
+            try {
+                if (i == int(Source::Netease)) got = search_netease(keyword, limit_per_source, 8000, error, st, source_page);
+                else if (i == int(Source::QQ)) got = search_qq(keyword, limit_per_source, 8000, error, st, source_page);
+                else if (i == int(Source::Kuwo)) got = search_kuwo(keyword, limit_per_source, 8000, error, source_page);
+                else if (i == int(Source::Bilibili)) got = search_bilibili(keyword, limit_per_source, 8000, error, source_page);
+                else if (i == int(Source::YouTube)) got = search_youtube(keyword, limit_per_source, 8000, error, st, continuations[size_t(i)], &cursor);
+            } catch (...) { error = "适配器异常"; }
+            std::lock_guard<std::mutex> lock(job->m);
+            auto& report = job->reports[size_t(i)];
+            report.pending = false; report.count = int(got.size()); report.ok = !got.empty() || error.empty(); report.err = error;
+            report.has_more = i == int(Source::YouTube) ? !cursor.empty() : int(got.size()) >= limit_per_source;
+            report.ms = int(std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - began).count());
+            job->per_source[size_t(i)] = std::move(got); next[size_t(i)] = std::move(cursor);
+            job->finished[size_t(i)] = 1; ++job->done; job->cv.notify_all();
+        });
     }
-
-    auto launch = [job, keyword, st, limit_per_source](Source src) {
-        const int idx = int(src);
-        const auto t0 = clock::now();
-        std::string err;
-        std::vector<Variant> got;
-        try {
-            if (src == Source::Netease) got = search_netease(keyword, limit_per_source, 8000, err, st);
-            else if (src == Source::Kuwo) got = search_kuwo(keyword, limit_per_source, 8000, err);
-            else if (src == Source::QQ) got = search_qq(keyword, limit_per_source, 8000, err, st);
-            else if (src == Source::YouTube) got = search_youtube(keyword, limit_per_source, 8000, err, st);
-            else if (src == Source::Bilibili) got = search_bilibili(keyword, limit_per_source, 8000, err);
-        } catch (...) {
-            err = "适配器异常";
-        }
-        const int ms = int(std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count());
-        std::lock_guard<std::mutex> lk(job->m);
-        job->per_source[size_t(idx)] = std::move(got);
-        SourceReport& rep = job->reports[size_t(idx)];
-        rep.count = int(job->per_source[size_t(idx)].size());
-        rep.ms = ms;
-        rep.ok = !(rep.count == 0 && !err.empty());
-        rep.err = rep.count > 0 ? std::string() : err;
-        job->finished[size_t(idx)] = 1;
-        ++job->done;
-        job->cv.notify_all();
-    };
-
-    int launched = 0;
-    for (int s = 0; s < kSourceCount; ++s) {
-        if (!st.enable[s]) continue;
-        std::thread(launch, Source(s)).detach();
-        ++launched;
-    }
-
-    {
-        std::unique_lock<std::mutex> lk(job->m);
-        job->cv.wait_for(lk, std::chrono::milliseconds(soft_timeout_ms),
-                         [&] { return job->done >= launched; });
-        for (int s = 0; s < kSourceCount; ++s) {
-            if (!st.enable[s] || job->finished[size_t(s)]) continue;
-            SourceReport& rep = job->reports[size_t(s)];
-            rep.ok = false;
-            rep.err = "超时 >" + std::to_string(soft_timeout_ms) + "ms";
-        }
-    }
-
-    std::vector<std::vector<Variant>> per_source;
-    per_source.resize(kSourceCount);
-    {
-        std::lock_guard<std::mutex> lk(job->m);
-        per_source = job->per_source;
-        result.reports = job->reports;
-    }
-
+    auto snapshot = [&] {
+        SearchResult result; result.keyword = keyword;
+        std::vector<std::vector<Variant>> per_source;
+        { std::lock_guard<std::mutex> lock(job->m); per_source = job->per_source; result.reports = job->reports; result.continuation = next; }
     // 合并 → 排序
     const std::string kw_norm = core_title(keyword);
     std::vector<Track> tracks;
@@ -977,9 +950,21 @@ inline SearchResult run_search(const std::string& keyword, const Settings& st, i
         return a.duration_ms > b.duration_ms;
     });
     result.tracks = std::move(tracks);
-    result.elapsed_ms =
-        int(std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t_start).count());
-    return result;
+        result.elapsed_ms = int(std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t_start).count());
+        return result;
+    };
+    int seen = -1;
+    for (;;) {
+        std::unique_lock<std::mutex> lock(job->m);
+        job->cv.wait_for(lock, std::chrono::milliseconds(30), [&] { return job->done != seen; });
+        const int done = job->done;
+        lock.unlock();
+        if (done != seen) { seen = done; if (publish) publish(snapshot()); }
+        if (done >= int(workers.size())) break;
+        if ((st.cancelled && st.cancelled()) || clock::now() - t_start >= std::chrono::milliseconds(soft_timeout_ms)) { stopped.store(true); break; }
+    }
+    for (auto& worker : workers) if (worker.joinable()) worker.join();
+    return snapshot();
 }
 
 // ---------------------------------------------------------------- 封面
@@ -1246,10 +1231,10 @@ inline ResolveResult parse_bilibili_audio(const js::Value& root, int quality) {
 }
 } // namespace providers
 
-inline std::vector<Variant> search_bilibili(const std::string& keyword, int limit, int timeout, std::string& error) {
+inline std::vector<Variant> search_bilibili(const std::string& keyword, int limit, int timeout, std::string& error, int page) {
     auto session = providers::bili_session(std::max(1000, timeout / 3), error);
     if (session.key.empty()) return {};
-    const auto query = providers::wbi_query({{"keyword", keyword}, {"search_type", "video"}, {"page", "1"},
+    const auto query = providers::wbi_query({{"keyword", keyword}, {"search_type", "video"}, {"page", std::to_string(std::max(0, page) + 1)},
         {"page_size", std::to_string(std::clamp(limit, 1, 50))}}, session.key, std::time(nullptr));
     js::Value root;
     if (!providers::json_response(net::get("https://api.bilibili.com/x/web-interface/wbi/search/type?" + query,
@@ -1473,15 +1458,28 @@ inline std::vector<std::string> youtube_headers(const YouTubeConfig& config, con
 }
 } // namespace providers
 
-inline std::vector<Variant> search_youtube(const std::string& keyword, int limit, int timeout, std::string& error, const Settings& st) {
+inline std::vector<Variant> search_youtube(const std::string& keyword, int limit, int timeout, std::string& error, const Settings& st, const std::string& continuation, std::string* next) {
     const auto config = providers::youtube_config(std::max(1000, timeout / 3));
-    const auto body = "{\"context\":" + providers::youtube_context(config, st) + ",\"query\":" + providers::quote(keyword) +
-        ",\"params\":\"EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D\"}";
+    const auto body = "{\"context\":" + providers::youtube_context(config, st) +
+        (continuation.empty() ? ",\"query\":" + providers::quote(keyword) + ",\"params\":\"EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D\"}" : ",\"continuation\":" + providers::quote(continuation) + "}");
     const auto response = net::post("https://music.youtube.com/youtubei/v1/search?prettyPrint=false&key=" + net::url_encode(config.key),
         body, providers::youtube_headers(config, st), timeout * 2 / 3);
     js::Value root;
     if (!providers::json_response(response, root, error)) { error = "YouTube Music 网络/接口不可用：" + error; return {}; }
-    auto out = providers::parse_youtube_search(root, limit);
+    if (next) {
+        next->clear();
+        std::function<void(const js::Value&, int)> find = [&](const js::Value& value, int depth) {
+            if (depth > 40 || !next->empty()) return;
+            if (value.is_object()) {
+                const auto token = value["nextContinuationData"]["continuation"].str(value["continuationCommand"]["token"].str());
+                if (!token.empty()) { *next = token; return; }
+                for (const auto& item : value.object) find(item.second, depth + 1);
+            } else if (value.is_array()) for (const auto& item : value.array) find(item, depth + 1);
+        };
+        find(root, 0);
+    }
+    // continuation 已经消费一整页，不能截掉本页剩余项后直接跳到下一页。
+    auto out = providers::parse_youtube_search(root, next ? 500 : limit);
     if (out.empty()) error = "YouTube Music 无可用结果（可能需要验证）";
     return out;
 }
@@ -1493,7 +1491,7 @@ inline ResolveResult resolve_youtube_tool(const Variant& v) {
     const auto file = platform::join(platform::temp_dir(), "yt-resolve-" + std::to_string(platform::process_id()) + "-" + std::to_string(++serial) + ".json");
     const int rc = platform::run_process({"yt-dlp", "--ignore-config", "--no-playlist", "--skip-download", "--quiet", "--no-warnings",
         "--no-cache-dir", "--socket-timeout", "8", "--retries", "0", "--extractor-retries", "0", "-f", "bestaudio[ext=m4a]/bestaudio",
-        "--print-to-file", "%()j", file, "--", "https://music.youtube.com/watch?v=" + v.id}, 25000);
+        "--print-to-file", "%()j", file, "--", "https://music.youtube.com/watch?v=" + v.id}, 25000, [] { return net::cancelled(); });
     if (rc != 0 || platform::file_size(file) > 8 * 1024 * 1024) {
         platform::remove(file);
         rr.reason = rc == -1 ? "可选 yt-dlp 未安装" : rc == 124 ? "yt-dlp 解析超时" : "yt-dlp 无法取得音轨（网络或平台验证）";

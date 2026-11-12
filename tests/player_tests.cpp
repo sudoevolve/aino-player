@@ -175,6 +175,24 @@ int main(int argc, char** argv) {
             }
             login::shutdown(); return 0;
         }
+        if (argc > 2 && std::string(argv[1]) == "--audio-stream") {
+            audio::StreamSpec spec; spec.local_path = argv[2]; spec.duration_ms = 1000;
+#ifdef _WIN32
+            int count = 0; auto args = CommandLineToArgvW(GetCommandLineW(), &count);
+            check(args && count > 2, "native stream file argument"); spec.local_path = platform::narrow(args[2]); LocalFree(args);
+#endif
+            std::string error; std::atomic<bool> cancelled{false};
+            for (const int offset : {0, 350}) {
+                spec.start_ms = offset;
+                auto stream = audio::Stream::open(spec, [&] { return cancelled.load(); }, error);
+                check(stream && !stream->failed(), error.c_str());
+                const auto began = platform::ticks(); stream->cancel(); stream.reset();
+                check(platform::ticks() - began < 2500, "cancel reaps stream with a full or partially full ring");
+            }
+            cancelled.store(true);
+            check(!audio::Stream::open(spec, [&] { return cancelled.load(); }, error) && !error.empty(), "cancelled stream cannot publish media");
+            std::cout << "Stream prebuffer, seek rebuild and cancellation checks passed\n"; return 0;
+        }
         if (argc > 2 && (std::string(argv[1]) == "--audio-device" || std::string(argv[1]) == "--audio-decode" ||
                          std::string(argv[1]) == "--audio-reject")) {
             std::string playable, error;
@@ -309,6 +327,43 @@ int main(int argc, char** argv) {
         platform::remove(cache_root);
         const auto utf16 = tag::utf16le_bom("中😀");
         check(utf16.size() == 8 && uint8_t(utf16[2]) == 0x2d && uint8_t(utf16[3]) == 0x4e, "UTF16 tags and surrogate pairs");
+        {
+            auto write_metadata = [&](const std::string& name, const std::string& bytes) {
+                const auto path = platform::join(dir, name);
+                auto* output = platform::fopen(path, "wb"); check(output != nullptr, "metadata fixture file");
+                check(std::fwrite(bytes.data(),1,bytes.size(),output) == bytes.size(), "metadata fixture write"); std::fclose(output);
+                return path;
+            };
+            const auto title = tag::id3_frame("TIT2", std::string(1,char(1)) + tag::utf16le_bom("中文标题"));
+            const auto artist = tag::id3_frame("TPE1", std::string(1,char(3)) + "Artist");
+            const auto image = tag::id3_frame("APIC", std::string(1,char(0)) + std::string("image/png\0\x03\0",12) + "PNG-data");
+            const auto size = title.size() + artist.size() + image.size();
+            std::string id3("ID3\x03\0\0",6);
+            for (int shift : {21,14,7,0}) id3 += char(size >> shift & 127);
+            id3 += title + artist + image;
+            const auto id3_path = write_metadata("tagged.mp3", id3);
+            const auto metadata = tag::read_metadata(id3_path);
+            check(metadata.title == "中文标题" && metadata.artist == "Artist" && metadata.cover == "PNG-data", "ID3 text encoding and embedded front cover");
+            check(tag::read_metadata(id3_path,false).cover.empty(), "cover extraction can be disabled");
+            std::string comments;
+            auto le = [](std::string& bytes,uint32_t n) { for (int i=0;i<4;++i) bytes += char(n >> (i*8)); };
+            le(comments,0); le(comments,2);
+            const auto value = std::string("TITLE=") + std::string(300,'x');
+            le(comments,uint32_t(value.size())); comments += value;
+            le(comments,13); comments += "ARTIST=Artist";
+            const auto packet = std::string("OpusTags") + comments;
+            auto page = [&](unsigned flags,unsigned sequence,const std::string& sizes,const std::string& payload) {
+                std::string header("OggS",4); header += char(0); header += char(flags); header.append(8,'\0');
+                le(header,1); le(header,sequence); le(header,0); header += char(sizes.size()); return header + sizes + payload;
+            };
+            const auto ogg_path = write_metadata("tags.opus",page(2,0,std::string(1,char(255)),packet.substr(0,255)) +
+                page(1,1,std::string(1,char(packet.size()-255)),packet.substr(255)));
+            const auto ogg = tag::read_metadata(ogg_path);
+            check(ogg.title == std::string(300,'x') && ogg.artist == "Artist", "Ogg lacing reconstructs metadata packet across pages");
+            const auto truncated = write_metadata("broken.mp3",id3.substr(0,14));
+            check(tag::read_metadata(truncated).title.empty(), "truncated metadata is ignored safely");
+            for (const auto& path : {id3_path,ogg_path,truncated}) platform::remove(path);
+        }
         const auto missing = platform::join(dir, "missing.wav");
         check(!audio::inspect_mp3(missing).valid, "missing audio rejected");
         platform::remove(file); platform::remove(dir);

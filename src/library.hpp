@@ -2,6 +2,7 @@
 #pragma once
 #include "sources.hpp"
 #include "platform.hpp"
+#include "tag.hpp"
 #include <fstream>
 #include <sstream>
 #include <regex>
@@ -86,7 +87,7 @@ inline bool parse_link(const std::string& input, music::Source& source, std::str
     id = match[1].str();
     return id.size() <= 24 && id.find_first_not_of('0') != std::string::npos;
 }
-// 扫描只读取文件路径；不跟随链接，不修改音乐目录。失败时调用方保留旧歌单。
+// 扫描路径与有界标签；不跟随链接、不修改原音乐，失败时调用方保留旧歌单。
 inline Playlist scan_folder(const std::string& input, bool recursive, std::string& error,
                             const std::function<bool()>& cancelled = {}) {
     error.clear();
@@ -128,9 +129,17 @@ inline Playlist scan_folder(const std::string& input, bool recursive, std::strin
         const auto split = v.title.find(" - ");
         if (split != std::string::npos) { v.artist = v.title.substr(0, split); v.title.erase(0, split + 3); }
         v.album = platform::fs::u8path(path).parent_path().filename().u8string();
-        music::Track t; t.title = v.title; t.artist = v.artist; t.album = v.album;
+        if (cancelled && cancelled()) { error = "扫描已取消"; return out; }
+        const auto metadata = tag::read_metadata(path);
+        if (!metadata.title.empty()) v.title = metadata.title;
+        if (!metadata.artist.empty()) v.artist = metadata.artist;
+        if (!metadata.album.empty()) v.album = metadata.album;
+        v.duration_ms = int(std::min(metadata.duration_ms, 2147483647LL));
+        if (!metadata.cover.empty()) v.cover_url = "local-cover:" + path;
+        music::Track t; t.title = v.title; t.artist = v.artist; t.album = v.album; t.cover_url = v.cover_url; t.duration_ms = v.duration_ms;
         t.variants.push_back(std::move(v)); out.tracks.push_back(std::move(t));
     }
+    if (!out.tracks.empty()) out.cover = out.tracks.front().cover_url;
     if (out.tracks.empty()) error = "文件夹内没有支持的音频文件，原歌单已保留";
     return out;
 }

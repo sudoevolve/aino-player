@@ -58,6 +58,8 @@ struct Transfer {
         curl_easy_setopt(handle, CURLOPT_PROTOCOLS, long(CURLPROTO_HTTP | CURLPROTO_HTTPS));
         curl_easy_setopt(handle, CURLOPT_REDIR_PROTOCOLS, long(CURLPROTO_HTTP | CURLPROTO_HTTPS));
         curl_easy_setopt(handle, CURLOPT_USERAGENT, "aino-player/1.0");
+        curl_easy_setopt(handle, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(handle, CURLOPT_XFERINFOFUNCTION, +[](void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int { return net::cancelled() ? 1 : 0; });
         curl_easy_setopt(handle, CURLOPT_ACCEPT_ENCODING, "");
         for (const auto& h : req.headers) headers = curl_slist_append(headers, h.c_str());
         if (headers) curl_easy_setopt(handle, CURLOPT_HTTPHEADER, headers);
@@ -157,30 +159,43 @@ inline AudioProbe probe_audio(const std::string& url, const std::vector<std::str
 }
 inline bool download(const std::string& url, const std::string& path, const std::vector<std::string>& headers,
                      const std::function<void(long long, long long)>& progress, const std::atomic<bool>& cancel,
-                     std::string& err, int timeout_ms = 20000) {
+                     std::string& err, int timeout_ms = 20000,
+                     const std::function<bool(const char*, size_t)>& sink = {}) {
     detail::Transfer transfer;
     if (!transfer.setup({url, {}, headers, timeout_ms, true})) { err = "网络初始化失败"; return false; }
-    auto* f = platform::fopen(path, "wb");
-    if (!f) { err = "无法创建临时文件"; return false; }
+    auto* file = sink ? nullptr : platform::fopen(path, "wb");
+    if (!sink && !file) { err = "无法创建临时文件"; return false; }
+    struct Output { std::FILE* file; const std::function<bool(const char*,size_t)>& sink; size_t bytes = 0; } output{file, sink};
     struct Progress { const std::atomic<bool>& cancel; const std::function<void(long long,long long)>& fn; } state{cancel, progress};
     curl_easy_setopt(transfer.handle, CURLOPT_FAILONERROR, 1L);
+    // 播放时管道背压会暂停网络读取，不能把整首播放时间当成总下载超时。
+    if (sink) {
+        curl_easy_setopt(transfer.handle, CURLOPT_TIMEOUT_MS, 0L);
+        curl_easy_setopt(transfer.handle, CURLOPT_LOW_SPEED_LIMIT, 1L);
+        curl_easy_setopt(transfer.handle, CURLOPT_LOW_SPEED_TIME, 20L);
+    }
     curl_easy_setopt(transfer.handle, CURLOPT_WRITEFUNCTION, +[](char* p, size_t a, size_t b, void* data) -> size_t {
-        return std::fwrite(p, 1, a * b, static_cast<std::FILE*>(data));
+        auto& output = *static_cast<Output*>(data);
+        const auto n = a * b;
+        if (net::cancelled()) return 0;
+        const auto written = output.sink ? (output.sink(p, n) ? n : size_t(0)) : std::fwrite(p, 1, n, output.file);
+        output.bytes += written; return written;
     });
-    curl_easy_setopt(transfer.handle, CURLOPT_WRITEDATA, f);
+    curl_easy_setopt(transfer.handle, CURLOPT_WRITEDATA, &output);
     curl_easy_setopt(transfer.handle, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(transfer.handle, CURLOPT_XFERINFOFUNCTION, +[](void* p, curl_off_t total, curl_off_t got, curl_off_t, curl_off_t) -> int {
         auto& state = *static_cast<Progress*>(p);
-        if (state.cancel.load()) return 1;
+        if (state.cancel.load() || net::cancelled()) return 1;
         if (state.fn) state.fn(got, total);
         return 0;
     });
     curl_easy_setopt(transfer.handle, CURLOPT_XFERINFODATA, &state);
     const auto rc = curl_easy_perform(transfer.handle);
-    const bool closed = std::fclose(f) == 0;
-    if (rc != CURLE_OK || !closed || platform::file_size(path) <= 0) {
-        err = cancel.load() ? "已取消" : rc != CURLE_OK ? curl_easy_strerror(rc) : "文件写入失败或响应为空";
-        platform::remove(path); return false;
+    const bool closed = !file || std::fclose(file) == 0;
+    if (rc != CURLE_OK || !closed || !output.bytes || cancel.load() || net::cancelled()) {
+        err = cancel.load() || net::cancelled() ? "已取消" : rc != CURLE_OK ? curl_easy_strerror(rc) : "文件写入失败或响应为空";
+        if (!sink) platform::remove(path);
+        return false;
     }
     return true;
 }
