@@ -65,7 +65,8 @@ struct Transfer {
             curl_easy_setopt(handle, CURLOPT_POSTFIELDS, req.body.data());
             curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE_LARGE, curl_off_t(req.body.size()));
         }
-        curl_easy_setopt(handle, CURLOPT_HEADERFUNCTION, +[](char* p, size_t a, size_t b, void* data) -> size_t {
+        // 部分 libcurl 头文件把 setopt 定义为宏，不能把含逗号声明的 lambda 直接作为宏参数。
+        const auto header_callback = +[](char* p, size_t a, size_t b, void* data) -> size_t {
             const size_t n = a * b;
             std::string line(p, n), lower = line;
             std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return char(std::tolower(c)); });
@@ -79,7 +80,8 @@ struct Transfer {
             if (lower.rfind("set-cookie:", 0) == 0) static_cast<Transfer*>(data)->set_cookies.push_back(value(11));
             if (lower.rfind("location:", 0) == 0) static_cast<Transfer*>(data)->location = value(9);
             return n;
-        });
+        };
+        curl_easy_setopt(handle, CURLOPT_HEADERFUNCTION, header_callback);
         curl_easy_setopt(handle, CURLOPT_HEADERDATA, this);
         return true;
     }
