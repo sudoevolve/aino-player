@@ -64,6 +64,13 @@ def build(output, jobs):
         candidates = [Path("C:/msys64/usr/bin/bash.exe"), Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/bin/bash.exe"]
         bash = next((str(path) for path in candidates if path.exists()), bash)
     make = shutil.which("make") or shutil.which("mingw32-make")
+    if windows:
+        # CI 可能同时安装多套 make；优先与 Bash 同一 MSYS2 的工具。
+        sibling_make = Path(bash).with_name("make.exe") if bash else None
+        if sibling_make and sibling_make.exists():
+            make = str(sibling_make)
+        else:
+            make = shutil.which("mingw32-make") or make
     if not bash or not make or not shutil.which("gcc"):
         raise RuntimeError("Build needs bash, GNU make and GCC (Windows: MSYS2 UCRT64 or MinGW-w64 + Git Bash)")
     environment = dict(os.environ)
@@ -94,7 +101,8 @@ def build(output, jobs):
         subprocess.run([bash, configure, *flags], cwd=directory, check=True, env=environment)
     else:
         print("Reusing FFmpeg configuration; checking incremental build", flush=True)
-    if reconfigure and windows and "mingw32-make" in Path(make).name.lower():
+    if reconfigure and windows:
+        # native GNU make 也可能命名为 make.exe，不能只按文件名识别。
         source_windows = source.resolve().as_posix()
         source_msys = "/" + source_windows[0].lower() + source_windows[2:]
         for name in ("makefile", "ffbuild/config.mak"):
