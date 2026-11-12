@@ -24,6 +24,18 @@ int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--ffmpeg-license") {
         std::printf("%s\n", audio::decoder_license().c_str()); return 0;
     }
+#ifdef _WIN32
+    // UI 线程先建立 STA，避免首帧 WIC 图标解码或音频初始化先选定 MTA，影响 TSF。
+    // 此对象晚于窗口及业务音频资源销毁，最后再释放本线程的 COM 初始化引用。
+    struct UiApartment {
+        HRESULT result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        ~UiApartment() { if (SUCCEEDED(result)) CoUninitialize(); }
+    } ui_apartment;
+    if (FAILED(ui_apartment.result)) {
+        std::fprintf(stderr, "Cannot initialize UI COM apartment: 0x%08lx\n", static_cast<unsigned long>(ui_apartment.result));
+        return 1;
+    }
+#endif
 #ifdef AINO_PLATFORM_X11
     // 后台任务调用 wake() 前，必须先初始化 Xlib 的线程支持。
     if (!XInitThreads()) { std::fprintf(stderr, "Xlib thread initialization failed\n"); return 1; }

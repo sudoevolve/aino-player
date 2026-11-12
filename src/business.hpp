@@ -3172,7 +3172,7 @@ void shutdown(bool smoke_test) {
     g_update_cancel.store(true);
     g_covers.clear(); // 退出只等待正在下载的封面，不继续处理积压的队列。
     login::shutdown();
-    g_player.close();
+    g_player.shutdown(); // 入口仍持有 UI 线程的 COM apartment，此处先释放音频引擎。
     { std::lock_guard<std::mutex> lock(g_mu); g_pending_stream.reset(); g_active_stream_spec = {}; }
     background::stop();
     g_current_media.reset();

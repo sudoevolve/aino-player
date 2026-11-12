@@ -339,6 +339,10 @@ void Player::close() {
     if (impl_->sound_ready) { ma_sound_uninit(&impl_->sound); impl_->sound_ready = false; }
     if (impl_->stream) { impl_->stream->cancel(); impl_->stream.reset(); }
 }
+void Player::shutdown() {
+    close();
+    if (impl_->engine_ready) { ma_engine_uninit(&impl_->engine); impl_->engine_ready = false; }
+}
 bool Player::play() {
     if (!impl_->sound_ready) return false;
     const auto rc = ma_sound_start(&impl_->sound);

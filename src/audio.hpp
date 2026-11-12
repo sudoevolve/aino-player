@@ -52,6 +52,8 @@ public:
     bool open(const std::string& path);
     bool open_stream(std::shared_ptr<Stream> stream);
     void close();
+    /** @brief 在所属线程退出 COM 前释放声音及音频引擎；普通切歌仍使用 close。 */
+    void shutdown();
     bool play();
     void pause();
     void resume();

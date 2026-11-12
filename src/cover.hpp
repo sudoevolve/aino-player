@@ -45,18 +45,21 @@ namespace detail {
 
 #ifdef _WIN32
 
-// COM 按线程初始化：解码发生在哪条线程，就得在那条线程上 CoInitializeEx
-inline void com_init_once() {
-    static thread_local bool inited = false;
-    if (inited) return;
-    inited = true;
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-}
+// WIC 同时用于 UI 图标和后台封面；沿用线程已有的 apartment，只释放本次成功取得的引用。
+struct DecodeApartment {
+    HRESULT result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    ~DecodeApartment() { if (SUCCEEDED(result)) CoUninitialize(); }
+    DecodeApartment() = default;
+    DecodeApartment(const DecodeApartment&) = delete;
+    DecodeApartment& operator=(const DecodeApartment&) = delete;
+};
 
 // 解码并在解码阶段就缩放到长边 ≤ max_side：一次到位，避免每帧缩放开销
 inline bool decode(const std::vector<uint8_t>& bytes, int max_side, Image& out) {
     if (bytes.size() < 16) return false;
-    com_init_once();
+    DecodeApartment apartment;
+    // 已有 STA 时返回 RPC_E_CHANGED_MODE，WIC 可在原 apartment 内使用，不能为失败调用 CoUninitialize。
+    if (FAILED(apartment.result) && apartment.result != RPC_E_CHANGED_MODE) return false;
 
     IWICImagingFactory* factory = nullptr;
     if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
