@@ -1,5 +1,6 @@
 name: build-and-test
-on: [push, pull_request]
+# 日常提交不自动跑回归；新版本由 release.yml 执行完整检查。
+on: workflow_dispatch
 jobs:
   linux:
     runs-on: ubuntu-24.04
