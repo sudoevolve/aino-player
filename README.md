@@ -60,12 +60,12 @@ Windows 文件夹选择器在独立 STA 任务打开，关闭应用会取消选�
 
 ## 下载与安装
 
-正式版在 [GitHub Releases](https://github.com/sudoevolve/aino-player/releases)。本次版本 v0.2.2 包含 Windows 搜索输入法及滑条反馈修复、流式播放、任务取消、渐进搜索、本地歌单管理和 Linux 资源开销优化；继续提供安装器、便携版和 deb。
+正式版在 [GitHub Releases](https://github.com/sudoevolve/aino-player/releases)。本次版本 v0.2.3 包含 Windows 搜索输入法及滑条反馈修复、流式播放、任务取消、渐进搜索、本地歌单管理和 Linux 资源开销优化；继续提供安装器、便携版和 deb。
 
 Windows x64 产物同时提供 `*-setup-windows-x64.exe` 安装器和 `*-windows-x64.exe` 便携版。安装器按当前用户安装到 `%LOCALAPPDATA%\Programs\Aino Player`，不需管理员权限，提供开始菜单、可选桌面快捷方式和卸载入口。后续从设置更新会通过安装器覆盖升级；首次从便携版迁移也使用该固定目录，原便携 exe 可自行移除。Linux amd64 下载 `.deb` 并使用软件安装器，或执行：
 
 ```bash
-sudo apt install ./aino-player_0.2.2_amd64.deb
+sudo apt install ./aino-player_0.2.3_amd64.deb
 ```
 
 Linux 包面向 Ubuntu 22.04+ / Debian 12+；Wayland 桌面需要 XWayland。更新和卸载保留用户配置、本地资料库及下载音乐；数据清理由播放器设置单独处理。启动检查更新不阻塞播放，每次启动检查一次，网络失败可在设置重试，不需要 GitHub 令牌。旧版更新器会在浏览器中下载安装包，新版才支持应用内下载并启动安装器。
@@ -134,7 +134,7 @@ aino_player --diagnostics
 
 网络拖动进度会重新连接并从头解码丢弃至目标，保留暂停状态，等待时显示缓冲；不承诺 HTTP Range 快速随机定位。尾部 moov 等不能通过单向管道读取的容器会退回整首缓存和 WAV 解码；起播后断流也尝试完整文件恢复。尚未实现无缝切歌。内置 FFmpeg 只启用本地文件和管道协议，不包含网络、视频解码或额外外部库；无需 Windows Media Foundation。
 
-上述流式播放、管理与输入法修复纳入 v0.2.2，Windows 搜索中文输入已由用户实机确认恢复正常。用户明确要求发布后，由发布流程统一执行 Windows/Linux 编译和回归，通过后打包发布；不将 CI 或 Xvfb 检查视为反馈者 Ubuntu 播放场景的实机验证。YouTube 实网测试继续暂停。
+上述流式播放、管理与输入法修复纳入 v0.2.3，Windows 搜索中文输入已由用户实机确认恢复正常。用户明确要求发布后，由发布流程统一执行 Windows/Linux 编译和回归，通过后打包发布；不将 CI 或 Xvfb 检查视为反馈者 Ubuntu 播放场景的实机验证。YouTube 实网测试继续暂停。
 解码器字节嵌入播放器可执行文件，首次需要时释放到本进程的私有临时缓存；正常退出删除，异常退出的旧文件可通过「设置 → 数据与缓存 → 清除缓存」清理，运行中的实例会保留。原音乐文件不改写；完整文件回退解码有 120 秒上限，取消会终止子进程，失败的临时输出会清理。Linux 临时目录需允许执行程序。
 
 「设置」底部显示解码器版本、体积和许可。命令行 `--codec-info` 查看内置信息，`--ffmpeg-license` 输出完整许可、源码校验值和编译选项；`AINO_FFMPEG` 可指定替代解码器路径。默认构建必须带解码器，缺失时 CMake 明确报错；仅开发时可显式使用 `-DAINO_BUNDLE_FFMPEG=OFF`，此时才依赖系统 FFmpeg。外部精简产物可用 `-DAINO_FFMPEG_EXECUTABLE=/absolute/path/to/ffmpeg` 指定。
@@ -211,7 +211,7 @@ Apache-2.0。`src/aino.hpp` 版权归 sudoevolve，见 `LICENSE-aino`。
 
 ## 发布流程
 
-`CMakeLists.txt` 中的项目版本是版本号来源。仅在明确要求发布新版本时运行回归，普通提交不触发 CI。推送对应 `v*` 标签后，`release.yml` 分别在 Windows 和 Ubuntu 编译精简 FFmpeg、嵌入播放器并运行无系统解码器的回归；Linux 生成 deb 后验证安装与 Xvfb 启动。两端成功后发布 exe、deb、FFmpeg 官方原始源码包、构建信息、许可及 `SHA256SUMS.txt`。当前 `0.2.2` 对应标签 `v0.2.2`，标签与程序版本不符或缺少内置解码器会中止发布；不会覆盖旧版标签或安装包。
+`CMakeLists.txt` 中的项目版本是版本号来源。仅在明确要求发布新版本时运行回归，普通提交不触发 CI。推送对应 `v*` 标签后，`release.yml` 分别在 Windows 和 Ubuntu 编译精简 FFmpeg、嵌入播放器并运行无系统解码器的回归；Linux 生成 deb 后验证安装与 Xvfb 启动。两端成功后发布 exe、deb、FFmpeg 官方原始源码包、构建信息、许可及 `SHA256SUMS.txt`。当前 `0.2.3` 对应标签 `v0.2.3`，标签与程序版本不符或缺少内置解码器会中止发布；不会覆盖旧版标签或安装包。
 
 本地 Debian 打包：
 

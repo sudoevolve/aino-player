@@ -1,4 +1,4 @@
-## aino player v0.2.2
+## aino player v0.2.3
 
 ### 更新内容
 
@@ -15,8 +15,8 @@
 
 ### 安装与升级
 
-- **Windows x64**：推荐 `aino-player-v0.2.2-setup-windows-x64.exe`，按当前用户安装，无需管理员权限；同时提供 `aino-player-v0.2.2-windows-x64.exe` 便携版。可从播放器设置检查更新并运行安装器覆盖升级。
-- **Ubuntu 22.04+ / Debian 12+ amd64**：下载 `aino-player_0.2.2_amd64.deb`，使用软件安装器或 `sudo apt install ./aino-player_0.2.2_amd64.deb`。建议安装 `fonts-noto-cjk`。
+- **Windows x64**：推荐 `aino-player-v0.2.3-setup-windows-x64.exe`，按当前用户安装，无需管理员权限；同时提供 `aino-player-v0.2.3-windows-x64.exe` 便携版。可从播放器设置检查更新并运行安装器覆盖升级。
+- **Ubuntu 22.04+ / Debian 12+ amd64**：下载 `aino-player_0.2.3_amd64.deb`，使用软件安装器或 `sudo apt install ./aino-player_0.2.3_amd64.deb`。建议安装 `fonts-noto-cjk`。
 - 官网登录回传使用受支持的 Chrome / Edge / Chromium，无需扩展和内嵌 WebView；Firefox 暂不支持。
 
 ### 验证与边界
