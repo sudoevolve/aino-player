@@ -1,3 +1,12 @@
+## 未发布：内置精简音频解码器
+
+- Windows / Linux 构建默认嵌入精简 FFmpeg，无需另装系统 FFmpeg 即可播放 AAC/M4A、ALAC、Ogg/Opus、WebM；Windows 解码器约 2.97 MiB。
+- 保留 miniaudio 播放链路；原文件不改写，正常退出删除释放的解码器，缓存清理可移除已退出进程的残留。
+- 设置显示内置解码器信息，增加 `--codec-info` 和 `--ffmpeg-license`；支持 `AINO_FFMPEG` 替换。
+- 发布前自动验证在无系统 FFmpeg 环境下解码，并附带 FFmpeg 源码、构建信息与许可。
+
+以下为已有版本说明；已有 v0.1.0 安装包未更新。
+
 ## aino player v0.1.0
 
 - 默认进入发现页，恢复播放队列；支持本地收藏、命名歌单和其他在线歌单快照。

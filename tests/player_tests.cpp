@@ -9,6 +9,9 @@
 static void check(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
 int main(int argc, char** argv) {
     try {
+        if (argc > 1 && std::string(argv[1]) == "--codec-info") {
+            std::cout << audio::decoder_info() << std::endl; return 0;
+        }
         if (argc > 1 && std::string(argv[1]) == "--child-sleep") { platform::sleep_ms(3000); return 0; }
         if (argc > 3 && std::string(argv[1]) == "--source-response") {
             net::Response response;
@@ -127,7 +130,8 @@ int main(int argc, char** argv) {
             }
             login::shutdown(); return 0;
         }
-        if (argc > 2 && std::string(argv[1]) == "--audio-device") {
+        if (argc > 2 && (std::string(argv[1]) == "--audio-device" || std::string(argv[1]) == "--audio-decode" ||
+                         std::string(argv[1]) == "--audio-reject")) {
             std::string playable, error;
             std::string path = argv[2];
             std::string conversion = argc > 3 ? argv[3] : "";
@@ -140,9 +144,17 @@ int main(int argc, char** argv) {
             LocalFree(args);
 #endif
             const bool prepared = audio::prepare_file(path, playable, error, conversion);
+            if (std::string(argv[1]) == "--audio-reject") {
+                check(!prepared && !error.empty(), "corrupt audio must report decode failure");
+                check(!platform::exists(conversion + ".part.wav"), "failed conversion cleaned up");
+                std::cout << "Invalid audio rejected\n"; return 0;
+            }
             check(prepared, error.c_str());
             const auto info = audio::inspect_mp3(playable);
-            check(info.valid && info.sample_rate > 0, "audio decoded");
+            check(info.valid && info.sample_rate > 0 && info.duration_ms >= 900, "audio decoded with duration");
+            if (std::string(argv[1]) == "--audio-decode") {
+                std::cout << "Audio decode checks passed\n"; return 0;
+            }
             audio::Player player;
             const bool opened = player.open(playable);
             check(opened, player.error().c_str());
@@ -215,9 +227,13 @@ int main(int argc, char** argv) {
             auto* handle = platform::fopen(platform::join(cache_root, relative), "wb");
             check(handle != nullptr, "cache fixture file"); std::fputs("fixture", handle); std::fclose(handle);
         };
-        for (const auto& relative : {"track-1.mp3", "7/track-2.m4a", "7/track-2.m4a.pcm.wav", "7/track-3.mp3", "8/track-4.flac", "9/track-5.wav", "outside/keep.txt", "library.json"}) fixture(relative);
+        for (const auto& relative : {"track-1.mp3", "7/track-2.m4a", "7/track-2.m4a.pcm.wav", "7/track-3.mp3", "8/track-4.flac", "9/track-5.wav", "outside/keep.txt", "library.json",
+                                    "7/ffmpeg-0123456789abcdef.exe", "8/ffmpeg-0123456789abcdef.exe.part", "9/ffmpeg-0123456789abcdef.exe"}) fixture(relative);
         const auto cleaned = cache::clear_audio(cache_root, 7, "track-2.", true, [](uint32_t pid) { return pid == 9; });
-        check(cleaned.files == 3 && cleaned.errors == 0, "cache cleanup removes legacy, stale and unused current audio");
+        check(cleaned.files == 4 && cleaned.errors == 0, "cache cleanup removes legacy, stale audio and abandoned decoder");
+        for (const auto& relative : {"7/ffmpeg-0123456789abcdef.exe", "9/ffmpeg-0123456789abcdef.exe"})
+            check(platform::exists(platform::join(cache_root, relative)), "cache cleanup preserves live decoder executables");
+        check(!cache::codec_file("ffmpeg-unrelated.exe") && !cache::codec_file("ffmpeg-0123456789abcdef.txt"), "codec cleanup recognizes only owned names");
         for (const auto& relative : {"7/track-2.m4a", "7/track-2.m4a.pcm.wav", "9/track-5.wav", "outside/keep.txt", "library.json"})
             check(platform::exists(platform::join(cache_root, relative)), "cache cleanup preserves active playback, other processes and unrelated data");
         fixture("7/track-6.mp3");
@@ -235,7 +251,8 @@ int main(int argc, char** argv) {
             platform::remove(platform::join(cache_root, "outside/track-10.mp3"));
             platform::remove(linked);
         }
-        for (const auto& relative : {"7/track-2.m4a", "7/track-2.m4a.pcm.wav", "7/track-6.mp3", "9/track-5.wav", "outside/keep.txt", "library.json", "7", "8", "9", "outside"})
+        for (const auto& relative : {"7/track-2.m4a", "7/track-2.m4a.pcm.wav", "7/track-6.mp3", "9/track-5.wav", "outside/keep.txt", "library.json",
+                                    "7/ffmpeg-0123456789abcdef.exe", "9/ffmpeg-0123456789abcdef.exe", "7", "8", "9", "outside"})
             platform::remove(platform::join(cache_root, relative));
         platform::remove(cache_root);
         const auto utf16 = tag::utf16le_bom("中😀");

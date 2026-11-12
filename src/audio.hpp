@@ -11,6 +11,10 @@ struct MediaInfo {
     long long duration_ms = 0;
 };
 MediaInfo inspect_mp3(const std::string& path);
+/** @brief 返回内置解码器的版本、体积和许可概况，未内置时明确说明。 */
+std::string decoder_info();
+/** @brief 返回随内置解码器提供的完整许可、来源校验值及构建信息。 */
+std::string decoder_license();
 bool prepare_file(const std::string& path, std::string& playable, std::string& err, const std::string& conversion_path = {});
 class Player {
 public:

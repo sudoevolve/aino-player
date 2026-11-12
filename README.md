@@ -27,7 +27,7 @@ https://y.qq.com/n/ryqq/playlist/123
 
 ## 导入本地音乐
 
-打开「歌单 → 本地」，在第三行选择音乐文件夹（Windows）或粘贴路径（Windows / Linux），点击「导入文件夹」。默认包含子文件夹，可以关闭。支持 MP3、FLAC、WAV、M4A、AAC、Ogg、Opus、WebM；后三类及 AAC 需要系统 FFmpeg 解码。
+打开「歌单 → 本地」，在第三行选择音乐文件夹（Windows）或粘贴路径（Windows / Linux），点击「导入文件夹」。默认包含子文件夹，可以关闭。支持 MP3、FLAC、WAV、M4A、AAC、Ogg、Opus、WebM；AAC/M4A（含 ALAC）、Ogg/Opus 和 WebM 由内置精简 FFmpeg 解码，无需用户安装系统 FFmpeg。
 
 导入后点击歌单进入独立详情，点击一首或「播放全部」开始播放。文件名 `歌手 - 标题` 会拆为歌手和标题；其他文件使用文件名，专辑取父目录名，尚不解析完整 ID3/Vorbis 标签。原生解码格式会在后台扫描时读取时长。与音频同名的 UTF-8 `.lrc` 自动作为本地歌词（支持 BOM），不会向在线歌词接口提交本地路径。
 
@@ -55,7 +55,12 @@ Linux 包面向 Ubuntu 22.04+ / Debian 12+；Wayland 桌面需要 XWayland。更
 
 ## 构建
 
+先编译精简解码器，再构建播放器。解码器源码固定为 FFmpeg 8.1.3，从官网获取并校验 SHA-256；构建时需要 Python 3.10.12+、GCC、GNU make 和 Bash。Windows 可用 MSYS2 UCRT64，或 MinGW-w64 + Git Bash。只在构建时下载源码，播放器运行时不会下载解码组件。
+
 ```bash
+# 首次构建解码器；生成 build/codec/ffmpeg.exe（Windows）或 ffmpeg（Linux）
+python tools/build_ffmpeg.py
+
 # MinGW-w64（GCC 12+，UCRT；需要 CMake 和 Ninja）
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
@@ -65,7 +70,8 @@ cmake -S . -B build -A x64
 cmake --build build --config Release
 
 # Ubuntu / Debian（Linux 使用 X11，Wayland 桌面需 XWayland）
-sudo apt-get install build-essential cmake libx11-dev libcurl4-openssl-dev libfreetype6 libfontconfig1 fonts-noto-cjk xdg-utils ffmpeg
+sudo apt-get install build-essential python3 cmake libx11-dev libcurl4-openssl-dev libfreetype6 libfontconfig1 fonts-noto-cjk xdg-utils
+python3 tools/build_ffmpeg.py
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 
@@ -75,7 +81,18 @@ ctest --test-dir build -C Release --output-on-failure
 
 Windows 需要 Windows SDK 或 mingw-w64 头文件。产物为 `build/aino_player.exe`（MSVC 为 `build/Release/aino_player.exe`），Linux 为 `build/aino_player`。Windows 静态链接 C/C++ 运行库；Linux 使用系统 libcurl、X11 和动态加载的字体/音频库。
 
-MP3、FLAC、WAV 由 miniaudio 直接解码。**AAC/m4a、Ogg/Opus、WebM 额外需要 `ffmpeg` 在 PATH 中**：后台转为临时 PCM WAV 后播放。未安装时会提示并尝试其他音源；不依赖原来的 Windows Media Foundation。
+MP3、FLAC、WAV 由 miniaudio 直接解码。**AAC/M4A、Ogg/Opus、WebM 使用内置精简 FFmpeg**：后台解码成缓存目录中的 PCM WAV，再交给 miniaudio 播放。Windows 精简解码器约 2.97 MiB；不包含网络、视频解码或额外外部库，不依赖 Windows Media Foundation。播放器仍先缓存、后解码，不做边下边播。
+
+解码器字节嵌入播放器可执行文件，首次需要时释放到本进程的私有临时缓存；正常退出删除，异常退出的旧文件可通过「设置 → 数据与缓存 → 清除缓存」清理，运行中的实例会保留。原音乐文件不改写；解码有 120 秒上限，失败的临时输出会清理。Linux 临时目录需允许执行程序。
+
+「设置」底部显示解码器版本、体积和许可。命令行 `--codec-info` 查看内置信息，`--ffmpeg-license` 输出完整许可、源码校验值和编译选项；`AINO_FFMPEG` 可指定替代解码器路径。默认构建必须带解码器，缺失时 CMake 明确报错；仅开发时可显式使用 `-DAINO_BUNDLE_FFMPEG=OFF`，此时才依赖系统 FFmpeg。外部精简产物可用 `-DAINO_FFMPEG_EXECUTABLE=/absolute/path/to/ffmpeg` 指定。
+
+内置解码回归使用仓库内的静音样本，不安装系统 FFmpeg，并清空子进程 PATH。无设备 CI 运行解码检查；真实设备可执行：
+
+```bash
+python tests/audio_formats_test.py build/portable/Release/player_tests.exe --bundled
+# Linux 将二进制路径替换为 build/player_tests；没有音频设备时加 --decode-only
+```
 
 ## 用法
 
@@ -138,11 +155,12 @@ Apache-2.0。`src/aino.hpp` 版权归 sudoevolve，见 `LICENSE-aino`。
 
 ## 发布流程
 
-`CMakeLists.txt` 中的项目版本是版本号来源。推送对应 `v*` 标签后，`release.yml` 分别在 Windows 和 Ubuntu 构建并运行回归；Linux 生成 deb 后验证安装与 Xvfb 启动，两端都成功才发布 exe、deb 和 `SHA256SUMS.txt`。例如 `0.1.0` 对应标签 `v0.1.0`，标签与程序版本不符会中止发布。
+`CMakeLists.txt` 中的项目版本是版本号来源。推送对应 `v*` 标签后，`release.yml` 分别在 Windows 和 Ubuntu 编译精简 FFmpeg、嵌入播放器并运行无系统解码器的回归；Linux 生成 deb 后验证安装与 Xvfb 启动。两端成功后发布 exe、deb、FFmpeg 官方原始源码包、构建信息、许可及 `SHA256SUMS.txt`。例如 `0.1.0` 对应标签 `v0.1.0`，标签与程序版本不符或缺少内置解码器会中止发布。已有 v0.1.0 仍是旧版，需新版本发布后才包含上述新功能。
 
 本地 Debian 打包：
 
 ```bash
+python3 tools/build_ffmpeg.py
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure

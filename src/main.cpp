@@ -18,6 +18,12 @@ int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--version") {
         std::printf("aino player %s\n", kVersion); return 0;
     }
+    if (argc > 1 && std::string(argv[1]) == "--codec-info") {
+        std::printf("%s\n", audio::decoder_info().c_str()); return 0;
+    }
+    if (argc > 1 && std::string(argv[1]) == "--ffmpeg-license") {
+        std::printf("%s\n", audio::decoder_license().c_str()); return 0;
+    }
 #ifdef AINO_PLATFORM_X11
     // 后台任务调用 wake() 前，必须先初始化 Xlib 的线程支持。
     if (!XInitThreads()) { std::fprintf(stderr, "Xlib thread initialization failed\n"); return 1; }

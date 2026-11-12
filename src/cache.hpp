@@ -20,6 +20,12 @@ inline bool audio_file(const std::string& name) {
     }
     return false;
 }
+inline bool codec_file(const std::string& name) {
+    if (name.rfind("ffmpeg-", 0) != 0 || name.size() < 23 ||
+        name.substr(7, 16).find_first_not_of("0123456789abcdef") != std::string::npos) return false;
+    const auto suffix = name.substr(23);
+    return suffix.empty() || suffix == ".exe" || suffix == ".part" || suffix == ".exe.part";
+}
 /** @brief 清理指定缓存根目录；调用方须锁住本进程的写入后才允许清理当前目录。 */
 inline Cleanup clear_audio(const std::string& root, uint32_t current_pid, const std::string& keep_prefix,
                            bool clear_current, const std::function<bool(uint32_t)>& alive = platform::process_running) {
@@ -29,9 +35,9 @@ inline Cleanup clear_audio(const std::string& root, uint32_t current_pid, const 
     const auto status = platform::fs::symlink_status(base, ec);
     if (ec == std::errc::no_such_file_or_directory) return result;
     if (ec || !platform::fs::is_directory(status) || platform::fs::is_symlink(status)) { ++result.errors; return result; }
-    auto clean_file = [&](const platform::fs::directory_entry& entry, const std::string& prefix) {
+    auto clean_file = [&](const platform::fs::directory_entry& entry, const std::string& prefix, bool stale_codec = false) {
         const auto name = entry.path().filename().u8string();
-        if (!audio_file(name)) return;
+        if (!audio_file(name) && !(stale_codec && codec_file(name))) return;
         std::error_code error;
         const auto type = entry.symlink_status(error);
         if (error || !platform::fs::is_regular_file(type)) { if (error) ++result.errors; return; }
@@ -57,7 +63,7 @@ inline Cleanup clear_audio(const std::string& root, uint32_t current_pid, const 
         const bool current = pid == current_pid;
         if ((current && !clear_current) || (!current && alive(pid))) { ++result.kept; continue; }
         for (platform::fs::directory_iterator child(it->path(), error), child_end; !error && child != child_end; child.increment(error))
-            clean_file(*child, current ? keep_prefix : std::string());
+            clean_file(*child, current ? keep_prefix : std::string(), !current);
         if (error) ++result.errors;
         // 仅移除已空的旧进程目录；未知文件或嵌套目录一律保留。
         if (!current && platform::fs::is_empty(it->path(), error) && !error) platform::fs::remove(it->path(), error);

@@ -1211,11 +1211,13 @@ static void tab_settings(Ctx& c) {
     if (c.ui.button(c.model.update.status == UpdateStatus::Available ? "发现新版" : "版本更新", {mx + mw - 224, 21, 100, 28}, Style().font(11.5f))) c.model.ui.update_settings = true;
     if (c.ui.button("数据与缓存", {mx + mw - 112, 21, 112, 28}, Style().font(11.5f))) c.model.ui.storage_settings = true;
 
-    account_card(c, 0, {mx, 60, mw, 110});
-    account_card(c, 1, {mx, 182, mw, 110});
+    c.ui.scroll({mx, 60, mw, c.bar_y - 72}, 1, 670, [&](int, const Rect& area) {
+    const float dy = area.y - 60;
+    account_card(c, 0, {mx, 60 + dy, mw, 110});
+    account_card(c, 1, {mx, 182 + dy, mw, 110});
 
     // ---------------- 外观 ----------------
-    const Rect look{mx, 304, mw, 56};
+    const Rect look{mx, 304 + dy, mw, 56};
     c.ui.panel(look, Style().corner(12));
     Style lbl;
     lbl.font_size = 11.5f;
@@ -1228,7 +1230,7 @@ static void tab_settings(Ctx& c) {
     }
 
     // ---------------- 音质 ----------------
-    const Rect qcard{mx, 372, mw, 56};
+    const Rect qcard{mx, 372 + dy, mw, 56};
     c.ui.panel(qcard, Style().corner(12));
     c.ui.draw_text("默认音质", {qcard.x + 20, qcard.y + 18, 120, 20}, c.th.label2, lbl);
     int q = c.model.ui.settings.quality;
@@ -1239,7 +1241,7 @@ static void tab_settings(Ctx& c) {
     }
 
     // ---------------- 播放 ----------------
-    const Rect card{mx, 440, mw, 84};
+    const Rect card{mx, 440 + dy, mw, 84};
     c.ui.panel(card, Style().corner(12));
     c.ui.draw_text("默认音量", {card.x + 20, card.y + 12, 120, 16}, c.th.label2, Style().font(11.5f));
     static SeekBar set_vol_bar;
@@ -1253,7 +1255,7 @@ static void tab_settings(Ctx& c) {
     c.ui.muted_text(buf, {card.x + 20, card.y + 60, card.w - 40, 16}, Style().font(10.0f));
 
     // ---------------- 下载 ----------------
-    const Rect dlcard{mx, 536, mw, 110};
+    const Rect dlcard{mx, 536 + dy, mw, 110};
     c.ui.panel(dlcard, Style().corner(12));
     c.ui.draw_text("下载目录", {dlcard.x + 20, dlcard.y + 10, 160, 16}, c.th.label2, Style().font(11.5f));
     if (c.ui.input(&c.model.ui.download_dir, {dlcard.x + 20, dlcard.y + 30, dlcard.w - 40, 28},
@@ -1274,6 +1276,8 @@ static void tab_settings(Ctx& c) {
         c.model.ui.config_dirty = true;
     }
 
+    c.ui.muted_text("音频解码：" + audio::decoder_info(), {mx + 20, 666 + dy, mw - 40, 20}, Style().font(10.5f));
+    });
 }
 
 // 歌词图标：三条递减的横线（像一段排版好的歌词）
