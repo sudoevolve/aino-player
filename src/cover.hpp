@@ -19,6 +19,7 @@
 #endif
 
 #include <functional>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -117,12 +118,12 @@ bool decode(const std::vector<uint8_t>& bytes, int max_side, Image& out);
 class Store {
 public:
     void set_notifier(std::function<void()> fn) { notify_ = std::move(fn); }
-    void clear() { std::lock_guard<std::mutex> lock(m_); ++generation_; map_.clear(); }
+    void clear() { std::lock_guard<std::mutex> lock(m_); ++generation_; map_.clear(); pending_.clear(); }
 
     // 就绪返回图；没就绪返回空（并确保后台已经在取）。UI 线程每帧调它。
     std::shared_ptr<const Image> get(const std::string& url) {
         if (url.empty()) return nullptr;
-        unsigned generation = 0;
+        bool launch = false;
         {
             std::lock_guard<std::mutex> lk(m_);
             auto it = map_.find(url);
@@ -130,14 +131,28 @@ public:
                 if (it->second.state == 2) return it->second.img;
                 return nullptr;
             }
-            map_[url].state = 1;  // 下载中
-            generation = generation_;
+            if (pending_.size() >= 32) return nullptr;
+            map_[url].state = 1;
+            pending_.push_back({url, generation_});
+            if (workers_ < 2) { ++workers_; launch = true; }
         }
-        background::start([this, url, generation] { load(url, generation); });
+        if (launch) background::start([this] { drain(); });
         return nullptr;
     }
 
 private:
+    void drain() {
+        for (;;) {
+            std::pair<std::string, unsigned> next;
+            {
+                std::lock_guard<std::mutex> lock(m_);
+                if (pending_.empty()) { --workers_; return; }
+                next = std::move(pending_.front()); pending_.pop_front();
+                if (next.second != generation_) continue;
+            }
+            load(next.first, next.second);
+        }
+    }
     struct Entry {
         int state = 0;  // 0 未知 / 1 下载中 / 2 就绪 / 3 失败
         std::shared_ptr<const Image> img;
@@ -158,11 +173,11 @@ private:
             Entry& e = map_[url];
             e.state = ok ? 2 : 3;
             if (ok) e.img = img;
-            // 简单的容量控制：超过 160 张就把已经就绪的前一半丢掉
+            // 失败条目也参与容量回收，避免失效 URL 长期堆积。
             if (map_.size() > 160) {
                 int budget = int(map_.size() / 2);
                 for (auto it = map_.begin(); it != map_.end() && budget > 0;) {
-                    if (it->second.state == 2) {
+                    if (it->second.state != 1 && it->first != url) {
                         it = map_.erase(it);
                         --budget;
                     } else {
@@ -176,6 +191,8 @@ private:
 
     std::mutex m_;
     std::map<std::string, Entry> map_;
+    std::deque<std::pair<std::string, unsigned>> pending_;
+    unsigned workers_ = 0;
     unsigned generation_ = 0;
     std::function<void()> notify_;
 };

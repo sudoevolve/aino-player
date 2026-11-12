@@ -5,8 +5,87 @@
 #include <stdexcept>
 
 static void check(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
-int main() {
+static std::vector<unsigned char> scale_settings(bool little, unsigned dpi, unsigned factor) {
+    std::vector<unsigned char> data(4); data[0] = little ? 0 : 1;
+    auto append = [&](unsigned v, int n) { for (int i = 0; i < n; ++i) data.push_back(uint8_t(v >> (8 * (little ? i : n - 1 - i)))); };
+    append(1, 4); append(2, 4);
+    for (const auto& entry : {std::make_pair(std::string("Xft/DPI"), dpi), std::make_pair(std::string("Gdk/WindowScalingFactor"), factor)}) {
+        append(0, 2); append(unsigned(entry.first.size()), 2);
+        data.insert(data.end(), entry.first.begin(), entry.first.end());
+        while (data.size() % 4) data.push_back(0);
+        append(1, 4); append(entry.second, 4);
+    }
+    return data;
+}
+#ifdef AINO_PLATFORM_X11
+static void linux_backend_checks() {
+    using namespace aino;
+    check(XInitThreads(), "Xlib threads");
+    unsetenv("AINO_SCALE"); unsetenv("GDK_SCALE");
+    auto* desktop = XOpenDisplay(nullptr); check(desktop != nullptr, "Xvfb display");
+    const auto root = DefaultRootWindow(desktop);
+    const auto selection = XInternAtom(desktop, "_XSETTINGS_S0", False);
+    const auto property = XInternAtom(desktop, "_XSETTINGS_SETTINGS", False);
+    const auto owner = XCreateSimpleWindow(desktop, root, 0, 0, 1, 1, 0, 0, 0);
+    auto publish = [&](unsigned dpi, unsigned factor) {
+        const auto bytes = scale_settings(true, dpi * 1024, factor);
+        XChangeProperty(desktop, owner, property, property, 8, PropModeReplace, bytes.data(), int(bytes.size()));
+        XSync(desktop, False);
+    };
+    publish(192, 2); XSetSelectionOwner(desktop, selection, owner, CurrentTime); XSync(desktop, False);
+    {
+        WindowConfig config; config.width = 220; config.height = 140; config.min_width = 120; config.min_height = 90;
+        aino::Window window(config); check(window.ok(), "scaled window creation");
+        auto* state = static_cast<detail::X11State*>(window.impl->native);
+        check(window.dpi_scale() == 2 && state->pw == 440 && state->ph == 280, "desktop scale applies to physical window");
+        XSizeHints hints{}; long supplied = 0;
+        XGetWMNormalHints(state->dpy, state->win, &hints, &supplied);
+        check(hints.min_width == 240 && hints.min_height == 180, "scaled minimum dimensions");
+        XEvent motion{}; motion.type = MotionNotify; motion.xmotion.x = 40; motion.xmotion.y = 60;
+        detail::x11_handle(state, motion); detail::x11_feed_input(state);
+        check(window.impl->ui.impl->input.mouse.x == 20 && window.impl->ui.impl->input.mouse.y == 30, "scaled input coordinates");
+        publish(144, 1);
+        XSync(state->dpy, False); window.poll();
+        check(window.dpi_scale() == 1.5f, "running window responds to desktop DPI changes");
+        window.set_size(200, 120); XSync(state->dpy, False); window.poll();
+        XWindowAttributes attributes{}; XGetWindowAttributes(state->dpy, state->win, &attributes);
+        check(attributes.width == 300 && attributes.height == 180, "set_size accepts logical dimensions");
+    }
+    XDestroyWindow(desktop, owner); XCloseDisplay(desktop);
+    detail::X11TextRenderer renderer; renderer.init(1, "sans", "monospace");
+    const auto width = renderer.measure("字体共享 Memory", 14, 400);
+    check(width > 0, "FreeType text metrics");
+    for (int size = 10; size <= 40; ++size) renderer.measure("字体共享 Memory", float(size), 400);
+    check(renderer.measure("字体共享 Memory", 14, 400) == width, "shared faces retain per-size glyph metrics");
+    const auto shared = renderer.cache_stats();
+    check(shared.faces > 0 && shared.faces < shared.fonts, "font faces are shared across sizes");
+    std::string glyphs;
+    for (uint32_t cp = 0x4e00; cp < 0x6e00; ++cp) {
+        glyphs.push_back(char(0xe0 | (cp >> 12))); glyphs.push_back(char(0x80 | ((cp >> 6) & 63))); glyphs.push_back(char(0x80 | (cp & 63)));
+    }
+    renderer.measure(glyphs, 40, 400);
+    check(renderer.cache_stats().glyph_bytes <= 4u * 1024u * 1024u, "glyph bitmap cache remains bounded");
+    std::cout << "Linux fonts=" << shared.fonts << " shared_faces=" << shared.faces << " glyph_bytes=" << renderer.cache_stats().glyph_bytes << '\n';
+    renderer.release(); check(renderer.cache_stats().faces == 0, "shared font faces released once");
+}
+#endif
+int main(int argc, char** argv) {
     try {
+        using namespace aino::detail;
+        for (const bool little : {false, true}) {
+            const auto bytes = scale_settings(little, 144 * 1024, 1);
+            const auto parsed = parse_xsettings_scale(bytes.data(), bytes.size());
+            check(parsed.dpi == 144 && parsed.factor == 1, "XSETTINGS endian and padding");
+            for (size_t n = 0; n < bytes.size(); ++n) check(parse_xsettings_scale(bytes.data(), n).dpi == 0, "truncated settings rejected without partial scale");
+        }
+        check(desktop_scale("1.25", nullptr, {192, 2}, 96) == 1.25f, "explicit fractional scale override");
+        check(desktop_scale("nan", "2", {}, 96) == 2, "invalid override falls back to GDK_SCALE");
+        check(desktop_scale("8", nullptr, {}, 144) == 1.5f, "resource DPI fallback and override bounds");
+        check(desktop_scale(nullptr, nullptr, {192, 2}, 96) == 2, "desktop settings are not multiplied twice");
+        check(desktop_scale(nullptr, nullptr, {}, 0) == 1 && parse_scale_number("1,5") == 0, "safe default and locale independent scale");
+#ifdef AINO_PLATFORM_X11
+        if (argc > 1 && std::string(argv[1]) == "--linux-backend") linux_backend_checks();
+#endif
         aino::Ui ui;
         auto& input = ui.impl->input;
         const aino::Rect box{0, 0, 100, 30};

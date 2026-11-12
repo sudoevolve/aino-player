@@ -6,9 +6,11 @@
 #include "../vendor/stb/stb_image.h"
 #include "cover.hpp"
 #include <algorithm>
+#include <climits>
 namespace cover { namespace detail {
 bool decode(const std::vector<uint8_t>& bytes, int max_side, Image& out) {
     int sw = 0, sh = 0, channels = 0;
+    if (max_side <= 0 || bytes.empty() || bytes.size() > size_t(INT_MAX)) return false;
     auto* pixels = stbi_load_from_memory(bytes.data(), int(bytes.size()), &sw, &sh, &channels, 4);
     if (!pixels || sw <= 0 || sh <= 0) { stbi_image_free(pixels); return false; }
     const double scale = std::min(1.0, double(max_side) / std::max(sw, sh));

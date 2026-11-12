@@ -31,6 +31,10 @@ int main(int argc, char** argv) {
     auto view = view_model();
     bool initial_search = argc > 1;
     bool smoke_test = argc > 1 && std::string(argv[1]) == "--smoke-test";
+#ifdef AINO_PLATFORM_X11
+    const bool diagnostics = argc > 1 && std::string(argv[1]) == "--diagnostics";
+    smoke_test = smoke_test || diagnostics;
+#endif
 #ifdef _WIN32
     int count = 0;
     if (auto args = CommandLineToArgvW(GetCommandLineW(), &count)) {
@@ -87,6 +91,18 @@ int main(int argc, char** argv) {
         }
         if (autostart) { autostart = false; bootstrap(initial_search, smoke_test); }
         ui::draw(ui, model);
+#ifdef AINO_PLATFORM_X11
+        if (diagnostics) {
+            const auto stats = static_cast<aino::detail::X11TextRenderer*>(win.impl->text)->cache_stats();
+            std::printf("scale=%.3f logical=%dx%d physical=%dx%d fonts=%zu faces=%zu glyph_bytes=%zu\n",
+                win.dpi_scale(), win.width(), win.height(), win.impl->client_w, win.impl->client_h,
+                stats.fonts, stats.faces, stats.glyph_bytes);
+            std::ifstream status("/proc/self/status"); std::string line;
+            while (std::getline(status, line))
+                if (line.rfind("VmRSS:", 0) == 0 || line.rfind("VmHWM:", 0) == 0 ||
+                    line.rfind("RssAnon:", 0) == 0 || line.rfind("RssFile:", 0) == 0) std::printf("%s\n", line.c_str());
+        }
+#endif
         if (smoke_test) win.close();
         const float elapsed = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - begin).count();
         finish_frame(elapsed);

@@ -42,6 +42,7 @@
 #include <cmath>
 #include <string>
 #include <vector>
+#include <map>
 #include <functional>
 
 // -----------------------------------------------------------------------------
@@ -1324,6 +1325,7 @@ namespace icons {
 #elif defined(AINO_PLATFORM_X11)
 #  include <X11/Xlib.h>
 #  include <X11/Xutil.h>
+#  include <X11/Xresource.h>
 #  include <X11/cursorfont.h>   // XC_left_ptr / XC_hand2 ...
 #  include <X11/keysym.h>
 #  include <X11/Xatom.h>
@@ -11240,6 +11242,65 @@ inline std::string Window::clipboard() const {
 //        **客户端**光栅化成灰度位图，逐像素 blend 进缓冲 —— 零 X 往返。
 //        两者都加载不到时，退回核心 X 的 XLFD 点阵字体（能跑，只是没抗锯齿）。
 // =============================================================================
+namespace detail {
+// XSETTINGS 的整数使用属性自身的字节序；解析器也用于无桌面的回归测试。
+struct DesktopScaleSettings { double dpi = 0; int factor = 0; };
+inline DesktopScaleSettings parse_xsettings_scale(const unsigned char* bytes, size_t length) {
+    DesktopScaleSettings result;
+    if (!bytes || length < 12 || length > 1024u * 1024u || bytes[0] > 1) return result;
+    const bool little = bytes[0] == 0;
+    size_t pos = 4;
+    bool ok = true;
+    auto read = [&](size_t n) -> uint32_t {
+        if (n > length - pos) { ok = false; return 0; }
+        uint32_t v = 0;
+        for (size_t i = 0; i < n; ++i) v |= uint32_t(bytes[pos + i]) << (8u * (little ? i : n - i - 1));
+        pos += n; return v;
+    };
+    read(4); const auto count = read(4);
+    if (count > 4096) return {};
+    auto skip = [&](size_t n) { if (n > length - pos) ok = false; else pos += n; };
+    auto align = [&] { skip((4 - pos % 4) % 4); };
+    for (uint32_t i = 0; i < count && ok; ++i) {
+        const auto type = read(1); read(1); const auto len = read(2);
+        if (!ok || len > length - pos) return {};
+        const std::string name(reinterpret_cast<const char*>(bytes + pos), len);
+        skip(len); align(); read(4);
+        if (type == 0) {
+            const auto value = read(4);
+            if (name == "Xft/DPI" && value >= 48u * 1024u && value <= 384u * 1024u) result.dpi = double(value) / 1024.0;
+            if (name == "Gdk/WindowScalingFactor" && value >= 1 && value <= 4) result.factor = int(value);
+        } else if (type == 1) { const auto size = read(4); skip(size); align(); }
+        else if (type == 2) skip(8);
+        else return {};
+    }
+    return ok ? result : DesktopScaleSettings{};
+}
+inline double parse_scale_number(const char* text, double low = .5, double high = 4) {
+    if (!text || !*text) return 0;
+    // 环境变量采用小数点格式，不受用户 locale 的小数分隔符影响。
+    double value = 0, fraction = .1; bool point = false, digit = false;
+    for (const char* p = text; *p; ++p) {
+        if (*p == '.' && !point) { point = true; continue; }
+        if (*p < '0' || *p > '9') return 0;
+        digit = true;
+        if (point) { value += (*p - '0') * fraction; fraction *= .1; }
+        else value = value * 10 + (*p - '0');
+        if (value > 1000) return 0;
+    }
+    return digit && value >= low && value <= high ? value : 0;
+}
+inline float desktop_scale(const char* override_scale, const char* gdk_scale,
+                           const DesktopScaleSettings& settings, double resource_dpi) {
+    if (const auto value = parse_scale_number(override_scale)) return float(value);
+    if (const auto value = parse_scale_number(gdk_scale)) return float(value);
+    const double dpi = settings.dpi > 0 ? settings.dpi : resource_dpi;
+    double scale = dpi >= 48 && dpi <= 384 ? dpi / 96 : 1;
+    if (settings.factor >= 1 && settings.factor <= 4) scale = std::max(scale, double(settings.factor));
+    return float(scale);
+}
+} // namespace detail
+
 #if defined(AINO_PLATFORM_X11)
 
 namespace detail {
@@ -11560,6 +11621,8 @@ public:
         dpy_ = d;
         target_ = target;
     }
+    struct CacheStats { size_t fonts, faces, glyph_bytes; };
+    CacheStats cache_stats() const { return {fonts_.size(), faces_.size(), glyph_bytes_}; }
 
 private:
     // -----------------------------------------------------------------------
@@ -11582,7 +11645,6 @@ private:
         int asc = 0, desc = 0;
         std::vector<std::string> files;   // 兜底链：文件路径
         std::vector<long> indices;
-        std::unordered_map<int, void*> opened;
         std::unordered_map<unsigned long, Glyph> glyphs;
         int hit = 0;                      // 上次命中的字体下标
     };
@@ -11703,18 +11765,23 @@ private:
 
     void* open_face(Font& f, size_t i) {
         if (i >= f.files.size()) return nullptr;
-        auto it = f.opened.find(int(i));
-        if (it != f.opened.end()) return it->second;
+        // FT_Face 含字体表；按字号重复打开大型 CJK 字体会占用大量内存。
+        // 字形位图仍按字号缓存，字体文件及 face 在渲染器内共享。
+        const auto key = std::make_pair(f.files[i], f.indices[i]);
+        auto inserted = faces_.emplace(key, SharedFace{});
+        auto& shared = inserted.first->second;
         FtApi& ft = ft_api();
-        void* face = nullptr;
-        if (ft.new_face(ft.ft_lib, f.files[i].c_str(), f.indices[i], &face) != 0 || !face) {
-            f.opened[int(i)] = nullptr;
-            return nullptr;
+        if (inserted.second) {
+            if (ft.new_face(ft.ft_lib, f.files[i].c_str(), f.indices[i], &shared.face) != 0) shared.face = nullptr;
         }
+        if (!shared.face) return nullptr;
         // 72dpi + 26.6 定点：char_size 的数值就等于像素，还能带小数
-        ft.set_char_size(face, 0, long(f.px * 64.0 + 0.5), 72, 72);
-        f.opened[int(i)] = face;
-        return face;
+        const long size = long(f.px * 64.0 + 0.5);
+        if (shared.size != size) {
+            if (ft.set_char_size(shared.face, 0, size, 72, 72) != 0) return nullptr;
+            shared.size = size;
+        }
+        return shared.face;
     }
 
     // 取一个码位的字形：先试上次命中的字体，再沿兜底链找第一个覆盖它的。
@@ -11767,6 +11834,13 @@ private:
         } else {
             g.adv = int(f.px * 0.5 * 64.0 + 0.5);
         }
+        constexpr size_t budget = 4u * 1024u * 1024u;
+        if (glyph_bytes_ + g.px.size() > budget || glyph_count_ >= 16384) {
+            for (auto& cached : fonts_) cached.second.glyphs.clear();
+            glyph_bytes_ = 0; glyph_count_ = 0;
+        }
+        glyph_bytes_ += g.px.size();
+        ++glyph_count_;
         return f.glyphs.emplace(cp, std::move(g)).first->second;
     }
 
@@ -11846,12 +11920,9 @@ private:
     void release_fonts() {
         FtApi& ft = ft_api();
         if (ft.lib) {
-            for (auto& kv : fonts_) {
-                for (auto& f : kv.second.opened)
-                    if (f.second) ft.done_face(f.second);
-            }
+            for (auto& kv : faces_) if (kv.second.face) ft.done_face(kv.second.face);
         }
-        fonts_.clear();
+        fonts_.clear(); faces_.clear(); glyph_bytes_ = 0; glyph_count_ = 0;
     }
 
     // 核心 XLFD 字体那条老路：1bit 点阵、无抗锯齿、字重拉不开。
@@ -11991,6 +12062,10 @@ private:
     std::string mono_;
     std::unordered_map<int, XFontSet> sets_;
     std::unordered_map<int, Font> fonts_;
+    struct SharedFace { void* face = nullptr; long size = 0; };
+    std::map<std::pair<std::string, long>, SharedFace> faces_;
+    size_t glyph_bytes_ = 0;
+    size_t glyph_count_ = 0;
 };
 
 
@@ -12005,6 +12080,9 @@ struct X11State {
     XIM im = nullptr;
     XIC ic = nullptr;
     int pw = 0, ph = 0;
+    ::Window settings_owner = 0;
+    Atom settings_selection = 0, settings_property = 0, resource_manager = 0, manager = 0;
+    WindowConfig config;
 
     float mx = -1e6f, my = -1e6f;
     bool  btn_down[3] = {false, false, false};
@@ -12118,6 +12196,82 @@ inline void x11_feed_input(X11State* s) {
     for (int i = 0; i < KEY_COUNT; ++i) s->key_pressed[i] = false;
 }
 
+inline std::vector<unsigned char> x11_property(Display* dpy, ::Window win, Atom name, Atom expected) {
+    Atom actual = 0; int format = 0; unsigned long count = 0, remaining = 0;
+    unsigned char* data = nullptr;
+    std::vector<unsigned char> out;
+    if (XGetWindowProperty(dpy, win, name, 0, 262144, False, expected, &actual, &format, &count, &remaining, &data) == Success &&
+        actual == expected && format == 8 && !remaining && data) out.assign(data, data + count);
+    if (data) XFree(data);
+    return out;
+}
+inline float x11_desktop_scale(X11State* s) {
+    const auto root = DefaultRootWindow(s->dpy);
+    // 读取 owner 和订阅事件期间避免设置管理器恰好销毁窗口。
+    XGrabServer(s->dpy);
+    s->settings_owner = XGetSelectionOwner(s->dpy, s->settings_selection);
+    std::vector<unsigned char> bytes;
+    if (s->settings_owner) {
+        XSelectInput(s->dpy, s->settings_owner, PropertyChangeMask | StructureNotifyMask);
+        bytes = x11_property(s->dpy, s->settings_owner, s->settings_property, s->settings_property);
+    }
+    XUngrabServer(s->dpy);
+    XFlush(s->dpy);
+    const auto settings = parse_xsettings_scale(bytes.data(), bytes.size());
+    const auto resource = x11_property(s->dpy, root, s->resource_manager, XA_STRING);
+    double dpi = 0;
+    if (!resource.empty()) {
+        const std::string text(resource.begin(), resource.end());
+        XrmInitialize();
+        if (auto database = XrmGetStringDatabase(text.c_str())) {
+            XrmValue value{}; char* type = nullptr;
+            if (XrmGetResource(database, "Xft.dpi", "Xft.Dpi", &type, &value) && value.addr) {
+                const std::string number(value.addr, value.size ? value.size - 1 : 0);
+                dpi = parse_scale_number(number.c_str(), 48, 384);
+            }
+            XrmDestroyDatabase(database);
+        }
+    }
+    return desktop_scale(std::getenv("AINO_SCALE"), std::getenv("GDK_SCALE"), settings, dpi);
+}
+inline void x11_size_hints(X11State* s, int width, int height) {
+    XSizeHints hints{};
+    const auto& cfg = s->config;
+    const auto sc = s->owner->scale;
+    const int maxw = std::max(1, int(DisplayWidth(s->dpy, DefaultScreen(s->dpy)) * .96));
+    const int maxh = std::max(1, int(DisplayHeight(s->dpy, DefaultScreen(s->dpy)) * .92));
+    if (!cfg.resizable) {
+        hints.flags = PMinSize | PMaxSize;
+        hints.min_width = hints.max_width = width; hints.min_height = hints.max_height = height;
+    } else {
+        hints.flags = PMinSize;
+        hints.min_width = std::min(maxw, std::max(1, int(cfg.min_width * sc + .5f)));
+        hints.min_height = std::min(maxh, std::max(1, int(cfg.min_height * sc + .5f)));
+        if (cfg.max_width > 0 || cfg.max_height > 0) {
+            hints.flags |= PMaxSize;
+            hints.max_width = cfg.max_width > 0 ? std::max(hints.min_width, int(cfg.max_width * sc + .5f)) : 32767;
+            hints.max_height = cfg.max_height > 0 ? std::max(hints.min_height, int(cfg.max_height * sc + .5f)) : 32767;
+        }
+    }
+    XSetWMNormalHints(s->dpy, s->win, &hints);
+}
+inline void x11_refresh_scale(X11State* s) {
+    auto* o = s->owner;
+    const float scale = x11_desktop_scale(s);
+    if (std::fabs(o->scale - scale) < .001f) return;
+    const int w = std::max(1, std::min(int(s->pw / o->scale * scale + .5f), int(DisplayWidth(s->dpy, DefaultScreen(s->dpy)) * .96)));
+    const int h = std::max(1, std::min(int(s->ph / o->scale * scale + .5f), int(DisplayHeight(s->dpy, DefaultScreen(s->dpy)) * .92)));
+    o->scale = scale;
+    // 新字号重新生成位图，释放旧 DPI 下的字体和字形缓存。
+    if (o->text) {
+        o->text->release(); o->text->init(scale, o->theme.font_family, o->theme.font_family_mono);
+        static_cast<X11TextRenderer*>(o->text)->set_drawable(s->dpy, s->win, s->gc);
+    }
+    x11_size_hints(s, w, h);
+    XResizeWindow(s->dpy, s->win, unsigned(w), unsigned(h));
+    o->need_frame = true;
+}
+
 inline bool x11_handle(X11State* s, XEvent& e) {
     Window::Impl* o = s->owner;
     switch (e.type) {
@@ -12125,6 +12279,7 @@ inline bool x11_handle(X11State* s, XEvent& e) {
         o->need_frame = true;
         break;
     case ConfigureNotify:
+        if (e.xconfigure.window != s->win) break;
         x11_create_backbuffer(s, e.xconfigure.width, e.xconfigure.height);
         o->need_frame = true;
         break;
@@ -12188,8 +12343,18 @@ inline bool x11_handle(X11State* s, XEvent& e) {
         break;
     }
     case ClientMessage:
+        if (e.xclient.message_type == s->manager && e.xclient.format == 32 && Atom(e.xclient.data.l[1]) == s->settings_selection) {
+            x11_refresh_scale(s); break;
+        }
         if (Atom(e.xclient.data.l[0]) == s->wm_delete) { o->running = false; return false; }
         o->need_frame = true; // wake() 只投消息，绘制标志由 UI 线程更新。
+        break;
+    case PropertyNotify:
+        if ((e.xproperty.window == DefaultRootWindow(s->dpy) && e.xproperty.atom == s->resource_manager) ||
+            (e.xproperty.window == s->settings_owner && e.xproperty.atom == s->settings_property)) x11_refresh_scale(s);
+        break;
+    case DestroyNotify:
+        if (e.xdestroywindow.window == s->settings_owner) x11_refresh_scale(s);
         break;
     case LeaveNotify:
         s->mx = -1e6f; s->my = -1e6f;
@@ -12232,9 +12397,8 @@ inline void x11_set_title(Display* dpy, ::Window win, const std::string& utf8) {
 
 inline void x11_create(Window* self, const WindowConfig& cfg) {
     Window::Impl* o = self->impl;
-    const int w = cfg.width > 0 ? cfg.width : 880;
-    const int h = cfg.height > 0 ? cfg.height : 560;
     X11State* s = new X11State();
+    s->config = cfg;
     s->owner = o;
     o->native = s;
 
@@ -12272,8 +12436,16 @@ inline void x11_create(Window* self, const WindowConfig& cfg) {
 
     int screen = DefaultScreen(s->dpy);
     ::Window root = RootWindow(s->dpy, screen);
+    s->settings_selection = XInternAtom(s->dpy, ("_XSETTINGS_S" + std::to_string(screen)).c_str(), False);
+    s->settings_property = XInternAtom(s->dpy, "_XSETTINGS_SETTINGS", False);
+    s->resource_manager = XInternAtom(s->dpy, "RESOURCE_MANAGER", False);
+    s->manager = XInternAtom(s->dpy, "MANAGER", False);
+    XSelectInput(s->dpy, root, PropertyChangeMask | StructureNotifyMask);
+    o->scale = x11_desktop_scale(s);
     const int scr_w = DisplayWidth(s->dpy, screen);
     const int scr_h = DisplayHeight(s->dpy, screen);
+    const int w = std::max(1, std::min(int((cfg.width > 0 ? cfg.width : 880) * o->scale + .5f), int(scr_w * .96)));
+    const int h = std::max(1, std::min(int((cfg.height > 0 ? cfg.height : 560) * o->scale + .5f), int(scr_h * .92)));
     const int wx = cfg.center ? (scr_w - w) / 2 : 0;
     const int wy = cfg.center ? (scr_h - h) / 2 : 0;
     s->win = XCreateSimpleWindow(s->dpy, root, wx, wy, unsigned(w), unsigned(h), 0,
@@ -12289,29 +12461,7 @@ inline void x11_create(Window* self, const WindowConfig& cfg) {
 
     // 尺寸约束。X11 没有"不可缩放"这个位，只能把 min 和 max 设成同一个值 ——
     // 主流 WM 都按这个理解（ICCCM 里没人保证，但这是唯一可移植的做法）。
-    {
-        XSizeHints* hints = XAllocSizeHints();
-        if (hints) {
-            hints->flags = 0;
-            int mnw = cfg.min_width > 0 ? cfg.min_width : 1;
-            int mnh = cfg.min_height > 0 ? cfg.min_height : 1;
-            int mxw = cfg.max_width > 0 ? cfg.max_width : 0;
-            int mxh = cfg.max_height > 0 ? cfg.max_height : 0;
-            if (!cfg.resizable) { mnw = mxw = w; mnh = mxh = h; }
-            if (mnw > 1 || mnh > 1) {
-                hints->flags |= PMinSize;
-                hints->min_width = mnw;
-                hints->min_height = mnh;
-            }
-            if (mxw > 0 || mxh > 0) {
-                hints->flags |= PMaxSize;
-                if (mxw > 0) hints->max_width = mxw;
-                if (mxh > 0) hints->max_height = mxh;
-            }
-            if (hints->flags) XSetWMNormalHints(s->dpy, s->win, hints);
-            XFree(hints);
-        }
-    }
+    x11_size_hints(s, w, h);
     // 图标与字体文件在 X11 上不做：_NET_WM_ICON 要自己把 PNG 解成 ARGB，
     // 而核心 X 字体（XLFD）没有"装一个字体文件进进程"这条路。
     // 行为：图标忽略；字体只按 cfg.font_family 挑已装的家族（见 CoreTextRenderer
@@ -12434,7 +12584,7 @@ inline void Window::set_title(const std::string& title) {
 }
 inline void Window::set_size(int w, int h) {
     detail::X11State* s = reinterpret_cast<detail::X11State*>(impl->native);
-    if (s && s->dpy && s->win) XResizeWindow(s->dpy, s->win, unsigned(w), unsigned(h));
+    if (s && s->dpy && s->win) XResizeWindow(s->dpy, s->win, unsigned(std::max(1, int(w * impl->scale + .5f))), unsigned(std::max(1, int(h * impl->scale + .5f))));
 }
 inline void Window::close() { if (impl) impl->running = false; }
 

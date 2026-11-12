@@ -2189,6 +2189,7 @@ void finish_frame(float frame_ms) {
 }
 void shutdown(bool smoke_test) {
     g_shutdown.store(true);
+    g_covers.clear(); // 退出只等待正在下载的封面，不继续处理积压的队列。
     login::shutdown();
     background::stop();
     g_player.close();

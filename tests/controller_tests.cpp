@@ -20,6 +20,27 @@ int main(int argc, char** argv) {
         check(model.ui.tab == 1 && model.playback.tracks.empty(), "default Discover and empty list");
         static std::atomic<int> wakes{0}, activations{0};
         start({[&] { ++wakes; }, [&] { ++activations; }});
+        if (argc > 2 && std::string(argv[1]) == "--cover-stress") {
+            const std::string base = argv[2];
+            const auto deadline = platform::ticks() + 15000;
+            bool ready = false;
+            while (!ready && platform::ticks() < deadline) {
+                ready = true;
+                for (int i = 0; i < 64; ++i) {
+                    const auto image = cover_image(base + "/" + std::to_string(i));
+                    if (!image) ready = false;
+                    else check(image->w > 0 && image->w <= 192 && image->h <= 192, "bounded decoded cover dimensions");
+                }
+                platform::sleep_ms(10);
+            }
+            check(ready, "bounded cover workers drain all queued images");
+            cover_image(base + "/old");
+            g_covers.clear();
+            const auto clear_deadline = platform::ticks() + 3000;
+            while (!cover_image(base + "/new") && platform::ticks() < clear_deadline) platform::sleep_ms(10);
+            check(cover_image(base + "/new") != nullptr, "clear during load accepts a new generation");
+            shutdown(true); return 0;
+        }
         if (argc > 1 && std::string(argv[1]) == "--update-probe") {
             check_updates(false);
             const auto deadline = platform::ticks() + 20000;
