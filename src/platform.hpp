@@ -29,6 +29,7 @@
 #include <sys/stat.h>
 #include <signal.h>
 #include <unistd.h>
+#include <fcntl.h>
 extern char** environ;
 #endif
 
@@ -88,6 +89,31 @@ inline bool replace_file(const std::string& from, const std::string& to) {
     return MoveFileExW(widen(from).c_str(), widen(to).c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 #else
     return ::rename(from.c_str(), to.c_str()) == 0;
+#endif
+}
+/** @brief 发布同目录临时文件，目标已存在时绝不覆盖；调用方可换名重试。 */
+inline bool move_file_no_replace(const std::string& from, const std::string& to) {
+#ifdef _WIN32
+    return MoveFileExW(widen(from).c_str(), widen(to).c_str(), MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    // link 原子创建最终名称；避免 exists + rename 之间被其他下载抢占。
+    if (::link(from.c_str(), to.c_str()) == 0) { ::unlink(from.c_str()); return true; }
+    if (errno == EEXIST) return false;
+    // FAT 等文件系统不支持硬链接；排他创建目标仍可保证不覆盖已有音乐。
+    std::FILE* input = std::fopen(from.c_str(), "rb");
+    if (!input) return false;
+    const int fd = ::open(to.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
+    if (fd < 0) { std::fclose(input); return false; }
+    std::FILE* output = ::fdopen(fd, "wb");
+    if (!output) { ::close(fd); ::unlink(to.c_str()); std::fclose(input); return false; }
+    char buffer[65536]; bool ok = true; size_t count;
+    while ((count = std::fread(buffer, 1, sizeof buffer, input)) != 0)
+        if (std::fwrite(buffer, 1, count, output) != count) { ok = false; break; }
+    ok = !std::ferror(input) && ok;
+    std::fclose(input);
+    ok = std::fclose(output) == 0 && ok;
+    if (!ok) { ::unlink(to.c_str()); return false; }
+    ::unlink(from.c_str()); return true;
 #endif
 }
 inline long long file_size(const std::string& path) {

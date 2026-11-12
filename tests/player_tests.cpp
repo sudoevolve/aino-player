@@ -290,6 +290,8 @@ int main(int argc, char** argv) {
         cache::clear_audio(cache_root, 7, {}, false, [](uint32_t) { return true; });
         check(platform::exists(platform::join(cache_root, "7/track-6.mp3")), "active writer blocks current cache cleanup");
         check(!cache::audio_file("track-not-a-number.mp3") && !cache::audio_file("track-1.json"), "cache deletion uses owned filenames only");
+        check(cache::audio_file("preload-42.m4a") && cache::audio_file("preload-42.pcm.wav") &&
+              !cache::audio_file("preload-owned-by-user.mp3"), "preload cache cleanup recognizes only generated filenames");
         std::error_code link_error;
         const auto linked = platform::join(cache_root, "10");
         platform::fs::create_directory_symlink(platform::fs::u8path(platform::join(cache_root, "outside")), platform::fs::u8path(linked), link_error);

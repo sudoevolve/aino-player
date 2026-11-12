@@ -105,6 +105,27 @@ int main(int argc, char** argv) {
         installers.body.insert(installers.body.rfind(']'), "," + portable_json.substr(asset_start, portable_json.rfind(']') - asset_start));
         check(updates::parse_release(installers, "1.0.0", "windows-x64.exe").installer, "installer choice independent of API ordering");
 
+        {
+            { std::lock_guard<std::mutex> lock(g_qq.m); g_qq.playlists.resize(1); g_qq.playlists[0].name = "first"; ++g_qq.playlists_revision; }
+            qq_snapshot();
+            { std::lock_guard<std::mutex> lock(g_qq.m); g_qq.playlists[0].name = "changed"; }
+            qq_snapshot(); check(g_qq_snap.playlists[0].name == "first", "QQ snapshot does not copy unchanged revision");
+            { std::lock_guard<std::mutex> lock(g_qq.m); ++g_qq.playlists_revision; }
+            qq_snapshot(); check(g_qq_snap.playlists[0].name == "changed", "QQ revision publishes changed playlists");
+            { std::lock_guard<std::mutex> lock(g_qq.m); g_qq.playlists.clear(); ++g_qq.playlists_revision; }
+            { std::lock_guard<std::mutex> lock(g_ne.m); g_ne.playlists.resize(1); g_ne.playlists[0].name = "first"; ++g_ne.playlists_revision; }
+            ne_snapshot();
+            { std::lock_guard<std::mutex> lock(g_ne.m); g_ne.playlists[0].name = "changed"; }
+            ne_snapshot(); check(g_ne_snap.playlists[0].name == "first", "NetEase snapshot does not copy unchanged revision");
+            { std::lock_guard<std::mutex> lock(g_ne.m); ++g_ne.playlists_revision; }
+            ne_snapshot(); check(g_ne_snap.playlists[0].name == "changed", "NetEase revision publishes changed playlists");
+            { std::lock_guard<std::mutex> lock(g_ne.m); g_ne.playlists.clear(); ++g_ne.playlists_revision; }
+            g_snapshot.ps = PlayState::Playing; finish_frame(1);
+            check(g_fps_hint.load() == 10, "ordinary playback uses lower refresh cadence");
+            model.ui.lyrics_open = true; finish_frame(1);
+            check(g_fps_hint.load() == 60, "visible lyrics retain smooth refresh cadence");
+            model.ui.lyrics_open = false; g_snapshot.ps = PlayState::Idle; finish_frame(1);
+        }
         music::Track nav_a, nav_b, nav_c;
         auto navigation_track = [](const char* name) {
             music::Track value; value.title = name;
@@ -121,13 +142,16 @@ int main(int argc, char** argv) {
         queue_play_next(nav_c); tick();
         check(model.playback.tracks.size() == 3 && model.playback.playing == 0 &&
               track_uid(model.playback.tracks[1]) == track_uid(nav_c), "play next moves without duplicating or interrupting current");
-        check(next_queue_index(1, true) == 1, "explicit next overrides repeat one");
+        check(next_queue_index(1, true, false) == 1 && next_queue_index(1, true, false) == 1 &&
+              next_queue_index(1, true) == 1, "preload peek preserves explicit next and overrides repeat one");
         set_play_mode(PlayMode::Sequential); mark_current(nav_b, 2);
         check(next_queue_index(1, true) == -1, "sequential mode stops at queue end");
         set_play_mode(PlayMode::RepeatAll);
         check(next_queue_index(1, true) == 0, "repeat all wraps at queue end");
         set_play_mode(PlayMode::Shuffle); mark_current(nav_a, 0);
+        const int preview_next = next_queue_index(1, true, false);
         const int shuffled = next_queue_index(1, true);
+        check(preview_next == shuffled, "preload peek reserves but does not consume shuffle selection");
         check(shuffled != 0, "shuffle skips current when alternatives exist");
         mark_current(shuffled == 1 ? nav_c : nav_b, shuffled);
         const int shuffled_again = next_queue_index(1, true);
@@ -186,6 +210,41 @@ int main(int argc, char** argv) {
             auto* f = platform::fopen(path, "wb"); check(f != nullptr, "create local fixture");
             std::fputs(contents, f); std::fclose(f);
         };
+        // 下载按实际格式排他发布；并发同名下载不得覆盖已有音乐。
+        for (const auto* extension : {"flac", "m4a"}) {
+            const auto existing = platform::join(music_folder, std::string("song.") + extension);
+            const auto part_a = platform::join(music_folder, "a.part"), part_b = platform::join(music_folder, "b.part");
+            write_fixture(existing, "original"); write_fixture(part_a, "first"); write_fixture(part_b, "second");
+            std::string path_a, path_b, error_a, error_b;
+            std::thread a([&] { path_a = publish_download(part_a, music_folder, "song", extension, error_a); });
+            std::thread b([&] { path_b = publish_download(part_b, music_folder, "song", extension, error_b); });
+            a.join(); b.join();
+            check(!path_a.empty() && !path_b.empty() && path_a != path_b && platform::file_size(existing) == 8 &&
+                  platform::file_size(path_a) == 5 && platform::file_size(path_b) == 6, "concurrent actual-extension downloads preserve all three files");
+            check(!platform::exists(part_a) && !platform::exists(part_b), "successful download publication removes partial files");
+            platform::remove(existing); platform::remove(path_a); platform::remove(path_b);
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            g_as.tracks.clear();
+            for (int i = 0; i < 1001; ++i) {
+                auto item = track; item.title = "title\twith\nnewlines";
+                for (auto& variant : item.variants) variant.id += std::to_string(i);
+                item.chosen = 1; g_as.tracks.push_back(std::move(item));
+            }
+            g_as.now_uid = track_uid(g_as.tracks[910]); g_as.position_ms = 12345;
+        }
+        check(queue_save(), "large multi-source queue save"); queue_load(); tick();
+        check(model.playback.tracks.size() == 1001 && model.playback.tracks[910].variants.size() == 2 &&
+              model.playback.tracks[910].chosen == 1 && model.playback.playing == 910 && model.ui.pos_ms == 12345 &&
+              model.playback.tracks[910].title == "title\twith\nnewlines" && model.playback.ps == PlayState::Idle,
+              "queue restores all songs, variants, chosen source and position without autoplay");
+        ++g_queue_gen; g_queue_dirty.store(false);
+        write_fixture(queue_path(), "{broken"); queue_load();
+        check(!queue_save() && platform::file_size(queue_path()) == 7, "corrupt queue is retained rather than overwritten");
+        write_fixture(queue_path(), "# aino queue v1\n5\tlocal.mp3\t\tLegacy\tArtist\tAlbum\t20000\t\n"); queue_load(); tick();
+        check(model.playback.tracks.size() == 1 && model.playback.tracks[0].current().id == "local.mp3", "legacy queue migration");
+        queue_clear(); queue_push(track); choose_source(0, 1, false); tick();
         const auto original = platform::join(music_folder, "歌手 - 歌名.MP3");
         write_fixture(original, "fixture");
         write_fixture(platform::join(music_folder, "disc/other.flac"), "fixture");
@@ -194,6 +253,24 @@ int main(int argc, char** argv) {
         auto scanned = library::scan_folder(music_folder, false, scan_error);
         check(scan_error.empty() && scanned.tracks.size() == 1 && scanned.tracks[0].title == "歌名", "folder scanner filters and parses names");
         check(scanned.tracks[0].current().source == music::Source::Local, "local source separated from network sources");
+        const auto before_preload_uid = model.playback.now_uid;
+        const auto before_preload_state = model.playback.ps;
+        request_preload(scanned.tracks[0], model.ui.settings);
+        bool prepared = false;
+        const auto preload_deadline = platform::ticks() + 3000;
+        while (!prepared && platform::ticks() < preload_deadline) {
+            { std::lock_guard<std::mutex> lock(g_preload_mutex); prepared = bool(g_preload_ready); }
+            if (!prepared) platform::sleep_ms(5);
+        }
+        auto preloaded = take_preloaded(scanned.tracks[0], model.ui.settings);
+        check(preloaded && preloaded->original == scanned.tracks[0].current().id && model.playback.now_uid == before_preload_uid &&
+              model.playback.ps == before_preload_state, "bounded preload prepares media without publishing playback state");
+        preloaded.reset(); check(platform::exists(original), "preload never deletes a local original");
+        auto cancelled_request = std::make_shared<PreloadRequest>(); cancelled_request->track = scanned.tracks[0];
+        cancelled_request->cancelled.store(true);
+        check(!prepare_next(cancelled_request), "cancelled preload cannot prepare or publish stale media");
+        auto changed_quality = model.ui.settings; ++changed_quality.quality;
+        check(preload_key(scanned.tracks[0], changed_quality) != preload_key(scanned.tracks[0], model.ui.settings), "quality changes invalidate preload");
         write_fixture(platform::join(music_folder, "歌手 - 歌名.lrc"), "\xef\xbb\xbf[00:01.00]本地歌词");
         const auto local_lyrics = lyr::fetch(scanned.tracks[0], model.ui.settings);
         check(local_lyrics.synced && local_lyrics.lines.size() == 1 && local_lyrics.lines[0].ms == 1000, "local BOM LRC is read offline");
@@ -213,6 +290,29 @@ int main(int argc, char** argv) {
         check(model.playback.tracks.size() == 1 && model.playback.results.size() == 1, "browsing playlist preserves queue and search results");
         music::Settings offline_search;
         for (auto& enabled : offline_search.enable) enabled = false;
+        {
+            std::lock_guard<std::mutex> lock(g_mu); g_search_worker = true; g_as.searching = true;
+        }
+        const auto saved_mask = model.ui.src_mask; model.ui.src_mask = 0;
+        model.ui.query = "older"; start_search(); const int obsolete_search = g_search_gen.load();
+        model.ui.query = "latest"; start_search();
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            check(g_pending_search.keyword == "latest" && g_pending_search.generation > obsolete_search,
+                  "busy search retains only the latest new request");
+            g_search_worker = false; g_pending_search = {};
+        }
+        do_search(g_win, "older", offline_search, obsolete_search);
+        check(g_as.searching, "obsolete search cannot clear latest request status");
+        model.ui.query = "独立的在线搜索词"; start_search();
+        const auto search_deadline = platform::ticks() + 3000;
+        bool searching = true;
+        while (searching && platform::ticks() < search_deadline) {
+            { std::lock_guard<std::mutex> lock(g_mu); searching = g_search_worker; }
+            if (searching) platform::sleep_ms(5);
+        }
+        check(!searching, "latest offline search completes on the bounded worker");
+        model.ui.src_mask = saved_mask;
         const int search_generation = ++g_search_gen;
         do_search(g_win, "fixture", offline_search, search_generation); tick();
         check(model.playback.tracks.size() == 1 && model.playback.results.empty() && model.playlist.playlist.tracks.size() == 2,

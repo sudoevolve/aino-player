@@ -1001,6 +1001,7 @@ inline std::string kuwo_cover_url(const std::string& rid) {
 //   3. 还没有的，按酷我 rid 问一次 pic.web（最贵，限流到前 20 首）
 // 全失败就保持空，界面回落到"程序化渐变封面"。
 inline void fill_covers(std::vector<Track>& tracks, const Settings& st, int kuwo_budget = 20) {
+    if (st.cancelled && st.cancelled()) return;
     std::vector<std::string> netease_ids;
     for (Track& t : tracks) {
         for (const auto& v : t.variants) {
@@ -1012,7 +1013,7 @@ inline void fill_covers(std::vector<Track>& tracks, const Settings& st, int kuwo
         }
     }
 
-    if (!netease_ids.empty()) {
+    if (!netease_ids.empty() && !(st.cancelled && st.cancelled())) {
         std::string ids = "%5B";
         for (size_t i = 0; i < netease_ids.size(); ++i) {
             if (i) ids += "%2C";
@@ -1048,6 +1049,7 @@ inline void fill_covers(std::vector<Track>& tracks, const Settings& st, int kuwo
     }
 
     for (Track& t : tracks) {
+        if (st.cancelled && st.cancelled()) return;
         if (!t.cover_url.empty() || kuwo_budget <= 0) continue;
         for (const auto& v : t.variants) {
             if (v.source != Source::Kuwo) continue;

@@ -173,8 +173,6 @@ struct UiState {
     // 歌词面板（Apple Music 那种右侧抽屉）
     bool lyrics_open = false;
     bool queue_open = false;
-    bool play_mode_menu_open = false;
-    bool sleep_timer_menu_open = false;
     // 账号登录态（cookie 存在 settings 里，uin/uid 单独存）
     std::string qq_uin;
     std::string ne_uid;
@@ -495,12 +493,16 @@ struct AsyncState {
     long long cached_bytes = 0;
     std::string pending_path;
     long long pending_duration_ms = 0;
+    long long position_ms = 0;
 };
 
 static AsyncState g_as;
 static std::mutex g_mu;
 static std::atomic<bool> g_shutdown{false};
 static std::atomic<int> g_search_gen{0};
+struct SearchRequest { std::string keyword; music::Settings settings; int generation = 0; };
+static SearchRequest g_pending_search; // g_mu；只保留最新的待执行搜索。
+static bool g_search_worker = false;
 // 界面希望的刷新节奏（帧/秒）：0 = 不用动，30 = 有进度要跟，60 = 歌词在滚动
 static std::atomic<int> g_fps_hint{0};
 static std::atomic<int> g_frame_ms_x10{100};
@@ -574,6 +576,7 @@ struct QqState {
     bool loading = false;
     std::string cookie, uin, nickname, err;
     std::vector<qq::Playlist> playlists;
+    unsigned playlists_revision = 1;
 };
 static QqState g_qq;
 
@@ -587,6 +590,7 @@ struct NeState {
     bool loading = false;
     std::string cookie, uid, nickname, err;
     std::vector<ne::Playlist> playlists;
+    unsigned playlists_revision = 1;
 };
 static NeState g_ne;
 
@@ -612,6 +616,8 @@ void set_volume(float v);
 static bool save_config() { return config::save(g_ui); }
 
 static void do_search(HostCallbacks* win, std::string keyword, music::Settings st, int gen) {
+    st.cancelled = [gen] { return g_shutdown.load() || gen != g_search_gen.load(); };
+    if (st.cancelled()) return;
     music::SearchResult r = music::run_search(keyword, st, 12, 9000);
     if (g_shutdown.load()) return;
     {
@@ -641,21 +647,34 @@ static void do_search(HostCallbacks* win, std::string keyword, music::Settings s
 }
 
 void start_search() {
+    g_ui.scroll_to_top = true;
     std::string keyword;
     music::Settings st;
     int gen = 0;
     {
         std::lock_guard<std::mutex> lk(g_mu);
-        if (g_as.searching) return;
         if (g_ui.query.empty()) return;
         keyword = g_ui.query;
         st = g_ui.settings;
         for (int i = 0; i < music::kSourceCount; ++i) st.enable[i] = (g_ui.src_mask >> i) & 1u;
         g_as.searching = true;
         gen = ++g_search_gen;
+        g_pending_search = {keyword, st, gen};
+        if (g_search_worker) return;
+        g_search_worker = true;
     }
-    g_ui.scroll_to_top = true;
-    background::start(do_search, g_win, keyword, st, gen);
+    background::start([] {
+        for (;;) {
+            SearchRequest request;
+            {
+                std::lock_guard<std::mutex> lock(g_mu);
+                if (g_shutdown.load() || !g_pending_search.generation) { g_search_worker = false; return; }
+                request = std::move(g_pending_search);
+                g_pending_search = {};
+            }
+            do_search(g_win, std::move(request.keyword), std::move(request.settings), request.generation);
+        }
+    });
 }
 
 // 按文件头判容器：QQ 给的是 m4a（ftypmp42），酷我/网易云是 mp3。
@@ -672,8 +691,124 @@ static std::string sniff_ext(const std::string& path) {
     if (n >= 4 && std::memcmp(h, "OggS", 4) == 0) return "ogg";
     if (n >= 4 && h[0] == 0x1a && h[1] == 0x45 && h[2] == 0xdf && h[3] == 0xa3) return "webm";
     if (n >= 3 && std::memcmp(h, "ID3", 3) == 0) return "mp3";
+    if (n >= 2 && h[0] == 0xFF && (h[1] & 0xF6) == 0xF0) return "aac";
     if (n >= 2 && h[0] == 0xFF && (h[1] & 0xE0) == 0xE0) return "mp3";
     return "mp3";
+}
+
+// 预加载仅拥有下一首的磁盘文件；不打开设备、不发布正在播放状态。
+struct PreparedMedia {
+    music::Variant variant;
+    std::string original, playable, converted;
+    bool owns_original = false;
+    ~PreparedMedia() {
+        if (owns_original && !original.empty()) platform::remove(original);
+        if (!converted.empty()) platform::remove(converted);
+    }
+};
+struct PreloadRequest {
+    music::Track track;
+    music::Settings settings;
+    std::string key;
+    std::atomic<bool> cancelled{false};
+    unsigned serial = 0;
+};
+static std::mutex g_preload_mutex;
+static std::shared_ptr<PreloadRequest> g_preload_request, g_preload_pending;
+static std::shared_ptr<PreparedMedia> g_preload_ready, g_current_media;
+static bool g_preload_worker = false;
+static unsigned g_preload_serial = 0;
+
+static std::string preload_key(const music::Track& track, const music::Settings& st) {
+    std::string key = library::encode_track(track) + ":" + std::to_string(st.quality);
+    for (bool enabled : st.enable) key += enabled ? '1' : '0';
+    for (const auto* value : {&st.netease_cookie, &st.qq_cookie, &st.youtube_cookie,
+         &st.youtube_authuser, &st.youtube_delegated_session, &st.youtube_visitor}) key += library::quote(*value);
+    return key;
+}
+static void cancel_preload() {
+    std::lock_guard<std::mutex> lock(g_preload_mutex);
+    if (g_preload_request) g_preload_request->cancelled.store(true);
+    g_preload_request.reset(); g_preload_pending.reset(); g_preload_ready.reset();
+}
+static std::shared_ptr<PreparedMedia> prepare_next(const std::shared_ptr<PreloadRequest>& request) {
+    auto st = request->settings;
+    st.cancelled = [request] { return g_shutdown.load() || request->cancelled.load(); };
+    std::shared_lock<std::shared_mutex> cache_lock(g_play_cache_mutex);
+    const auto& track = request->track;
+    std::vector<int> order;
+    if (track.variants.empty() || st.cancelled()) return {};
+    order.push_back(std::clamp(track.chosen, 0, int(track.variants.size()) - 1));
+    for (int i = 0; i < int(track.variants.size()); ++i) if (i != order[0]) order.push_back(i);
+    for (int index : order) {
+        if (st.cancelled()) return {};
+        auto media = std::make_shared<PreparedMedia>();
+        media->variant = track.variants[size_t(index)];
+        const auto& variant = media->variant;
+        const auto base = g_temp_dir + "preload-" + std::to_string(request->serial);
+        std::string error;
+        if (variant.source == music::Source::Local) {
+            media->original = variant.id;
+            if (!platform::exists(media->original)) continue;
+        } else {
+            const auto resolved = music::resolve(variant, st);
+            if (!resolved.ok || st.cancelled()) continue;
+            const auto probe = net::probe_audio(resolved.url, resolved.headers, 6000);
+            // 预加载不缓存试听片段；需要换源或试听兜底时仍走完整点播流程。
+            if (int(variant.source) <= int(music::Source::Kuwo) && probe.total_bytes > 0 && variant.duration_ms > 0 &&
+                probe.total_bytes * 5 < variant.duration_ms * 16LL * 3) continue;
+            if (st.cancelled()) return {};
+            media->original = base + ".mp3"; media->owns_original = true;
+            if (!net::download(resolved.url, media->original, resolved.headers,
+                [&](long long, long long) {}, request->cancelled, error) || st.cancelled()) continue;
+            const auto extension = sniff_ext(media->original);
+            if (extension != "mp3") {
+                const auto renamed = base + "." + extension;
+                if (!platform::replace_file(media->original, renamed)) continue;
+                media->original = renamed;
+            }
+        }
+        media->converted = base + ".pcm.wav";
+        if (audio::prepare_file(media->original, media->playable, error, media->converted) && !st.cancelled()) return media;
+    }
+    return {};
+}
+static void request_preload(const music::Track& track, const music::Settings& settings) {
+    const auto key = preload_key(track, settings);
+    {
+        std::lock_guard<std::mutex> lock(g_preload_mutex);
+        if (g_preload_request && g_preload_request->key == key) return;
+        if (g_preload_request) g_preload_request->cancelled.store(true);
+        auto request = std::make_shared<PreloadRequest>();
+        request->track = track; request->settings = settings; request->key = key; request->serial = ++g_preload_serial;
+        g_preload_request = request; g_preload_pending = request; g_preload_ready.reset();
+        if (g_preload_worker) return;
+        g_preload_worker = true;
+    }
+    background::start([] {
+        for (;;) {
+            std::shared_ptr<PreloadRequest> request;
+            {
+                std::lock_guard<std::mutex> lock(g_preload_mutex);
+                if (!g_preload_pending || g_shutdown.load()) { g_preload_worker = false; return; }
+                request = std::move(g_preload_pending);
+            }
+            auto ready = prepare_next(request);
+            {
+                std::lock_guard<std::mutex> lock(g_preload_mutex);
+                if (g_preload_request == request && !request->cancelled.load()) g_preload_ready = std::move(ready);
+            }
+        }
+    });
+}
+static std::shared_ptr<PreparedMedia> take_preloaded(const music::Track& track, const music::Settings& settings) {
+    const auto key = preload_key(track, settings);
+    std::lock_guard<std::mutex> lock(g_preload_mutex);
+    std::shared_ptr<PreparedMedia> result;
+    if (g_preload_request && g_preload_request->key == key) result = std::move(g_preload_ready);
+    if (g_preload_request) g_preload_request->cancelled.store(true);
+    g_preload_request.reset(); g_preload_pending.reset(); g_preload_ready.reset();
+    return result;
 }
 
 // 下载完成 → 交给主线程开 miniaudio
@@ -991,6 +1126,18 @@ static void dl_set(const std::string& uid, int percent, int state, const std::st
     if (!err.empty()) it->second.err = err;
 }
 
+static std::string publish_download(const std::string& part, const std::string& dir,
+                                    const std::string& stem, const std::string& extension, std::string& error) {
+    for (unsigned suffix = 0; suffix < 100000; ++suffix) {
+        const auto name = stem + (suffix ? " (" + std::to_string(suffix + 1) + ")" : "") + "." + extension;
+        const auto target = platform::join(dir, name);
+        if (platform::move_file_no_replace(part, target)) return target;
+        if (!platform::exists(target)) { error = "无法保存下载文件，请检查目录权限或剩余空间"; return {}; }
+    }
+    error = "同名下载文件过多，请更换目录或歌曲名称";
+    return {};
+}
+
 // 沿所有源试一遍，第一个"完整曲目"落盘；三源都只有试听片段就把最长的那段存下来并标注
 void start_download(music::Track track, music::Settings st) {
     st.cancelled = [] { return g_shutdown.load(); };
@@ -1024,14 +1171,11 @@ void start_download(music::Track track, music::Settings st) {
             if (it == g_dls.end()) return;
             name = it->second.name;
         }
-        // 同名不同曲目：加序号，别静默覆盖用户已有的文件
-        std::string path = dir + "/" + name;
         const std::string stem = name.size() > 4 ? name.substr(0, name.size() - 4) : name;
-        for (int k = 2; k < 200; ++k) {
-            if (!platform::exists(path)) break;
-            path = dir + "/" + stem + " (" + std::to_string(k) + ").mp3";
-        }
-        const std::string part = path + ".part";
+        static std::atomic<unsigned long long> serial{0};
+        const std::string part = platform::join(dir, ".aino-download-" + std::to_string(platform::process_id()) +
+            "-" + std::to_string(platform::ticks()) + "-" + std::to_string(++serial) + ".part");
+        struct PartialFile { std::string path; ~PartialFile() { platform::remove(path); } } partial{part};
 
         std::string reasons;
         std::string best_url;
@@ -1160,28 +1304,16 @@ void start_download(music::Track track, music::Settings st) {
             }
             return;
         }
-        // 只有试听片段时在文件名里标出来：过几天翻目录，光看名字没法分辨整曲和 11 秒片段
-        std::string final_path = path;
-        if (saved_preview) {
-            // 标记必须留着（重名时加序号，而不是把 "(试听)" 丢掉）
-            const std::string base = dir + "/" + stem + " (试听)";
-            std::string cand = base + ".mp3";
-            for (int k = 2; k < 200 && platform::exists(cand); ++k)
-                cand = base + " (" + std::to_string(k) + ").mp3";
-            final_path = cand;
-        }
-        // 扩展名跟着真实容器走：m4a / flac 存成 .mp3 的话，双击时系统的
-        // 字节流处理器会按扩展名挑解码器，结果就是"文件在但打不开"。
-        {
-            const std::string ext = sniff_ext(part);
-            if (ext != "mp3" && final_path.size() > 4 && final_path.compare(final_path.size() - 4, 4, ".mp3") == 0)
-                final_path = final_path.substr(0, final_path.size() - 4) + "." + ext;
-        }
-        if (!platform::replace_file(part, final_path)) {
-            dl_set(uid, 0, 2, "重命名失败（目标目录被占用？）");
+        std::string publish_error;
+        const auto final_path = publish_download(part, dir, stem + (saved_preview ? " (试听)" : ""), sniff_ext(part), publish_error);
+        if (final_path.empty()) {
+            dl_set(uid, 0, 2, publish_error);
+            toast(publish_error, 7000);
             if (g_win) g_win->wake();
             return;
         }
+        { std::lock_guard<std::mutex> lock(g_dlm);
+          g_dls[uid].name = platform::fs::u8path(final_path).filename().u8string(); }
         // 内嵌封面 / 歌词：先拿素材，再写标签。写失败不影响"文件已经下好了"这个事实，
         // 只额外提示一句，别把一次成功的下载报成失败。
         std::string tag_note;
@@ -1224,12 +1356,15 @@ void start_download(music::Track track, music::Settings st) {
 // =============================================================================
 
 static void qq_snapshot() {
+    static unsigned revision = 0;
     std::lock_guard<std::mutex> lk(g_qq.m);
     g_qq_snap.logged = g_qq.logged;
     g_qq_snap.loading = g_qq.loading;
     g_qq_snap.nickname = g_qq.nickname;
     g_qq_snap.err = g_qq.err;
-    g_qq_snap.playlists = g_qq.playlists;
+    if (revision != g_qq.playlists_revision) {
+        g_qq_snap.playlists = g_qq.playlists; revision = g_qq.playlists_revision;
+    }
 }
 
 void qq_refresh() {
@@ -1253,6 +1388,7 @@ void qq_refresh() {
         } else {
             g_qq.nickname = p.nickname;
             g_qq.playlists = std::move(p.playlists);
+            ++g_qq.playlists_revision;
             g_qq.err.clear();
         }
         if (g_win) g_win->wake();
@@ -1333,13 +1469,16 @@ void playlist_sync_to(int site, int idx) {
 // ---------------- 网易云音乐（和 QQ 那套对称） ----------------
 
 static void ne_snapshot() {
+    static unsigned revision = 0;
     std::lock_guard<std::mutex> lk(g_ne.m);
     g_ne_snap.logged = g_ne.logged;
     g_ne_snap.loading = g_ne.loading;
     g_ne_snap.nickname = g_ne.nickname;
     g_ne_snap.err = g_ne.err;
     g_ne_snap.uid = g_ne.uid;
-    g_ne_snap.playlists = g_ne.playlists;
+    if (revision != g_ne.playlists_revision) {
+        g_ne_snap.playlists = g_ne.playlists; revision = g_ne.playlists_revision;
+    }
 }
 
 void ne_refresh() {
@@ -1364,6 +1503,7 @@ void ne_refresh() {
             g_ne.nickname = p.nickname;
             g_ne.uid = p.uid;
             g_ne.playlists = std::move(p.playlists);
+            ++g_ne.playlists_revision;
             g_ne.err.clear();
         }
         if (g_win) g_win->wake();
@@ -1558,36 +1698,35 @@ static std::string queue_path() {
     return dir.empty() ? std::string() : platform::join(dir, "queue.txt");
 }
 
-static std::string q_escape(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    for (char c : s) out += (c == '\t' || c == '\n' || c == '\r') ? ' ' : c;
-    return out;
-}
+static bool g_queue_writable = true; // 损坏的旧文件在用户修改队列前保留。
+static long long g_resume_on_start = 0, g_pending_seek = 0; // g_mu
+static constexpr size_t kQueueFileLimit = 64u * 1024u * 1024u;
 
 static bool queue_save() {
     static std::mutex file_mutex;
     std::lock_guard<std::mutex> file_lock(file_mutex);
     const std::string path = queue_path();
     if (path.empty()) return false;
-    std::vector<music::Track> copy;
+    std::string encoded;
     {
         std::lock_guard<std::mutex> lk(g_mu);
-        copy = g_as.tracks;
+        if (!g_queue_writable) return false;
+        encoded = "{\"version\":2,\"current\":" + library::quote(g_as.now_uid) +
+            ",\"position_ms\":" + std::to_string(g_as.position_ms) + ",\"tracks\":[";
+        bool first = true;
+        for (const auto& track : g_as.tracks) {
+            if (track.variants.empty() || track.variants.size() > 12) return false;
+            if (!first) encoded += ',';
+            first = false;
+            encoded += library::encode_track(track);
+            if (encoded.size() > kQueueFileLimit - 2) return false;
+        }
+        encoded += "]}";
     }
-    if (copy.size() > 800) copy.resize(800);
     const auto temporary = path + ".tmp";
     std::FILE* f = platform::fopen(temporary, "wb");
     if (!f) return false;
-    std::fprintf(f, "# aino queue v1\n");
-    for (const auto& t : copy) {
-        if (t.variants.empty()) continue;
-        const music::Variant& v = t.variants[size_t(std::min<int>(t.chosen, int(t.variants.size()) - 1))];
-        std::fprintf(f, "%d\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n", int(v.source), q_escape(v.id).c_str(),
-                     q_escape(v.native_id).c_str(), q_escape(t.title).c_str(), q_escape(t.artist).c_str(),
-                     q_escape(t.album).c_str(), t.duration_ms, q_escape(t.cover_url).c_str());
-    }
-    const bool ok = !std::ferror(f);
+    const bool ok = std::fwrite(encoded.data(), 1, encoded.size(), f) == encoded.size() && !std::ferror(f);
     const bool closed = std::fclose(f) == 0;
     const bool saved = ok && closed && platform::replace_file(temporary, path);
     if (!saved) platform::remove(temporary);
@@ -1602,13 +1741,14 @@ static std::atomic<int> g_queue_gen{0};
 // 不能只靠主循环里的判断 —— 界面静止时根本不出帧（0 帧 0% CPU 的代价），
 // 那时候删完一首就再也不保存了。所以这里自己起一个短命线程。
 static void queue_mark_dirty() {
+    { std::lock_guard<std::mutex> lock(g_mu); g_queue_writable = true; }
     const int mine = ++g_queue_gen;
     g_queue_dirty.store(true);
     background::start([mine] {
         platform::sleep_ms(1200);
         if (g_queue_gen.load() != mine) return;  // 期间又改了，让最后一次负责写
         if (!g_queue_dirty.exchange(false)) return;
-        queue_save();
+        if (!queue_save()) toast("播放队列保存失败，原文件已保留；请检查目录权限或队列是否超过 64 MiB", 7000);
     });
 }
 
@@ -1630,21 +1770,43 @@ static std::vector<std::string> split_tab(const std::string& line) {
 static void queue_load() {
     const std::string path = queue_path();
     if (path.empty()) return;
-    std::FILE* f = platform::fopen(path, "rb");
-    if (!f) return;
+    std::ifstream file(platform::fs::u8path(path), std::ios::binary);
+    if (!file) return;
+    const auto bytes = platform::file_size(path);
+    auto corrupt = [] {
+        { std::lock_guard<std::mutex> lock(g_mu); g_queue_writable = false; }
+        toast("播放队列文件损坏或过大，已保留原文件", 7000);
+    };
+    if (bytes < 0 || bytes > static_cast<long long>(kQueueFileLimit)) { corrupt(); return; }
+    const std::string text((std::istreambuf_iterator<char>(file)), {});
     std::vector<music::Track> tracks;
-    char buf[4096];
-    while (std::fgets(buf, sizeof buf, f)) {
-        std::string line(buf);
+    std::string current;
+    long long position = 0;
+    const auto begin = text.find_first_not_of(" \t\r\n");
+    if (begin != std::string::npos && text[begin] == '{') {
+        js::Value root;
+        if (!js::parse(text, root) || root["version"].integer() != 2 || !root["tracks"].is_array()) { corrupt(); return; }
+        for (const auto& row : root["tracks"].array) {
+            music::Track track;
+            if (!library::decode_track(row, track) || track.variants.size() != row["variants"].size()) { corrupt(); return; }
+            tracks.push_back(std::move(track));
+        }
+        current = root["current"].str();
+        position = std::clamp(root["position_ms"].integer(), 0LL, 7LL * 24 * 3600 * 1000);
+    } else {
+    if (text.rfind("# aino queue v1", 0) != 0) { corrupt(); return; }
+    std::istringstream lines(text);
+    std::string line;
+    while (std::getline(lines, line)) {
         while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
         if (line.empty() || line[0] == '#') continue;
         const auto f8 = split_tab(line);
-        if (f8.size() < 8) continue;
+        if (f8.size() < 8) { corrupt(); return; }
         music::Variant v;
         v.source = music::Source(std::atoi(f8[0].c_str()));
         v.id = f8[1];
         v.native_id = f8[2];
-        if (v.id.empty() || int(v.source) < 0 || int(v.source) > int(music::Source::Local)) continue;
+        if (v.id.empty() || int(v.source) < 0 || int(v.source) > int(music::Source::Local)) { corrupt(); return; }
         music::Track t;
         t.title = f8[3];
         t.artist = f8[4];
@@ -1660,11 +1822,24 @@ static void queue_load() {
         t.chosen = 0;
         tracks.push_back(std::move(t));
     }
-    std::fclose(f);
-    if (tracks.empty()) return;
+    }
     {
         std::lock_guard<std::mutex> lk(g_mu);
         g_as.tracks = std::move(tracks);
+        g_queue_writable = true;
+        g_as.playing = -1;
+        g_as.ps = PlayState::Idle;
+        g_as.now_uid.clear(); g_as.now_track = {};
+        g_resume_on_start = 0; g_as.position_ms = 0;
+        for (int i = 0; i < int(g_as.tracks.size()); ++i) if (track_uid(g_as.tracks[size_t(i)]) == current) {
+            const auto& track = g_as.tracks[size_t(i)];
+            g_as.playing = i; g_as.now_uid = current; g_as.now_track = track;
+            g_as.now_title = track.title; g_as.now_artist = track.artist; g_as.now_cover = track.cover_url;
+            g_as.now_source = int(track.current().source); g_as.now_quality = "待续播";
+            g_as.position_ms = position; g_resume_on_start = position;
+            g_ui.pos_ms = float(position); g_ui.dur_ms = float(track.duration_ms);
+            break;
+        }
         g_as.reports.clear();
         g_as.elapsed_ms = 0;
         g_as.searching = false;
@@ -1695,6 +1870,9 @@ void start_play(int index) {
         st = g_ui.settings;
         for (int i = 0; i < music::kSourceCount; ++i) st.enable[i] = (g_ui.src_mask >> i) & 1u;
         gen = ++g_as.gen;
+        g_pending_seek = g_as.now_uid == track_uid(track) ? g_resume_on_start : 0;
+        g_resume_on_start = 0;
+        g_as.position_ms = g_pending_seek;
         g_as.playing = index;
         g_as.ps = PlayState::Resolving;
         g_as.error.clear();
@@ -1718,11 +1896,16 @@ void start_play(int index) {
         g_as.cached_bytes = 0;
         g_as.pending_path.clear();
     }
-    g_ui.pos_ms = 0.0f;
+    g_ui.pos_ms = float(g_pending_seek);
     g_ui.dur_ms = float(track.duration_ms);
     g_player.close();  // 播放设备只由主线程操作。
+    g_current_media = take_preloaded(track, st);
     cleanup_temp(gen);
     if (g_ui.lyrics_open) request_lyrics(track);
+    if (g_current_media) {
+        finish_play(g_win, g_current_media->variant, g_current_media->original, gen, false, g_current_media->playable);
+        return;
+    }
     background::start(do_play, g_win, track, st, gen);
 }
 
@@ -1744,7 +1927,7 @@ void toggle_pause() {
 }
 
 // 只选择索引，不触碰音频设备；UI 和自然结束共用边界规则。
-static int next_queue_index(int delta, bool automatic) {
+static int next_queue_index(int delta, bool automatic, bool consume = true) {
     std::lock_guard<std::mutex> lock(g_mu);
     const int count = int(g_as.tracks.size());
     if (!count) return -1;
@@ -1753,11 +1936,15 @@ static int next_queue_index(int delta, bool automatic) {
         if (track_uid(g_as.tracks[size_t(i)]) == g_as.now_uid) { cur = i; break; }
     if (cur < 0) cur = g_as.playing;
     if (delta > 0) {
-        while (!g_play_next.empty()) {
-            const auto uid = g_play_next.front(); g_play_next.pop_front();
+        for (auto it = g_play_next.begin(); it != g_play_next.end(); ++it) {
+            const auto uid = *it;
             for (int i = 0; i < count; ++i)
-                if (track_uid(g_as.tracks[size_t(i)]) == uid) return i;
+                if (track_uid(g_as.tracks[size_t(i)]) == uid) {
+                    if (consume) g_play_next.erase(g_play_next.begin(), std::next(it));
+                    return i;
+                }
         }
+        if (consume) g_play_next.clear();
     }
     if (automatic && g_ui.play_mode == PlayMode::RepeatOne && cur >= 0) return cur;
     if (g_ui.play_mode == PlayMode::Shuffle) {
@@ -1768,9 +1955,13 @@ static int next_queue_index(int delta, bool automatic) {
             }
             return cur < 0 ? 0 : cur;
         }
-        while (g_shuffle_cursor + 1 < int(g_shuffle_history.size())) {
-            const auto& uid = g_shuffle_history[size_t(++g_shuffle_cursor)];
-            for (int i = 0; i < count; ++i) if (track_uid(g_as.tracks[size_t(i)]) == uid) return i;
+        int cursor = g_shuffle_cursor;
+        while (cursor + 1 < int(g_shuffle_history.size())) {
+            const auto& uid = g_shuffle_history[size_t(++cursor)];
+            for (int i = 0; i < count; ++i) if (track_uid(g_as.tracks[size_t(i)]) == uid) {
+                if (consume) g_shuffle_cursor = cursor;
+                return i;
+            }
         }
         if (g_shuffle_version != g_as.tracks_version) {
             g_shuffle_remaining.clear(); g_shuffle_version = g_as.tracks_version;
@@ -1780,7 +1971,8 @@ static int next_queue_index(int delta, bool automatic) {
             std::shuffle(g_shuffle_remaining.begin(), g_shuffle_remaining.end(), g_shuffle_random);
         }
         if (g_shuffle_remaining.empty()) return 0;
-        const auto uid = g_shuffle_remaining.back(); g_shuffle_remaining.pop_back();
+        const auto uid = g_shuffle_remaining.back();
+        if (consume) g_shuffle_remaining.pop_back();
         for (int i = 0; i < count; ++i) if (track_uid(g_as.tracks[size_t(i)]) == uid) return i;
     }
     int next = cur < 0 ? 0 : cur + delta;
@@ -1788,13 +1980,32 @@ static int next_queue_index(int delta, bool automatic) {
     if (next >= count) return g_ui.play_mode == PlayMode::Sequential ? -1 : 0;
     return next;
 }
+static void refresh_preload() {
+    if (g_shutdown.load() || g_ui.sleep_after_track || g_snapshot.ps != PlayState::Playing) {
+        if (g_snapshot.ps != PlayState::Paused) cancel_preload();
+        return;
+    }
+    const int next = next_queue_index(1, true, false);
+    music::Track track;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        if (next >= 0 && next < int(g_as.tracks.size())) track = g_as.tracks[size_t(next)];
+        if (!track.variants.empty() && track_uid(track) == g_as.now_uid) track = {};
+    }
+    if (track.variants.empty()) { cancel_preload(); return; }
+    auto settings = g_ui.settings;
+    for (int i = 0; i < music::kSourceCount; ++i) settings.enable[i] = (g_ui.src_mask >> i) & 1u;
+    request_preload(track, settings);
+}
 static void stop_playback() {
     {
         std::lock_guard<std::mutex> lock(g_mu);
         ++g_as.gen; // 拒绝仍在解析/缓冲的旧任务，避免定时停止后重新起播。
         g_as.ps = PlayState::Idle; g_as.pending_path.clear(); g_as.error.clear();
+        g_as.position_ms = 0; g_pending_seek = 0; g_resume_on_start = 0;
     }
     g_player.close();
+    cancel_preload(); g_current_media.reset();
     g_ui.pos_ms = 0;
     g_ui.seek_to = -1;
 }
@@ -2171,11 +2382,13 @@ void clear_data(ClearAction action) {
         {
             std::lock_guard<std::mutex> lock(g_qq.m);
             g_qq.cookie.clear(); g_qq.uin.clear(); g_qq.nickname.clear(); g_qq.playlists.clear();
+            ++g_qq.playlists_revision;
             g_qq.err.clear(); g_qq.logged = false; g_qq.loading = false;
         }
         {
             std::lock_guard<std::mutex> lock(g_ne.m);
             g_ne.cookie.clear(); g_ne.uid.clear(); g_ne.nickname.clear(); g_ne.playlists.clear();
+            ++g_ne.playlists_revision;
             g_ne.err.clear(); g_ne.logged = false; g_ne.loading = false;
         }
         g_ui.settings.qq_cookie.clear(); g_ui.settings.netease_cookie.clear();
@@ -2196,12 +2409,17 @@ void clear_data(ClearAction action) {
         queue_clear();
         toast(queue_save() ? "已清空当前列表；正在播放的歌曲可继续播放" : "列表已清空，但保存失败，请检查配置目录权限", 6500);
     } else if (action == ClearAction::Cache) {
+        cancel_preload();
         std::unique_lock<std::shared_mutex> cache_write(g_play_cache_mutex, std::try_to_lock);
         std::string keep;
         {
             std::lock_guard<std::mutex> lock(g_mu);
             if (g_as.ps == PlayState::Playing || g_as.ps == PlayState::Paused || g_as.ps == PlayState::Ready)
                 keep = "track-" + std::to_string(g_as.gen) + ".";
+        }
+        if (!keep.empty() && g_current_media) {
+            const auto name = platform::fs::u8path(g_current_media->converted).filename().u8string();
+            keep = name.substr(0, name.find('.')) + ".";
         }
         const auto result = cache::clear_audio(platform::cache_root(), platform::process_id(), keep, cache_write.owns_lock());
         g_covers.clear();
@@ -2366,14 +2584,12 @@ void start(HostCallbacks host) {
                 if (g_win) g_win->wake();   // toast 刚过期，补一帧把它擦掉
             }
             if (busy && g_win) g_win->wake();
-            // 11fps 的刷新率下，歌词滚动和进度条都是"一格一格跳"的 —— 这就是卡顿感的来源。
-            // 歌词面板开着时给 60fps，只放歌给 30fps，其余时间照旧睡觉（0 帧 0% CPU）。
+            // 歌词滚动保留高帧率；普通进度刷新按实际需要降频。
             const int fps = g_fps_hint.load();
             // 目标周期减去本帧已经花掉的时间：不然 30fps 实际只有 1000/(33+14) ≈ 21fps
             const int spent = g_frame_ms_x10.load() / 10;
             int wait = 250;
-            if (fps >= 60) wait = 16 - spent;
-            else if (fps > 0) wait = 33 - spent;
+            if (fps > 0) wait = 1000 / fps - spent;
             else if (busy) wait = 90;
             if (wait < 2) wait = 2;
             platform::sleep_ms(wait);
@@ -2481,7 +2697,11 @@ void tick() {
                 g_player.set_volume(int(g_ui.volume));
                 g_ui.dur_ms = float(g_player.duration_ms());
                 if (g_ui.dur_ms <= 0) g_ui.dur_ms = float(snap.pending_duration_ms);
-                g_ui.pos_ms = 0.0f;
+                long long resume;
+                { std::lock_guard<std::mutex> lock(g_mu); resume = g_pending_seek; g_pending_seek = 0; }
+                resume = std::clamp(resume, 0LL, std::max(0LL, static_cast<long long>(g_ui.dur_ms) - 1));
+                if (resume) g_player.seek_ms(resume);
+                g_ui.pos_ms = float(resume);
                 std::lock_guard<std::mutex> lk(g_mu);
                 if (g_as.gen == snap.gen) g_as.ps = PlayState::Playing;
                 snap.ps = PlayState::Playing;
@@ -2513,7 +2733,8 @@ void tick() {
         // ---- 每帧同步播放位置 ----
         if (snap.ps == PlayState::Playing || snap.ps == PlayState::Paused) {
             const long long p = g_player.position_ms();
-            if (p > 0) g_ui.pos_ms = float(p);
+            g_ui.pos_ms = float(std::max(p, 0LL));
+            { std::lock_guard<std::mutex> lock(g_mu); g_as.position_ms = std::max(p, 0LL); }
             const long long d = g_player.duration_ms();
             if (d > 0) g_ui.dur_ms = float(d);
             // 放完了自动下一首
@@ -2536,6 +2757,7 @@ void tick() {
             std::lock_guard<std::mutex> lock(g_lyr.m);
             g_lyric_view = {g_lyr.doc, g_lyr.for_uid, g_lyr.loading};
         }
+        refresh_preload();
 }
 void bootstrap(bool initial_search, bool smoke_test) {
     if (!smoke_test) queue_load();
@@ -2558,7 +2780,7 @@ void finish_frame(float frame_ms) {
             if (snap.ps == PlayState::Playing) {
                 // 歌词抽屉展开就一直 60fps：滚动是唯一需要连续动画的地方，
                 // 30fps 下无论缓动怎么调都能看出顿感。帧耗时 10ms 上下，撑得住。
-                fps = g_ui.lyrics_open ? 60 : 30;
+                fps = g_ui.lyrics_open && !g_ui.queue_open ? 60 : 10;
             } else if (snap.ps == PlayState::Buffering || snap.ps == PlayState::Resolving) {
                 fps = 30;
             }
@@ -2570,11 +2792,13 @@ void finish_frame(float frame_ms) {
 }
 void shutdown(bool smoke_test) {
     g_shutdown.store(true);
+    cancel_preload();
     g_update_cancel.store(true);
     g_covers.clear(); // 退出只等待正在下载的封面，不继续处理积压的队列。
     login::shutdown();
     background::stop();
     g_player.close();
+    g_current_media.reset();
     if (!smoke_test) {
         save_config();
         queue_save(); // 后台任务全部结束后保存最终队列。
@@ -2582,7 +2806,11 @@ void shutdown(bool smoke_test) {
     g_win = nullptr;
 }
 void cancel_login(int site) { if (site >= 0 && site < 3) login::cancel(login_site(site)); }
-void seek_playback(int milliseconds) { g_player.seek_ms(milliseconds); }
+void seek_playback(int milliseconds) {
+    g_player.seek_ms(milliseconds);
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_as.position_ms = std::max(milliseconds, 0);
+}
 void choose_source(int index, int variant, bool replay) {
     {
         std::lock_guard<std::mutex> lock(g_mu);

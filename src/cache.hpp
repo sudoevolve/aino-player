@@ -10,9 +10,10 @@ struct Cleanup {
     uintmax_t bytes = 0;
 };
 inline bool audio_file(const std::string& name) {
-    if (name.rfind("track-", 0) != 0) return false;
-    const auto dot = name.find('.', 6);
-    if (dot == std::string::npos || dot == 6 || name.substr(6, dot-6).find_first_not_of("0123456789") != std::string::npos) return false;
+    const size_t prefix = name.rfind("track-", 0) == 0 ? 6 : name.rfind("preload-", 0) == 0 ? 8 : 0;
+    if (!prefix) return false;
+    const auto dot = name.find('.', prefix);
+    if (dot == std::string::npos || dot == prefix || name.substr(prefix, dot-prefix).find_first_not_of("0123456789") != std::string::npos) return false;
     const auto suffix = name.substr(dot);
     if (suffix == ".pcm.wav" || suffix == ".pcm.wav.part.wav") return true;
     for (const char* ext : {".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".webm"}) {
