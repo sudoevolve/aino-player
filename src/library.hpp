@@ -21,7 +21,7 @@ inline std::string quote(const std::string& text) {
 }
 inline bool same_track(const music::Track& a, const music::Track& b) {
     for (const auto& x : a.variants) for (const auto& y : b.variants)
-        if (x.source == y.source && !x.id.empty() && x.id == y.id) return true;
+        if (music::same_variant(x, y)) return true;
     return false;
 }
 inline std::string encode_track(const music::Track& t) {

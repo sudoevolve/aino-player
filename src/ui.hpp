@@ -352,6 +352,10 @@ static void result_row(Ctx& c, const music::Track& t, int index, const Rect& box
     const float dl_w = 26.0f;
     const float q_w = 26.0f;   // 「加入队列」占位，和下载按钮并排
     const float fav_w = 26.0f;
+    const bool has_parts = std::any_of(t.variants.begin(), t.variants.end(), [](const auto& v) {
+        return v.source == music::Source::Bilibili && v.native_id.empty();
+    });
+    const float parts_w = has_parts ? 46.0f : 0.0f;
     const float pill_h = 18.0f;
     const float mid_y = box.y + box.h * 0.5f;
 
@@ -359,7 +363,7 @@ static void result_row(Ctx& c, const music::Track& t, int index, const Rect& box
     for (const auto& v : t.variants)
         pills_w += tw_cached(c.ui, music::source_name(v.source), 10.5f) + 16.0f + 4.0f;
 
-    const bool compact_sources = box.w - 76 - pills_w - dur_w - dl_w - q_w - fav_w - 18 < 120;
+    const bool compact_sources = box.w - 76 - pills_w - dur_w - dl_w - q_w - fav_w - parts_w - 18 < 120;
     if (compact_sources) pills_w = 44;
 
     // ---- 1) 先把右侧的小控件"认领"掉，再画整行 ----
@@ -370,6 +374,7 @@ static void result_row(Ctx& c, const music::Track& t, int index, const Rect& box
     const Rect favorite{qa.x - fav_w, mid_y - 11.0f, 22.0f, 22.0f};
     const bool saved = c.model.library.contains(t);
     const bool favorite_clicked = c.ui.item("", "", "", favorite, Style().corner(6));
+    const bool parts_clicked = has_parts && c.ui.button("分 P", {favorite.x - parts_w, mid_y - 12, 42, 24}, Style().font(10.5f));
     int pct = -1;
     bool dl_done = false, dl_failed = false;
     const std::string uid = track_uid(t);
@@ -389,7 +394,7 @@ static void result_row(Ctx& c, const music::Track& t, int index, const Rect& box
     Rect pill_rect[6];
     int pill_n = 0;
     {
-        float px = box.right() - dur_w - 6 - dl_w - q_w - fav_w - pills_w;
+        float px = box.right() - dur_w - 6 - dl_w - q_w - fav_w - parts_w - pills_w;
         for (int i = 0; !compact_sources && i < nvar && i < 6; ++i) {
             const float w = tw_cached(c.ui, music::source_name(t.variants[size_t(i)].source), 10.5f) + 16.0f;
             pill_rect[pill_n++] = Rect(px, mid_y - pill_h * 0.5f, w, pill_h);
@@ -400,7 +405,7 @@ static void result_row(Ctx& c, const music::Track& t, int index, const Rect& box
     if (compact_sources) {
         std::vector<std::string> names;
         for (const auto& variant : t.variants) names.emplace_back(music::source_name(variant.source));
-        const Rect source_menu{favorite.x - 50, mid_y - 12, 44, 24};
+        const Rect source_menu{favorite.x - parts_w - 50, mid_y - 12, 44, 24};
         c.ui.menu("源", names, &pill_clicked, source_menu, Style().font(10.5f));
     }
     for (int i = 0; i < pill_n; ++i)
@@ -420,7 +425,7 @@ static void result_row(Ctx& c, const music::Track& t, int index, const Rect& box
     }
 
     const float text_x = cov.right() + 12;
-    const float max_text = box.w - (text_x - box.x) - pills_w - dur_w - dl_w - q_w - fav_w - 18;
+    const float max_text = std::max(20.0f, box.w - (text_x - box.x) - pills_w - dur_w - dl_w - q_w - fav_w - parts_w - 18);
 
     Style ts;
     ts.font_size = 13.5f;
@@ -484,6 +489,7 @@ static void result_row(Ctx& c, const music::Track& t, int index, const Rect& box
 
     if (dl_clicked) start_download(t, c.model.ui.settings);
     if (favorite_clicked) favorite_toggle(t);
+    if (parts_clicked) bilibili_open_parts(t);
     if (qa_clicked) {
         // 「＋」= 追加到队列末尾（不覆盖当前列表）
         if (queue_push(t)) toast("已加入队列：" + t.title, 2600);
@@ -833,12 +839,13 @@ static void playlist_detail(Ctx& c) {
     const float mw = c.W - mx - 24.0f - (c.model.ui.lyrics_open ? kLyricsWidth : 0.0f);
     const auto& view = c.model.playlist;
     const auto& playlist = view.playlist;
-    if (c.ui.button(view.return_tab == 1 ? "返回发现" : "返回歌单", {mx, 20, 88, 28}, Style().font(11.5f))) {
+    const char* back = view.return_tab == 0 ? "返回搜索" : view.return_tab == 1 ? "返回发现" : view.return_tab == 2 ? "返回队列" : "返回歌单";
+    if (c.ui.button(back, {mx, 20, 88, 28}, Style().font(11.5f))) {
         playlist_close(); return;
     }
     c.ui.heading(ellipsize(c.ui, playlist.name, mw, 22, 600), {mx, 66, mw, 32});
     const auto origin = !playlist.local_folder.empty() ? "本地文件夹" : playlist.online() ?
-        std::string(music::source_name(playlist.source)) + (view.saved ? " · 已保存快照" : " · 在线歌单") : "本地歌单";
+        std::string(music::source_name(playlist.source)) + (view.saved ? " · 已保存快照" : playlist.source == music::Source::Bilibili ? " · 视频分 P" : " · 在线歌单") : "本地歌单";
     c.ui.muted_text(origin + " · " + std::to_string(playlist.tracks.size()) + " 首", {mx, 106, mw, 18}, Style().font(11.5f));
     if (view.loading) { c.ui.spinner({mx + mw / 2 - 11, 174, 22, 22}); return; }
     if (!view.error.empty()) { c.ui.empty_state("歌单加载失败", view.error, {mx, 158, mw, 140}); return; }
@@ -1087,7 +1094,7 @@ static void tab_sources(Ctx& c) {
         }
         if (!has_cookie) {
             const char* note = i == int(music::Source::YouTube) ? "YouTube Music · 公开曲目，受网络与平台验证限制" :
-                i == int(music::Source::Bilibili) ? "公开视频音轨 · 多 P 默认第一 P · AAC 需 FFmpeg" : "匿名取流，部分歌曲仅提供试听";
+                i == int(music::Source::Bilibili) ? "公开视频音轨 · 分 P 可单独播放、收藏与下载 · 内置 AAC 解码" : "匿名取流，部分歌曲仅提供试听";
             c.ui.muted_text(note, {card.x + 20, card.y + 76, card.w - 40, 24}, Style().font(10.5f));
         }
     });

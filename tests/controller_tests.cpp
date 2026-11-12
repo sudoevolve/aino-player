@@ -90,6 +90,15 @@ int main(int argc, char** argv) {
         check(updates::parse_release(absent, "1.0.0", "").status == UpdateStatus::Failed, "transport errors reported");
 
         music::Track track;
+        music::Track part1, part2;
+        music::Variant part_variant; part_variant.source = music::Source::Bilibili; part_variant.id = "BV1fixture01";
+        part_variant.native_id = "101"; part1.title = "First"; part1.variants = {part_variant};
+        part_variant.native_id = "202"; part2.title = "Second"; part2.variants = {part_variant};
+        check(queue_push(part1) && queue_push(part2) && !queue_push(part2), "queue preserves different parts while rejecting exact duplicates");
+        check(queue_save(), "multipart queue save"); queue_load(); tick();
+        check(model.playback.tracks.size() == 2 && model.playback.tracks[1].current().native_id == "202" &&
+            track_uid(model.playback.tracks[0]) != track_uid(model.playback.tracks[1]), "queue reload retains part identity and current-song highlighting");
+        queue_clear(); tick();
         track.title = "业务分层回归";
         music::Variant first; first.id = "fixture";
         music::Variant second = first; second.source = music::Source::QQ;

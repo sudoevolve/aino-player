@@ -227,7 +227,7 @@ struct ViewModel {
 };
 inline std::string track_uid(const music::Track& track) {
     const auto& variant = track.current();
-    return std::string(music::source_key(variant.source)) + "#" + variant.id;
+    return music::variant_uid(variant);
 }
 } // namespace player
 
@@ -289,6 +289,7 @@ void favorite_toggle(const music::Track& track);
 void library_open(size_t index);
 void library_save_current();
 void playlist_open_remote(library::Playlist playlist);
+void bilibili_open_parts(const music::Track& track);
 void playlist_close();
 void playlist_play(int index);
 void playlist_choose_source(int index, int variant, bool replay);
@@ -682,7 +683,7 @@ static void do_play(HostCallbacks* win, music::Track track, music::Settings st, 
         if (index < 0 || index >= int(g_as.tracks.size())) return;
         music::Track& t = g_as.tracks[size_t(index)];
         for (const auto& x : t.variants)
-            if (x.source == v.source && x.id == v.id) return;
+            if (music::same_variant(x, v)) return;
         t.variants.push_back(v);
         ++g_as.tracks_version;
     };
@@ -775,7 +776,8 @@ static void do_play(HostCallbacks* win, music::Track track, music::Settings st, 
     // 二、列表里一条能播的都没有 → 按「歌名 + 歌手」去别的源补位。
     //     歌单里的曲目只有本源那一条 id，本源不可用时只在列表内换源是死路，
     //     必须真的去搜 —— 这就是"自动换源"。
-    if (!track.title.empty()) {
+    const bool selected_part = track.current().source == music::Source::Bilibili && !track.current().native_id.empty();
+    if (!track.title.empty() && !selected_part) {
         for (int si = 0; si < music::kSourceCount; ++si) {
             if (g_shutdown.load()) return;
             if (!st.enable[si]) continue;
@@ -1329,7 +1331,7 @@ bool queue_push(const music::Track& t) {
         for (const auto& x : g_as.tracks) {
             for (const auto& a : x.variants) {
                 for (const auto& b : t.variants) {
-                    if (a.source == b.source && a.id == b.id) {
+                    if (music::same_variant(a, b)) {
                         dup = true;
                         break;
                     }
@@ -1703,7 +1705,7 @@ void playlist_close() {
 void playlist_open_remote(library::Playlist playlist) {
     const auto generation = ++g_playlist_generation;
     g_playlist_view = {};
-    g_playlist_view.return_tab = g_ui.tab == 1 ? 1 : 3;
+    g_playlist_view.return_tab = g_ui.tab;
     g_playlist_view.open = true; g_playlist_view.loading = true;
     playlist.key = std::string(music::source_key(playlist.source)) + "#" +
         (playlist.remote_owner.empty() ? "" : playlist.remote_owner + "#") + playlist.remote_id;
@@ -1712,7 +1714,12 @@ void playlist_open_remote(library::Playlist playlist) {
     const auto uin = g_ui.qq_uin;
     background::start([playlist = std::move(playlist), settings, uin, generation]() mutable {
         std::string error;
-        playlist.tracks = playlist.source == music::Source::Netease ?
+        if (playlist.source == music::Source::Bilibili) {
+            auto parts = music::bilibili_parts(playlist.remote_id, error);
+            playlist.tracks = std::move(parts.tracks);
+            if (!parts.title.empty()) playlist.name = parts.title;
+            if (!parts.cover.empty()) playlist.cover = parts.cover;
+        } else playlist.tracks = playlist.source == music::Source::Netease ?
             ne::fetch_playlist(settings.netease_cookie, playlist.remote_id, error) :
             qq::fetch_playlist(settings.qq_cookie, playlist.remote_id, uin, error, 15000, playlist.remote_owner.empty());
         post_ui([playlist = std::move(playlist), error, generation]() mutable {
@@ -1732,6 +1739,13 @@ static void replace_queue_and_play(std::vector<music::Track> tracks, int index) 
     }
     queue_mark_dirty(); start_play(index);
 }
+void bilibili_open_parts(const music::Track& track) {
+    for (const auto& variant : track.variants) if (variant.source == music::Source::Bilibili) {
+        library::Playlist playlist; playlist.source = music::Source::Bilibili;
+        playlist.remote_id = variant.id; playlist.name = variant.album.empty() ? variant.title : variant.album;
+        playlist.cover = variant.cover_url; playlist_open_remote(std::move(playlist)); return;
+    }
+}
 void playlist_play(int index) { replace_queue_and_play(g_playlist_view.playlist.tracks, index); }
 void play_search_result(int index) {
     // 点播使用本帧显示的结果，后台新搜索不能把同一索引换成另一首歌。
@@ -1748,7 +1762,7 @@ void choose_search_source(int index, int variant, bool replay) {
             if (track_uid(track) != track_uid(displayed)) continue;
             for (size_t i = 0; i < track.variants.size(); ++i) {
                 const auto& candidate = track.variants[i];
-                if (candidate.source == selected.source && candidate.id == selected.id) {
+                if (music::same_variant(candidate, selected)) {
                     track.chosen = int(i); ++g_as.results_version; break;
                 }
             }
@@ -1823,7 +1837,13 @@ void library_fetch(library::Playlist playlist) {
         std::string error;
         ne::Playlist ne_metadata;
         qq::Playlist qq_metadata;
-        auto tracks = playlist.source == music::Source::Netease ?
+        std::vector<music::Track> tracks;
+        if (playlist.source == music::Source::Bilibili) {
+            auto parts = music::bilibili_parts(playlist.remote_id, error);
+            tracks = std::move(parts.tracks);
+            if (!parts.title.empty()) playlist.name = parts.title;
+            if (!parts.cover.empty()) playlist.cover = parts.cover;
+        } else tracks = playlist.source == music::Source::Netease ?
             ne::fetch_playlist(settings.netease_cookie, playlist.remote_id, error, 15000, &ne_metadata) :
             qq::fetch_playlist(settings.qq_cookie, playlist.remote_id, uin, error, 15000, playlist.remote_owner.empty(), &qq_metadata);
         const auto name = playlist.source == music::Source::Netease ? ne_metadata.name : qq_metadata.name;

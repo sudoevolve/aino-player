@@ -13,6 +13,32 @@ int main(int argc, char** argv) {
             std::cout << audio::decoder_info() << std::endl; return 0;
         }
         if (argc > 1 && std::string(argv[1]) == "--child-sleep") { platform::sleep_ms(3000); return 0; }
+        if (argc > 2 && std::string(argv[1]) == "--bilibili-parts-probe") {
+            std::string error;
+            auto parts = music::bilibili_parts(argv[2], error);
+            check(parts.tracks.size() >= 2, error.empty() ? "live video needs at least two parts" : error.c_str());
+            std::string previous;
+            for (size_t i = 0; i < 2; ++i) {
+                const auto& part = parts.tracks[i];
+                const auto stream = music::resolve_bilibili(part.current(), {});
+                check(stream.ok, stream.reason.c_str());
+                const auto probe = net::probe_audio(stream.url, stream.headers, 6000);
+                check(probe.playable, probe.reason.c_str());
+                check(stream.url != previous, "different selected cids resolve to different audio"); previous = stream.url;
+                std::cout << "part=" << i + 1 << " cid=" << part.current().native_id << " duration_ms=" << part.duration_ms
+                          << " bytes=" << probe.total_bytes << '\n';
+                if (i == 1 && argc > 3) {
+                    std::atomic<bool> cancel{false};
+                    check(net::download(stream.url, argv[3], stream.headers, [](long long, long long) {}, cancel, error, 30000), error.c_str());
+                    std::string playable;
+                    check(audio::prepare_file(argv[3], playable, error, std::string(argv[3]) + ".pcm.wav"), error.c_str());
+                    const auto info = audio::inspect_mp3(playable);
+                    check(info.valid && std::abs(info.duration_ms - part.duration_ms) < 3000, "selected second part decoded at expected duration");
+                    std::cout << "decoded_second_part_ms=" << info.duration_ms << '\n';
+                }
+            }
+            return 0;
+        }
         if (argc > 3 && std::string(argv[1]) == "--source-response") {
             net::Response response;
             if (std::string(argv[2]) == "youtube") {
@@ -78,6 +104,25 @@ int main(int argc, char** argv) {
             videos[0].cover_url == "https://cdn.test/a.jpg", "Bilibili title cover and duration parsing");
         check(js::parse(R"({"data":{"dash":{"audio":[{"baseUrl":"https://cdn.test/low","bandwidth":64000},{"base_url":"https://cdn.test/high","bandwidth":192000}]}}})", fixture), "DASH fixture");
         check(parse_bilibili_audio(fixture, 0).url == "https://cdn.test/low" && parse_bilibili_audio(fixture, 1).url == "https://cdn.test/high", "Bilibili quality selection and URL aliases");
+        check(js::parse(R"({"code":0,"data":{"title":"Video collection","pic":"https://cdn.test/cover.jpg","owner":{"name":"Author"},"pages":[{"page":1,"cid":101,"part":"First","duration":60},{"page":2,"cid":202,"part":"Second","duration":90},{"page":3,"cid":202,"part":"Duplicate"},{"page":4,"cid":0}]}})", fixture), "multipart fixture");
+        std::string parts_error;
+        const auto parts = parse_bilibili_parts(fixture, "BV1fixture01", parts_error);
+        check(parts_error.empty() && parts.tracks.size() == 2 && parts.tracks[1].duration_ms == 90000 &&
+            parts.tracks[1].title == "P2 · Second" && parts.tracks[1].current().native_id == "202", "multipart metadata and cid deduplication");
+        check(!library::same_track(parts.tracks[0], parts.tracks[1]) &&
+            music::variant_uid(parts.tracks[0].current()) != music::variant_uid(parts.tracks[1].current()), "same BV different cid has independent identity");
+        check(bili_playurl(parts.tracks[1].current(), "202").find("&cid=202&") != std::string::npos &&
+            bili_playurl(parts.tracks[1].current(), "202&cid=101").empty(), "selected part request uses validated cid");
+        library::Library part_library;
+        check(part_library.toggle(parts.tracks[0]) && part_library.toggle(parts.tracks[1]) &&
+            part_library.playlists.front().tracks.size() == 2, "multipart favorites do not overwrite each other");
+        music::Track restored_part; js::Value saved_part;
+        check(js::parse(library::encode_track(parts.tracks[1]), saved_part) && library::decode_track(saved_part, restored_part) &&
+            music::same_variant(restored_part.current(), parts.tracks[1].current()), "multipart cid persistence");
+        auto qq_a = parts.tracks[0].current(), qq_b = qq_a; qq_a.source = qq_b.source = music::Source::QQ; qq_b.native_id = "other";
+        check(music::same_variant(qq_a, qq_b), "other sources retain existing identity semantics");
+        auto default_part = parts.tracks[0].current(); default_part.native_id.clear();
+        check(!music::same_variant(default_part, parts.tracks[1].current()), "legacy default video does not match another part");
         check(js::parse(R"({"contents":[{"musicResponsiveListItemRenderer":{"playlistItemData":{"videoId":"abcdefghijk"},"flexColumns":[{"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Music title"}]}}},{"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Artist"},{"text":" • "},{"text":"3:24"}]}}}],"thumbnail":{"musicThumbnailRenderer":{"thumbnail":{"thumbnails":[{"url":"https://cdn.test/music.jpg"}]}}}}},{"musicTwoRowItemRenderer":{"title":{"runs":[{"text":"Other title"}]},"navigationEndpoint":{"watchEndpoint":{"videoId":"0123456789_"}}}},{"videoRenderer":{"videoId":"abcdefghijk","title":{"simpleText":"duplicate"}}}]})", fixture), "YouTube Music fixture");
         auto music_results = parse_youtube_search(fixture, 10);
         check(music_results.size() == 2 && music_results[0].artist == "Artist" && music_results[0].duration_ms == 204000 &&

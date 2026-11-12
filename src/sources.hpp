@@ -72,8 +72,17 @@ struct Variant {  // 某一首歌在某个源上的一条结果
     int bitrate = 0;          // 源标称档位（0 = 未知）
     bool needs_login = false; // 该源自己说"要登录"，取流时会明确拒绝
     std::string cover_url;    // 该源能直接给出的封面（QQ 有 pmid，网易云要批量查）
-    std::string native_id;    // 源内部用的数字 id（QQ 的 songid；同步歌单/写操作要用它）
+    std::string native_id;    // 源内部 ID：QQ songid、B 站分 P cid 等。
 };
+
+inline bool same_variant(const Variant& a, const Variant& b) {
+    return a.source == b.source && !a.id.empty() && a.id == b.id &&
+        (a.source != Source::Bilibili || a.native_id == b.native_id);
+}
+inline std::string variant_uid(const Variant& v) {
+    return std::string(source_key(v.source)) + "#" + v.id +
+        (v.source == Source::Bilibili && !v.native_id.empty() ? "#" + v.native_id : "");
+}
 
 struct Track {  // 合并后的"同一首歌"
     std::string title;
@@ -1242,16 +1251,63 @@ inline std::vector<Variant> search_bilibili(const std::string& keyword, int limi
     if (tracks.empty()) error = "B 站没有返回可用的视频结果";
     return tracks;
 }
+struct BilibiliParts {
+    std::string title, cover;
+    std::vector<Track> tracks;
+};
+namespace providers {
+inline bool bili_cid(const std::string& cid) {
+    return !cid.empty() && cid.size() <= 18 && cid[0] != '0' &&
+        cid.find_first_not_of("0123456789") == std::string::npos;
+}
+inline BilibiliParts parse_bilibili_parts(const js::Value& root, const std::string& bvid, std::string& error) {
+    error.clear();
+    BilibiliParts out;
+    if (root["code"].integer(-1) != 0) { error = "B 站视频详情不可用：" + root["message"].str(); return out; }
+    const auto& data = root["data"];
+    out.title = data["title"].str(); out.cover = data["pic"].str();
+    std::set<std::string> seen;
+    for (const auto& page : data["pages"].array) {
+        const auto cid = std::to_string(page["cid"].integer());
+        if (!bili_cid(cid) || !seen.insert(cid).second) continue;
+        Variant v; v.source = Source::Bilibili; v.id = bvid; v.native_id = cid;
+        v.title = "P" + std::to_string(page["page"].integer(out.tracks.size() + 1)) + " · " + page["part"].str(out.title);
+        v.artist = data["owner"]["name"].str(); v.album = out.title; v.cover_url = out.cover;
+        v.duration_ms = int(std::clamp<long long>(page["duration"].integer(), 0, 2147483) * 1000);
+        Track t; t.title = v.title; t.artist = v.artist; t.album = v.album;
+        t.duration_ms = v.duration_ms; t.cover_url = v.cover_url; t.variants.push_back(std::move(v));
+        out.tracks.push_back(std::move(t));
+    }
+    if (out.tracks.empty()) error = "B 站没有返回可读取的分 P";
+    return out;
+}
+inline std::string bili_playurl(const Variant& v, const std::string& cid) {
+    if (v.id.rfind("BV", 0) != 0 || !bili_cid(cid)) return {};
+    return "https://api.bilibili.com/x/player/playurl?bvid=" + net::url_encode(v.id) +
+        "&cid=" + cid + "&fnval=16&fnver=0&fourk=1";
+}
+} // namespace providers
+inline BilibiliParts bilibili_parts(const std::string& bvid, std::string& error) {
+    error.clear(); js::Value root;
+    if (bvid.rfind("BV", 0) != 0 || bvid.size() > 32) { error = "无效的 B 站视频 ID"; return {}; }
+    if (!providers::json_response(net::get("https://api.bilibili.com/x/web-interface/view?bvid=" + net::url_encode(bvid),
+        {"User-Agent: Mozilla/5.0", "Referer: https://www.bilibili.com/"}, 8000), root, error)) return {};
+    return providers::parse_bilibili_parts(root, bvid, error);
+}
 inline ResolveResult resolve_bilibili(const Variant& v, const Settings& st) {
     ResolveResult rr; js::Value view, streams; std::string error;
     const std::vector<std::string> headers = {"User-Agent: Mozilla/5.0", "Referer: https://www.bilibili.com/"};
-    if (!providers::json_response(net::get("https://api.bilibili.com/x/web-interface/view?bvid=" + net::url_encode(v.id), headers, 5000), view, error)) {
-        rr.reason = error; return rr;
+    auto cid = v.native_id;
+    if (cid.empty()) {
+        if (!providers::json_response(net::get("https://api.bilibili.com/x/web-interface/view?bvid=" + net::url_encode(v.id), headers, 5000), view, error)) {
+            rr.reason = error; return rr;
+        }
+        if (view["code"].integer(-1) != 0) { rr.reason = "B 站视频详情不可用"; rr.detail = view["message"].str(); return rr; }
+        cid = std::to_string(view["data"]["cid"].integer());
     }
-    const auto cid = view["data"]["cid"].integer();
-    if (view["code"].integer(-1) != 0 || cid <= 0) { rr.reason = "B 站视频详情不可用"; rr.detail = view["message"].str(); return rr; }
-    if (!providers::json_response(net::get("https://api.bilibili.com/x/player/playurl?bvid=" + net::url_encode(v.id) +
-        "&cid=" + std::to_string(cid) + "&fnval=16&fnver=0&fourk=1", headers, 5000), streams, error)) {
+    const auto url = providers::bili_playurl(v, cid);
+    if (url.empty()) { rr.reason = "B 站分 P cid 无效，请重新打开分 P 列表"; return rr; }
+    if (!providers::json_response(net::get(url, headers, 5000), streams, error)) {
         rr.reason = error; return rr;
     }
     return providers::parse_bilibili_audio(streams, st.quality);
