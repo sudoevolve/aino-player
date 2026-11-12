@@ -434,6 +434,34 @@ inline std::vector<Variant> search_netease(const std::string& keyword, int limit
     return out;
 }
 
+/** @brief 解析网易云播放地址，保留服务端拒绝码；码率仅作展示，不决定播放权限。 */
+inline ResolveResult parse_netease_audio(const js::Value& root) {
+    ResolveResult rr;
+    if (root["code"].integer() != 200) {
+        rr.reason = root["code"].is_null() ? "播放地址响应缺少 code"
+            : "播放地址接口拒绝（code " + std::to_string(root["code"].integer()) + "）";
+        return rr;
+    }
+    const auto& data = root["data"];
+    if (!data.is_array() || !data.size()) { rr.reason = "播放地址响应缺少 data"; return rr; }
+    const auto& item = data[size_t(0)];
+    if (item["code"].integer() != 200) {
+        rr.reason = item["code"].is_null() ? "播放地址响应缺少歌曲 code"
+            : "平台拒绝播放地址（code " + std::to_string(item["code"].integer()) + "）";
+        return rr;
+    }
+    const auto url = item["url"].str();
+    if (url.rfind("https://", 0) != 0 && url.rfind("http://", 0) != 0) {
+        rr.reason = "平台未提供有效播放地址"; return rr;
+    }
+    rr.ok = true; rr.url = url; rr.reason = "ok";
+    const auto bitrate = item["br"].integer();
+    const auto type = item["type"].str();
+    rr.detail = bitrate > 0 ? std::to_string(bitrate / 1000) + "kbps" : "在线音频";
+    if (!type.empty()) rr.detail += " " + type;
+    return rr;
+}
+
 inline ResolveResult resolve_netease(const Variant& v, const Settings& st) {
     ResolveResult rr;
     std::vector<std::string> headers = {"Referer: https://music.163.com/",
@@ -442,30 +470,26 @@ inline ResolveResult resolve_netease(const Variant& v, const Settings& st) {
                                             (st.netease_cookie.empty() ? std::string()
                                                                        : "; " + st.netease_cookie)};
 
-    // 有 cookie 时先走播放地址接口（能拿到更高档），失败再回退免费外链
-    if (!st.netease_cookie.empty() && st.quality > 0) {
+    // 标准档同样需要携带账号权限，不能仅因音质设置而跳过登录态取流。
+    std::string account_error;
+    if (!st.netease_cookie.empty()) {
         // br：128000 / 320000 / 999000（999000 = 无损，服务端没有就自己降档返回）
-        const int want_br = st.quality >= 2 ? 999000 : 320000;
+        const int want_br = st.quality >= 2 ? 999000 : st.quality == 0 ? 128000 : 320000;
         const std::string api = "https://music.163.com/api/song/enhance/player/url?ids=%5B" + v.id +
                                 "%5D&br=" + std::to_string(want_br);
         const net::Response r = net::get(api, headers, 6000);
         if (r.ok()) {
             js::Value root;
             if (js::parse(r.body, root, true)) {
-                const std::string u = root["data"][size_t(0)]["url"].str();
-                const long long br = root["data"][size_t(0)]["br"].integer();
-                if (!u.empty() && br > 0) {
-                    rr.ok = true;
-                    rr.url = u;
+                rr = parse_netease_audio(root);
+                if (rr.ok) {
                     rr.headers = headers;
-                    rr.reason = "ok";
-                    const std::string type = root["data"][size_t(0)]["type"].str();
-                    rr.detail = type.empty() ? (std::to_string(br / 1000) + "kbps")
-                                             : (std::to_string(br / 1000) + "kbps " + type);
                     return rr;
                 }
-            }
-        }
+                account_error = rr.reason;
+            } else account_error = "播放地址响应不是 JSON";
+        } else account_error = "播放地址请求失败（" +
+            (r.error.empty() ? "HTTP " + std::to_string(r.status) : r.error) + "）";
     }
 
     // 免费外链：对 free / fee=8 的曲目直出 mp3；会员曲会跳到 404 页面
@@ -480,7 +504,9 @@ inline ResolveResult resolve_netease(const Variant& v, const Settings& st) {
         return rr;
     }
     rr.ok = false;
-    rr.reason = v.needs_login ? "需要登录 / 会员" : "无版权或直链被拒";
+    rr.reason = !account_error.empty() ? account_error :
+        (v.needs_login ? "请先登录并确认账号播放权限" : "免费外链不可用");
+    if (!account_error.empty() && !p.reason.empty()) rr.reason += "；免费外链：" + p.reason;
     rr.detail = p.reason;
     return rr;
 }

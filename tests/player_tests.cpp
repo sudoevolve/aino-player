@@ -98,6 +98,16 @@ int main(int argc, char** argv) {
         check(signed_query.rfind("bar=%E7%A9%BA%20%E6%A0%BC&foo=abc&wts=123&w_rid=", 0) == 0, "WBI sorting encoding and character filtering");
         check(wbi_key("bad", "keys").empty(), "invalid WBI key rejected");
         js::Value fixture;
+        check(js::parse(R"({"code":200,"data":[{"code":200,"url":"https://cdn.test/song.mp3","br":128000,"type":"mp3"}]})", fixture), "NetEase playback fixture");
+        auto netease_audio = music::parse_netease_audio(fixture);
+        check(netease_audio.ok && netease_audio.url == "https://cdn.test/song.mp3" && netease_audio.detail == "128kbps mp3", "NetEase authenticated playback address");
+        check(js::parse(R"({"code":200,"data":[{"code":-110,"url":null,"br":0}]})", fixture), "NetEase refused address fixture");
+        netease_audio = music::parse_netease_audio(fixture);
+        check(!netease_audio.ok && netease_audio.reason.find("-110") != std::string::npos, "NetEase preserves service refusal instead of guessing membership");
+        check(js::parse(R"({"code":301,"data":[]})", fixture) && !music::parse_netease_audio(fixture).ok, "NetEase rejects expired session response");
+        check(js::parse(R"({"code":200,"data":[]})", fixture) && !music::parse_netease_audio(fixture).ok, "NetEase rejects missing audio data");
+        check(js::parse(R"({"code":200,"data":[{"code":200,"url":"https://cdn.test/song.flac","br":0,"type":"flac"}]})", fixture) && music::parse_netease_audio(fixture).ok, "NetEase accepts address when bitrate metadata is unknown");
+        check(js::parse(R"({"code":200,"data":[{"code":200,"url":"file:///untrusted"}]})", fixture) && !music::parse_netease_audio(fixture).ok, "NetEase only accepts network playback addresses");
         check(js::parse(R"({"data":{"result":[{"bvid":"BV1fixture01","title":"<em>Hello</em> &amp; world","author":"Artist","pic":"//cdn.test/a.jpg","duration":"1:02:03"}]}})", fixture), "Bilibili fixture JSON");
         auto videos = parse_bilibili_search(fixture, 2);
         check(videos.size() == 1 && videos[0].title == "Hello & world" && videos[0].duration_ms == 3723000 &&

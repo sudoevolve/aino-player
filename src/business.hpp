@@ -1177,7 +1177,7 @@ static void do_play(HostCallbacks* win, music::Track track, music::Settings st, 
     g_as.ps = PlayState::Failed;
     g_as.now_quality = "不可用";
     g_as.error = reasons.empty() ? "没有可用音源"
-                                 : ("取流失败 — " + reasons + "（可在「音源」页填 Cookie，或换一行）");
+                                 : ("取流失败 — " + reasons);
     win->wake();
 }
 
