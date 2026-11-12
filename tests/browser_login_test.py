@@ -135,18 +135,25 @@ class Probe:
         return result
 
     def close(self):
-        if self.process.poll() is None:
-            try:
-                self.finish("cancel")
-            finally:
-                if self.process.poll() is None:
-                    self.process.kill()
-                    self.process.wait(timeout=8)
-        if self.cdp:
-            self.cdp.close()
-        self.process.stdin.close()
-        self.process.stdout.close()
-        self.log.close()
+        failed = sys.exc_info()[0] is not None
+        try:
+            if self.process.poll() is None:
+                try:
+                    self.finish("cancel")
+                finally:
+                    if self.process.poll() is None:
+                        self.process.kill()
+                        self.process.wait(timeout=8)
+        except Exception:
+            if not failed:
+                raise
+        finally:
+            if self.cdp:
+                self.cdp.close()
+            self.reader.join(timeout=2)
+            self.process.stdin.close()
+            self.process.stdout.close()
+            self.log.close()
 
 
 def run(binary, browser):

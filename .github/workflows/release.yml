@@ -30,10 +30,12 @@ jobs:
           if-no-files-found: error
   linux:
     runs-on: ubuntu-22.04
+    env:
+      CHROME_DEVEL_SANDBOX: /opt/google/chrome/chrome-sandbox
     steps:
       - uses: actions/checkout@v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y libx11-dev libcurl4-openssl-dev libfreetype6 libfontconfig1 fonts-noto-cjk libasound2 xvfb ffmpeg xdg-utils dpkg-dev
-      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_TESTING=ON
+      - run: test -u "$CHROME_DEVEL_SANDBOX" && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_TESTING=ON -DAINO_TEST_BROWSER=/usr/bin/google-chrome
       - run: cmake --build build --parallel 2
       - run: ctest --test-dir build --output-on-failure
       - name: Build and verify Debian package

@@ -28,6 +28,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cstring>
+#include <cwchar>
 
 namespace login {
 namespace {
@@ -433,6 +434,35 @@ public:
         trace("Browser.close sent");
     }
 };
+#ifdef _WIN32
+// 仅清理本次生成的临时 profile；原生枚举支持扩展路径，且不递归进入重解析点。
+bool remove_browser_profile(const std::wstring& path, unsigned depth = 0) {
+    if (depth > 64) return false;
+    const auto attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) return GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND;
+    if (attributes & FILE_ATTRIBUTE_REPARSE_POINT) return RemoveDirectoryW(path.c_str()) != FALSE;
+    WIN32_FIND_DATAW entry{};
+    const HANDLE find = FindFirstFileW((path + L"\\*").c_str(), &entry);
+    bool ok = true;
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            if (!std::wcscmp(entry.cFileName, L".") || !std::wcscmp(entry.cFileName, L"..")) continue;
+            const auto child = path + L"\\" + entry.cFileName;
+            if (entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                if (!remove_browser_profile(child, depth + 1)) ok = false;
+            } else {
+                if ((entry.dwFileAttributes & FILE_ATTRIBUTE_READONLY) && !(entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+                    SetFileAttributesW(child.c_str(), entry.dwFileAttributes & ~FILE_ATTRIBUTE_READONLY);
+                if (!DeleteFileW(child.c_str())) ok = false;
+            }
+        } while (FindNextFileW(find, &entry));
+        if (GetLastError() != ERROR_NO_MORE_FILES) ok = false;
+        FindClose(find);
+    } else if (GetLastError() != ERROR_FILE_NOT_FOUND) ok = false;
+    if (attributes & FILE_ATTRIBUTE_READONLY) SetFileAttributesW(path.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY);
+    return RemoveDirectoryW(path.c_str()) && ok;
+}
+#endif
 bool browser_credentials(Site site, const js::Value& result, std::string& cookie, std::string& uid) {
     if (!result["cookies"].is_array()) return false;
     cookie.clear();
@@ -475,9 +505,13 @@ void run_browser(Site site, BrowserOptions options) {
 #endif
             // Windows 上浏览器主进程退出后，子进程仍可能短暂持有 profile 文件锁。
             for (int i = 0; i < 40; ++i) {
+#ifdef _WIN32
+                if (remove_browser_profile(directory.native())) { trace("owned browser profile removed"); return; }
+#else
                 std::error_code error;
                 platform::fs::remove_all(directory, error);
                 if (!error) { trace("owned browser profile removed"); return; }
+#endif
                 platform::sleep_ms(100);
             }
         }
