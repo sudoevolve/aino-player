@@ -10206,14 +10206,6 @@ struct Win32State {
     // 铁律：bb_valid 为 false 时**绝不允许 BitBlt 上屏** —— 那块新建的 DIB 全是 0，
     // 贴上去就是一片黑（这就是拖边框时的黑闪）。
     bool bb_valid = false;
-    // 组字期间的低频计时器（见 WM_TIMER）。0 = 没开。
-    UINT_PTR ime_timer = 0;
-    // 系统那个浮动组合窗，以及它的高度（物理像素）。
-    // 为什么要高度：候选窗是**挂在组合窗底下**的 —— 输入法自己算，我们的
-    // ImmSetCandidateWindow 说了不算。所以想让候选窗贴着输入框，就得把组合窗
-    // 整体上移它自己的高度，让它的**底边**落在框底（反正它已经被我们涂透明了）。
-    HWND ime_ghost = nullptr;
-    int  ime_ghost_h = 0;
     RECT ime_caret{};
     bool native_caret = false;
 
@@ -10427,10 +10419,6 @@ constexpr DWORD AINO_CFS_CANDIDATEPOS = 0x0040;   // 候选窗左上角 = ptCurr
 // WM_IME_COMPOSITION 的 lParam 位
 constexpr DWORD AINO_GCS_COMPSTR      = 0x0008;   // 还没上屏的组字串（拼音）
 constexpr DWORD AINO_GCS_RESULTSTR    = 0x0800;   // 已经上屏的结果串
-// 组字期间压输入法浮动组合窗用的线程计时器 id（见 Window::poll）。
-// 只是个"想要的" id —— 线程计时器最终由系统分配，实际值存在 Win32State::ime_timer。
-constexpr UINT_PTR AINO_IME_TIMER_ID = 0xA1;
-
 // WM_IME_SETCONTEXT 的 lParam 位：让系统画那个悬空的组合窗
 constexpr LPARAM AINO_ISC_SHOWUICOMPOSITIONWINDOW = LPARAM(0x80000000);
 
@@ -10475,16 +10463,11 @@ inline void win_set_ime_pos(Win32State* s, float caret_x, float top, float botto
     HIMC himc = api.get_ctx(s->hwnd);
     if (!himc) return;
 
-    // 组合窗整体上移它自己的高度：让它的**底边**落在输入框底边上。
-    // 候选窗是挂在组合窗底下由输入法自己摆的（ImmSetCandidateWindow 对它无效，
-    // 实测报 (caret, bottom+4) 完全没人理），所以只报 bottom 的话，候选窗会被
-    // 组合窗那 22px 顶下去 —— 用户看到的就是"候选窗离输入框那么远"。
-    // 组合窗本身已经被涂成全透明了，挪上去不会有任何视觉副作用。
-    const int ghost_h = s->ime_ghost_h;
+    // 只通过 IMM 上报位置；不能隐藏或修改系统 IME 的原生窗口。
     AinoCompositionFormW cf{};
     cf.dwStyle = AINO_CFS_POINT;
     cf.ptCurrentPos.x = LONG(caret_x);
-    cf.ptCurrentPos.y = LONG(bottom - float(ghost_h));
+    cf.ptCurrentPos.y = LONG(bottom);
     api.set_comp(himc, &cf);
 
     AinoCandidateFormW cd{};
@@ -10495,54 +10478,6 @@ inline void win_set_ime_pos(Win32State* s, float caret_x, float top, float botto
     api.set_cand(himc, &cd);
 
     api.rel_ctx(s->hwnd, himc);
-}
-
-// 微软拼音这类 TSF 输入法经 CUAS 转发时，会**自己在进程里**开一个
-// "MSCTFIME Composition" 顶层窗口画组字串。我们已经把同一串画进输入框了，
-// 两个一起出现就是重影 —— 用户截图里"框里框外各一份"就是这个。
-// 这个窗口属于本进程（不一定在 UI 线程），按 pid + 类名找出来藏掉；
-// 候选窗是另一个类（"MSCTFIME UI"），绝不能动 —— 那个我们画不了。
-struct AinoImeHideCtx { DWORD pid; void* st; };
-
-inline BOOL CALLBACK aino_hide_ime_comp_cb(HWND w, LPARAM lp) {
-    DWORD p = 0;
-    GetWindowThreadProcessId(w, &p);
-    if (p != reinterpret_cast<AinoImeHideCtx*>(lp)->pid) return TRUE;
-    wchar_t cls[64];
-    if (!GetClassNameW(w, cls, 64)) return TRUE;
-    if (lstrcmpW(cls, L"MSCTFIME Composition") != 0) return TRUE;
-
-    // ① 先把它变成"全透明的分层窗"。这一步才是防闪烁的关键。
-    //    SW_HIDE 是**状态**操作，可输入法在每次组字更新时会再 ShowWindow 一次 ——
-    //    我们 20 ms 后才压回去，于是"亮一下、藏起来、再亮一下"。
-    //    实测：空闲时它是干净的（240 帧零变化），**每个按键**都会露出一次
-    //    （框下 11x15 的小白块），连打就是用户说的"一直闪烁"。
-    //    分层 + alpha=0 之后窗口**照旧是可见的**（输入法不会再来抢显示），
-    //    只是画不出任何像素；WS_EX_TRANSPARENT 让点击穿过去，别挡住输入框。
-    //    对不可见的窗口也照做：提前上好，等它下次亮出来时已经是透明的。
-    LONG_PTR ex = GetWindowLongPtrW(w, GWL_EXSTYLE);
-    const LONG_PTR want = ex | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
-    if (want != ex) SetWindowLongPtrW(w, GWL_EXSTYLE, want);
-    SetLayeredWindowAttributes(w, 0, 0, LWA_ALPHA);   // 幂等，重复调不心疼
-
-    // ② 再藏一次当兜底：万一分层没生效（老主题／输入法重置样式），至少还挡得住。
-    if (IsWindowVisible(w)) ShowWindow(w, SW_HIDE);
-    // ③ 记下它和它的高度，给定位用（见 win_set_ime_pos：候选窗贴着它的底边）。
-    if (auto* st = reinterpret_cast<Win32State*>(reinterpret_cast<AinoImeHideCtx*>(lp)->st))
-        st->ime_ghost = w;
-    RECT gr{};
-    if (GetWindowRect(w, &gr) && gr.bottom > gr.top)
-        if (auto* st = reinterpret_cast<Win32State*>(reinterpret_cast<AinoImeHideCtx*>(lp)->st))
-            st->ime_ghost_h = int(gr.bottom - gr.top);
-    return TRUE;
-}
-
-inline void win_hide_ime_comp_window(Win32State* s) {
-    if (!s || !s->owner) return;
-    if (!s->owner->ui.impl->ime_owner) return;              // 没输入框接管 → 别动系统那份
-    if (s->owner->ui.impl->ime_comp.empty()) return;        // 没在组字 → 别动
-    AinoImeHideCtx ctx{GetCurrentProcessId(), s};
-    EnumWindows(aino_hide_ime_comp_cb, reinterpret_cast<LPARAM>(&ctx));
 }
 
 inline void win_apply_cursor(Win32State* s) {
@@ -10695,8 +10630,8 @@ inline LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     // input / textarea 画在光标处。上屏字符仍然走 WM_CHAR —— 所以这几个 case
     // 一律 break（交给 DefWindowProc），绝不自己插入 RESULTSTR：两条路都插就是双份。
     case WM_IME_SETCONTEXT:
-        // 组字串我们自己画在框里了，别让系统再画一个悬在下面。
-        // 候选窗（ISC_SHOWUIFIRSTCANDIDATE 等）不动 —— 那个只能系统画。
+        // 只屏蔽自绘的组合串，候选窗口的所有显示位原样交给系统。
+        // 不按窗口类名隐藏/透明化 IME 窗口，组合窗和候选窗可能共享可见性。
         l &= ~AINO_ISC_SHOWUICOMPOSITIONWINDOW;
         break;
 
@@ -10837,11 +10772,7 @@ inline LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
     default: break;
     }
-    LRESULT dw = DefWindowProcW(h, m, w, l);
-    // 隐藏操作必须在初始 ShowWindow 调用后执行。
-    if (m == WM_IME_COMPOSITION || m == WM_IME_STARTCOMPOSITION)
-        detail::win_hide_ime_comp_window(s);
-    return dw;
+    return DefWindowProcW(h, m, w, l);
 }
 
 inline void w32_create(Window* self, const WindowConfig& cfg) {
@@ -11115,14 +11046,6 @@ inline bool Window::poll() {
     MSG msg;
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) { o->running = false; break; }
-        // 线程计时器（组字期间压输入法浮动组合窗用的）。这种消息 hwnd 为空、
-        // 没有窗口过程可派发，只能在这儿消费。它**故意**不置 need_frame ——
-        // 否则组字时会被这个计时器拖着 50fps 重绘。
-        if (!msg.hwnd && msg.message == WM_TIMER && s->ime_timer
-            && msg.wParam == s->ime_timer) {
-            detail::win_hide_ime_comp_window(s);
-            continue;
-        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -11158,20 +11081,6 @@ inline void Window::render() {
     ui.begin_frame(float(s->pw) / o->scale, float(s->ph) / o->scale, dt, o->scale);
     if (o->frame_cb_ptr) o->frame_cb_ptr();
     if (!ui.impl->ime_owner && s->native_caret) { DestroyCaret(); s->native_caret = false; }
-    // 组字期间开一个 20 ms 的低频计时器压住输入法的浮动组合窗。
-    // 不能只靠"每帧压一次"：光标闪烁的 38% 相位不请求重绘，帧会停，
-    // 停住之后输入法再把窗口亮出来就没人压了（实测多行 textarea 上就这么漏的）。
-    // 必须是**线程计时器**（hwnd = nullptr）：窗口计时器的 WM_TIMER 只有在消息泵
-    // 转起来时才被合成，而我们的循环没帧就阻塞在 WaitMessage 里 —— 那种情况下
-    // 它一次都不会来。线程计时器的 WM_TIMER 是**真入队**的，能把 WaitMessage 叫醒，
-    // 在 poll() 里消费（见 Window::poll）。
-    if (o->ui.impl->ime_owner && !o->ui.impl->ime_comp.empty()) {
-        // 无关联窗口的计时器由系统分配 ID，保存 SetTimer 返回值以匹配 WM_TIMER。
-        if (!s->ime_timer) s->ime_timer = SetTimer(nullptr, detail::AINO_IME_TIMER_ID, 20, nullptr);
-    } else if (s->ime_timer) {
-        KillTimer(nullptr, s->ime_timer);
-        s->ime_timer = 0;
-    }
     ui.set_cursor(ui.cursor());
     uint64_t p1 = prof ? detail::win_ticks_us() : 0;
     ui.end_frame();
