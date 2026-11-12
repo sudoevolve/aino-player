@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=aino player
+GenericName=Music Player
+GenericName[zh_CN]=音乐播放器
+Comment=Discover music, play songs and manage local favorites
+Comment[zh_CN]=发现音乐、播放歌曲与管理本地收藏
+Exec=aino_player
+Icon=multimedia-player
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+StartupNotify=true

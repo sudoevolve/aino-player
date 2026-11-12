@@ -51,14 +51,17 @@ inline std::string cookie_value(const std::string& jar, const char* key) {
 
 // QQ 的 g_tk：djb2 变体，取低 31 位
 inline int calc_g_tk(const std::string& skey) {
-    int h = 5381;
-    for (unsigned char c : skey) h += (h << 5) + int(c);
+    uint32_t h = 5381;
+    for (unsigned char c : skey) h += (h << 5) + uint32_t(c);
     return h & 0x7fffffff;
 }
 
 inline std::string g_tk_of(const std::string& jar) {
     std::string skey = cookie_value(jar, "p_skey");
     if (skey.empty()) skey = cookie_value(jar, "skey");
+    if (skey.empty()) skey = cookie_value(jar, "qqmusic_key");
+    if (skey.empty()) skey = cookie_value(jar, "musickey");
+    if (skey.empty()) skey = cookie_value(jar, "qm_keyst");
     return std::to_string(calc_g_tk(skey));
 }
 
@@ -142,7 +145,7 @@ inline Profile fetch_profile(const std::string& cookie, const std::string& uin_r
 // 传错一律 -100008 param error。plaza=true 表示后者（热门歌单 / 别人分享的歌单）。
 inline std::vector<music::Track> fetch_playlist(const std::string& cookie, const std::string& dirid,
                                                 const std::string& uin_raw, std::string& err,
-                                                int timeout_ms = 15000, bool plaza = false) {
+                                                int timeout_ms = 15000, bool plaza = false, Playlist* metadata = nullptr) {
     std::vector<music::Track> out;
     const std::string uin = clean_uin(uin_raw);
     // 广场歌单匿名就能读，uin 给 0 即可；自建歌单必须有登录态
@@ -189,6 +192,12 @@ inline std::vector<music::Track> fetch_playlist(const std::string& cookie, const
             return out;
         }
         const js::Value& list = data["songlist"];
+        if (metadata && page == 0) {
+            metadata->dirid = dirid;
+            metadata->name = music::text::decode_entities(data["dirinfo"]["title"].str(data["dissinfo"]["dissname"].str()));
+            metadata->cover = data["dirinfo"]["picurl"].str(data["dissinfo"]["logo"].str());
+            metadata->count = int(data["total_song_num"].integer());
+        }
         if (list.size() == 0) break;
 
         for (size_t i = 0; i < list.size(); ++i) {

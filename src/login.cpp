@@ -1,417 +1,699 @@
-// login.cpp —— WebView2 登录窗口的实现（QQ 音乐 / 网易云音乐）
-//
-// 流程：开一个独立小窗口 → 加载站点首页 → 用户扫码/密码登录 →
-// 每 1.5 秒用 ICoreWebView2CookieManager 抓一次该域的 cookie →
-// 看到站点自己的登录凭据（QQ: qm_keyst，网易云: MUSIC_U）就认为登录成功，
-// 把 cookie 串回传并自动关窗。
-//
-// 为什么要独立线程 + 独立窗口：aino 的主循环靠 WaitMessage 阻塞，如果把 WebView2
-// 塞进主窗口，消息循环会互相打架（而且 WebView2 要求在自己线程里 pump 消息）。
+// 官网在独立外部浏览器会话登录；只连接本机调试端口，手动导入保留为备用入口。
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <shlwapi.h>
+#else
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
+#endif
 #include "login.h"
-
-#include <windows.h>
-#include <wrl/client.h>
-
-#include <atomic>
-#include <cstdarg>
-#include <cstdio>
-#include <functional>
-#include <memory>
-#include <string>
+#include "platform.hpp"
+#include "json.hpp"
+#include "netease_api.hpp"
+#include "qqapi.hpp"
+#include <array>
+#include <random>
 #include <thread>
-
-#include "../vendor/webview2/include/WebView2.h"
-
-using Microsoft::WRL::ComPtr;
+#include <cctype>
+#include <limits>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+#include <cstring>
 
 namespace login {
 namespace {
-
-// MinGW 没有 __uuidof(MIDL_INTERFACE) 和 WRL Callback，IID 手写、回调对象自己实现
-const GUID kIidEnvHandler = {0x4e8a3389, 0xc9d8, 0x4bd2, {0xb6, 0xb5, 0x12, 0x4f, 0xee, 0x6c, 0xc1, 0x4d}};
-const GUID kIidControllerHandler = {0x6c4819f3, 0xc9b7, 0x4260, {0x81, 0x27, 0xc9, 0xf5, 0xbd, 0xe7, 0xf6, 0x8c}};
-const GUID kIidCookiesHandler = {0x5a4f5069, 0x5c15, 0x47c3, {0x86, 0x46, 0xf4, 0xde, 0x1c, 0x11, 0x66, 0x70}};
-const GUID kIidWebView2_2 = {0x9E8F0CF8, 0xE670, 0x4B5E, {0xB2, 0xBC, 0x73, 0xE0, 0x61, 0xE3, 0x18, 0x4C}};
-
-// WebView2 的 *CompletedHandler 都是 Invoke(HRESULT, T*)，一个模板全覆盖
-template <class Iface, class Arg>
-class Handler final : public Iface {
-public:
-    Handler(const GUID& iid, std::function<HRESULT(HRESULT, Arg*)> fn) : iid_(iid), fn_(std::move(fn)) {}
-
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
-        if (!out) return E_POINTER;
-        if (IsEqualGUID(riid, IID_IUnknown) || IsEqualGUID(riid, iid_)) {
-            *out = static_cast<Iface*>(this);
-            AddRef();
-            return S_OK;
-        }
-        *out = nullptr;
-        return E_NOINTERFACE;
-    }
-    ULONG STDMETHODCALLTYPE AddRef() override { return ++ref_; }
-    ULONG STDMETHODCALLTYPE Release() override {
-        const ULONG n = --ref_;
-        if (n == 0) delete this;
-        return n;
-    }
-    HRESULT STDMETHODCALLTYPE Invoke(HRESULT hr, Arg* arg) override { return fn_(hr, arg); }
-
-private:
-    GUID iid_;
-    std::function<HRESULT(HRESULT, Arg*)> fn_;
-    std::atomic<ULONG> ref_{1};
-};
-
-template <class Iface, class Arg>
-ComPtr<Iface> make_handler(const GUID& iid, std::function<HRESULT(HRESULT, Arg*)> fn) {
-    ComPtr<Iface> p;
-    p.Attach(new Handler<Iface, Arg>(iid, std::move(fn)));
-    return p;
-}
-
-#if defined(_MSC_VER)
-HRESULT create_environment(PCWSTR data_dir, ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler* h) {
-    return CreateCoreWebView2EnvironmentWithOptions(nullptr, data_dir, nullptr, h);
-}
-
-bool runtime_installed() {
-    LPWSTR ver = nullptr;
-    const HRESULT hr = GetAvailableCoreWebView2BrowserVersionString(nullptr, &ver);
-    if (ver) CoTaskMemFree(ver);
-    return SUCCEEDED(hr);
-}
+#ifdef _WIN32
+using Socket = SOCKET;
+constexpr Socket invalid_socket = INVALID_SOCKET;
+void close_socket(Socket s) { closesocket(s); }
 #else
-// MSVC 的 WebView2LoaderStatic.lib MinGW 链不了：自己读注册表找到运行时里的
-// EmbeddedBrowserWebView.dll，直接调它导出的内部入口（官方 loader 做的也是这件事）
-std::wstring read_reg_str(HKEY root, REGSAM wow, const wchar_t* sub, const wchar_t* name) {
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(root, sub, 0, KEY_READ | wow, &key) != ERROR_SUCCESS) return std::wstring();
-    wchar_t buf[MAX_PATH] = {0};
-    DWORD size = sizeof buf - sizeof(wchar_t), type = 0;
-    const LONG rc = RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<BYTE*>(buf), &size);
-    RegCloseKey(key);
-    return (rc == ERROR_SUCCESS && type == REG_SZ) ? std::wstring(buf) : std::wstring();
-}
-
-std::wstring find_runtime_dll() {
-    const wchar_t* sub = L"SOFTWARE\\Microsoft\\EdgeUpdate\\ClientState\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
-    const struct {
-        HKEY root;
-        REGSAM wow;
-    } where[] = {{HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY}, {HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY},
-                 {HKEY_CURRENT_USER, 0}};
-    const wchar_t* arch = sizeof(void*) == 8 ? L"x64" : L"x86";
-    for (const auto& w : where) {
-        const std::wstring dir = read_reg_str(w.root, w.wow, sub, L"EBWebView");
-        if (dir.empty()) continue;
-        const std::wstring dll = dir + L"\\EBWebView\\" + arch + L"\\EmbeddedBrowserWebView.dll";
-        if (GetFileAttributesW(dll.c_str()) != INVALID_FILE_ATTRIBUTES) return dll;
-    }
-    return std::wstring();
-}
-
-HRESULT create_environment(PCWSTR data_dir, ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler* h) {
-    using Fn = HRESULT(STDMETHODCALLTYPE*)(BOOL, int, PCWSTR, IUnknown*,
-                                           ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*);
-    const std::wstring dll = find_runtime_dll();
-    if (dll.empty()) return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
-    HMODULE mod = LoadLibraryW(dll.c_str());
-    if (!mod) return HRESULT_FROM_WIN32(GetLastError());
-    const auto fn = reinterpret_cast<Fn>(reinterpret_cast<void*>(
-        GetProcAddress(mod, "CreateWebViewEnvironmentWithOptionsInternal")));
-    if (!fn) return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
-    return fn(TRUE, 0 /* installed runtime */, data_dir, nullptr, h);
-}
-
-bool runtime_installed() { return !find_runtime_dll().empty(); }
+using Socket = int;
+constexpr Socket invalid_socket = -1;
+void close_socket(Socket s) { ::close(s); }
 #endif
-
-// 每个站点只需要这几条差异，剩下的窗口/线程/抓 cookie 逻辑完全共用
-struct SiteCfg {
-    const wchar_t* title;
-    const wchar_t* url;
-    const wchar_t* cookie_uri;
-    const wchar_t* cls;
-    const char* host;            // 只用于日志和提示文案
-    const char* success_cookie;  // 出现这个 cookie 值 ≠ 空 就认定登录成功
-    const char* uid_key;         // 能从 cookie 直接读到的用户 id（网易云没有，填空）
-    bool strip_leading_o;        // QQ 的 uin 可能是 "o0123456789"
+struct Connection {
+    Socket socket = invalid_socket;
+    ~Connection() { if (socket != invalid_socket) close_socket(socket); }
 };
-
-const SiteCfg& cfg_of(Site s) {
-    static const SiteCfg kQq = {L"登录 QQ 音乐 — 登录成功后窗口会自动关闭", L"https://y.qq.com/",
-                                L"https://y.qq.com/", L"aino_login_qq", "y.qq.com", "qm_keyst", "uin", true};
-    static const SiteCfg kNe = {L"登录网易云音乐 — 登录成功后窗口会自动关闭", L"https://music.163.com/",
-                                L"https://music.163.com/", L"aino_login_netease", "music.163.com", "MUSIC_U",
-                                nullptr, false};
-    return s == Site::QQ ? kQq : kNe;
+State states[kSiteCount];
+std::array<std::atomic<bool>, kSiteCount> cancelled{};
+std::array<std::thread, kSiteCount> workers;
+std::mutex worker_mutex;
+std::string token() {
+    std::random_device rd;
+    std::string value;
+    const char* hex = "0123456789abcdef";
+    for (int i = 0; i < 32; ++i) { const auto b = rd(); value += hex[b & 15]; value += hex[(b >> 4) & 15]; }
+    return value;
 }
-
-void logf(const SiteCfg& cfg, const char* fmt, ...) {
-    wchar_t tmp[MAX_PATH] = {0};
-    GetTempPathW(MAX_PATH, tmp);
-    std::wstring name = L"aino-login-";
-    for (const char* p = cfg.host; *p; ++p) name += wchar_t(*p);
-    std::wstring wpath = std::wstring(tmp) + name + L".log";
-    std::FILE* f = _wfopen(wpath.c_str(), L"a");
-    if (!f) return;
-    va_list ap;
-    va_start(ap, fmt);
-    std::vfprintf(f, fmt, ap);
-    va_end(ap);
-    std::fputc('\n', f);
-    std::fclose(f);
+void note(Site site, const std::string& text) {
+    auto& s = state(site);
+    std::lock_guard<std::mutex> lock(s.m); s.note = text;
 }
-
-std::string to_utf8(const std::wstring& w) {
-    if (w.empty()) return std::string();
-    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), int(w.size()), nullptr, 0, nullptr, nullptr);
-    std::string s(size_t(n), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), int(w.size()), s.data(), n, nullptr, nullptr);
-    return s;
+bool ready(Socket fd, int milliseconds) {
+    fd_set reads; FD_ZERO(&reads); FD_SET(fd, &reads);
+    timeval timeout{milliseconds / 1000, (milliseconds % 1000) * 1000};
+    return select(int(fd + 1), &reads, nullptr, nullptr, &timeout) > 0;
 }
-
-std::wstring to_wide(const std::string& s) {
-    if (s.empty()) return std::wstring();
-    const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), int(s.size()), nullptr, 0);
-    std::wstring w(size_t(n), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), int(s.size()), w.data(), n);
-    return w;
-}
-
-std::wstring take_lpstr(LPWSTR p) {
-    std::wstring s = p ? p : L"";
-    if (p) CoTaskMemFree(p);
-    return s;
-}
-
-// 两个站点各用一份 user data 目录：登录态互不干扰，退出登录也好清
-std::string user_data_dir(Site s) {
-    wchar_t buf[MAX_PATH] = {0};
-    std::string base;
-    if (GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH)) base = to_utf8(buf);
-    if (base.empty()) base = ".";
-    return base + "\\aino-player\\webview2\\" + (s == Site::QQ ? "qq" : "netease");
-}
-
-struct Ctx {
-    Site site = Site::QQ;
-    HWND hwnd = nullptr;
-    ComPtr<ICoreWebView2Controller> controller;
-    ComPtr<ICoreWebView2> webview;
-    ComPtr<ICoreWebView2CookieManager> cookies;
-    bool finished = false;
-};
-
-void set_note(Site s, const std::string& note) {
-    auto& st = state(s);
-    std::lock_guard<std::mutex> lk(st.m);
-    st.note = note;
-}
-
-void finish(const std::shared_ptr<Ctx>& ctx, const std::string& cookie, const std::string& uid,
-            const std::string& note) {
-    if (ctx->finished) return;
-    ctx->finished = true;
-    auto& st = state(ctx->site);
-    {
-        std::lock_guard<std::mutex> lk(st.m);
-        st.cookie = cookie;
-        st.uid = uid;
-        st.note = note;
+bool send_all(Socket fd, const std::string& data) {
+    size_t sent = 0;
+    while (sent < data.size()) {
+#ifdef _WIN32
+        const int n = ::send(fd, data.data() + sent, int(data.size() - sent), 0);
+#else
+        const auto n = ::send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
+#endif
+        if (n <= 0) return false;
+        sent += size_t(n);
     }
-    st.done.store(true);
-    if (ctx->hwnd) PostMessageW(ctx->hwnd, WM_CLOSE, 0, 0);
+    return true;
 }
-
-void poll_cookies(const std::shared_ptr<Ctx>& ctx) {
-    if (!ctx->cookies) return;
-    const SiteCfg& cfg = cfg_of(ctx->site);
-    auto on_cookies = [ctx](HRESULT hr, ICoreWebView2CookieList* list) -> HRESULT {
-        if (FAILED(hr) || !list) return S_OK;
-        if (ctx->finished) return S_OK;
-        const SiteCfg& c = cfg_of(ctx->site);
-
-        UINT count = 0;
-        list->get_Count(&count);
-        std::string jar;
-        std::string uid_raw;
-        std::string token;
-        for (UINT i = 0; i < count; ++i) {
-            ComPtr<ICoreWebView2Cookie> ck;
-            if (FAILED(list->GetValueAtIndex(i, ck.GetAddressOf())) || !ck) continue;
-            LPWSTR pn = nullptr;
-            ck->get_Name(&pn);
-            const std::wstring name = take_lpstr(pn);
-            LPWSTR pv = nullptr;
-            ck->get_Value(&pv);
-            const std::wstring value = take_lpstr(pv);
-            if (name.empty()) continue;
-            const std::string n8 = to_utf8(name), v8 = to_utf8(value);
-            if (!jar.empty()) jar += "; ";
-            jar += n8 + "=" + v8;
-            if (n8 == c.success_cookie) token = v8;
-            if (c.uid_key && n8 == c.uid_key) uid_raw = v8;
-        }
-
-        set_note(ctx->site, std::string("已加载 ") + c.host + (token.empty() ? "，等待登录…" : "，检测到登录态"));
-
-        if (token.size() > 8) {
-            std::string uid = uid_raw;
-            if (c.strip_leading_o && uid.size() > 1 && (uid[0] == 'o' || uid[0] == 'O')) uid = uid.substr(1);
-            finish(ctx, jar, uid, "登录成功");
-        }
-        return S_OK;
+void respond(Socket fd, int status, const std::string& body, const std::string& type = "text/plain; charset=utf-8") {
+    const auto headers = "HTTP/1.1 " + std::to_string(status) + " Response\r\nContent-Type: " + type +
+        "\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n"
+        "X-Frame-Options: DENY\r\nConnection: close\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n";
+    send_all(fd, headers + body);
+}
+struct HttpRequest { std::string method, path, host, origin, type, body; };
+bool read_request(Socket fd, HttpRequest& out) {
+    std::string data;
+    size_t split = std::string::npos;
+    const auto deadline = platform::ticks() + 4000;
+    auto read_more = [&]() {
+        while (!ready(fd, 100)) if (platform::ticks() >= deadline) return false;
+        if (platform::ticks() >= deadline) return false;
+        char buffer[4096];
+        const auto n = recv(fd, buffer, sizeof(buffer), 0);
+        if (n <= 0) return false;
+        data.append(buffer, size_t(n));
+        return data.size() <= 96 * 1024;
     };
-    auto handler = make_handler<ICoreWebView2GetCookiesCompletedHandler, ICoreWebView2CookieList>(
-        kIidCookiesHandler, on_cookies);
-    ctx->cookies->GetCookies(cfg.cookie_uri, handler.Get());
+    while ((split = data.find("\r\n\r\n")) == std::string::npos) {
+        if (!read_more()) return false;
+        if (data.size() > 16 * 1024) return false;
+    }
+    const auto first = data.find("\r\n");
+    const auto space = data.find(' '), second = data.find(' ', space + 1);
+    if (space == std::string::npos || second == std::string::npos || second > first) return false;
+    out.method = data.substr(0, space); out.path = data.substr(space + 1, second - space - 1);
+    size_t length = 0;
+    bool has_length = false;
+    for (size_t pos = first + 2; pos < split;) {
+        const auto end = data.find("\r\n", pos);
+        const auto colon = data.find(':', pos);
+        if (colon == std::string::npos || colon > end) return false;
+        auto name = data.substr(pos, colon - pos);
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        auto value = music::text::trim(data.substr(colon + 1, end - colon - 1));
+        if (name == "host") { if (!out.host.empty()) return false; out.host = value; }
+        else if (name == "origin") out.origin = value;
+        else if (name == "content-type") out.type = value;
+        else if (name == "transfer-encoding") return false;
+        else if (name == "content-length") {
+            if (has_length || value.empty() || value.find_first_not_of("0123456789") != std::string::npos) return false;
+            try { length = std::stoul(value); } catch (...) { return false; }
+            if (length > 64 * 1024) return false;
+            has_length = true;
+        }
+        pos = end + 2;
+    }
+    if (out.method == "POST" && !has_length) return false;
+    while (data.size() < split + 4 + length) if (!read_more()) return false;
+    out.body = data.substr(split + 4, length);
+    return true;
 }
+std::string json_string(const std::string& value) {
+    std::string out = "\"";
+    for (unsigned char c : value) {
+        if (c == '"' || c == '\\') { out += '\\'; out += char(c); }
+        else if (c >= 32) out += char(c);
+    }
+    return out + '"';
+}
+const char* official_url(Site site) { return site == Site::QQ ? "https://y.qq.com/" : "https://music.163.com/"; }
 
-LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    auto* ctx = reinterpret_cast<Ctx*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-    switch (msg) {
-        case WM_SIZE:
-            if (ctx && ctx->controller) {
-                RECT rc{};
-                GetClientRect(hwnd, &rc);
-                ctx->controller->put_Bounds(rc);
+// 只连接自己启动的独立浏览器会话，不读取用户日常浏览器的配置或 Cookie 数据库。
+std::string default_browser() {
+#ifdef _WIN32
+    wchar_t executable[32768]{};
+    DWORD size = DWORD(std::size(executable));
+    if (SUCCEEDED(AssocQueryStringW(ASSOCF_NONE, ASSOCSTR_EXECUTABLE, L"https", L"open", executable, &size)))
+        return platform::narrow(executable);
+    return {};
+#else
+    // 命令固定，不拼接用户输入；桌面文件只用于解析默认浏览器可执行文件。
+    std::string desktop;
+    if (auto* pipe = popen("xdg-settings get default-web-browser 2>/dev/null", "r")) {
+        char text[512]{};
+        if (std::fgets(text, sizeof(text), pipe)) desktop = music::text::trim(text);
+        pclose(pipe);
+    }
+    if (desktop.empty() || desktop.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") != std::string::npos) return {};
+    std::vector<std::string> directories;
+    auto home = platform::env("XDG_DATA_HOME");
+    if (home.empty()) home = platform::join(platform::env("HOME"), ".local/share");
+    directories.push_back(home);
+    auto system = platform::env("XDG_DATA_DIRS");
+    if (system.empty()) system = "/usr/local/share:/usr/share";
+    std::istringstream paths(system);
+    for (std::string path; std::getline(paths, path, ':');) directories.push_back(path);
+    for (const auto& directory : directories) {
+        std::ifstream input(platform::fs::u8path(platform::join(platform::join(directory, "applications"), desktop)));
+        for (std::string line; std::getline(input, line);) if (line.rfind("Exec=", 0) == 0) {
+            std::istringstream command(line.substr(5));
+            std::string executable;
+            if (command.peek() == '"') { command.get(); std::getline(command, executable, '"'); }
+            else command >> executable;
+            return executable;
+        }
+    }
+    return {};
+#endif
+}
+bool chromium_browser(const std::string& path) {
+    auto name = platform::fs::u8path(path).filename().u8string();
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    for (const char* supported : {"chrome.exe", "msedge.exe", "brave.exe", "vivaldi.exe", "chrome", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "microsoft-edge", "microsoft-edge-stable", "brave-browser", "vivaldi", "vivaldi-stable"})
+        if (name == supported) return true;
+    return false;
+}
+struct BrowserProcess {
+#ifdef _WIN32
+    HANDLE handle = nullptr;
+    HANDLE job = nullptr;
+#else
+    pid_t pid = 0;
+    pid_t group = 0;
+#endif
+    bool launch(const std::vector<std::string>& args) {
+#ifdef _WIN32
+        std::wstring command;
+        for (const auto& argument : args) {
+            if (!command.empty()) command += L' ';
+            command += L'"';
+            size_t slashes = 0;
+            for (wchar_t c : platform::widen(argument)) {
+                if (c == L'\\') { ++slashes; continue; }
+                if (c == L'"') command.append(slashes * 2 + 1, L'\\');
+                else command.append(slashes, L'\\');
+                slashes = 0; command += c;
             }
-            return 0;
-        case WM_CLOSE:
-            DestroyWindow(hwnd);
-            return 0;
-        case WM_DESTROY:
-            PostQuitMessage(0);
-            return 0;
-        default:
-            break;
+            command.append(slashes * 2, L'\\'); command += L'"';
+        }
+        STARTUPINFOW startup{}; startup.cb = sizeof(startup);
+        PROCESS_INFORMATION process{};
+        const auto executable = platform::widen(args.front());
+        job = CreateJobObjectW(nullptr, nullptr);
+        if (!job) return false;
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) return false;
+        // 挂起时加入独立 Job，确保登录窗口及其子进程均归本次尝试所有。
+        if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, nullptr, &startup, &process)) return false;
+        handle = process.hProcess;
+        if (!AssignProcessToJobObject(job, handle)) {
+            TerminateProcess(handle, 1); WaitForSingleObject(handle, 2000);
+            CloseHandle(process.hThread); return false;
+        }
+        const bool resumed = ResumeThread(process.hThread) != DWORD(-1);
+        CloseHandle(process.hThread); return resumed;
+#else
+        std::vector<char*> argv;
+        for (const auto& argument : args) argv.push_back(const_cast<char*>(argument.c_str()));
+        argv.push_back(nullptr);
+        posix_spawnattr_t attributes;
+        if (posix_spawnattr_init(&attributes)) return false;
+        const bool configured = posix_spawnattr_setpgroup(&attributes, 0) == 0 &&
+                                posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP) == 0;
+        const int result = configured ? posix_spawnp(&pid, argv[0], nullptr, &attributes, argv.data(), environ) : -1;
+        posix_spawnattr_destroy(&attributes);
+        if (result) { pid = 0; return false; }
+        group = pid; return true;
+#endif
     }
-    return DefWindowProcW(hwnd, msg, wp, lp);
+    bool running() {
+#ifdef _WIN32
+        return handle && WaitForSingleObject(handle, 0) == WAIT_TIMEOUT;
+#else
+        if (!pid) return false;
+        const auto result = waitpid(pid, nullptr, WNOHANG);
+        if (result == pid || (result < 0 && errno == ECHILD)) { pid = 0; return false; }
+        return true;
+#endif
+    }
+    void stop() {
+        // Browser.close 异步关闭；先等本次启动的进程退出，再兜底终止。
+        for (int i = 0; i < 20 && running(); ++i) platform::sleep_ms(50);
+#ifdef _WIN32
+        if (running()) { TerminateProcess(handle, 0); WaitForSingleObject(handle, 2000); }
+#else
+        // 独立进程组也覆盖浏览器启动脚本和仍存活的子进程，绝不向播放器的进程组发信号。
+        if (group > 0) {
+            kill(-group, SIGTERM);
+            for (int i = 0; i < 20 && kill(-group, 0) == 0; ++i) platform::sleep_ms(50);
+            if (kill(-group, 0) == 0) kill(-group, SIGKILL);
+            group = 0;
+        }
+        if (running()) { kill(pid, SIGKILL); waitpid(pid, nullptr, 0); pid = 0; }
+#endif
+#ifdef _WIN32
+        if (job) {
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
+            for (int i = 0; i < 20; ++i) {
+                if (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &accounting, sizeof(accounting), nullptr) || !accounting.ActiveProcesses) break;
+                platform::sleep_ms(50);
+            }
+            TerminateJobObject(job, 0);
+            for (int i = 0; i < 40; ++i) {
+                if (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &accounting, sizeof(accounting), nullptr) || !accounting.ActiveProcesses) break;
+                platform::sleep_ms(50);
+            }
+            CloseHandle(job); job = nullptr;
+        }
+        if (handle) { CloseHandle(handle); handle = nullptr; }
+#endif
+    }
+    ~BrowserProcess() { stop(); }
+};
+std::string base64(const unsigned char* data, size_t size) {
+    const char* alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string output;
+    for (size_t at = 0; at < size; at += 3) {
+        const uint32_t bits = uint32_t(data[at]) << 16 | (at + 1 < size ? uint32_t(data[at + 1]) << 8 : 0) | (at + 2 < size ? data[at + 2] : 0);
+        output += alphabet[(bits >> 18) & 63]; output += alphabet[(bits >> 12) & 63];
+        output += at + 1 < size ? alphabet[(bits >> 6) & 63] : '=';
+        output += at + 2 < size ? alphabet[bits & 63] : '=';
+    }
+    return output;
 }
-
-void run_window(Site site) {
-    const SiteCfg& cfg = cfg_of(site);
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    auto ctx = std::make_shared<Ctx>();
-    ctx->site = site;
-
-    const HINSTANCE inst = GetModuleHandleW(nullptr);
-    WNDCLASSEXW wc{};
-    wc.cbSize = sizeof wc;
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = inst;
-    wc.hCursor = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
-    wc.lpszClassName = cfg.cls;
-    RegisterClassExW(&wc);
-
-    RECT work{};
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-    const int w = 620, h = 780;
-    const int x = work.left + (work.right - work.left - w) / 2;
-    const int y = work.top + (work.bottom - work.top - h) / 2;
-
-    HWND hwnd = CreateWindowExW(0, cfg.cls, cfg.title, WS_OVERLAPPEDWINDOW, x, y, w, h, nullptr, nullptr, inst,
-                                nullptr);
-    if (!hwnd) {
-        logf(cfg, "CreateWindowExW failed err=%lu", GetLastError());
-        set_note(site, "创建登录窗口失败");
-        state(site).running.store(false);
-        state(site).done.store(true);
-        CoUninitialize();
-        return;
+// SHA-1 仅用于校验本机 WebSocket 握手，不承担凭据加密职责。
+std::string websocket_accept(const std::string& key) {
+    std::string input = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    const uint64_t bits = uint64_t(input.size()) * 8;
+    input += char(0x80);
+    while (input.size() % 64 != 56) input += '\0';
+    for (int i = 7; i >= 0; --i) input += char(bits >> (i * 8));
+    uint32_t hash[] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0};
+    const auto rotate = [](uint32_t value, int count) { return value << count | value >> (32 - count); };
+    for (size_t block = 0; block < input.size(); block += 64) {
+        uint32_t words[80]{};
+        for (int i = 0; i < 16; ++i) for (int j = 0; j < 4; ++j) words[i] = words[i] << 8 | uint8_t(input[block + i * 4 + j]);
+        for (int i = 16; i < 80; ++i) words[i] = rotate(words[i-3] ^ words[i-8] ^ words[i-14] ^ words[i-16], 1);
+        uint32_t a = hash[0], b = hash[1], c = hash[2], d = hash[3], e = hash[4];
+        for (int i = 0; i < 80; ++i) {
+            const uint32_t f = i < 20 ? (b & c) | (~b & d) : i < 40 ? b ^ c ^ d : i < 60 ? (b & c) | (b & d) | (c & d) : b ^ c ^ d;
+            const uint32_t k = i < 20 ? 0x5a827999 : i < 40 ? 0x6ed9eba1 : i < 60 ? 0x8f1bbcdc : 0xca62c1d6;
+            const uint32_t next = rotate(a, 5) + f + e + k + words[i];
+            e = d; d = c; c = rotate(b, 30); b = a; a = next;
+        }
+        hash[0] += a; hash[1] += b; hash[2] += c; hash[3] += d; hash[4] += e;
     }
-    ctx->hwnd = hwnd;
-    logf(cfg, "window created hwnd=%p", (void*)hwnd);
-    SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ctx.get()));
-    ShowWindow(hwnd, SW_SHOW);
-    UpdateWindow(hwnd);
-    set_note(site, "正在启动内置浏览器…");
-
-    const std::wstring data_dir = to_wide(user_data_dir(site));
-    auto on_controller = [ctx, cfg](HRESULT hr2, ICoreWebView2Controller* ctrl) -> HRESULT {
-        logf(cfg, "controller hr=0x%08lx ctrl=%p", (unsigned long)hr2, (void*)ctrl);
-        if (FAILED(hr2) || !ctrl) {
-            finish(ctx, std::string(), std::string(), "创建浏览器控件失败");
-            return S_OK;
+    unsigned char digest[20];
+    for (int i = 0; i < 20; ++i) digest[i] = uint8_t(hash[i / 4] >> (24 - i % 4 * 8));
+    return base64(digest, sizeof(digest));
+}
+class BrowserConnection {
+    Connection connection_;
+    int sequence_ = 0;
+    bool healthy_ = true;
+    bool read_bytes(char* target, size_t size, unsigned long long deadline, const std::atomic<bool>& cancel) {
+        size_t received = 0;
+        while (received < size && !cancel.load() && platform::ticks() < deadline) {
+            if (!ready(connection_.socket, 100)) continue;
+            const auto count = recv(connection_.socket, target + received, int(size - received), 0);
+            if (count <= 0) return false;
+            received += size_t(count);
         }
-        ctx->controller = ctrl;
-        ctrl->get_CoreWebView2(ctx->webview.GetAddressOf());
-        ComPtr<ICoreWebView2_2> newer;
-        if (SUCCEEDED(ctx->webview->QueryInterface(kIidWebView2_2, reinterpret_cast<void**>(newer.GetAddressOf()))) &&
-            newer)
-            newer->get_CookieManager(ctx->cookies.GetAddressOf());
-
-        RECT rc{};
-        GetClientRect(ctx->hwnd, &rc);
-        ctrl->put_Bounds(rc);
-        ctx->webview->Navigate(cfg.url);
-        SetTimer(ctx->hwnd, 1, 1500, nullptr);
-        set_note(ctx->site, std::string("已打开 ") + cfg.host + "，请扫码或账号登录");
-        return S_OK;
-    };
-    auto on_env = [ctx, cfg, on_controller](HRESULT hr, ICoreWebView2Environment* env) -> HRESULT {
-        logf(cfg, "env hr=0x%08lx env=%p", (unsigned long)hr, (void*)env);
-        if (FAILED(hr) || !env) {
-            finish(ctx, std::string(), std::string(), "WebView2 初始化失败（没装 Edge WebView2 运行时？）");
-            return S_OK;
+        return received == size;
+    }
+    bool send_frame(unsigned char opcode, const std::string& message) {
+        std::string frame(1, char(0x80 | opcode));
+        if (message.size() < 126) frame += char(0x80 | message.size());
+        else if (message.size() <= 65535) { frame += char(0xfe); frame += char(message.size() >> 8); frame += char(message.size()); }
+        else { frame += char(0xff); for (int i = 7; i >= 0; --i) frame += char(uint64_t(message.size()) >> (i * 8)); }
+        std::random_device random;
+        unsigned char mask[4];
+        for (auto& byte : mask) { byte = uint8_t(random()); frame += char(byte); }
+        for (size_t i = 0; i < message.size(); ++i) frame += char(uint8_t(message[i]) ^ mask[i % 4]);
+        return send_all(connection_.socket, frame);
+    }
+    bool read_message(std::string& message, const std::atomic<bool>& cancel, unsigned long long deadline) {
+        message.clear();
+        for (;;) {
+            unsigned char header[2];
+            if (!read_bytes(reinterpret_cast<char*>(header), 2, deadline, cancel)) return false;
+            uint64_t length = header[1] & 127;
+            if (length >= 126) {
+                unsigned char extra[8]{}; const int count = length == 126 ? 2 : 8;
+                if (!read_bytes(reinterpret_cast<char*>(extra), count, deadline, cancel)) return false;
+                length = 0; for (int i = 0; i < count; ++i) length = length << 8 | extra[i];
+            }
+            if (length > 2 * 1024 * 1024 || message.size() + length > 2 * 1024 * 1024) return false;
+            unsigned char mask[4]{};
+            if ((header[1] & 128) && !read_bytes(reinterpret_cast<char*>(mask), 4, deadline, cancel)) return false;
+            std::string payload(size_t(length), '\0');
+            if (!read_bytes(payload.data(), payload.size(), deadline, cancel)) return false;
+            if (header[1] & 128) for (size_t i = 0; i < payload.size(); ++i) payload[i] = char(uint8_t(payload[i]) ^ mask[i % 4]);
+            const auto opcode = header[0] & 15;
+            if (opcode == 8) return false;
+            if (opcode == 9) { if (!send_frame(10, payload)) return false; continue; }
+            if (opcode == 10) continue;
+            if (opcode != 0 && opcode != 1) return false;
+            message += payload;
+            if (header[0] & 128) return true;
         }
-        auto ch = make_handler<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler, ICoreWebView2Controller>(
-            kIidControllerHandler, on_controller);
-        env->CreateCoreWebView2Controller(ctx->hwnd, ch.Get());
-        return S_OK;
-    };
-    auto env_handler = make_handler<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler,
-                                    ICoreWebView2Environment>(kIidEnvHandler, on_env);
-    const HRESULT env_hr = create_environment(data_dir.c_str(), env_handler.Get());
-    logf(cfg, "create_environment hr=0x%08lx", (unsigned long)env_hr);
-    if (FAILED(env_hr)) finish(ctx, std::string(), std::string(), "WebView2 初始化失败（没装 Edge WebView2 运行时？）");
-
-    MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0)) {
-        // 定时器 → 抓 cookie
-        if (msg.message == WM_TIMER && msg.hwnd == hwnd && msg.wParam == 1) {
-            poll_cookies(ctx);
+    }
+public:
+    bool connect(int port, const std::string& path, const std::atomic<bool>& cancel) {
+        if (port < 1 || port > 65535 || path.rfind("/devtools/browser/", 0) != 0 || path.find_first_of("\r\n ") != std::string::npos) return false;
+        connection_.socket = socket(AF_INET, SOCK_STREAM, 0);
+        if (connection_.socket == invalid_socket) return false;
+        sockaddr_in address{}; address.sin_family = AF_INET; address.sin_port = htons(uint16_t(port)); address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (::connect(connection_.socket, reinterpret_cast<sockaddr*>(&address), sizeof(address))) return false;
+#ifdef _WIN32
+        DWORD timeout = 3000;
+        setsockopt(connection_.socket, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+#else
+        timeval timeout{3, 0}; setsockopt(connection_.socket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+#endif
+        std::random_device random; unsigned char bytes[16]; for (auto& byte : bytes) byte = uint8_t(random());
+        const auto key = base64(bytes, sizeof(bytes));
+        if (!send_all(connection_.socket, "GET " + path + " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(port) + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + key + "\r\nSec-WebSocket-Version: 13\r\n\r\n")) return false;
+        std::string response;
+        const auto deadline = platform::ticks() + 5000;
+        while (response.size() < 16384 && response.find("\r\n\r\n") == std::string::npos) {
+            char next;
+            if (!read_bytes(&next, 1, deadline, cancel)) return false;
+            response += next;
+        }
+        if (response.rfind("HTTP/1.1 101 ", 0) != 0) return false;
+        std::istringstream headers(response);
+        for (std::string line; std::getline(headers, line);) {
+            const auto colon = line.find(':');
+            if (colon == std::string::npos) continue;
+            auto name = line.substr(0, colon);
+            std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+            if (name == "sec-websocket-accept") return music::text::trim(line.substr(colon + 1)) == websocket_accept(key);
+        }
+        return false;
+    }
+    bool call(const std::string& method, const std::string& parameters, js::Value& result, const std::atomic<bool>& cancel, const std::string& session = {}) {
+        const int id = ++sequence_;
+        if (!send_frame(1, "{\"id\":" + std::to_string(id) + ",\"method\":" + json_string(method) + ",\"params\":" + parameters + (session.empty() ? "" : ",\"sessionId\":" + json_string(session)) + "}")) { healthy_ = false; return false; }
+        const auto deadline = platform::ticks() + 5000;
+        for (int i = 0; i < 256; ++i) {
+            std::string message; js::Value root;
+            if (!read_message(message, cancel, deadline) || !js::parse(message, root)) { healthy_ = false; return false; }
+            if (root["id"].integer(-1) != id) continue;
+            if (!root["error"].is_null()) return false;
+            result = root["result"]; return true;
+        }
+        return false;
+    }
+    bool healthy() const { return healthy_; }
+    void close_browser() { send_frame(1, "{\"id\":999999,\"method\":\"Browser.close\",\"params\":{}}"); }
+};
+bool browser_credentials(Site site, const js::Value& result, std::string& cookie, std::string& uid) {
+    if (!result["cookies"].is_array()) return false;
+    cookie.clear();
+    for (const auto& item : result["cookies"].array) {
+        auto domain = item["domain"].str();
+        if (!domain.empty() && domain.front() == '.') domain.erase(0, 1);
+        // Network.getCookies 已按官网 URL 限定，额外校验域名，防止伪造同名 Cookie。
+        const bool allowed = site == Site::QQ ? domain == "qq.com" || domain == "y.qq.com" : domain == "music.163.com" || domain == "163.com";
+        const auto name = item["name"].str(), value = item["value"].str();
+        if (!allowed || name.empty() || name.find_first_of(";=\r\n\0", 0, 5) != std::string::npos || value.find_first_of(";\r\n\0", 0, 4) != std::string::npos) continue;
+        if (!cookie.empty()) cookie += "; "; cookie += name + "=" + value;
+    }
+    std::string accepted, error;
+    if (!parse_credentials(site, "{\"cookie\":" + json_string(cookie) + "}", accepted, uid, error)) { cookie.clear(); return false; }
+    cookie = std::move(accepted); return true;
+}
+void run_browser(Site site, BrowserOptions options) {
+    const auto executable = options.executable.empty() ? default_browser() : options.executable;
+    if (!chromium_browser(executable)) { note(site, "默认浏览器暂不支持自动回传；请将 Chrome、Edge 或 Chromium 设为默认浏览器后重试"); return; }
+#ifdef _WIN32
+    static const bool initialized = [] { WSADATA data; return WSAStartup(MAKEWORD(2,2), &data) == 0; }();
+    if (!initialized) { note(site, "无法初始化官网登录连接"); return; }
+#endif
+    const auto parent = platform::temp_dir();
+    if (parent.empty()) { note(site, "无法创建浏览器临时登录目录"); return; }
+    const auto profile = platform::join(parent, "browser-auth-" + token());
+    if (!platform::make_dirs(profile)) { note(site, "无法创建浏览器临时登录目录"); return; }
+    // 目录名由本进程生成；析构只清除此目录，不处理浏览器的正常用户配置。
+    struct ProfileCleanup {
+        std::string path;
+        ~ProfileCleanup() {
+            auto directory = platform::fs::u8path(path);
+#ifdef _WIN32
+            // Chromium 的组件文件名可能使完整路径超过 MAX_PATH。
+            directory.make_preferred();
+            const auto native = directory.native();
+            if (native.rfind(L"\\\\?\\", 0) != 0)
+                directory = native.rfind(L"\\\\", 0) == 0 ? L"\\\\?\\UNC\\" + native.substr(2) : L"\\\\?\\" + native;
+#endif
+            // Windows 上浏览器主进程退出后，子进程仍可能短暂持有 profile 文件锁。
+            for (int i = 0; i < 40; ++i) {
+                std::error_code error;
+                platform::fs::remove_all(directory, error);
+                if (!error) return;
+                platform::sleep_ms(100);
+            }
+        }
+    } cleanup{profile};
+    BrowserProcess browser;
+    std::vector<std::string> arguments = {executable, "--user-data-dir=" + profile, "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0", "--no-first-run", "--no-default-browser-check", "--disable-background-mode", "--new-window"};
+    if (options.headless) { arguments.push_back("--headless=new"); arguments.push_back("--disable-gpu"); arguments.push_back("--disable-background-networking"); }
+    arguments.push_back(options.headless ? "about:blank" : official_url(site));
+    if (!browser.launch(arguments)) { note(site, "无法启动默认浏览器的独立登录窗口"); return; }
+    auto& cancel = cancelled[int(site)];
+    auto& s = state(site);
+    note(site, "已打开官网，请在网页中点击登录，使用官网支持的扫码或密码方式完成登录");
+    const auto startup_deadline = platform::ticks() + 15000;
+    int port = 0; std::string websocket_path;
+    while (!cancel.load() && platform::ticks() < startup_deadline) {
+        std::ifstream input(platform::fs::u8path(platform::join(profile, "DevToolsActivePort")));
+        std::string number;
+        if (std::getline(input, number) && std::getline(input, websocket_path)) {
+            try { port = std::stoi(number); } catch (...) { port = 0; }
+            if (port > 0 && port <= 65535) break;
+        }
+        platform::sleep_ms(100);
+    }
+    BrowserConnection connection;
+    if (!port || !connection.connect(port, websocket_path, cancel)) { note(site, cancel.load() ? "登录已取消" : "浏览器登录回传连接失败，请重试"); return; }
+    struct CloseBrowser { BrowserConnection& connection; ~CloseBrowser() { connection.close_browser(); } } close{connection};
+    const auto endpoint = "ws://127.0.0.1:" + std::to_string(port) + websocket_path;
+    if (options.on_ready) options.on_ready(endpoint);
+    const auto deadline = platform::ticks() + 300000;
+    std::string session;
+    int retries = 0;
+    while (!cancel.load() && platform::ticks() < deadline) {
+        js::Value result;
+        if (session.empty()) {
+            if (!connection.call("Target.getTargets", "{}", result, cancel)) break;
+            std::string target;
+            for (const auto& item : result["targetInfos"].array) if (item["type"].str() == "page") { target = item["targetId"].str(); break; }
+            if (target.empty()) { platform::sleep_ms(100); continue; }
+            if (!connection.call("Target.attachToTarget", "{\"targetId\":" + json_string(target) + ",\"flatten\":true}", result, cancel)) {
+                if (!connection.healthy() || ++retries > 5) break;
+                platform::sleep_ms(100); continue;
+            }
+            session = result["sessionId"].str();
+            if (session.empty()) break;
+        }
+        if (!connection.call("Network.getCookies", "{\"urls\":[" + json_string(official_url(site)) + "]}", result, cancel, session)) {
+            if (!connection.healthy() || ++retries > 5) break;
+            session.clear(); platform::sleep_ms(100); continue;
+        }
+        retries = 0;
+        std::string cookie, uid;
+        if (browser_credentials(site, result, cookie, uid)) {
+            std::lock_guard<std::mutex> lock(s.m);
+            if (cancel.load()) return;
+            s.cookie = std::move(cookie); s.uid = std::move(uid); s.note = "官网登录成功，已返回播放器";
+            s.return_requested.store(true); s.done.store(true); return;
+        }
+        for (int i = 0; i < 10 && !cancel.load(); ++i) platform::sleep_ms(100);
+    }
+    note(site, cancel.load() ? "登录已取消" : platform::ticks() >= deadline ? "官网登录等待超时，请重试" : "官网登录窗口已关闭或连接中断，请重试");
+}
+std::string page(Site site) {
+    const std::string name = site == Site::QQ ? "QQ 音乐" : "网易云音乐";
+    return R"HTML(<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'">
+<title>aino player 官网登录</title><style>body{font:16px system-ui,sans-serif;background:#f5f5f7;color:#222;max-width:620px;margin:40px auto;padding:24px}section{background:white;padding:28px;border-radius:16px}button,a{display:inline-block;margin:8px 12px 8px 0;padding:10px;border-radius:8px}button{cursor:pointer}textarea{box-sizing:border-box;width:100%;padding:12px;font:14px system-ui;height:120px}p{line-height:1.7}#status{white-space:pre-wrap}</style><section>
+<h1>)HTML" + name + R"HTML(官网登录</h1><p>正常登录会直接打开默认浏览器的专用官网窗口，由官网处理扫码、密码和验证；支持 Chrome、Edge 和 Chromium。</p>
+<p>此页仅用于不支持自动回传时的备用导入。</p><a id="official" target="_blank" rel="noreferrer" href=")HTML" + official_url(site) + R"HTML(">前往官网登录</a>
+<p>登录后，从开发者工具 Network 中复制官网请求的 Cookie 值。</p><textarea id="cookie" autocomplete="off" spellcheck="false" placeholder="完整 Cookie 值（只发送到本机播放器）"></textarea><button id="import">导入并验证</button>
+<button id="cancel">取消连接</button><button id="return" hidden>返回播放器</button><p id="status" role="status">等待导入登录信息</p></section>
+<script>
+const path=location.pathname,status=document.getElementById('status');let finished=false;
+async function post(endpoint,body={}){const r=await fetch(path+'/'+endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw Error(await r.text());return r}
+function success(){finished=true;status.textContent='登录成功，已通知播放器返回前台';document.getElementById('return').hidden=false;document.getElementById('import').disabled=true;document.getElementById('cancel').hidden=true}
+async function poll(){if(finished)return;try{const data=await(await fetch(path+'/status')).json();status.textContent=data.note;if(data.done){success();return}}catch(e){status.textContent='连接已结束，请返回播放器查看结果';return}setTimeout(poll,1200)}
+document.getElementById('return').onclick=async()=>{try{await post('return')}catch(e){status.textContent='请从任务栏打开播放器'}};
+document.getElementById('cancel').onclick=async()=>{finished=true;try{await post('cancel');status.textContent='已取消连接'}catch(e){status.textContent='连接已结束'}};
+document.getElementById('import').onclick=async()=>{const input=document.getElementById('cookie');try{await post('cookie',{cookie:input.value});input.value='';success()}catch(e){status.textContent=e.message}};poll();
+</script></html>)HTML";
+}
+void run_manual(Site site, bool launch_browser) {
+    auto& s = state(site);
+    const int idx = int(site);
+#ifdef _WIN32
+    static const bool initialized = [] { WSADATA data; return WSAStartup(MAKEWORD(2,2), &data) == 0; }();
+    if (!initialized) { note(site, "无法初始化本机登录连接"); return; }
+#endif
+    Connection server;
+    server.socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (server.socket == invalid_socket) { note(site, "无法创建本机登录连接"); return; }
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(server.socket, reinterpret_cast<sockaddr*>(&address), sizeof(address)) || listen(server.socket, 4)) {
+        note(site, "本机登录连接被系统拒绝"); return;
+    }
+#ifdef _WIN32
+    int size = sizeof(address);
+#else
+    socklen_t size = sizeof(address);
+#endif
+    if (getsockname(server.socket, reinterpret_cast<sockaddr*>(&address), &size)) return;
+    const std::string host = "127.0.0.1:" + std::to_string(ntohs(address.sin_port));
+    const std::string origin = "http://" + host;
+    const std::string path = "/session/" + token();
+    const auto url = origin + path;
+    { std::lock_guard<std::mutex> lock(s.m); s.portal_url = url; s.note = "等待备用导入登录信息（5 分钟内有效）"; }
+    if (launch_browser && !platform::open_browser(url)) { note(site, "无法打开系统默认浏览器，请检查默认浏览器设置"); return; }
+    const auto deadline = platform::ticks() + 300000;
+    bool completed = false;
+    unsigned long long complete_deadline = 0;
+    while (!cancelled[idx].load() && platform::ticks() < deadline) {
+        if (completed && platform::ticks() > complete_deadline) return;
+        if (!ready(server.socket, 200)) continue;
+        Connection client;
+        client.socket = accept(server.socket, nullptr, nullptr);
+        if (client.socket == invalid_socket) continue;
+        HttpRequest req;
+        if (!read_request(client.socket, req)) { respond(client.socket, 400, "无效请求"); continue; }
+        const auto route = req.path.substr(0, req.path.find('?'));
+        const bool session_route = route == path || route == path + "/cookie" || route == path + "/cancel" ||
+            route == path + "/status" || route == path + "/return";
+        if (req.host != host || !session_route) { respond(client.socket, 403, "登录地址无效"); continue; }
+        if (req.method == "GET") {
+            if (route == path) respond(client.socket, 200, page(site), "text/html; charset=utf-8");
+            else if (route == path + "/status") {
+                std::string text;
+                { std::lock_guard<std::mutex> lock(s.m); text = s.note; }
+                respond(client.socket, 200, "{\"done\":" + std::string(completed ? "true" : "false") + ",\"note\":" + json_string(text) + "}", "application/json");
+            } else respond(client.socket, 404, "无效路径");
             continue;
         }
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+        if (req.method != "POST" || req.origin != origin || req.type != "application/json") {
+            respond(client.socket, 403, "请求来源或类型无效"); continue;
+        }
+        if (route == path + "/return") {
+            if (!completed) { respond(client.socket, 409, "请先完成登录"); continue; }
+            {
+                std::lock_guard<std::mutex> lock(s.m);
+                if (!cancelled[idx].load()) s.return_requested.store(true);
+            }
+            respond(client.socket, 200, "已通知播放器返回前台"); continue;
+        }
+        if (route == path + "/cancel") { respond(client.socket, 200, "已取消"); cancelled[idx].store(true); break; }
+        if (route != path + "/cookie") { respond(client.socket, 404, "无效路径"); continue; }
+        if (completed) { respond(client.socket, 409, "本次登录已成功，请返回播放器"); continue; }
+        std::string cookie, uid, error;
+        if (!parse_credentials(site, req.body, cookie, uid, error)) { respond(client.socket, 400, error); continue; }
+        note(site, "正在向官网验证登录态…");
+        if (site == Site::QQ) {
+            const auto profile = qq::fetch_profile(cookie, uid, 6000);
+            if (!profile.ok()) error = "QQ 音乐登录态验证失败，请重新登录或导入完整 Cookie";
+        } else {
+            const auto profile = ne::fetch_profile(cookie, {}, 6000);
+            if (!profile.ok() || profile.uid.empty()) error = "网易云登录态验证失败，请重新登录或导入完整 Cookie";
+            else uid = profile.uid;
+        }
+        if (!error.empty()) { note(site, error); respond(client.socket, 401, error); continue; }
+        if (cancelled[idx].load()) break;
+        {
+            std::lock_guard<std::mutex> lock(s.m);
+            if (cancelled[idx].load()) return;
+            s.cookie = cookie; s.uid = uid; s.note = "连接成功，可以返回播放器";
+            s.return_requested.store(true); s.done.store(true);
+        }
+        completed = true; complete_deadline = platform::ticks() + 60000;
+        respond(client.socket, 200, "连接成功，可以关闭本页并返回播放器");
     }
-    KillTimer(hwnd, 1);
-    if (ctx->controller) ctx->controller->Close();
-
-    auto& st = state(site);
-    st.running.store(false);
-    if (!st.done.load()) {
-        // 用户直接关窗 = 取消
-        std::lock_guard<std::mutex> lk(st.m);
-        st.note = "已取消登录";
-        st.done.store(true);
-    }
-    CoUninitialize();
+    note(site, cancelled[idx].load() ? "登录已取消" : "登录连接已超时，请重试");
 }
-
-State g_states[kSiteCount];
-
-}  // namespace
-
-State& state(Site s) { return g_states[int(s)]; }
-
-bool runtime_available() { return runtime_installed(); }
-
-void start(Site site) {
-    auto& st = state(site);
-    if (st.running.exchange(true)) return;  // 已经开着
-    {
-        std::lock_guard<std::mutex> lk(st.m);
-        st.cookie.clear();
-        st.uid.clear();
-        st.note = "准备打开登录窗口…";
+} // namespace
+State& state(Site s) { return states[int(s)]; }
+bool parse_credentials(Site site, const std::string& input, std::string& cookie, std::string& uid, std::string& error) {
+    cookie.clear(); uid.clear(); error.clear();
+    js::Value root;
+    if (input.size() > 64 * 1024 || !js::parse(input, root) || !root.is_object()) { error = "无效的登录数据"; return false; }
+    cookie = music::text::trim(root["cookie"].str());
+    if (cookie.rfind("Cookie:", 0) == 0 || cookie.rfind("cookie:", 0) == 0) cookie = music::text::trim(cookie.substr(7));
+    if (cookie.empty() || cookie.size() > 32768 || std::any_of(cookie.begin(), cookie.end(), [](unsigned char c) { return c < 32 || c == 127; })) {
+        error = "请粘贴完整 Cookie 值，不要包含换行"; cookie.clear(); return false;
     }
-    st.done.store(false);
-    std::thread([site] { run_window(site); }).detach();
+    if (site == Site::NetEase) {
+        if (ne::cookie_value(cookie, "MUSIC_U").empty()) { error = "缺少 MUSIC_U，请先在官网登录"; return false; }
+    } else {
+        uid = qq::cookie_value(cookie, "uin");
+        if (uid.empty()) uid = qq::cookie_value(cookie, "p_uin");
+        if (uid.empty()) uid = qq::cookie_value(cookie, "wxuin");
+        uid = qq::clean_uin(uid);
+        const bool key = !qq::cookie_value(cookie, "qm_keyst").empty() || !qq::cookie_value(cookie, "qqmusic_key").empty() ||
+            !qq::cookie_value(cookie, "musickey").empty() || !qq::cookie_value(cookie, "authst").empty();
+        if (uid.empty() || uid.find_first_not_of("0123456789") != std::string::npos || !key) {
+            error = "缺少 QQ 音乐账号或登录凭据，请先在官网登录"; return false;
+        }
+    }
+    return true;
 }
-
-}  // namespace login
+static void begin_work(Site site, std::function<void()> action) {
+    std::lock_guard<std::mutex> lock(worker_mutex);
+    auto& s = state(site);
+    if (s.running.load() && !s.done.load()) return;
+    if (s.running.load()) cancelled[int(site)].store(true);
+    if (workers[int(site)].joinable()) workers[int(site)].join();
+    s.running.store(true);
+    cancelled[int(site)].store(false); s.done.store(false); s.return_requested.store(false);
+    { std::lock_guard<std::mutex> guard(s.m); s.cookie.clear(); s.uid.clear(); s.portal_url.clear(); s.note = "正在打开系统默认浏览器官网…"; }
+    workers[int(site)] = std::thread([site, action = std::move(action)] {
+        try { action(); } catch (...) { note(site, "官网登录连接失败，请重试"); }
+        auto& s = state(site); s.running.store(false); s.done.store(true);
+    });
+}
+void start(Site site, bool launch_browser) {
+    if (launch_browser) start_browser(site, {});
+    else begin_work(site, [site] { run_manual(site, false); });
+}
+void start_browser(Site site, BrowserOptions options) {
+    begin_work(site, [site, options = std::move(options)] { run_browser(site, options); });
+}
+void cancel(Site site) { cancelled[int(site)].store(true); }
+void forget(Site site) {
+    cancelled[int(site)].store(true);
+    auto& s = state(site);
+    std::lock_guard<std::mutex> lock(s.m);
+    s.cookie.clear(); s.uid.clear(); s.portal_url.clear(); s.note = "已清除登录信息";
+    s.return_requested.store(false);
+}
+void shutdown() {
+    std::lock_guard<std::mutex> lock(worker_mutex);
+    for (auto& c : cancelled) c.store(true);
+    for (auto& w : workers) if (w.joinable()) w.join();
+}
+} // namespace login

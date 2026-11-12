@@ -15,6 +15,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 
+#ifdef _WIN32
 #include <windows.h>
 #include <winhttp.h>
 
@@ -66,6 +67,8 @@ struct Response {
     std::string content_type;
     std::string final_url;
     std::string error;   // 非空 = 传输层失败
+    std::vector<std::string> set_cookies;
+    std::string location;
     bool ok() const { return error.empty() && status >= 200 && status < 300; }
 };
 
@@ -212,6 +215,16 @@ inline Response execute(const Request& req) {
     out.status = int(status);
     out.content_type = detail::query_header(hreq, WINHTTP_QUERY_CONTENT_TYPE);
     out.final_url = detail::final_url_of(hreq);
+    out.location = detail::query_header(hreq, WINHTTP_QUERY_LOCATION);
+    DWORD cookie_index = 0;
+    for (int i = 0; i < 64; ++i) {
+        std::wstring buffer(16384, L'\0');
+        DWORD length = DWORD(buffer.size() * sizeof(wchar_t));
+        if (!WinHttpQueryHeaders(hreq, WINHTTP_QUERY_SET_COOKIE, WINHTTP_HEADER_NAME_BY_INDEX,
+                                 buffer.data(), &length, &cookie_index)) break;
+        buffer.resize(length / sizeof(wchar_t));
+        out.set_cookies.push_back(narrow(buffer));
+    }
 
     for (;;) {
         DWORD avail = 0;
@@ -397,3 +410,7 @@ inline bool download(const std::string& url, const std::string& path,
 }
 
 }  // namespace net
+
+#else
+#include "net_curl.hpp"
+#endif

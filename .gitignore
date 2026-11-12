@@ -27,6 +27,3 @@ __pycache__/
 Thumbs.db
 desktop.ini
 .DS_Store
-
-# 说明：vendor/webview2 里的头文件与 WebView2LoaderStatic.lib 是构建必需的，
-# 必须提交（体积大，但本机没法重新生成）。

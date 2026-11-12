@@ -10,7 +10,9 @@
 //      表现是"能打开、没声音"或者干脆打不开。
 #pragma once
 
-#include <windows.h>
+#include "platform.hpp"
+#include <codecvt>
+#include <locale>
 
 #include <cstdio>
 #include <cstring>
@@ -52,10 +54,9 @@ inline void wr_be32(char* p, uint32_t v) {
 inline std::string utf16le_bom(const std::string& utf8) {
     std::string out;
     if (utf8.empty()) return out;
-    const int n = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), int(utf8.size()), nullptr, 0);
-    if (n <= 0) return out;
-    std::wstring w(size_t(n), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), int(utf8.size()), w.data(), n);
+    std::u16string w;
+    try { w = std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t>{}.from_bytes(utf8); }
+    catch (...) { return out; }
     out += char(0xFF);
     out += char(0xFE);
     for (wchar_t c : w) {
@@ -65,16 +66,10 @@ inline std::string utf16le_bom(const std::string& utf8) {
     return out;
 }
 
-inline std::wstring widen(const std::string& s) {
-    if (s.empty()) return std::wstring();
-    const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), int(s.size()), nullptr, 0);
-    std::wstring w(size_t(n), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), int(s.size()), w.data(), n);
-    return w;
-}
+inline std::wstring widen(const std::string& s) { return platform::widen(s); }
 
 inline bool read_file(const std::string& path, std::string& out) {
-    std::FILE* f = _wfopen(widen(path).c_str(), L"rb");
+    std::FILE* f = platform::fopen(path, "rb");
     if (!f) return false;
     std::fseek(f, 0, SEEK_END);
     const long n = std::ftell(f);
@@ -92,31 +87,25 @@ inline bool read_file(const std::string& path, std::string& out) {
 // 写临时文件再整体替换：中途失败也不会留下半个损坏的音频
 inline bool write_replace(const std::string& path, const std::string& bytes) {
     const std::string tmp = path + ".tagtmp";
-    std::FILE* f = _wfopen(widen(tmp).c_str(), L"wb");
+    std::FILE* f = platform::fopen(tmp, "wb");
     if (!f) return false;
     const size_t n = std::fwrite(bytes.data(), 1, bytes.size(), f);
     std::fclose(f);
     if (n != bytes.size()) {
-        DeleteFileW(widen(tmp).c_str());
+        platform::remove(tmp);
         return false;
     }
-    if (!MoveFileExW(widen(tmp).c_str(), widen(path).c_str(), MOVEFILE_REPLACE_EXISTING)) {
-        DeleteFileW(widen(tmp).c_str());
+    if (!platform::replace_file(tmp, path)) {
+        platform::remove(tmp);
         return false;
     }
     return true;
 }
 
-inline std::string narrow(const std::wstring& w) {
-    if (w.empty()) return std::string();
-    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), int(w.size()), nullptr, 0, nullptr, nullptr);
-    std::string s(size_t(n), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), int(w.size()), s.data(), n, nullptr, nullptr);
-    return s;
-}
+inline std::string narrow(const std::wstring& s) { return platform::narrow(s); }
 
 inline bool read_file_w(const std::wstring& wpath, std::string& out) {
-    std::FILE* f = _wfopen(wpath.c_str(), L"rb");
+    std::FILE* f = platform::fopen(narrow(wpath), "rb");
     if (!f) return false;
     std::fseek(f, 0, SEEK_END);
     const long n = std::ftell(f);
@@ -415,7 +404,7 @@ inline bool embed(const std::string& path, const std::string& cover, bool is_png
     if (cover.empty() && lyrics.empty()) return true;
     std::string head;
     {
-        std::FILE* f = _wfopen(widen(path).c_str(), L"rb");
+        std::FILE* f = platform::fopen(path, "rb");
         if (!f) {
             err = "读文件失败";
             return false;

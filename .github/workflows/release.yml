@@ -1,0 +1,72 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - run: cmake -S . -B build -A x64 -DBUILD_TESTING=ON
+      - run: cmake --build build --config Release --parallel 2
+      - run: ctest --test-dir build -C Release --output-on-failure
+      - name: Prepare Windows executable
+        shell: pwsh
+        run: |
+          $expected = "aino player $($env:GITHUB_REF_NAME.TrimStart('v'))"
+          $actual = & .\build\Release\aino_player.exe --version
+          if ($actual.Trim() -ne $expected) { throw "Version mismatch: $actual / $expected" }
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item build/Release/aino_player.exe "dist/aino-player-$($env:GITHUB_REF_NAME)-windows-x64.exe"
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: windows-exe
+          path: dist/*.exe
+          if-no-files-found: error
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - run: sudo apt-get update && sudo apt-get install -y libx11-dev libcurl4-openssl-dev libfreetype6 libfontconfig1 fonts-noto-cjk libasound2 xvfb ffmpeg xdg-utils dpkg-dev
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_TESTING=ON
+      - run: cmake --build build --parallel 2
+      - run: ctest --test-dir build --output-on-failure
+      - name: Build and verify Debian package
+        shell: bash
+        run: |
+          test "$(build/aino_player --version)" = "aino player ${GITHUB_REF_NAME#v}"
+          cpack --config build/CPackConfig.cmake -G DEB -B dist
+          dpkg-deb --info dist/*.deb
+          sudo apt-get install -y ./dist/*.deb
+          test "$(/usr/bin/aino_player --version)" = "aino player ${GITHUB_REF_NAME#v}"
+          xvfb-run -a /usr/bin/aino_player --smoke-test
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: linux-deb
+          path: dist/*.deb
+          if-no-files-found: error
+  publish:
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish tested assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          cd dist
+          sha256sum *.exe *.deb > SHA256SUMS.txt
+          cd ..
+          gh release create "$GITHUB_REF_NAME" dist/*.exe dist/*.deb dist/SHA256SUMS.txt --verify-tag --title "aino player $GITHUB_REF_NAME" --notes-file docs/RELEASE_NOTES.md --latest

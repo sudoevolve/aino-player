@@ -6,6 +6,10 @@
 *.hpp text eol=lf
 *.h   text eol=lf
 *.md  text eol=lf
+*.desktop text eol=lf
+*.yml text eol=lf
+# 保留上游 vendored 头文件中的原始行尾空格，不对第三方源码做格式改写。
+vendor/miniaudio/miniaudio.h whitespace=-blank-at-eol
 
 # 二进制
 *.lib binary

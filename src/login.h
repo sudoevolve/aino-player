@@ -1,18 +1,10 @@
-// login.h —— 内置浏览器登录（QQ 音乐 / 网易云音乐共用一套流程）
-//
-// 为什么不读浏览器的 cookie：
-//   Chrome 127+ / Edge 用的是 App-Bound Encryption，cookie 值用应用绑定的密钥加密，
-//   外部进程拿不到主密钥（拿了也解不开），而且还要处理 DPAPI 的 user scope。
-//   与其做一堆"可能明天就失效"的破解，不如用系统自带的 WebView2 开一个真浏览器窗口：
-//   用户扫一次码，cookie 存在自己的 user data 目录里，之后启动就是登录态。
-//
-// 这个头故意不 include WebView2.h（那个头 6 万行），实现放在 login.cpp 里，
-// 免得每次改主程序都要重编一遍 2.5MB 的头。
+// 外部默认浏览器打开官网，独立临时会话回传登录态；不读取日常浏览器数据库。
 #pragma once
 
 #include <atomic>
 #include <mutex>
 #include <string>
+#include <functional>
 
 namespace login {
 
@@ -21,19 +13,31 @@ constexpr int kSiteCount = 2;
 
 struct State {
     std::mutex m;
-    std::atomic<bool> running{false};   // 窗口是否开着
+    std::atomic<bool> running{false};   // 本机登录服务是否运行
     std::atomic<bool> done{false};      // 一次尝试是否结束（成功 / 取消 / 失败）
+    std::atomic<bool> return_requested{false};
     std::string cookie;                 // 成功时：形如 "a=b; c=d"
     std::string uid;                    // 成功时：QQ 号 / 网易云 userId（拿不到就空着）
     std::string note;                   // 阶段说明，给界面显示
+    std::string portal_url;
 };
 
 State& state(Site s);
 
-// 后台线程打开登录窗口并等待登录；不阻塞调用方。重复调用会忽略。
-void start(Site s);
+// 后台线程打开默认浏览器官网；false 仅启动备用导入入口。未完成时忽略重复调用。
+void start(Site s, bool launch_browser = true);
+// 独立会话的浏览器启动参数；空路径自动选择默认浏览器，headless 仅供离线回归。
+struct BrowserOptions {
+    std::string executable;
+    bool headless = false;
+    std::function<void(const std::string&)> on_ready;
+};
+void start_browser(Site site, BrowserOptions options);
+void cancel(Site s);
+void forget(Site s);
+void shutdown();
 
-// 检查是否装了 WebView2 运行时
-bool runtime_available();
+// 纯解析；不回显凭据，返回缺失字段信息。
+bool parse_credentials(Site s, const std::string& input, std::string& cookie, std::string& uid, std::string& error);
 
 }  // namespace login

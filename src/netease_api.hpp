@@ -145,7 +145,7 @@ inline Profile fetch_profile(const std::string& cookie, const std::string& uid_h
 // ---------------------------------------------------------------- 歌单内容
 
 inline std::vector<music::Track> fetch_playlist(const std::string& cookie, const std::string& pid,
-                                                std::string& err, int timeout_ms = 15000) {
+                                                std::string& err, int timeout_ms = 15000, Playlist* metadata = nullptr) {
     std::vector<music::Track> out;
     // 公开歌单（热门 / 官方榜）匿名就能读，只有"我喜欢的音乐"这类私有歌单才依赖登录态
     if (pid.empty()) {
@@ -170,6 +170,12 @@ inline std::vector<music::Track> fetch_playlist(const std::string& cookie, const
         return out;
     }
     const js::Value& tracks = root["playlist"]["tracks"];
+    if (metadata) {
+        metadata->id = pid;
+        metadata->name = music::text::decode_entities(root["playlist"]["name"].str());
+        metadata->cover = root["playlist"]["coverImgUrl"].str();
+        metadata->count = int(root["playlist"]["trackCount"].integer());
+    }
     for (size_t i = 0; i < tracks.size(); ++i) {
         const js::Value& s = tracks[i];
         const long long id = s["id"].integer();

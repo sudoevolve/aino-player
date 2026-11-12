@@ -1226,6 +1226,8 @@ public:
     float dpi_scale() const;
     bool should_close() const;
     void close();
+    /** @brief 在 UI 线程请求恢复并激活窗口；系统可能限制后台抢占焦点。 */
+    void activate();
 
     // 请求下一帧。帧回调内会忽略此调用；帧外的主线程更新可使用它。
     // 跨线程叫醒主循环请使用 wake()。
@@ -2859,6 +2861,11 @@ inline std::string from_wide(const std::wstring& s) {
 }
 
 inline std::string default_ui_font_family() {
+    // 跟随本机的 Windows 消息字体，避免中文长期依赖 Segoe 的隐式回退。
+    NONCLIENTMETRICSW metrics{};
+    metrics.cbSize = sizeof(metrics);
+    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0) &&
+        metrics.lfMessageFont.lfFaceName[0]) return from_wide(metrics.lfMessageFont.lfFaceName);
     static const char* kCandidates[] = {
         "Segoe UI Variable Text",   // Win11 正文
         "Segoe UI Variable",        // Win11 旧命名
@@ -3792,6 +3799,8 @@ inline void Ui::end_frame() {
 
     // 清掉"本帧一次性"的输入事件
     Input& in = impl->input;
+    // 按下的控件可能因列表刷新、滚动或切页不再绘制；松手后统一释放，避免锁死其余控件。
+    if (!in.down[0]) impl->active = 0;
     for (int i = 0; i < 3; ++i) { in.pressed[i] = false; in.released[i] = false; }
     in.wheel = 0.0f;
     in.double_click = false;
@@ -10687,9 +10696,20 @@ inline LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
 
+    case WM_CAPTURECHANGED: case WM_CANCELMODE:
+        // 正常鼠标松开也会触发 WM_CAPTURECHANGED，必须保留那次 released 供控件处理。
+        if (m == WM_CANCELMODE || s->btn_down[0] || s->btn_down[1] || s->btn_down[2]) {
+            for (int i = 0; i < 3; ++i) s->btn_down[i] = s->btn_pressed[i] = s->btn_released[i] = false;
+            s->owner->ui.impl->active = 0;
+            s->owner->need_frame = true;
+        }
+        return 0;
+
     case WM_KILLFOCUS:
-        for (int i = 0; i < 3; ++i) s->btn_down[i] = false;
+        for (int i = 0; i < 3; ++i) s->btn_down[i] = s->btn_pressed[i] = s->btn_released[i] = false;
+        s->owner->ui.impl->active = 0;
         for (int i = 0; i < KEY_COUNT; ++i) s->key_down[i] = false;
+        if (GetCapture() == h) ReleaseCapture();
         s->owner->need_frame = true;
         return 0;
 
@@ -11112,6 +11132,16 @@ inline void Window::set_title(const std::string& title) {
     if (!o) return;
     detail::Win32State* s = reinterpret_cast<detail::Win32State*>(o->native);
     if (s && s->hwnd) SetWindowTextW(s->hwnd, detail::to_wide(title).c_str());
+}
+inline void Window::activate() {
+    if (!impl) return;
+    auto* s = reinterpret_cast<detail::Win32State*>(impl->native);
+    if (!s || !s->hwnd) return;
+    ShowWindow(s->hwnd, IsIconic(s->hwnd) ? SW_RESTORE : SW_SHOW);
+    if (!SetForegroundWindow(s->hwnd)) {
+        FLASHWINFO flash{sizeof(FLASHWINFO), s->hwnd, FLASHW_TRAY, 3, 0};
+        FlashWindowEx(&flash);
+    }
 }
 
 inline void Window::set_size(int w, int h) {
@@ -12159,9 +12189,16 @@ inline bool x11_handle(X11State* s, XEvent& e) {
     }
     case ClientMessage:
         if (Atom(e.xclient.data.l[0]) == s->wm_delete) { o->running = false; return false; }
+        o->need_frame = true; // wake() 只投消息，绘制标志由 UI 线程更新。
         break;
     case LeaveNotify:
         s->mx = -1e6f; s->my = -1e6f;
+        o->need_frame = true;
+        break;
+    case FocusOut:
+        for (int i = 0; i < 3; ++i) s->btn_down[i] = s->btn_pressed[i] = s->btn_released[i] = false;
+        for (int i = 0; i < KEY_COUNT; ++i) s->key_down[i] = false;
+        o->ui.impl->active = 0;
         o->need_frame = true;
         break;
     default: break;
@@ -12245,7 +12282,7 @@ inline void x11_create(Window* self, const WindowConfig& cfg) {
     XSelectInput(s->dpy, s->win,
                  ExposureMask | StructureNotifyMask | PointerMotionMask |
                  ButtonPressMask | ButtonReleaseMask | KeyPressMask | KeyReleaseMask |
-                 EnterWindowMask | LeaveWindowMask);
+                 EnterWindowMask | LeaveWindowMask | FocusChangeMask);
     s->wm_delete = XInternAtom(s->dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(s->dpy, s->win, &s->wm_delete, 1);
     s->gc = XCreateGC(s->dpy, s->win, 0, nullptr);
@@ -12401,6 +12438,19 @@ inline void Window::set_size(int w, int h) {
 }
 inline void Window::close() { if (impl) impl->running = false; }
 
+inline void Window::activate() {
+    if (!impl) return;
+    auto* s = reinterpret_cast<detail::X11State*>(impl->native);
+    if (!s || !s->dpy || !s->win) return;
+    XMapRaised(s->dpy, s->win);
+    XEvent event{};
+    event.xclient.type = ClientMessage; event.xclient.window = s->win;
+    event.xclient.message_type = XInternAtom(s->dpy, "_NET_ACTIVE_WINDOW", False);
+    event.xclient.format = 32; event.xclient.data.l[0] = 1; event.xclient.data.l[1] = CurrentTime;
+    XSendEvent(s->dpy, DefaultRootWindow(s->dpy), False, SubstructureRedirectMask | SubstructureNotifyMask, &event);
+    XFlush(s->dpy);
+}
+
 // X11 的主循环阻塞在 XNextEvent。往自己窗口投一条 ClientMessage（data.l[0]=0，
 // 不会命中 wm_delete）就能把它捅醒；x11_handle 里这条消息落到 default 分支，
 // 除了让循环再空转一圈之外没有别的效果。
@@ -12411,7 +12461,6 @@ inline void Window::close() { if (impl) impl->running = false; }
 inline void Window::wake() {
     Window::Impl* o = impl;
     if (!o) return;
-    o->need_frame = true;
     detail::X11State* s = reinterpret_cast<detail::X11State*>(o->native);
     if (!s || !s->dpy || !s->win) return;
     XEvent e{};
@@ -12910,6 +12959,15 @@ inline void Window::set_size(int w, int h) {
         oc_send<void>(s->window, sel_registerName("setContentSize:"), CGSizeMake(CGFloat(w), CGFloat(h)));
 }
 inline void Window::close() { if (impl) impl->running = false; }
+
+inline void Window::activate() {
+    if (!impl) return;
+    auto* s = reinterpret_cast<detail::CocoaState*>(impl->native);
+    if (!s || !s->window) return;
+    auto app = oc_send<id>(objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
+    oc_send<void>(app, sel_registerName("activateIgnoringOtherApps:"), (BOOL)YES);
+    oc_send<void>(s->window, sel_registerName("makeKeyAndOrderFront:"), (id)nullptr);
+}
 
 // macOS 的 run() 是 usleep(2000) 轮询（没有真阻塞），所以只改标志就够了，
 // 后台线程直接调也不会碰 UIKit/AppKit。

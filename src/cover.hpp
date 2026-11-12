@@ -13,8 +13,10 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 
+#ifdef _WIN32
 #include <windows.h>
 #include <wincodec.h>
+#endif
 
 #include <functional>
 #include <map>
@@ -25,16 +27,21 @@
 #include <vector>
 
 #include "net.hpp"
+#include "background.hpp"
 
 namespace cover {
 
 struct Image {
     int w = 0;
     int h = 0;
-    std::vector<uint8_t> rgba;  // 4 字节/像素，RGBA 顺序（WIC 直接给这个格式）
+    std::vector<uint8_t> rgba;
 };
 
+
+
 namespace detail {
+
+#ifdef _WIN32
 
 // COM 按线程初始化：解码发生在哪条线程，就得在那条线程上 CoInitializeEx
 inline void com_init_once() {
@@ -101,16 +108,21 @@ inline bool decode(const std::vector<uint8_t>& bytes, int max_side, Image& out) 
     return ok;
 }
 
+#else
+bool decode(const std::vector<uint8_t>& bytes, int max_side, Image& out);
+#endif
 }  // namespace detail
 
 // 一张封面对应一条 http 地址；同一个地址只下载一次
 class Store {
 public:
     void set_notifier(std::function<void()> fn) { notify_ = std::move(fn); }
+    void clear() { std::lock_guard<std::mutex> lock(m_); ++generation_; map_.clear(); }
 
     // 就绪返回图；没就绪返回空（并确保后台已经在取）。UI 线程每帧调它。
     std::shared_ptr<const Image> get(const std::string& url) {
         if (url.empty()) return nullptr;
+        unsigned generation = 0;
         {
             std::lock_guard<std::mutex> lk(m_);
             auto it = map_.find(url);
@@ -119,8 +131,9 @@ public:
                 return nullptr;
             }
             map_[url].state = 1;  // 下载中
+            generation = generation_;
         }
-        std::thread([this, url] { load(url); }).detach();
+        background::start([this, url, generation] { load(url, generation); });
         return nullptr;
     }
 
@@ -130,7 +143,7 @@ private:
         std::shared_ptr<const Image> img;
     };
 
-    void load(const std::string& url) {
+    void load(const std::string& url, unsigned generation) {
         auto img = std::make_shared<Image>();
         bool ok = false;
         const net::Response r = net::get(url, {"User-Agent: Mozilla/5.0", "Referer: https://music.163.com/"},
@@ -141,6 +154,7 @@ private:
         }
         {
             std::lock_guard<std::mutex> lk(m_);
+            if (generation != generation_) return;
             Entry& e = map_[url];
             e.state = ok ? 2 : 3;
             if (ok) e.img = img;
@@ -162,6 +176,7 @@ private:
 
     std::mutex m_;
     std::map<std::string, Entry> map_;
+    unsigned generation_ = 0;
     std::function<void()> notify_;
 };
 
