@@ -121,8 +121,11 @@ bool decode(const std::vector<uint8_t>& bytes, int max_side, Image& out);
 // 一张封面对应一条 http 地址；同一个地址只下载一次
 class Store {
 public:
+    static constexpr size_t pixel_budget = 12u * 1024u * 1024u;
+    struct Stats { size_t entries, pixel_bytes; };
+    Stats stats() { std::lock_guard<std::mutex> lock(m_); return {map_.size(), pixel_bytes_}; }
     void set_notifier(std::function<void()> fn) { notify_ = std::move(fn); }
-    void clear() { std::lock_guard<std::mutex> lock(m_); ++generation_; map_.clear(); pending_.clear(); }
+    void clear() { std::lock_guard<std::mutex> lock(m_); ++generation_; map_.clear(); pending_.clear(); pixel_bytes_ = 0; }
 
     // 就绪返回图；没就绪返回空（并确保后台已经在取）。UI 线程每帧调它。
     std::shared_ptr<const Image> get(const std::string& url) {
@@ -132,11 +135,13 @@ public:
             std::lock_guard<std::mutex> lk(m_);
             auto it = map_.find(url);
             if (it != map_.end()) {
+                it->second.touched = ++clock_;
                 if (it->second.state == 2) return it->second.img;
                 return nullptr;
             }
             if (pending_.size() >= 32) return nullptr;
             map_[url].state = 1;
+            map_[url].touched = ++clock_;
             pending_.push_back({url, generation_});
             if (workers_ < 2) { ++workers_; launch = true; }
         }
@@ -160,6 +165,7 @@ private:
     struct Entry {
         int state = 0;  // 0 未知 / 1 下载中 / 2 就绪 / 3 失败
         std::shared_ptr<const Image> img;
+        uint64_t touched = 0;
     };
 
     void load(const std::string& url, unsigned generation) {
@@ -183,18 +189,17 @@ private:
             if (generation != generation_) return;
             Entry& e = map_[url];
             e.state = ok ? 2 : 3;
-            if (ok) e.img = img;
-            // 失败条目也参与容量回收，避免失效 URL 长期堆积。
-            if (map_.size() > 160) {
-                int budget = int(map_.size() / 2);
-                for (auto it = map_.begin(); it != map_.end() && budget > 0;) {
-                    if (it->second.state != 1 && it->first != url) {
-                        it = map_.erase(it);
-                        --budget;
-                    } else {
-                        ++it;
-                    }
+            if (ok) { e.img = img; pixel_bytes_ += img->rgba.size(); }
+            // 按实际像素字节和访问时间回收，而不是按 URL 字典序保留最多 160 张完整封面。
+            while (map_.size() > 160 || pixel_bytes_ > pixel_budget) {
+                auto victim = map_.end();
+                for (auto it = map_.begin(); it != map_.end(); ++it) {
+                    if (it->second.state == 1 || it->first == url) continue;
+                    if (victim == map_.end() || it->second.touched < victim->second.touched) victim = it;
                 }
+                if (victim == map_.end()) break;
+                if (victim->second.img) pixel_bytes_ -= victim->second.img->rgba.size();
+                map_.erase(victim);
             }
         }
         if (notify_) notify_();
@@ -205,6 +210,8 @@ private:
     std::deque<std::pair<std::string, unsigned>> pending_;
     unsigned workers_ = 0;
     unsigned generation_ = 0;
+    size_t pixel_bytes_ = 0;
+    uint64_t clock_ = 0;
     std::function<void()> notify_;
 };
 

@@ -2950,6 +2950,7 @@ void start(HostCallbacks host) {
 
 }
 void tick() {
+        background::reap();
         drain_ui_mail();
         if (g_ui.sleep_deadline) {
             const auto now = platform::ticks();

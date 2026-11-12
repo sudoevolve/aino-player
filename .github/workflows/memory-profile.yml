@@ -1,0 +1,63 @@
+name: Linux playback memory profile
+# 专项内存诊断分支；不运行 CTest、音频格式回归、浏览器回归或发布。
+on:
+  push:
+    branches: ['diagnostics/linux-memory-20261112']
+permissions:
+  contents: read
+jobs:
+  memory:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Install build and profiling prerequisites
+        run: sudo apt-get update && sudo apt-get install -y build-essential python3 libx11-dev libgdk-pixbuf-2.0-0 librsvg2-common adwaita-icon-theme libcurl4-openssl-dev libfreetype6 libfontconfig1 fonts-noto-cjk xvfb ffmpeg pulseaudio
+      - name: Build shared minimal decoder
+        run: python3 tools/build_ffmpeg.py --jobs 2
+      - name: Prepare identical instrumentation for baseline and candidate
+        shell: bash
+        run: |
+          mkdir -p build/memory-baseline-src build/memory-candidate-src
+          git archive v0.2.3 | tar -x -C build/memory-baseline-src
+          git archive HEAD | tar -x -C build/memory-candidate-src
+          python3 tools/profile_memory.py prepare build/memory-baseline-src
+          python3 tools/profile_memory.py prepare build/memory-candidate-src
+      - name: Build players only
+        shell: bash
+        run: |
+          for variant in baseline candidate; do
+            cmake -S "build/memory-$variant-src" -B "build/memory-$variant" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DAINO_FFMPEG_EXECUTABLE="$GITHUB_WORKSPACE/build/codec/ffmpeg"
+            cmake --build "build/memory-$variant" --target aino_player --parallel 2
+          done
+      - name: Profile sustained playback at 100 and 200 percent DPI
+        shell: bash
+        run: |
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/aino-memory-runtime"
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=aino_memory rate=48000 channels=2
+          pactl set-default-sink aino_memory
+          export PULSE_SERVER="unix:$XDG_RUNTIME_DIR/pulse/native"
+          export PULSE_COOKIE="$HOME/.config/pulse/cookie"
+          for scale in 1 2; do
+            for variant in baseline candidate; do
+              xvfb-run -a -s '-screen 0 3200x2000x24' python3 tools/profile_memory.py run "build/memory-$variant/aino_player" "build/memory-results/$variant-scale$scale" --scale "$scale"
+            done
+          done
+          python3 tools/profile_memory.py report build/memory-results | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Upload memory samples and mappings
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: linux-playback-memory
+          path: |
+            build/memory-results/**/samples.*
+            build/memory-results/**/validated.json
+            build/memory-results/**/*-smaps.txt
+            build/memory-results/**/player.log
+            build/memory-results/summary.*
+          if-no-files-found: warn
