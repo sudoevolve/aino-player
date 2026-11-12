@@ -793,8 +793,14 @@ public:
     void end_frame();
 
     // ---------------- 环境查询 ----------------
+    /** @brief 当前调用层可见的输入；被浮层或裁剪挡住时屏蔽鼠标按键、滚轮和拖拽。
+     * 鼠标坐标和键盘保留；自绘 hover 使用 pointer_available() 或 hovered()。
+     * 引用只在当前交互作用域内使用，不要带入 deferred 回调。
+     */
     const Input& input() const;
-    /** @brief 自绘控件读取鼠标前检查浮层输入闸门与当前裁剪区。 */
+    /** @brief 原始帧输入，仅供全局快捷键、弹层外部点击检测等输入管理代码使用。 */
+    const Input& raw_input() const;
+    /** @brief 当前调用层的指针是否未被浮层、裁剪或测量模式屏蔽。 */
     bool pointer_available() const;
     const Theme& theme() const;
     void  set_theme(const Theme& t);
@@ -3340,6 +3346,7 @@ struct ProfTick {
 struct Ui::Impl {
     Theme theme = Theme::light();
     Input input;
+    Input masked_input;
     float width = 0.0f, height = 0.0f;
     float dt = 1.0f / 60.0f;
     float scale = 1.0f;
@@ -3836,7 +3843,21 @@ inline void Ui::deferred(std::function<void()> fn) {
     impl->defer.push_back(std::move(fn));
 }
 
-inline const Input& Ui::input() const { return impl->input; }
+inline const Input& Ui::input() const {
+    if (pointer_available()) return impl->input;
+    // 不修改后端事件：同一帧的浮层内容仍须收到原始按下和松手。
+    Input& masked = impl->masked_input;
+    masked = impl->input;
+    for (int i = 0; i < 3; ++i)
+        masked.down[i] = masked.pressed[i] = masked.released[i] = false;
+    masked.wheel = 0.0f;
+    masked.double_click = false;
+    masked.click_count = 0;
+    masked.mouse_delta = Vec2(0, 0);
+    masked.dragging = false;
+    return masked;
+}
+inline const Input& Ui::raw_input() const { return impl->input; }
 inline bool Ui::pointer_available() const {
     return !impl->measure_on && !impl->gate_blocked_pointer() &&
            !impl->clip_excludes(impl->input.mouse.x, impl->input.mouse.y);
@@ -6681,11 +6702,6 @@ inline bool Ui::select(const std::vector<std::string>& items, int* index, const 
         if (ly + list_h > height() - 4.0f) ly = std::max(4.0f, box.y - 4.0f - list_h);
         Rect list(box.x, ly, box.w, list_h);
 
-        // 同上：展开期间只有主体和下拉列表能接收点击。
-        // 触发器在普通层（它自己已经 interact 过），列表是帧末画的，层级取帧末基准。
-        impl->gate_claim(box, z_first);
-        impl->gate_claim(list, Impl::Z_FRAME_END);
-
         // ---- 逐项交互：必须在**帧内**做完 ----
         // 早先把交互放在 deferred 里，写回的是调用方栈上的 int*（帧末早就出栈了），
         // 而且 changed 永远是 false —— 表现就是"点了没反应"。menu 也是这么处理的：
@@ -6726,7 +6742,11 @@ inline bool Ui::select(const std::vector<std::string>& items, int* index, const 
 
         // ---- 绘制：帧末，只画不判 ----
         // 选中/点外部的那一帧不再画：状态已经变了，再画一遍旧弹层会多闪一帧。
+        // 同上：展开期间只有主体和下拉列表能接收点击。
+        // 触发器在普通层（它自己已经 interact 过），列表是帧末画的，层级取帧末基准。
         if (clicked_index < 0 && !click_outside) {
+            impl->gate_claim(box, z_first);
+            impl->gate_claim(list, Impl::Z_FRAME_END);
             const int sel_now = *index;
             const std::vector<std::string> items_copy = items;
             deferred([this, list, items_copy, rects, ids, hov, sel_now, fs]() {
@@ -9108,9 +9128,6 @@ inline bool Ui::popover(const std::string& label, bool* open, const Rect& box,
     const Rect panel(px, py, pw, ph);
     const Rect inner = panel.inset(inner_pad, inner_pad);
 
-    impl->gate_claim(box, z_first);
-    impl->gate_claim(panel, Impl::Z_FRAME_END);
-
     // 点面板和触发器以外的地方、或按 Esc → 关闭
     bool dismiss = false;
     const Input& kin = impl->input;
@@ -9120,7 +9137,10 @@ inline bool Ui::popover(const std::string& label, bool* open, const Rect& box,
     }
     if (kin.key_pressed[KEY_ESC]) dismiss = true;
 
-    deferred([this, panel, inner, panel_rad, draw]() {
+    if (dismiss) { *open = false; repaint(); return false; }
+
+    deferred([this, open, box, z_first, panel, inner, panel_rad, draw]() {
+        if (!*open) return;
         const Theme& t2 = impl->theme;
         // 气泡只有投影，没有描边（一圈 1px 线是 Web 的 Popover）
         detail::pop_shadow(*this, panel, panel_rad, t2, 1);
@@ -9128,9 +9148,13 @@ inline bool Ui::popover(const std::string& label, bool* open, const Rect& box,
         push_clip(panel);
         if (draw) draw(inner);          // 内容自己画，可以继续调 ui.* 组件
         pop_clip();
+        // 回调可能关闭面板；只给仍打开的面板登记下一帧闸门。
+        if (*open) {
+            impl->gate_claim(box, z_first);
+            impl->gate_claim(panel, Impl::Z_FRAME_END);
+        } else repaint();
     });
 
-    if (dismiss) { *open = false; repaint(); }
     return true;
 }
 
@@ -9356,8 +9380,6 @@ inline bool Ui::context_menu(const Rect& area, const std::vector<std::string>& i
     ly = detail::clampf(ly, 4.0f, std::max(4.0f, height() - lh - 4.0f));
     const Rect list(lx, ly, lw, lh);
 
-    impl->gate_claim(list, Impl::Z_FRAME_END);
-
     std::vector<Rect> rects;
     std::vector<uint64_t> ids;
     std::vector<uint8_t> hov;
@@ -9386,10 +9408,13 @@ inline bool Ui::context_menu(const Rect& area, const std::vector<std::string>& i
     if ((kin.pressed[0] || kin.pressed[1]) && !list.contains(kin.mouse.x, kin.mouse.y)) close = true;
     if (kin.key_pressed[KEY_ESC]) close = true;
 
-    std::vector<std::string> items_copy = items;
-    deferred([this, list, rects, ids, hov, items_copy, fs]() mutable {
-        detail::paint_menu(*this, list, items_copy, rects, ids, hov, -1, false, fs);
-    });
+    if (!close) {
+        impl->gate_claim(list, Impl::Z_FRAME_END);
+        std::vector<std::string> items_copy = items;
+        deferred([this, list, rects, ids, hov, items_copy, fs]() mutable {
+            detail::paint_menu(*this, list, items_copy, rects, ids, hov, -1, false, fs);
+        });
+    }
 
     if (close) {
         impl->flags[id] = 0.0f;

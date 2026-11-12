@@ -77,6 +77,131 @@ static void linux_backend_checks() {
     renderer.release(); check(renderer.cache_stats().faces == 0, "shared font faces released once");
 }
 #endif
+// 自绘输入与原生组件共享浮层闸门；关闭回调不得留下下一帧闸门。
+static void overlay_input_checks() {
+    using namespace aino;
+    Ui ui; auto& input = ui.impl->input;
+    const Rect trigger{350, 265, 30, 30};
+    bool open = true, expect_blocked = false, masked_ok = true;
+    bool close_inside = false, close_before_end = false, visible = false;
+    bool inner_press = false, raw_press = false;
+    int callbacks = 0, inner_clicks = 0, background_clicks = 0;
+    auto sample = [&] {
+        if (!expect_blocked) return;
+        const auto& in = ui.input();
+        masked_ok = masked_ok && !ui.pointer_available() && in.wheel == 0 &&
+            !in.double_click && in.click_count == 0 && !in.dragging &&
+            in.mouse_delta.x == 0 && in.mouse_delta.y == 0 &&
+            in.mouse.x == input.mouse.x && in.mouse.y == input.mouse.y;
+        for (int i = 0; i < 3; ++i)
+            masked_ok = masked_ok && !in.down[i] && !in.pressed[i] && !in.released[i];
+        check(in.key_pressed[KEY_ENTER] == input.key_pressed[KEY_ENTER] &&
+              in.text_input == input.text_input, "pointer filtering preserves keyboard input");
+    };
+    auto draw = [&] {
+        ui.begin_frame(400, 300, .016f, 1);
+        sample();
+        if (detail::interact(ui.impl, 8101, {0, 0, 340, 300}, true).clicked) ++background_clicks;
+        visible = ui.popover("popup", &open, trigger, {200, 100}, [&](const Rect& inner) {
+            ++callbacks;
+            inner_press = inner_press || (ui.pointer_available() && ui.input().pressed[0]);
+            if (ui.button("inner", inner)) ++inner_clicks;
+            if (close_inside) open = false;
+        });
+        sample();
+        if (detail::interact(ui.impl, 8102, {0, 0, 340, 300}, true).clicked) ++background_clicks;
+        raw_press = ui.raw_input().pressed[0];
+        if (close_before_end) open = false;
+        ui.end_frame();
+    };
+    draw();
+    check(ui.impl->gate_next_allow_n == 2, "popover registers only its live trigger and panel");
+    const auto panel = ui.impl->gate_next_allow[1];
+    input.mouse = {panel.cx(), panel.cy()};
+    for (int i = 0; i < 3; ++i) input.down[i] = input.pressed[i] = true;
+    input.wheel = 2; input.double_click = true; input.click_count = 2;
+    input.mouse_delta = {3, 4}; input.dragging = true;
+    input.key_pressed[KEY_ENTER] = true; input.text_input = "a";
+    expect_blocked = true; draw();
+    check(masked_ok && inner_press && raw_press,
+          "custom background input is masked while the popup and raw_input retain the press");
+    for (int i = 0; i < 3; ++i) { input.down[i] = false; input.released[i] = true; }
+    input.dragging = false; draw();
+    check(masked_ok && inner_clicks == 1 && background_clicks == 0,
+          "popup button receives release without leaking to native or custom background controls");
+    const int before = callbacks;
+    input.mouse = {10, 10}; input.down[0] = true; input.pressed[0] = true;
+    draw();
+    check(!open && !visible && callbacks == before && !ui.impl->gate_next && masked_ok,
+          "outside press dismisses without running the closed callback or renewing its gate");
+    expect_blocked = false; input.down[0] = false; input.released[0] = true; draw();
+    check(!ui.impl->gate_on && background_clicks == 0, "closing gesture does not activate background controls");
+    input.down[0] = true; input.pressed[0] = true; draw();
+    input.down[0] = false; input.released[0] = true; draw();
+    check(background_clicks == 1, "next background click works immediately after dismissal");
+    open = true; draw();
+    const int before_escape = callbacks;
+    input.key_pressed[KEY_ESC] = true; expect_blocked = true; draw();
+    check(!open && !visible && callbacks == before_escape && !ui.impl->gate_next,
+          "Escape dismisses without executing a stale popover callback");
+    expect_blocked = false; open = true; close_inside = true; draw();
+    check(!open && !ui.impl->gate_next, "closing inside the deferred callback leaves no stale gate");
+    close_inside = false; close_before_end = true; open = true;
+    const int before_cancel = callbacks; draw();
+    check(callbacks == before_cancel && !ui.impl->gate_next,
+          "popover cancelled before frame end does not execute or retain input");
+
+    input.mouse = {10, 10}; input.pressed[0] = input.down[0] = true;
+    ui.begin_frame(400, 300, .016f, 1);
+    ui.push_clip({20, 20, 30, 30});
+    check(!ui.pointer_available() && !ui.input().pressed[0] && ui.raw_input().pressed[0],
+          "custom input obeys clipping without consuming the original event");
+    ui.pop_clip();
+    check(ui.pointer_available() && ui.input().pressed[0], "leaving clip restores visible input");
+    ui.begin_measure();
+    check(!ui.pointer_available() && !ui.input().pressed[0], "measurement cannot activate custom input");
+    ui.end_measure();
+    check(ui.input().pressed[0], "measurement preserves the real frame input");
+    ui.end_frame();
+}
+
+static void overlay_menu_lifecycle_checks() {
+    using namespace aino;
+    for (int kind = 0; kind < 3; ++kind) {
+        Ui ui; auto& input = ui.impl->input;
+        const Rect trigger{20, 20, 80, 24};
+        const std::vector<std::string> items{"one", "two", "three"};
+        int choice = -1, selected = 0, background = 0;
+        auto draw = [&] {
+            ui.begin_frame(400, 300, .016f, 1);
+            if (detail::interact(ui.impl, 8201, {0, 80, 400, 220}, true).clicked) ++background;
+            if (kind == 0) ui.menu("menu", items, &choice, trigger);
+            else if (kind == 1) ui.select(items, &selected, trigger);
+            else ui.context_menu(trigger, items, &choice);
+            ui.end_frame();
+        };
+        auto press = [&](float x, float y, int button) {
+            input.mouse = {x, y}; input.down[button] = input.pressed[button] = true; draw();
+        };
+        auto release = [&](int button) {
+            input.down[button] = false; input.released[button] = true; draw();
+        };
+        auto open = [&] { const int button = kind == 2 ? 1 : 0; press(trigger.cx(), trigger.cy(), button); release(button); };
+        open();
+        check(ui.impl->gate_next_allow_n > 0, "open menu registers its live gate");
+        const auto panel = ui.impl->gate_next_allow[ui.impl->gate_next_allow_n - 1];
+        press(panel.cx(), panel.y + 4 + 24 + 12, 0); release(0);
+        check((kind == 1 ? selected : choice) == 1 && !ui.impl->gate_next && background == 0,
+              "selecting an item does not renew the closed menu gate or click through");
+        open(); press(10, 280, 0);
+        check(!ui.impl->gate_next && background == 0, "outside press closes menu without renewing its gate");
+        release(0); draw();
+        check(!ui.impl->gate_on && background == 0, "closed menu releases the background gate");
+        open(); input.key_pressed[KEY_ESC] = true; draw();
+        check(!ui.impl->gate_next, "Escape closes every menu type without a stale gate");
+    }
+}
+
 static void menu_checks() {
     using namespace aino;
     for (const bool timer : {false, true}) {
@@ -175,6 +300,8 @@ int main(int argc, char** argv) {
         frame(); check(aino::detail::interact(ui.impl, 4, box, true).clicked, "drag releases normally"); ui.end_frame();
         click(5);
         menu_checks();
+        overlay_input_checks();
+        overlay_menu_lifecycle_checks();
         std::cout << "UI capture lifecycle regression checks passed\n";
         return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

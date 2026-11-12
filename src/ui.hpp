@@ -199,7 +199,7 @@ static void draw_song_menu(Ctx& c) {
     const float height = 24 * float(items.size()) + 8;
     const Rect menu{std::clamp(song_menu.position.x, 4.0f, std::max(4.0f, c.W - width - 4)),
                     std::clamp(song_menu.position.y, 4.0f, std::max(4.0f, c.H - height - 4)), width, height};
-    const auto& in = c.ui.input();
+    const auto& in = c.ui.raw_input();
     if (picked) {
         const auto track = song_menu.track;
         if (chosen == 0) queue_play_next(track);
