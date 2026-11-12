@@ -20,6 +20,7 @@
 #endif
 #include <windows.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #else
 #include <spawn.h>
 #include <sys/wait.h>
@@ -167,7 +168,7 @@ inline std::string download_dir() {
     return join(join(home, "Music"), "aino player");
 }
 // argv 不经过 shell，中文、引号等文件名不会成为命令。
-inline int run_process(const std::vector<std::string>& args) {
+inline int run_process(const std::vector<std::string>& args, unsigned timeout_ms = 0) {
     if (args.empty()) return -1;
 #ifdef _WIN32
     std::wstring command;
@@ -186,10 +187,25 @@ inline int run_process(const std::vector<std::string>& args) {
     }
     STARTUPINFOW si{}; si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
-    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW | (timeout_ms ? CREATE_SUSPENDED : 0),
                         nullptr, nullptr, &si, &pi)) return -1;
+    HANDLE job = timeout_ms ? CreateJobObjectW(nullptr, nullptr) : nullptr;
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof limits) ||
+            !AssignProcessToJobObject(job, pi.hProcess)) { CloseHandle(job); job = nullptr; }
+    }
+    if (timeout_ms) ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
-    WaitForSingleObject(pi.hProcess, INFINITE);
+    if (WaitForSingleObject(pi.hProcess, timeout_ms ? timeout_ms : INFINITE) == WAIT_TIMEOUT) {
+        if (job) TerminateJobObject(job, 124); else TerminateProcess(pi.hProcess, 124);
+        WaitForSingleObject(pi.hProcess, 5000);
+        if (job) CloseHandle(job);
+        CloseHandle(pi.hProcess); return 124;
+    }
+    if (job) CloseHandle(job);
     DWORD code = 1;
     GetExitCodeProcess(pi.hProcess, &code);
     CloseHandle(pi.hProcess);
@@ -199,10 +215,41 @@ inline int run_process(const std::vector<std::string>& args) {
     for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
     argv.push_back(nullptr);
     pid_t pid = 0;
-    if (posix_spawnp(&pid, argv[0], nullptr, nullptr, argv.data(), environ)) return -1;
+    posix_spawnattr_t attr; posix_spawnattr_init(&attr);
+    if (timeout_ms) { posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP); posix_spawnattr_setpgroup(&attr, 0); }
+    const int spawned = posix_spawnp(&pid, argv[0], nullptr, &attr, argv.data(), environ);
+    posix_spawnattr_destroy(&attr);
+    if (spawned) return -1;
     int status = 0;
-    while (waitpid(pid, &status, 0) == -1) { if (errno != EINTR) return -1; }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    for (;;) {
+        const auto result = waitpid(pid, &status, timeout_ms ? WNOHANG : 0);
+        if (result == pid) break;
+        if (result < 0 && errno != EINTR) return -1;
+        if (timeout_ms && std::chrono::steady_clock::now() >= deadline) {
+            kill(-pid, SIGKILL); while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+            return 124;
+        }
+        if (timeout_ms) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+}
+// Windows 原生选择器；其他桌面保留可粘贴的跨平台路径输入，不新增桌面工具依赖。
+inline std::string choose_music_folder() {
+#ifdef _WIN32
+    const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    BROWSEINFOW info{}; info.hwndOwner = GetActiveWindow();
+    info.lpszTitle = L"选择音乐文件夹";
+    info.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    auto* item = SHBrowseForFolderW(&info);
+    wchar_t path[MAX_PATH]{};
+    std::string result;
+    if (item) { if (SHGetPathFromIDListW(item, path)) result = narrow(path); CoTaskMemFree(item); }
+    if (SUCCEEDED(initialized)) CoUninitialize();
+    return result;
+#else
+    return {};
 #endif
 }
 inline bool open_browser(const std::string& url) {

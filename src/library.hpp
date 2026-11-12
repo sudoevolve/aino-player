@@ -1,10 +1,12 @@
-// 本地资料库只保存曲目元数据和在线歌单引用，不保存音频或账号凭据。
+// 本地资料库只保存曲目元数据和在线歌单引用，本地文件只保存路径，不复制音频或保存账号凭据。
 #pragma once
 #include "sources.hpp"
 #include "platform.hpp"
 #include <fstream>
 #include <sstream>
 #include <regex>
+#include <functional>
+#include <cctype>
 
 namespace library {
 inline std::string quote(const std::string& text) {
@@ -46,7 +48,7 @@ inline bool decode_track(const js::Value& value, music::Track& t) {
     for (const auto& row : variants.array) {
         const int source = int(row["source"].integer(-1));
         const auto id = row["id"].str();
-        if (source < 0 || source >= music::kSourceCount || id.empty()) continue;
+        if (source < 0 || source > int(music::Source::Local) || id.empty()) continue;
         music::Variant v;
         v.source = music::Source(source); v.id = id; v.native_id = row["native_id"].str();
         v.title = row["title"].str(t.title); v.artist = row["artist"].str(t.artist);
@@ -64,6 +66,8 @@ struct Playlist {
     music::Source source = music::Source::Netease;
     std::vector<music::Track> tracks;
     std::string remote_owner; // QQ 自建歌单使用 dirid + uin；公开歌单使用 disstid。
+    std::string local_folder;
+    bool recursive = true;
     bool online() const { return !remote_id.empty(); }
 };
 inline bool parse_link(const std::string& input, music::Source& source, std::string& id) {
@@ -77,6 +81,54 @@ inline bool parse_link(const std::string& input, music::Source& source, std::str
     else return false;
     id = match[1].str();
     return id.size() <= 24 && id.find_first_not_of('0') != std::string::npos;
+}
+// 扫描只读取文件路径；不跟随链接，不修改音乐目录。失败时调用方保留旧歌单。
+inline Playlist scan_folder(const std::string& input, bool recursive, std::string& error,
+                            const std::function<bool()>& cancelled = {}) {
+    error.clear();
+    Playlist out;
+    std::error_code ec;
+    auto folder = platform::fs::canonical(platform::fs::u8path(music::text::trim(input)), ec);
+    if (ec || !platform::fs::is_directory(folder, ec)) { error = "文件夹不存在或无法读取"; return out; }
+    out.local_folder = folder.u8string(); out.recursive = recursive;
+    out.source = music::Source::Local; out.key = "folder#" + out.local_folder;
+    out.name = folder.filename().u8string();
+    if (out.name.empty()) out.name = out.local_folder;
+    std::vector<std::string> files;
+    auto add = [&](const platform::fs::directory_entry& entry) {
+        if (entry.is_symlink(ec) || !entry.is_regular_file(ec) || ec) return;
+        auto ext = entry.path().extension().u8string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        if (ext == ".mp3" || ext == ".flac" || ext == ".wav" || ext == ".m4a" || ext == ".aac" ||
+            ext == ".ogg" || ext == ".opus" || ext == ".webm") files.push_back(entry.path().u8string());
+    };
+    if (recursive) {
+        for (platform::fs::recursive_directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec)) {
+            if (cancelled && cancelled()) { error = "扫描已取消"; return out; }
+            add(*it);
+            if (ec) break;
+        }
+    } else {
+        for (platform::fs::directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec)) {
+            if (cancelled && cancelled()) { error = "扫描已取消"; return out; }
+            add(*it);
+            if (ec) break;
+        }
+    }
+    if (ec) { error = "部分目录无法读取，原歌单已保留：" + ec.message(); return out; }
+    std::sort(files.begin(), files.end());
+    files.erase(std::unique(files.begin(), files.end()), files.end());
+    for (const auto& path : files) {
+        music::Variant v; v.source = music::Source::Local; v.id = path;
+        v.title = platform::fs::u8path(path).stem().u8string();
+        const auto split = v.title.find(" - ");
+        if (split != std::string::npos) { v.artist = v.title.substr(0, split); v.title.erase(0, split + 3); }
+        v.album = platform::fs::u8path(path).parent_path().filename().u8string();
+        music::Track t; t.title = v.title; t.artist = v.artist; t.album = v.album;
+        t.variants.push_back(std::move(v)); out.tracks.push_back(std::move(t));
+    }
+    if (out.tracks.empty()) error = "文件夹内没有支持的音频文件，原歌单已保留";
+    return out;
 }
 class Library {
 public:
@@ -107,7 +159,8 @@ public:
             first = false;
             out += "{\"key\":" + quote(p.key) + ",\"name\":" + quote(p.name) +
                 ",\"remote_id\":" + quote(p.remote_id) + ",\"cover\":" + quote(p.cover) +
-                ",\"source\":" + std::to_string(int(p.source)) + ",\"remote_owner\":" + quote(p.remote_owner) + ",\"tracks\":[";
+                ",\"source\":" + std::to_string(int(p.source)) + ",\"remote_owner\":" + quote(p.remote_owner) + ",\"local_folder\":" + quote(p.local_folder) +
+                ",\"recursive\":" + (p.recursive ? "true" : "false") + ",\"tracks\":[";
             bool first_track = true;
             for (const auto& t : p.tracks) {
                 if (!first_track) out += ',';
@@ -116,6 +169,7 @@ public:
             out += "]}";
         }
         out += "]}\n";
+        if (out.size() > 64 * 1024 * 1024) { err = "本地资料库超过 64 MiB，原文件已保留"; return false; }
         const auto tmp = path + ".tmp";
         auto* f = platform::fopen(tmp, "wb");
         if (!f) { err = "无法创建本地资料库文件"; return false; }
@@ -141,8 +195,10 @@ public:
             Playlist p;
             p.key = row["key"].str(); p.name = row["name"].str(); p.remote_id = row["remote_id"].str(); p.cover = row["cover"].str();
             p.remote_owner = row["remote_owner"].str();
+            p.local_folder = row["local_folder"].str();
+            p.recursive = row["recursive"].is_null() || row["recursive"].truthy();
             const int source = int(row["source"].integer(-1));
-            if (p.key.empty() || p.name.empty() || source < 0 || source >= music::kSourceCount || !row["tracks"].is_array()) {
+            if (p.key.empty() || p.name.empty() || source < 0 || source > int(music::Source::Local) || !row["tracks"].is_array()) {
                 err = "本地资料库条目损坏，原文件保留"; return false;
             }
             p.source = music::Source(source);

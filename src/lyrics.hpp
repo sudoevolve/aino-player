@@ -16,6 +16,8 @@
 #include "json.hpp"
 #include "net.hpp"
 #include "sources.hpp"
+#include "platform.hpp"
+#include <fstream>
 
 namespace lyr {
 
@@ -333,6 +335,19 @@ inline std::string search_netease_id(const music::Track& t, const music::Setting
 }
 
 inline Doc fetch(const music::Track& t, const music::Settings& st, int timeout_ms = 8000) {
+    if (!t.variants.empty() && t.current().source == music::Source::Local) {
+        Doc d; d.origin = "本地 LRC";
+        auto path = platform::fs::u8path(t.current().id); path.replace_extension(".lrc");
+        const auto size = platform::file_size(path.u8string());
+        if (size > 0 && size < 4 * 1024 * 1024) {
+            std::ifstream f(path, std::ios::binary);
+            std::string text((std::istreambuf_iterator<char>(f)), {});
+            if (text.rfind("\xef\xbb\xbf", 0) == 0) text.erase(0, 3);
+            d.lines = parse(text, &d.synced);
+        }
+        if (d.lines.empty()) d.error = "未找到同名 UTF-8 .lrc 歌词";
+        return d;
+    }
     // 顺序：当前选中的源 → 其它源。每家用自己那条曲目的 id，不去猜。
     std::vector<int> order;
     if (!t.variants.empty()) {
@@ -350,7 +365,8 @@ inline Doc fetch(const music::Track& t, const music::Settings& st, int timeout_m
         switch (v.source) {
             case music::Source::Netease: d = fetch_netease_lyric(v.id, st, timeout_ms); break;
             case music::Source::QQ: d = fetch_qq_lyric(v.id, st.qq_cookie, timeout_ms); break;
-            default: d = fetch_kuwo_lyric(v.id, timeout_ms); break;
+            case music::Source::Kuwo: d = fetch_kuwo_lyric(v.id, timeout_ms); break;
+            default: continue;
         }
         if (!d.lines.empty()) return d;
         if (!d.error.empty()) last_err = std::string(music::source_name(v.source)) + "：" + d.error;

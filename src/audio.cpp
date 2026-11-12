@@ -1,9 +1,9 @@
+#include "platform.hpp"
 #define MINIAUDIO_IMPLEMENTATION
 #define MA_NO_ENCODING
 #define MA_NO_GENERATION
 #include "../vendor/miniaudio/miniaudio.h"
 #include "audio.hpp"
-#include "platform.hpp"
 #include <algorithm>
 #include <cstring>
 
@@ -21,6 +21,7 @@ MediaInfo inspect_mp3(const std::string& path) {
     mi.channels = int(decoder.outputChannels);
     ma_uint64 frames = 0;
     if (ma_decoder_get_length_in_pcm_frames(&decoder, &frames) == MA_SUCCESS && frames && mi.sample_rate) {
+        mi.duration_ms = static_cast<long long>(frames * 1000 / mi.sample_rate);
         const auto bytes = platform::file_size(path);
         if (bytes > 0) mi.bitrate_kbps = int(double(bytes) * 8 * mi.sample_rate / double(frames) / 1000);
     }
@@ -28,7 +29,7 @@ MediaInfo inspect_mp3(const std::string& path) {
     ma_decoder_uninit(&decoder);
     return mi;
 }
-bool prepare_file(const std::string& path, std::string& playable, std::string& err) {
+bool prepare_file(const std::string& path, std::string& playable, std::string& err, const std::string& conversion_path) {
     playable = path;
     auto* f = platform::fopen(path, "rb");
     if (!f) { err = "无法读取音频文件"; return false; }
@@ -37,14 +38,16 @@ bool prepare_file(const std::string& path, std::string& playable, std::string& e
     std::fclose(f);
     const bool m4a = n >= 8 && !std::memcmp(head + 4, "ftyp", 4);
     const bool adts = n >= 2 && head[0] == 0xff && (head[1] & 0xf6) == 0xf0;
-    if (!m4a && !adts) return true;
-    playable = path + ".pcm.wav";
+    const bool webm = n >= 4 && head[0] == 0x1a && head[1] == 0x45 && head[2] == 0xdf && head[3] == 0xa3;
+    const bool ogg = n >= 4 && !std::memcmp(head, "OggS", 4);
+    if (!m4a && !adts && !webm && !ogg) return true;
+    playable = conversion_path.empty() ? path + ".pcm.wav" : conversion_path;
     const auto partial = playable + ".part.wav";
     const int rc = platform::run_process({"ffmpeg", "-nostdin", "-v", "error", "-y", "-i", path,
         "-vn", "-acodec", "pcm_s16le", partial});
     if (rc != 0 || platform::file_size(partial) <= 44 || !platform::replace_file(partial, playable)) {
         platform::remove(partial);
-        err = rc == -1 ? "AAC/m4a 需要 FFmpeg，请安装并加入 PATH" : "FFmpeg 无法解码 AAC/m4a 音频";
+        err = rc == -1 ? "此音频格式需要 FFmpeg，请安装并加入 PATH" : "FFmpeg 无法解码此音频";
         return false;
     }
     return true;

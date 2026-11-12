@@ -14,7 +14,8 @@ inline bool audio_file(const std::string& name) {
     const auto dot = name.find('.', 6);
     if (dot == std::string::npos || dot == 6 || name.substr(6, dot-6).find_first_not_of("0123456789") != std::string::npos) return false;
     const auto suffix = name.substr(dot);
-    for (const char* ext : {".mp3", ".flac", ".wav", ".m4a", ".aac"}) {
+    if (suffix == ".pcm.wav" || suffix == ".pcm.wav.part.wav") return true;
+    for (const char* ext : {".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".webm"}) {
         if (suffix == ext || suffix == std::string(ext) + ".pcm.wav" || suffix == std::string(ext) + ".pcm.wav.part.wav") return true;
     }
     return false;

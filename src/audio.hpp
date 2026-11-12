@@ -8,9 +8,10 @@ struct MediaInfo {
     int bitrate_kbps = 0;
     int sample_rate = 0;
     int channels = 0;
+    long long duration_ms = 0;
 };
 MediaInfo inspect_mp3(const std::string& path);
-bool prepare_file(const std::string& path, std::string& playable, std::string& err);
+bool prepare_file(const std::string& path, std::string& playable, std::string& err, const std::string& conversion_path = {});
 class Player {
 public:
     Player();

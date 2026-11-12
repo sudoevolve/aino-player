@@ -9,6 +9,84 @@
 static void check(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
 int main(int argc, char** argv) {
     try {
+        if (argc > 1 && std::string(argv[1]) == "--child-sleep") { platform::sleep_ms(3000); return 0; }
+        if (argc > 3 && std::string(argv[1]) == "--source-response") {
+            net::Response response;
+            if (std::string(argv[2]) == "youtube") {
+                const auto config = music::providers::youtube_config(2000);
+                response = net::post("https://music.youtube.com/youtubei/v1/search?prettyPrint=false&key=" + net::url_encode(config.key),
+                    "{\"context\":" + music::providers::youtube_context(config) + ",\"query\":\"Hello Adele\"}", music::providers::youtube_headers(config), 6000);
+            } else {
+                std::string error;
+                const auto session = music::providers::bili_session(3000, error);
+                check(!session.key.empty(), error.c_str());
+                const auto query = music::providers::wbi_query({{"keyword", "Hello Adele"}, {"search_type", "video"}, {"page", "1"}, {"page_size", "3"}}, session.key, std::time(nullptr));
+                response = net::get("https://api.bilibili.com/x/web-interface/wbi/search/type?" + query,
+                    {"User-Agent: Mozilla/5.0", "Referer: https://www.bilibili.com/", "Cookie: " + session.cookie}, 6000);
+            }
+            auto* file = platform::fopen(argv[3], "wb"); check(file != nullptr, "diagnostic output file");
+            std::fwrite(response.body.data(), 1, response.body.size(), file); std::fclose(file);
+            std::cout << "status=" << response.status << " bytes=" << response.body.size() << " error=" << response.error << std::endl;
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[1]) == "--source-probe") {
+            std::string error;
+            const std::string source = argv[2];
+            music::Settings settings;
+            const auto tracks = source == "bilibili" ? music::search_bilibili("Hello Adele", 3, 12000, error) :
+                source == "kuwo" ? music::search_kuwo("Hello Adele", 3, 12000, error) : music::search_youtube("Hello Adele", 3, 9000, error);
+            std::cout << "source=" << source << " count=" << tracks.size() << " error=" << error << std::endl;
+            if (tracks.empty()) return 2;
+            auto stream = music::resolve(tracks.front(), settings);
+            std::cout << "resolve=" << stream.ok << " reason=" << stream.reason << " detail=" << stream.detail << std::endl;
+            if (!stream.ok) return 3;
+            const auto probe = net::probe_audio(stream.url, stream.headers, 6000);
+            std::cout << "probe=" << probe.playable << " bytes=" << probe.total_bytes << " reason=" << probe.reason << std::endl;
+            if (!probe.playable) return 4;
+            if (argc > 3) {
+                std::atomic<bool> cancel{false};
+                check(net::download(stream.url, argv[3], stream.headers, [](long long, long long) {}, cancel, error, 30000), error.c_str());
+                std::string playable;
+                check(audio::prepare_file(argv[3], playable, error, std::string(argv[3]) + ".pcm.wav"), error.c_str());
+                const auto info = audio::inspect_mp3(playable);
+                check(info.valid && info.duration_ms > 0, "live source downloaded and decoded");
+                std::cout << "decoded_ms=" << info.duration_ms << " rate=" << info.sample_rate << std::endl;
+            }
+            return 0;
+        }
+        {
+        using namespace music::providers;
+        const auto child_start = platform::ticks();
+        check(platform::run_process({argv[0], "--child-sleep"}, 100) == 124 && platform::ticks() - child_start < 2500,
+            "optional source tool timeout terminates and reaps child");
+        check(net::audio_prefix("\0\0\0\x20" "ftypisom", 12) && net::audio_prefix("fLaC", 4) &&
+            net::audio_prefix("RIFF1234WAVE", 12) && net::audio_prefix("OggS", 4) &&
+            net::audio_prefix("\x1a\x45\xdf\xa3", 4) && !net::audio_prefix("<html>login", 11), "audio container signatures reject login pages");
+        static_assert(int(music::Source::Netease) == 0 && int(music::Source::QQ) == 1 && int(music::Source::Kuwo) == 2);
+        static_assert(int(music::Source::Local) >= music::kSourceCount);
+        check(Md5Hex("") == "d41d8cd98f00b204e9800998ecf8427e" && Md5Hex("abc") == "900150983cd24fb0d6963f7d28e17f72", "MD5 protocol vectors");
+        const auto signed_query = wbi_query({{"foo", "a!b(c)*'"}, {"bar", "空 格"}}, "key", 123);
+        check(signed_query.rfind("bar=%E7%A9%BA%20%E6%A0%BC&foo=abc&wts=123&w_rid=", 0) == 0, "WBI sorting encoding and character filtering");
+        check(wbi_key("bad", "keys").empty(), "invalid WBI key rejected");
+        js::Value fixture;
+        check(js::parse(R"({"data":{"result":[{"bvid":"BV1fixture01","title":"<em>Hello</em> &amp; world","author":"Artist","pic":"//cdn.test/a.jpg","duration":"1:02:03"}]}})", fixture), "Bilibili fixture JSON");
+        auto videos = parse_bilibili_search(fixture, 2);
+        check(videos.size() == 1 && videos[0].title == "Hello & world" && videos[0].duration_ms == 3723000 &&
+            videos[0].cover_url == "https://cdn.test/a.jpg", "Bilibili title cover and duration parsing");
+        check(js::parse(R"({"data":{"dash":{"audio":[{"baseUrl":"https://cdn.test/low","bandwidth":64000},{"base_url":"https://cdn.test/high","bandwidth":192000}]}}})", fixture), "DASH fixture");
+        check(parse_bilibili_audio(fixture, 0).url == "https://cdn.test/low" && parse_bilibili_audio(fixture, 1).url == "https://cdn.test/high", "Bilibili quality selection and URL aliases");
+        check(js::parse(R"({"contents":[{"musicResponsiveListItemRenderer":{"playlistItemData":{"videoId":"abcdefghijk"},"flexColumns":[{"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Music title"}]}}},{"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Artist"},{"text":" • "},{"text":"3:24"}]}}}],"thumbnail":{"musicThumbnailRenderer":{"thumbnail":{"thumbnails":[{"url":"https://cdn.test/music.jpg"}]}}}}},{"musicTwoRowItemRenderer":{"title":{"runs":[{"text":"Other title"}]},"navigationEndpoint":{"watchEndpoint":{"videoId":"0123456789_"}}}},{"videoRenderer":{"videoId":"abcdefghijk","title":{"simpleText":"duplicate"}}}]})", fixture), "YouTube Music fixture");
+        auto music_results = parse_youtube_search(fixture, 10);
+        check(music_results.size() == 2 && music_results[0].artist == "Artist" && music_results[0].duration_ms == 204000 &&
+            music_results[0].cover_url == "https://cdn.test/music.jpg", "Music renderer parsing and deduplication");
+        check(parse_youtube_search(fixture, 1).size() == 1, "YouTube search limit");
+        check(js::parse(R"({"playabilityStatus":{"status":"OK"},"streamingData":{"adaptiveFormats":[{"mimeType":"video/mp4","url":"https://cdn.test/video","bitrate":900000},{"mimeType":"audio/webm","url":"https://cdn.test/webm","bitrate":160000},{"mimeType":"audio/mp4","url":"https://cdn.test/m4a","bitrate":128000},{"mimeType":"audio/mp4","signatureCipher":"url=untrusted&s=signature","bitrate":256000}]}})", fixture), "YouTube audio fixture");
+        check(parse_youtube_audio(fixture, {}, 1).url == "https://cdn.test/m4a", "prefer direct audio MP4 and never mistake cipher or video for audio");
+        check(js::parse(R"({"playabilityStatus":{"status":"LOGIN_REQUIRED","reason":"Sign in"}})", fixture) &&
+            !parse_youtube_audio(fixture, {}, 1).ok, "YouTube login errors stay explicit");
+        const auto page = youtube_page_config(R"(<script>ytcfg.set({"INNERTUBE_CLIENT_VERSION":"new","nested":{"quoted":"}\\\"{"}});</script>)");
+        check(page["INNERTUBE_CLIENT_VERSION"].str() == "new", "homepage config handles nested objects and escaped strings");
+        }
         if (argc > 1 && std::string(argv[1]) == "--login-probe") {
             const auto site = argc > 2 && std::string(argv[2]) == "qq" ? login::Site::QQ : login::Site::NetEase;
             login::start(site, false);
@@ -52,13 +130,16 @@ int main(int argc, char** argv) {
         if (argc > 2 && std::string(argv[1]) == "--audio-device") {
             std::string playable, error;
             std::string path = argv[2];
+            std::string conversion = argc > 3 ? argv[3] : "";
 #ifdef _WIN32
             int count = 0;
             auto args = CommandLineToArgvW(GetCommandLineW(), &count);
             check(args && count > 2, "native audio command line");
-            path = platform::narrow(args[2]); LocalFree(args);
+            path = platform::narrow(args[2]);
+            if (count > 3) conversion = platform::narrow(args[3]);
+            LocalFree(args);
 #endif
-            const bool prepared = audio::prepare_file(path, playable, error);
+            const bool prepared = audio::prepare_file(path, playable, error, conversion);
             check(prepared, error.c_str());
             const auto info = audio::inspect_mp3(playable);
             check(info.valid && info.sample_rate > 0, "audio decoded");

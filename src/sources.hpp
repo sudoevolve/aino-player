@@ -24,19 +24,29 @@
 
 #include "json.hpp"
 #include "net.hpp"
+#include "platform.hpp"
+#include <cstring>
+#include <ctime>
+#include <functional>
+#include <fstream>
+#include <set>
 
 namespace music {
 
 // ---------------------------------------------------------------- 数据结构
 
-enum class Source { Netease = 0, QQ = 1, Kuwo = 2 };
-constexpr int kSourceCount = 3;
+enum class Source { Netease = 0, QQ = 1, Kuwo = 2, YouTube = 3, Bilibili = 4, Local = 5 };
+constexpr int kSourceCount = 5;
 
 inline const char* source_name(Source s) {
     switch (s) {
         case Source::Netease: return "网易云";
         case Source::QQ: return "QQ";
-        default: return "酷我";
+        case Source::Kuwo: return "酷我";
+        case Source::YouTube: return "YouTube";
+        case Source::Bilibili: return "B 站";
+        case Source::Local: return "本地";
+        default: return "未知";
     }
 }
 
@@ -44,7 +54,11 @@ inline const char* source_key(Source s) {
     switch (s) {
         case Source::Netease: return "netease";
         case Source::QQ: return "qq";
-        default: return "kuwo";
+        case Source::Kuwo: return "kuwo";
+        case Source::YouTube: return "youtube";
+        case Source::Bilibili: return "bilibili";
+        case Source::Local: return "local";
+        default: return "unknown";
     }
 }
 
@@ -96,7 +110,7 @@ struct SearchResult {
 struct Settings {
     std::string netease_cookie;  // MUSIC_U=...；留空则只用免费档
     std::string qq_cookie;       // qm_keyst=...
-    bool enable[kSourceCount] = {true, true, true};
+    bool enable[kSourceCount] = {true, true, true, false, false};
     // 音质：0 = 标准 128k，1 = 高 320k，2 = 无损
     // 能到哪一档由源决定：网易云要 Cookie（无损还要会员），QQ 要登录，
     // 酷我的直链跟资源走、没有档位参数（填了也忽略）。
@@ -131,6 +145,9 @@ struct ResolveResult {
     std::string reason;                // 结构化原因（失败时）
     std::string detail;                // 人话补充
 };
+
+inline std::vector<Variant> search_bilibili(const std::string&, int, int, std::string&);
+inline std::vector<Variant> search_youtube(const std::string&, int, int, std::string&);
 
 // ---------------------------------------------------------------- 小工具
 
@@ -457,7 +474,7 @@ inline std::vector<Variant> search_kuwo(const std::string& keyword, int limit, i
                                         std::string& err) {
     std::vector<Variant> out;
     const std::string url =
-        "http://search.kuwo.cn/r.s?all=" + net::url_encode(keyword) +
+        "https://search.kuwo.cn/r.s?all=" + net::url_encode(keyword) +
         "&ft=music&itemset=web_2013&client=kt&pn=0&rn=" + std::to_string(limit) +
         "&rformat=json&encoding=utf8&vipver=1&show_copyright_off=1&newver=1";
     const net::Response r =
@@ -508,25 +525,19 @@ inline std::vector<Variant> search_kuwo(const std::string& keyword, int limit, i
 
 inline ResolveResult resolve_kuwo(const Variant& v) {
     ResolveResult rr;
-    const std::string api =
-        "http://antiserver.kuwo.cn/anti.s?type=convert_url&format=mp3&response=url&rid=MUSIC_" + v.id;
-    const net::Response r = net::get(api, {"User-Agent: Mozilla/5.0"}, 6000);
-    if (!r.ok()) {
-        rr.reason = "取流接口失败";
-        rr.detail = r.error.empty() ? ("HTTP " + std::to_string(r.status)) : r.error;
-        return rr;
+    rr.headers = {"User-Agent: Mozilla/5.0", "Referer: https://www.kuwo.cn/"};
+    const auto response = net::get("https://antiserver.kuwo.cn/anti.s?type=convert_url3&format=mp3&br=320kmp3&rid=MUSIC_" +
+        net::url_encode(v.id), rr.headers, 5000);
+    js::Value root;
+    if (response.ok() && js::parse(response.body, root)) rr.url = root["url"].str();
+    if (rr.url.rfind("https://", 0) != 0 && rr.url.rfind("http://", 0) != 0) {
+        const auto fallback = net::get("https://antiserver.kuwo.cn/anti.s?type=convert_url&format=mp3&response=url&rid=MUSIC_" +
+            net::url_encode(v.id), rr.headers, 5000);
+        rr.url = text::trim(fallback.body);
     }
-    const std::string body = text::trim(r.body);
-    if (body.rfind("http", 0) != 0) {
-        rr.reason = "该曲目无可用直链";
-        rr.detail = body.empty() ? "接口返回空" : body.substr(0, 64);
-        return rr;
-    }
-    rr.url = body;
-    rr.headers = {"User-Agent: Mozilla/5.0", "Referer: http://www.kuwo.cn/"};
-    rr.ok = true;
-    rr.reason = "ok";
-    rr.detail = v.bitrate ? ("标称 " + std::to_string(v.bitrate / 1000) + "kbps") : "码率未知";
+    rr.ok = rr.url.rfind("https://", 0) == 0 || rr.url.rfind("http://", 0) == 0;
+    rr.reason = rr.ok ? "ok" : "酷我未返回可用直链";
+    rr.detail = rr.ok ? "实际音质以音频为准，受限曲目可能仅试听" : "平台版权、网络或取流限制";
     return rr;
 }
 
@@ -883,7 +894,9 @@ inline SearchResult run_search(const std::string& keyword, const Settings& st, i
         try {
             if (src == Source::Netease) got = search_netease(keyword, limit_per_source, 8000, err, st);
             else if (src == Source::Kuwo) got = search_kuwo(keyword, limit_per_source, 8000, err);
-            else got = search_qq(keyword, limit_per_source, 8000, err, st);
+            else if (src == Source::QQ) got = search_qq(keyword, limit_per_source, 8000, err, st);
+            else if (src == Source::YouTube) got = search_youtube(keyword, limit_per_source, 8000, err);
+            else if (src == Source::Bilibili) got = search_bilibili(keyword, limit_per_source, 8000, err);
         } catch (...) {
             err = "适配器异常";
         }
@@ -1033,12 +1046,424 @@ inline void fill_covers(std::vector<Track>& tracks, const Settings& st, int kuwo
     }
 }
 
+// 新适配器复用 net/js/platform；不依赖参考工程的 Windows 专属网络层。
+namespace providers {
+inline bool http_url(const std::string& url) { return url.rfind("https://", 0) == 0 || url.rfind("http://", 0) == 0; }
+inline std::string quote(const std::string& input) {
+    std::string out = "\"";
+    for (unsigned char c : input) {
+        if (c == '"' || c == '\\') { out += '\\'; out += char(c); }
+        else if (c < 32) out += ' '; else out += char(c);
+    }
+    return out + '"';
+}
+inline bool json_response(const net::Response& r, js::Value& root, std::string& error) {
+    if (!r.ok()) { error = r.error.empty() ? "HTTP " + std::to_string(r.status) : r.error; return false; }
+    if (r.body.size() > 8 * 1024 * 1024 || !js::parse(r.body, root) || !root.is_object()) {
+        error = "接口返回非 JSON（可能需要验证）"; return false;
+    }
+    return true;
+}
+inline int clock_ms(const std::string& text) {
+    if (text.empty() || text.find(':') == std::string::npos || text.size() > 12) return 0;
+    long long total = 0, part = 0;
+    for (char c : text) {
+        if (c == ':') { total = total * 60 + part; part = 0; }
+        else if (c >= '0' && c <= '9') part = part * 10 + c - '0';
+        else return 0;
+    }
+    const auto seconds = total * 60 + part;
+    return seconds <= 2147483 ? int(seconds * 1000) : 0;
+}
+namespace detail {
+
+inline uint32_t Rotl32(uint32_t x, int c) { return (x << c) | (x >> (32 - c)); }
+
+inline void Md5Block(uint32_t st[4], const unsigned char* p) {
+    static const uint32_t K[64] = {
+        0xd76aa478u, 0xe8c7b756u, 0x242070dbu, 0xc1bdceeeu, 0xf57c0fafu, 0x4787c62au,
+        0xa8304613u, 0xfd469501u, 0x698098d8u, 0x8b44f7afu, 0xffff5bb1u, 0x895cd7beu,
+        0x6b901122u, 0xfd987193u, 0xa679438eu, 0x49b40821u, 0xf61e2562u, 0xc040b340u,
+        0x265e5a51u, 0xe9b6c7aau, 0xd62f105du, 0x02441453u, 0xd8a1e681u, 0xe7d3fbc8u,
+        0x21e1cde6u, 0xc33707d6u, 0xf4d50d87u, 0x455a14edu, 0xa9e3e905u, 0xfcefa3f8u,
+        0x676f02d9u, 0x8d2a4c8au, 0xfffa3942u, 0x8771f681u, 0x6d9d6122u, 0xfde5380cu,
+        0xa4beea44u, 0x4bdecfa9u, 0xf6bb4b60u, 0xbebfbc70u, 0x289b7ec6u, 0xeaa127fau,
+        0xd4ef3085u, 0x04881d05u, 0xd9d4d039u, 0xe6db99e5u, 0x1fa27cf8u, 0xc4ac5665u,
+        0xf4292244u, 0x432aff97u, 0xab9423a7u, 0xfc93a039u, 0x655b59c3u, 0x8f0ccc92u,
+        0xffeff47du, 0x85845dd1u, 0x6fa87e4fu, 0xfe2ce6e0u, 0xa3014314u, 0x4e0811a1u,
+        0xf7537e82u, 0xbd3af235u, 0x2ad7d2bbu, 0xeb86d391u};
+    static const int S[64] = {
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21};
+
+    uint32_t m[16];
+    for (int i = 0; i < 16; ++i)
+        m[i] = (uint32_t)p[i * 4] | ((uint32_t)p[i * 4 + 1] << 8) |
+               ((uint32_t)p[i * 4 + 2] << 16) | ((uint32_t)p[i * 4 + 3] << 24);
+
+    uint32_t a = st[0], b = st[1], c = st[2], d = st[3];
+    for (int i = 0; i < 64; ++i) {
+        uint32_t f;
+        int g;
+        if (i < 16)      { f = (b & c) | (~b & d); g = i; }
+        else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) & 15; }
+        else if (i < 48) { f = b ^ c ^ d;          g = (3 * i + 5) & 15; }
+        else             { f = c ^ (b | ~d);       g = (7 * i) & 15; }
+        uint32_t tmp = d;
+        d = c;
+        c = b;
+        b = b + Rotl32(a + f + K[i] + m[g], S[i]);
+        a = tmp;
+    }
+    st[0] += a; st[1] += b; st[2] += c; st[3] += d;
+}
+
+}  // namespace detail
+
+inline std::string Md5Hex(const std::string& input) {
+    uint32_t st[4] = {0x67452301u, 0xefcdab89u, 0x98badcfeu, 0x10325476u};
+    const unsigned char* data = (const unsigned char*)input.data();
+    size_t len = input.size();
+    size_t full = len / 64;
+    for (size_t i = 0; i < full; ++i) detail::Md5Block(st, data + i * 64);
+
+    unsigned char tail[128];
+    size_t rem = len - full * 64;
+    std::memcpy(tail, data + full * 64, rem);
+    tail[rem] = 0x80;
+    size_t padLen = (rem < 56) ? 64 : 128;
+    std::memset(tail + rem + 1, 0, padLen - rem - 1 - 8);
+    uint64_t bits = (uint64_t)len * 8;
+    for (int i = 0; i < 8; ++i) tail[padLen - 8 + i] = (unsigned char)((bits >> (8 * i)) & 0xFF);
+    detail::Md5Block(st, tail);
+    if (padLen == 128) detail::Md5Block(st, tail + 64);
+
+    static const char* kHex = "0123456789abcdef";
+    std::string out;
+    out.resize(32);
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) {
+            unsigned char byte = (unsigned char)((st[i] >> (8 * j)) & 0xFF);
+            out[(size_t)(i * 8 + j * 2)] = kHex[byte >> 4];
+            out[(size_t)(i * 8 + j * 2 + 1)] = kHex[byte & 0x0F];
+        }
+    return out;
+}
+
+
+inline std::string wbi_key(const std::string& img, const std::string& sub) {
+    auto stem = [](const std::string& url) {
+        const auto slash = url.find_last_of('/'); auto name = url.substr(slash == std::string::npos ? 0 : slash + 1);
+        return name.substr(0, name.find('.'));
+    };
+    const auto raw = stem(img) + stem(sub);
+    if (raw.size() != 64) return {};
+    static const int indices[] = {46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13};
+    std::string key; for (const int i : indices) key += raw[size_t(i)]; return key;
+}
+inline std::string wbi_query(std::map<std::string, std::string> params, const std::string& key, long long timestamp) {
+    params["wts"] = std::to_string(timestamp);
+    std::string query;
+    for (auto& pair : params) {
+        auto& value = pair.second;
+        value.erase(std::remove_if(value.begin(), value.end(), [](char c) { return c == '!' || c == '\'' || c == '(' || c == ')' || c == '*'; }), value.end());
+        if (!query.empty()) query += '&'; query += net::url_encode(pair.first) + '=' + net::url_encode(value);
+    }
+    return query + "&w_rid=" + Md5Hex(query + key);
+}
+inline std::string strip_tags(const std::string& text) {
+    std::string out; bool tag = false;
+    for (char c : text) { if (c == '<') tag = true; else if (c == '>') tag = false; else if (!tag) out += c; }
+    return music::text::decode_entities(out);
+}
+inline std::vector<Variant> parse_bilibili_search(const js::Value& root, int limit) {
+    std::vector<Variant> out;
+    for (const auto& item : root["data"]["result"].array) {
+        Variant v; v.source = Source::Bilibili; v.id = item["bvid"].str();
+        v.title = strip_tags(item["title"].str()); v.artist = music::text::decode_entities(item["author"].str());
+        v.duration_ms = clock_ms(item["duration"].str()); v.cover_url = item["pic"].str();
+        if (v.cover_url.rfind("//", 0) == 0) v.cover_url = "https:" + v.cover_url;
+        if (v.id.rfind("BV", 0) != 0 || v.title.empty()) continue;
+        out.push_back(std::move(v)); if (int(out.size()) >= limit) break;
+    }
+    return out;
+}
+struct BiliSession { std::string key, cookie; std::time_t expires = 0; };
+inline BiliSession bili_session(int timeout, std::string& error) {
+    static std::mutex mutex; static BiliSession cached;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!cached.key.empty() && cached.expires > std::time(nullptr)) return cached;
+    const std::vector<std::string> headers = {"User-Agent: Mozilla/5.0", "Referer: https://www.bilibili.com/"};
+    js::Value finger, nav;
+    if (!json_response(net::get("https://api.bilibili.com/x/frontend/finger/spi", headers, timeout), finger, error)) return {};
+    const auto buvid = finger["data"]["b_3"].str();
+    if (buvid.empty()) { error = "B 站会话指纹获取失败"; return {}; }
+    auto request_headers = headers;
+    const auto cookie = "buvid3=" + buvid + "; buvid4=" + finger["data"]["b_4"].str();
+    request_headers.push_back("Cookie: " + cookie);
+    if (!json_response(net::get("https://api.bilibili.com/x/web-interface/nav", request_headers, timeout), nav, error)) return {};
+    const auto key = wbi_key(nav["data"]["wbi_img"]["img_url"].str(), nav["data"]["wbi_img"]["sub_url"].str());
+    if (key.empty()) { error = "B 站 WBI 密钥缺失"; return {}; }
+    cached = {key, cookie, std::time(nullptr) + 3600}; return cached;
+}
+inline ResolveResult parse_bilibili_audio(const js::Value& root, int quality) {
+    ResolveResult rr; long long best = -1;
+    auto push = [&](const js::Value& format) {
+        auto url = format["baseUrl"].str(format["base_url"].str());
+        const auto bandwidth = format["bandwidth"].integer();
+        if (!http_url(url)) return;
+        if (best < 0 || (quality == 0 ? bandwidth < best : bandwidth > best)) { best = bandwidth; rr.url = url; }
+    };
+    const auto& dash = root["data"]["dash"];
+    for (const auto& f : dash["audio"].array) push(f);
+    if (quality == 2) {
+        for (const auto& f : dash["dolby"]["audio"].array) push(f);
+        push(dash["flac"]["audio"]);
+    }
+    rr.ok = !rr.url.empty(); rr.headers = {"User-Agent: Mozilla/5.0", "Referer: https://www.bilibili.com/"};
+    rr.reason = rr.ok ? "ok" : "B 站无可用音轨（版权、地区或登录限制）";
+    rr.detail = rr.ok ? std::to_string(best / 1000) + "kbps · 视频音轨" : root["message"].str();
+    return rr;
+}
+} // namespace providers
+
+inline std::vector<Variant> search_bilibili(const std::string& keyword, int limit, int timeout, std::string& error) {
+    auto session = providers::bili_session(std::max(1000, timeout / 3), error);
+    if (session.key.empty()) return {};
+    const auto query = providers::wbi_query({{"keyword", keyword}, {"search_type", "video"}, {"page", "1"},
+        {"page_size", std::to_string(std::clamp(limit, 1, 50))}}, session.key, std::time(nullptr));
+    js::Value root;
+    if (!providers::json_response(net::get("https://api.bilibili.com/x/web-interface/wbi/search/type?" + query,
+        {"User-Agent: Mozilla/5.0", "Referer: https://www.bilibili.com/", "Cookie: " + session.cookie}, timeout / 3), root, error)) return {};
+    if (root["code"].integer(-1) != 0) { error = "B 站 code=" + std::to_string(root["code"].integer()) + " " + root["message"].str(); return {}; }
+    auto tracks = providers::parse_bilibili_search(root, limit);
+    if (tracks.empty()) error = "B 站没有返回可用的视频结果";
+    return tracks;
+}
+inline ResolveResult resolve_bilibili(const Variant& v, const Settings& st) {
+    ResolveResult rr; js::Value view, streams; std::string error;
+    const std::vector<std::string> headers = {"User-Agent: Mozilla/5.0", "Referer: https://www.bilibili.com/"};
+    if (!providers::json_response(net::get("https://api.bilibili.com/x/web-interface/view?bvid=" + net::url_encode(v.id), headers, 5000), view, error)) {
+        rr.reason = error; return rr;
+    }
+    const auto cid = view["data"]["cid"].integer();
+    if (view["code"].integer(-1) != 0 || cid <= 0) { rr.reason = "B 站视频详情不可用"; rr.detail = view["message"].str(); return rr; }
+    if (!providers::json_response(net::get("https://api.bilibili.com/x/player/playurl?bvid=" + net::url_encode(v.id) +
+        "&cid=" + std::to_string(cid) + "&fnval=16&fnver=0&fourk=1", headers, 5000), streams, error)) {
+        rr.reason = error; return rr;
+    }
+    return providers::parse_bilibili_audio(streams, st.quality);
+}
+
+namespace providers {
+inline std::string runs_text(const js::Value& text) {
+    std::string out = text["simpleText"].str();
+    if (out.empty()) for (const auto& run : text["runs"].array) out += run["text"].str();
+    return out;
+}
+inline std::string video_id(const js::Value& node, int depth = 0) {
+    if (depth > 10) return {};
+    auto id = node["videoId"].str();
+    if (!id.empty()) return id;
+    for (const auto& pair : node.object) {
+        id = video_id(pair.second, depth + 1); if (!id.empty()) return id;
+    }
+    for (const auto& item : node.array) {
+        id = video_id(item, depth + 1); if (!id.empty()) return id;
+    }
+    return {};
+}
+inline bool valid_youtube_id(const std::string& id) {
+    return id.size() == 11 && id.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") == std::string::npos;
+}
+inline std::vector<Variant> parse_youtube_search(const js::Value& root, int limit) {
+    std::vector<Variant> out; std::set<std::string> seen;
+    std::function<void(const js::Value&, int)> walk;
+    walk = [&](const js::Value& node, int depth) {
+        if (depth > 64 || int(out.size()) >= limit) return;
+        const auto& responsive = node["musicResponsiveListItemRenderer"];
+        const auto& two_row = node["musicTwoRowItemRenderer"];
+        const auto& video = node["videoRenderer"];
+        const js::Value* item = nullptr;
+        Variant v; v.source = Source::YouTube;
+        if (responsive.is_object()) {
+            item = &responsive;
+            const auto& columns = responsive["flexColumns"];
+            v.id = responsive["playlistItemData"]["videoId"].str();
+            if (v.id.empty()) v.id = video_id(columns[size_t(0)]);
+            v.title = runs_text(columns[size_t(0)]["musicResponsiveListItemFlexColumnRenderer"]["text"]);
+            const auto& metadata = columns[size_t(1)]["musicResponsiveListItemFlexColumnRenderer"]["text"];
+            for (const auto& run : metadata["runs"].array) {
+                const auto text = run["text"].str();
+                if (clock_ms(text) > 0) v.duration_ms = clock_ms(text);
+                else if (v.artist.empty() && text != " • " && text != " · ") v.artist = text;
+            }
+            for (const auto& fixed : responsive["fixedColumns"].array) {
+                const auto duration = clock_ms(runs_text(fixed["musicResponsiveListItemFixedColumnRenderer"]["text"]));
+                if (duration) v.duration_ms = duration;
+            }
+        } else if (two_row.is_object()) {
+            item = &two_row; v.id = video_id(two_row["navigationEndpoint"]);
+            v.title = runs_text(two_row["title"]); v.artist = runs_text(two_row["subtitle"]);
+        } else if (video.is_object()) {
+            item = &video; v.id = video["videoId"].str(); v.title = runs_text(video["title"]);
+            v.artist = runs_text(video["ownerText"]); v.duration_ms = clock_ms(runs_text(video["lengthText"]));
+        }
+        if (item) {
+            const auto& thumbs = (*item)["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"].is_array() ?
+                (*item)["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"] : (*item)["thumbnail"]["thumbnails"];
+            if (!thumbs.array.empty()) v.cover_url = thumbs.array.back()["url"].str();
+            if (valid_youtube_id(v.id) && !v.title.empty() && seen.insert(v.id).second) out.push_back(std::move(v));
+            return;
+        }
+        for (const auto& pair : node.object) walk(pair.second, depth + 1);
+        for (const auto& child : node.array) walk(child, depth + 1);
+    };
+    walk(root, 0); return out;
+}
+// 只接受明确直链；signatureCipher 需要解签，不能把其 URL 直接当成可播地址。
+inline ResolveResult parse_youtube_audio(const js::Value& root, const std::vector<std::string>& headers, int quality) {
+    ResolveResult rr; rr.headers = headers;
+    const auto status = root["playabilityStatus"]["status"].str();
+    if (status != "OK") { rr.reason = root["playabilityStatus"]["reason"].str("YouTube " + status); return rr; }
+    long long best = -1; bool best_mp4 = false, cipher = false;
+    for (const auto& format : root["streamingData"]["adaptiveFormats"].array) {
+        const auto mime = format["mimeType"].str();
+        if (mime.rfind("audio/", 0) != 0) continue;
+        if (!format["signatureCipher"].str().empty() || !format["cipher"].str().empty()) { cipher = true; continue; }
+        const auto url = format["url"].str();
+        if (!http_url(url)) continue;
+        const bool mp4 = mime.find("mp4") != std::string::npos;
+        const auto bitrate = format["bitrate"].integer();
+        if (best < 0 || (mp4 && !best_mp4) || (mp4 == best_mp4 && (quality == 0 ? bitrate < best : bitrate > best))) {
+            best = bitrate; best_mp4 = mp4; rr.url = url;
+        }
+    }
+    rr.ok = !rr.url.empty(); rr.reason = rr.ok ? "ok" : cipher ? "YouTube 音轨需要签名解析" : "YouTube 未提供直接音轨";
+    if (rr.ok) rr.detail = std::to_string(best / 1000) + "kbps · YouTube Music";
+    return rr;
+}
+inline js::Value youtube_page_config(const std::string& page) {
+    const auto begin = page.find("ytcfg.set({");
+    if (begin == std::string::npos) return {};
+    const auto start = page.find('{', begin);
+    bool quoted = false, escaped = false; int depth = 0;
+    for (size_t i = start; i < page.size(); ++i) {
+        const char c = page[i];
+        if (quoted) {
+            if (escaped) escaped = false; else if (c == '\\') escaped = true; else if (c == '"') quoted = false;
+        } else {
+            if (c == '"') quoted = true; else if (c == '{') ++depth; else if (c == '}' && --depth == 0) {
+                js::Value config; js::parse(page.substr(start, i - start + 1), config); return config;
+            }
+        }
+    }
+    return {};
+}
+struct YouTubeConfig {
+    // yt-dlp WEB_REMIX 后备值；有网络时优先读取官网当前 ytcfg。
+    std::string version = "1.20260707.12.00";
+    std::string key = "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w";
+    std::string visitor;
+};
+inline YouTubeConfig youtube_config(int timeout) {
+    static std::mutex mutex; static YouTubeConfig cached; static std::time_t expires = 0;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (expires > std::time(nullptr)) return cached;
+    const auto response = net::get("https://music.youtube.com/", {"User-Agent: Mozilla/5.0"}, timeout);
+    const auto config = response.ok() && response.body.size() < 8 * 1024 * 1024 ? youtube_page_config(response.body) : js::Value();
+    const auto& client = config["INNERTUBE_CONTEXT"]["client"];
+    cached.version = client["clientVersion"].str(config["INNERTUBE_CLIENT_VERSION"].str(cached.version));
+    cached.key = config["INNERTUBE_API_KEY"].str(cached.key); cached.visitor = client["visitorData"].str();
+    expires = std::time(nullptr) + (config.is_object() ? 3600 : 60); return cached;
+}
+inline std::string youtube_context(const YouTubeConfig& config) {
+    return "{\"client\":{\"clientName\":\"WEB_REMIX\",\"clientVersion\":" + quote(config.version) +
+        ",\"hl\":\"zh-CN\",\"gl\":\"US\",\"visitorData\":" + quote(config.visitor) + "}}";
+}
+inline std::vector<std::string> youtube_headers(const YouTubeConfig& config) {
+    auto headers = std::vector<std::string>{"Content-Type: application/json", "User-Agent: Mozilla/5.0",
+        "Origin: https://music.youtube.com", "Referer: https://music.youtube.com/", "X-YouTube-Client-Name: 67",
+        "X-YouTube-Client-Version: " + config.version};
+    if (!config.visitor.empty()) headers.push_back("X-Goog-Visitor-Id: " + config.visitor);
+    return headers;
+}
+} // namespace providers
+
+inline std::vector<Variant> search_youtube(const std::string& keyword, int limit, int timeout, std::string& error) {
+    const auto config = providers::youtube_config(std::max(1000, timeout / 3));
+    const auto body = "{\"context\":" + providers::youtube_context(config) + ",\"query\":" + providers::quote(keyword) + "}";
+    const auto response = net::post("https://music.youtube.com/youtubei/v1/search?prettyPrint=false&key=" + net::url_encode(config.key),
+        body, providers::youtube_headers(config), timeout * 2 / 3);
+    js::Value root;
+    if (!providers::json_response(response, root, error)) { error = "YouTube Music 网络/接口不可用：" + error; return {}; }
+    auto out = providers::parse_youtube_search(root, limit);
+    if (out.empty()) error = "YouTube Music 无可用结果（可能需要验证）";
+    return out;
+}
+
+// 可选系统工具兜底签名，不自动下载、不装浏览器扩展、不读用户浏览器 Cookie。
+inline ResolveResult resolve_youtube_tool(const Variant& v) {
+    ResolveResult rr;
+    static std::atomic<unsigned> serial{0};
+    const auto file = platform::join(platform::temp_dir(), "yt-resolve-" + std::to_string(platform::process_id()) + "-" + std::to_string(++serial) + ".json");
+    const int rc = platform::run_process({"yt-dlp", "--ignore-config", "--no-playlist", "--skip-download", "--quiet", "--no-warnings",
+        "--no-cache-dir", "--socket-timeout", "8", "--retries", "0", "--extractor-retries", "0", "-f", "bestaudio[ext=m4a]/bestaudio",
+        "--print-to-file", "%()j", file, "--", "https://music.youtube.com/watch?v=" + v.id}, 25000);
+    if (rc != 0 || platform::file_size(file) > 8 * 1024 * 1024) {
+        platform::remove(file);
+        rr.reason = rc == -1 ? "可选 yt-dlp 未安装" : rc == 124 ? "yt-dlp 解析超时" : "yt-dlp 无法取得音轨（网络或平台验证）";
+        return rr;
+    }
+    std::ifstream input(platform::fs::u8path(file), std::ios::binary);
+    std::string text((std::istreambuf_iterator<char>(input)), {}); input.close(); platform::remove(file);
+    js::Value info;
+    if (!js::parse(text, info)) { rr.reason = "yt-dlp 返回无效数据"; return rr; }
+    const auto* selected = &info;
+    if (!info["requested_downloads"].array.empty()) selected = &info["requested_downloads"].array.front();
+    rr.url = (*selected)["url"].str();
+    const auto protocol = (*selected)["protocol"].str();
+    rr.ok = providers::http_url(rr.url) && (protocol.empty() || protocol == "https" || protocol == "http");
+    for (const auto& pair : (*selected)["http_headers"].object) {
+        const auto value = pair.second.str();
+        if (pair.first.find_first_of("\r\n:") == std::string::npos && value.find_first_of("\r\n") == std::string::npos)
+            rr.headers.push_back(pair.first + ": " + value);
+    }
+    rr.reason = rr.ok ? "ok" : "yt-dlp 未返回直接音轨"; rr.detail = "YouTube Music · yt-dlp"; return rr;
+}
+inline ResolveResult resolve_youtube(const Variant& v, const Settings& st) {
+    ResolveResult rr;
+    if (!providers::valid_youtube_id(v.id)) { rr.reason = "无效的 YouTube 曲目 ID"; return rr; }
+    const auto config = providers::youtube_config(2000);
+    const auto headers = providers::youtube_headers(config);
+    const auto body = "{\"context\":" + providers::youtube_context(config) + ",\"videoId\":" + providers::quote(v.id) +
+        ",\"contentCheckOk\":true,\"racyCheckOk\":true}";
+    js::Value root; std::string error;
+    const auto response = net::post("https://music.youtube.com/youtubei/v1/player?prettyPrint=false&key=" + net::url_encode(config.key), body, headers, 5000);
+    if (providers::json_response(response, root, error)) {
+        rr = providers::parse_youtube_audio(root, {"User-Agent: Mozilla/5.0", "Referer: https://music.youtube.com/"}, st.quality);
+        if (rr.ok) {
+            const auto probe = net::probe_audio(rr.url, rr.headers, 4000);
+            if (probe.playable) return rr;
+            rr.reason = "YouTube 音轨被拒（需要签名或平台验证）";
+        }
+    } else rr.reason = error;
+    auto fallback = resolve_youtube_tool(v);
+    if (fallback.ok) return fallback;
+    rr.ok = false; rr.url.clear(); rr.reason += "；" + fallback.reason; return rr;
+}
+
 // 取流：按当前选中源解析，失败就沿"其它源"换源
 inline ResolveResult resolve(const Variant& v, const Settings& st) {
     switch (v.source) {
         case Source::Netease: return resolve_netease(v, st);
         case Source::Kuwo: return resolve_kuwo(v);
-        default: return resolve_qq(v, st);
+        case Source::QQ: return resolve_qq(v, st);
+        case Source::Bilibili: return resolve_bilibili(v, st);
+        case Source::YouTube: return resolve_youtube(v, st);
+        default: { ResolveResult rr; rr.reason = "此音源暂不支持网络取流"; return rr; }
     }
 }
 
@@ -1063,7 +1488,9 @@ inline bool find_on_source(Source src, const Track& t, const Settings& st, Varia
     std::vector<Variant> got;
     if (src == Source::Netease) got = search_netease(kw, 10, 6000, err, st);
     else if (src == Source::QQ) got = search_qq(kw, 10, 6000, err, st);
-    else got = search_kuwo(kw, 10, 6000, err);
+    else if (src == Source::Kuwo) got = search_kuwo(kw, 10, 6000, err);
+    else if (src == Source::YouTube) got = search_youtube(kw, 10, 6000, err);
+    else if (src == Source::Bilibili) got = search_bilibili(kw, 10, 6000, err);
 
     if (got.empty()) {
         if (err.empty()) err = std::string(source_name(src)) + " 没搜到";

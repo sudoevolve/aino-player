@@ -131,15 +131,15 @@ struct AudioProbe {
 inline AudioProbe probe_audio(const std::string& url, const std::vector<std::string>& headers, int timeout_ms = 6000) {
     AudioProbe out;
     Request req{url, {}, headers, timeout_ms, true};
-    req.headers.push_back("Range: bytes=0-1");
+    req.headers.push_back("Range: bytes=0-11");
     detail::Transfer transfer;
     if (!transfer.setup(req)) { out.reason = "网络初始化失败"; return out; }
     std::string first;
     curl_easy_setopt(transfer.handle, CURLOPT_WRITEFUNCTION, +[](char* p, size_t a, size_t b, void* data) -> size_t {
         auto& first = *static_cast<std::string*>(data);
         const auto n = a * b;
-        first.append(p, std::min(n, size_t(2) - first.size()));
-        return first.size() >= 2 ? 0 : n;
+        first.append(p, std::min(n, size_t(12) - first.size()));
+        return first.size() >= 12 ? 0 : n;
     });
     curl_easy_setopt(transfer.handle, CURLOPT_WRITEDATA, &first);
     const auto rc = curl_easy_perform(transfer.handle);
@@ -148,8 +148,9 @@ inline AudioProbe probe_audio(const std::string& url, const std::vector<std::str
     out.status = response.status; out.content_type = response.content_type; out.final_url = response.final_url;
     const auto slash = transfer.content_range.find('/');
     if (slash != std::string::npos) { try { out.total_bytes = std::stoll(transfer.content_range.substr(slash + 1)); } catch (...) {} }
-    const bool audio_type = out.content_type.find("audio") != std::string::npos || out.content_type.find("octet-stream") != std::string::npos;
-    out.playable = (rc == CURLE_OK || rc == CURLE_WRITE_ERROR) && !first.empty() &&
+    const bool audio_type = out.content_type.find("audio") != std::string::npos || out.content_type.find("octet-stream") != std::string::npos ||
+        out.content_type.find("mpeg") != std::string::npos || out.content_type.find("mp4") != std::string::npos || out.content_type.find("webm") != std::string::npos;
+    out.playable = (rc == CURLE_OK || rc == CURLE_WRITE_ERROR) && audio_prefix(first.data(), first.size()) &&
         (out.status == 200 || out.status == 206) && audio_type;
     if (!out.playable) out.reason = "取流失败 HTTP " + std::to_string(out.status);
     return out;

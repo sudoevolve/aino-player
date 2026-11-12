@@ -85,6 +85,87 @@ int main(int argc, char** argv) {
         library_remove(1);
         check(model.library.playlists.size() == 1 && model.library.contains(track), "remove playlist preserves favorites");
 
+        const auto music_folder = platform::join(model.paths.config, "music 中文");
+        platform::make_dirs(platform::join(music_folder, "disc"));
+        auto write_fixture = [](const std::string& path, const char* contents) {
+            auto* f = platform::fopen(path, "wb"); check(f != nullptr, "create local fixture");
+            std::fputs(contents, f); std::fclose(f);
+        };
+        const auto original = platform::join(music_folder, "歌手 - 歌名.MP3");
+        write_fixture(original, "fixture");
+        write_fixture(platform::join(music_folder, "disc/other.flac"), "fixture");
+        write_fixture(platform::join(music_folder, "ignore.txt"), "fixture");
+        std::string scan_error;
+        auto scanned = library::scan_folder(music_folder, false, scan_error);
+        check(scan_error.empty() && scanned.tracks.size() == 1 && scanned.tracks[0].title == "歌名", "folder scanner filters and parses names");
+        check(scanned.tracks[0].current().source == music::Source::Local, "local source separated from network sources");
+        write_fixture(platform::join(music_folder, "歌手 - 歌名.lrc"), "\xef\xbb\xbf[00:01.00]本地歌词");
+        const auto local_lyrics = lyr::fetch(scanned.tracks[0], model.ui.settings);
+        check(local_lyrics.synced && local_lyrics.lines.size() == 1 && local_lyrics.lines[0].ms == 1000, "local BOM LRC is read offline");
+        auto cancelled = library::scan_folder(music_folder, true, scan_error, [] { return true; });
+        check(!scan_error.empty() && cancelled.tracks.empty(), "scan cancellation");
+        library_import_folder(music_folder, true);
+        const auto scan_deadline = platform::ticks() + 3000;
+        while (model.ui.importing_playlist && platform::ticks() < scan_deadline) { tick(); platform::sleep_ms(10); }
+        check(!model.ui.importing_playlist && model.library.playlists.size() == 2, "asynchronous folder import");
+        check(model.library.playlists[1].tracks.size() == 2 && !model.library.playlists[1].local_folder.empty(), "recursive folder playlist");
+        model.ui.query = "独立的在线搜索词";
+        { std::lock_guard<std::mutex> lock(g_mu); g_as.results = {track}; ++g_as.results_version; }
+        tick();
+        library_open(1); tick();
+        check(model.ui.tab == 3 && model.ui.query == "独立的在线搜索词" && model.playlist.open &&
+            model.playlist.playlist.tracks.size() == 2, "folder opens a dedicated detail view without changing search text");
+        check(model.playback.tracks.size() == 1 && model.playback.results.size() == 1, "browsing playlist preserves queue and search results");
+        music::Settings offline_search;
+        for (auto& enabled : offline_search.enable) enabled = false;
+        const int search_generation = ++g_search_gen;
+        do_search(g_win, "fixture", offline_search, search_generation); tick();
+        check(model.playback.tracks.size() == 1 && model.playback.results.empty() && model.playlist.playlist.tracks.size() == 2,
+            "online search does not overwrite the playing queue or playlist detail");
+        playlist_close();
+        check(!model.playlist.open && model.ui.tab == 3 && model.ui.query == "独立的在线搜索词", "return from playlist keeps search state");
+        queue_clear();
+        for (const auto& local : model.library.playlists[1].tracks) queue_push(local);
+        tick();
+        const auto queued_local_id = model.playback.tracks[0].current().id;
+        check(queue_save(), "local queue save");
+        queue_load(); tick();
+        check(model.playback.tracks[0].current().id == queued_local_id, "local queue path round trip");
+        library::Library restored_local;
+        scan_error.clear();
+        check(restored_local.load(library_path(), scan_error) && restored_local.playlists[1].tracks.size() == 2 &&
+            restored_local.playlists[1].recursive, "local playlist persistence");
+        library_remove(1);
+        check(platform::exists(original), "removing playlist preserves music files");
+        music::Track missing = scanned.tracks[0]; missing.variants[0].id += ".missing";
+        int local_gen;
+        { std::lock_guard<std::mutex> lock(g_mu); local_gen = ++g_as.gen; }
+        do_play(g_win, missing, model.ui.settings, local_gen, -1); tick();
+        check(model.playback.ps == PlayState::Failed && model.playback.error.find("移动或删除") != std::string::npos,
+            "missing local file fails offline without online substitution");
+        { std::lock_guard<std::mutex> lock(g_mu); g_as.results = {track}; ++g_as.results_version; }
+        tick();
+        auto incoming = track; incoming.variants[0].id = "new-search-result";
+        { std::lock_guard<std::mutex> lock(g_mu); g_as.results = {incoming, track}; ++g_as.results_version; }
+        choose_search_source(0, 1, false);
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            check(g_as.results[0].chosen == 0 && g_as.results[1].chosen == 1,
+                "source selection follows displayed song identity after background results reorder");
+            g_as.results = {missing}; ++g_as.results_version;
+        }
+        tick();
+        auto next_result = missing; next_result.variants[0].id += ".next";
+        { std::lock_guard<std::mutex> lock(g_mu); g_as.results = {next_result}; ++g_as.results_version; }
+        play_search_result(0);
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            check(g_as.tracks.size() == 1 && g_as.tracks[0].current().id == missing.current().id &&
+                g_as.results[0].current().id == next_result.current().id,
+                "search click queues the displayed song while preserving incoming results");
+        }
+        { std::lock_guard<std::mutex> lock(g_mu); g_as.results = {track}; ++g_as.results_version; }
+
         model.ui.volume = 43;
         model.ui.dark = true;
         model.ui.download_dir = platform::join(model.paths.config, "downloads");
@@ -109,13 +190,13 @@ int main(int argc, char** argv) {
         check(model.library.contains(track), "logout preserves local library");
         clear_data(ClearAction::Queue);
         tick();
-        check(model.playback.tracks.empty(), "clear queue publishes empty snapshot");
+        check(model.playback.tracks.empty() && model.playback.results.size() == 1, "clear queue preserves independent search results");
         check(model.library.contains(track), "clear queue preserves favorites");
         const auto cached = platform::join(model.paths.current_cache, "track-99.mp3");
         file = platform::fopen(cached, "wb");
         check(file != nullptr, "cache fixture"); std::fputs("remove", file); std::fclose(file);
         clear_data(ClearAction::Cache);
-        check(!platform::exists(cached) && platform::exists(downloaded), "cache clear preserves downloaded songs");
+        check(!platform::exists(cached) && platform::exists(downloaded) && platform::exists(original), "cache clear preserves downloaded songs");
         clear_data(ClearAction::Library);
         library::Library library;
         std::string error;

@@ -15,6 +15,21 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 
+#include <cstddef>
+#include <cstring>
+namespace net {
+// 判断容器头而非只认 MP3；DASH 音轨通常是 M4A，YouTube 也可能返回 WebM。
+inline bool audio_prefix(const char* bytes, size_t size) {
+    if (size >= 3 && !std::memcmp(bytes, "ID3", 3)) return true;
+    if (size >= 2 && static_cast<unsigned char>(bytes[0]) == 0xff &&
+        (static_cast<unsigned char>(bytes[1]) & 0xe0) == 0xe0) return true;
+    if (size >= 4 && (!std::memcmp(bytes, "fLaC", 4) || !std::memcmp(bytes, "OggS", 4) ||
+        !std::memcmp(bytes, "\x1a\x45\xdf\xa3", 4))) return true;
+    if (size >= 8 && !std::memcmp(bytes + 4, "ftyp", 4)) return true;
+    return size >= 12 && !std::memcmp(bytes, "RIFF", 4) && !std::memcmp(bytes + 8, "WAVE", 4);
+}
+}
+
 #ifdef _WIN32
 #include <windows.h>
 #include <winhttp.h>
@@ -268,7 +283,7 @@ struct AudioProbe {
     std::string reason;  // 不可播时的结构化原因
 };
 
-// 只取前 2 字节：能出声的直链一定返回 206/200 + audio/*（或其首字节像 mp3）
+// 小范围读取容器头，既拒绝 HTML/JSON，也支持 MP3/FLAC/WAV/M4A/Ogg/WebM。
 inline AudioProbe probe_audio(const std::string& url, const std::vector<std::string>& headers,
                               int timeout_ms = 6000) {
     AudioProbe out;
@@ -280,7 +295,7 @@ inline AudioProbe probe_audio(const std::string& url, const std::vector<std::str
     Request req;
     req.url = url;
     req.headers = headers;
-    req.headers.push_back("Range: bytes=0-1");
+    req.headers.push_back("Range: bytes=0-11");
     req.timeout_ms = timeout_ms;
 
     HINTERNET conn = nullptr;
@@ -312,21 +327,27 @@ inline AudioProbe probe_audio(const std::string& url, const std::vector<std::str
         try { out.total_bytes = std::stoll(cr.substr(slash + 1)); } catch (...) {}
     }
 
-    char head[2] = {0, 0};
+    char head[12]{};
     DWORD read = 0;
-    WinHttpReadData(hreq, head, 2, &read);
+    while (read < sizeof head) {
+        DWORD received = 0;
+        if (!WinHttpReadData(hreq, head + read, DWORD(sizeof head) - read, &received) || !received) break;
+        read += received;
+    }
     WinHttpCloseHandle(hreq);
     WinHttpCloseHandle(conn);
 
-    const bool looks_mp3 = read >= 2 && ((unsigned char)head[0] == 0xFF || head[0] == 'I');
+    const bool looks_audio = audio_prefix(head, read);
     const bool audio_type = out.content_type.find("audio") != std::string::npos ||
                             out.content_type.find("octet-stream") != std::string::npos ||
-                            out.content_type.find("mpeg") != std::string::npos;
-    out.playable = (out.status == 200 || out.status == 206) && audio_type && looks_mp3;
+                            out.content_type.find("mpeg") != std::string::npos ||
+                            out.content_type.find("mp4") != std::string::npos ||
+                            out.content_type.find("webm") != std::string::npos;
+    out.playable = (out.status == 200 || out.status == 206) && audio_type && looks_audio;
     if (!out.playable) {
         if (out.status == 404) out.reason = "已下架 / 无版权";
         else if (out.status == 403) out.reason = "直链被拒（可能需要登录）";
-        else if (!looks_mp3 && audio_type) out.reason = "返回内容不是音频";
+        else if (!looks_audio && audio_type) out.reason = "返回内容不是音频";
         else if (out.status == 200 && !audio_type) out.reason = "需要登录或会员";
         else out.reason = "取流失败 HTTP " + std::to_string(out.status);
     }
