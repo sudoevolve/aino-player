@@ -51,6 +51,14 @@ static void linux_backend_checks() {
         XWindowAttributes attributes{}; XGetWindowAttributes(state->dpy, state->win, &attributes);
         check(attributes.width == 300 && attributes.height == 180, "set_size accepts logical dimensions");
     }
+    {
+        publish(192, 2); setenv("AINO_SCALE", "3", 1);
+        WindowConfig config; config.width = 220; config.height = 140; config.high_dpi = false;
+        aino::Window window(config); check(window.ok(), "unscaled window creation");
+        check(window.dpi_scale() == 1 && window.width() == 220 && window.height() == 140,
+              "high_dpi=false ignores desktop scale and environment override");
+        unsetenv("AINO_SCALE");
+    }
     XDestroyWindow(desktop, owner); XCloseDisplay(desktop);
     detail::X11TextRenderer renderer; renderer.init(1, "sans", "monospace");
     const auto width = renderer.measure("字体共享 Memory", 14, 400);

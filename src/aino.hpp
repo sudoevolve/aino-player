@@ -1204,8 +1204,8 @@ struct WindowConfig {
     // 首次显示时居中到当前显示器的工作区（不含任务栏）。
     bool center = true;
 
-    // 关掉后不对进程声明 DPI 感知，整窗由系统按比例缩放（字会糊，但尺寸
-    // 跟 96 DPI 一致）。这是**进程级**设置，只有第一个窗口说了算。
+    // Windows：关掉后不声明进程 DPI 感知，由系统缩放；只有第一个窗口说了算。
+    // X11：关掉后固定使用 1 倍逻辑像素，不读取桌面 DPI 或缩放环境变量。
     bool high_dpi = true;
 };
 
@@ -10704,6 +10704,7 @@ inline LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
             for (int i = 0; i < 3; ++i) s->btn_down[i] = s->btn_pressed[i] = s->btn_released[i] = false;
             s->owner->ui.impl->active = 0;
             s->owner->need_frame = true;
+            if (m == WM_CANCELMODE && GetCapture() == h) ReleaseCapture();
         }
         return 0;
 
@@ -11243,7 +11244,7 @@ inline std::string Window::clipboard() const {
 //        两者都加载不到时，退回核心 X 的 XLFD 点阵字体（能跑，只是没抗锯齿）。
 // =============================================================================
 namespace detail {
-// XSETTINGS 的整数使用属性自身的字节序；解析器也用于无桌面的回归测试。
+// XSETTINGS 的整数使用属性自身的字节序；截断或无效属性不采用部分解析结果。
 struct DesktopScaleSettings { double dpi = 0; int factor = 0; };
 inline DesktopScaleSettings parse_xsettings_scale(const unsigned char* bytes, size_t length) {
     DesktopScaleSettings result;
@@ -11630,8 +11631,8 @@ private:
     //
     //  兜底链来自 FcFontSort —— fontconfig 按匹配度排好的整张字体表。西文
     //  几乎永远命中主字体（hit 记住上次命中的下标，省掉反复查找），汉字则
-    //  一路找到 Noto Sans CJK。字体按需打开（opened），没人用的不去碰。
-    //  字形位图也缓存：同一个字每帧只光栅化一次。
+    //  一路找到 Noto Sans CJK。字体按需打开，同一文件与 face index 在渲染器内共享。
+    //  字形位图按字号缓存；达到预算后清理，后续按需重新光栅化。
     // -----------------------------------------------------------------------
     struct Glyph {
         int adv = 0;       // 前进量，26.6 定点
@@ -11787,6 +11788,7 @@ private:
     // 取一个码位的字形：先试上次命中的字体，再沿兜底链找第一个覆盖它的。
     // 一个都没有就只占半格宽度、不画墨 —— 宁可空白也不吐豆腐方块。
     const Glyph& glyph(Font& f, unsigned long cp) {
+        uncached_glyph_ = Glyph{};
         auto it = f.glyphs.find(cp);
         if (it != f.glyphs.end()) return it->second;
         FtApi& ft = ft_api();
@@ -11835,6 +11837,11 @@ private:
             g.adv = int(f.px * 0.5 * 64.0 + 0.5);
         }
         constexpr size_t budget = 4u * 1024u * 1024u;
+        // 单个超大字形只供本次调用使用，不让它撑破持久缓存预算。
+        if (g.px.size() > budget) {
+            uncached_glyph_ = std::move(g);
+            return uncached_glyph_;
+        }
         if (glyph_bytes_ + g.px.size() > budget || glyph_count_ >= 16384) {
             for (auto& cached : fonts_) cached.second.glyphs.clear();
             glyph_bytes_ = 0; glyph_count_ = 0;
@@ -11923,6 +11930,7 @@ private:
             for (auto& kv : faces_) if (kv.second.face) ft.done_face(kv.second.face);
         }
         fonts_.clear(); faces_.clear(); glyph_bytes_ = 0; glyph_count_ = 0;
+        uncached_glyph_ = Glyph{};
     }
 
     // 核心 XLFD 字体那条老路：1bit 点阵、无抗锯齿、字重拉不开。
@@ -12066,6 +12074,7 @@ private:
     std::map<std::pair<std::string, long>, SharedFace> faces_;
     size_t glyph_bytes_ = 0;
     size_t glyph_count_ = 0;
+    Glyph uncached_glyph_;
 };
 
 
@@ -12206,6 +12215,7 @@ inline std::vector<unsigned char> x11_property(Display* dpy, ::Window win, Atom 
     return out;
 }
 inline float x11_desktop_scale(X11State* s) {
+    if (!s->config.high_dpi) return 1.0f;
     const auto root = DefaultRootWindow(s->dpy);
     // 读取 owner 和订阅事件期间避免设置管理器恰好销毁窗口。
     XGrabServer(s->dpy);
