@@ -538,6 +538,14 @@ struct Style {
     Style& link()        { variant = Link;        return *this; }
 };
 
+/** @brief 菜单的勾选状态与禁用项。 */
+struct MenuOptions {
+    /** @brief 当前勾选项，-1 不显示勾选列；空字符串项为分隔线。 */
+    int selected = -1;
+    /** @brief 不可点击的菜单项下标，可用于状态行及暂不可用的动作。 */
+    std::vector<int> disabled;
+};
+
 /** @brief 普通页签的可选关闭、状态标记及宽度限制；指针仅在 tabs 调用期间借用。 */
 struct TabOptions {
     /** @brief 输出本帧请求关闭的索引，未请求时写入 -1；由调用方移除对应数据。 */
@@ -786,6 +794,8 @@ public:
 
     // ---------------- 环境查询 ----------------
     const Input& input() const;
+    /** @brief 自绘控件读取鼠标前检查浮层输入闸门与当前裁剪区。 */
+    bool pointer_available() const;
     const Theme& theme() const;
     void  set_theme(const Theme& t);
     float dpi_scale() const;              // 例如 1.5
@@ -1036,7 +1046,8 @@ public:
     void tooltip(const Rect& anchor, const std::string& text, const Style& st = Style());
     // 下拉菜单：box 是触发按钮，点开后弹列表；选中某项时返回 true 并写入 *clicked_index
     bool menu(const std::string& label, const std::vector<std::string>& items,
-              int* clicked_index, const Rect& box, const Style& st = Style());
+              int* clicked_index, const Rect& box, const Style& st = Style(),
+              const MenuOptions& options = MenuOptions());
     // 菜单栏：横向一排顶级菜单，点开一个之后把鼠标划到隔壁会自动切换
     // （桌面菜单栏的标准行为，Web 上一般做不到）。labels 与 items 一一对应。
     // 返回本帧选中的是哪一项，没选到就 MenuPick{}。
@@ -3826,6 +3837,10 @@ inline void Ui::deferred(std::function<void()> fn) {
 }
 
 inline const Input& Ui::input() const { return impl->input; }
+inline bool Ui::pointer_available() const {
+    return !impl->measure_on && !impl->gate_blocked_pointer() &&
+           !impl->clip_excludes(impl->input.mouse.x, impl->input.mouse.y);
+}
 inline const Theme& Ui::theme() const { return impl->theme; }
 inline void  Ui::set_theme(const Theme& t) { impl->theme = t; }
 inline float Ui::dpi_scale() const { return impl->scale; }
@@ -5125,13 +5140,14 @@ inline void paint_focus_ring(Ui& ui, const Rect& r, float radius, const Color& r
 // 不透明 —— 深色主题下直接变成一块纯白实心矩形把文字盖死。必须缩现有 alpha。
 inline Color on_color(const Color& bg);   // 反色文字（定义在后面）
 
-// menu、menubar、context_menu、select、combobox 共用菜单绘制。所有行预留勾选列，避免文字位置变化。
+// menu、menubar、context_menu、select、combobox 共用菜单绘制；勾选列在整个菜单内保持一致。
 inline void paint_menu(Ui& ui, const Rect& list,
                        const std::vector<std::string>& items,
                        const std::vector<Rect>& rects,
                        const std::vector<uint64_t>& ids,
                        const std::vector<uint8_t>& hov,
-                       int selected, bool show_check, float fs) {
+                       int selected, bool show_check, float fs,
+                       const std::vector<uint8_t>& enabled = {}) {
     const Theme& th = ui.theme();
     const float r = 12.0f;
     pop_shadow(ui, list, r, th, 0);          // 菜单 = Quaternary 投影
@@ -5142,14 +5158,16 @@ inline void paint_menu(Ui& ui, const Rect& list,
     // 菜单行使用中性色悬停高亮。
     const Color hover_bg = th.is_dark() ? Color::hex(0x141414) : Color::hex(0xE6E6E6);
     for (size_t i = 0; i < rects.size() && i < items.size(); ++i) {
+        if (items[i].empty()) {
+            ui.fill_rect({rects[i].x + 6, rects[i].cy(), rects[i].w - 12, 1}, th.separator);
+            continue;
+        }
         const float t_h = animate_value(ui.impl, ids[i] * 83u + 1u, hov[i] ? 1.0f : 0.0f, 20.0f);
         if (t_h > 0.02f) ui.fill_rect_s(rects[i], hover_bg.scaled_alpha(t_h), 8.0f, 0.35f);
-        const Color fg = th.popover_foreground;
+        const Color fg = i < enabled.size() && !enabled[i] ? th.label3 : th.popover_foreground;
         const float left = rects[i].x + (show_check ? 24.0f : 10.0f);
         if (show_check && selected == int(i)) {
-            const float ccx = rects[i].x + 11.0f, ccy = rects[i].cy(), sc = 3.1f;
-            ui.draw_line(ccx - sc, ccy, ccx - sc * 0.15f, ccy + sc * 0.8f, fg, 1.6f);
-            ui.draw_line(ccx - sc * 0.15f, ccy + sc * 0.8f, ccx + sc * 1.1f, ccy - sc * 0.85f, fg, 1.6f);
+            ui.system_icon(SystemIcon::Check, {rects[i].x + 5, rects[i].cy() - 6, 12, 12}, fg);
         }
         Style its;
         its.font_size = fs;
@@ -7872,7 +7890,7 @@ inline void Ui::tooltip(const Rect& anchor, const std::string& text, const Style
 // 关键点：**交互在帧内做，绘制推迟到帧末**。这样既保证了弹层盖住其它组件，
 // 又能让返回值在点击当帧就生效（不用等到下一帧）。
 inline bool Ui::menu(const std::string& label, const std::vector<std::string>& items,
-                     int* clicked_index, const Rect& box, const Style& st) {
+                     int* clicked_index, const Rect& box, const Style& st, const MenuOptions& options) {
     const Theme& th = impl->theme;
     uint64_t id = impl->widget_id("menu", box);
     // 同 select：触发器在 claim 之前就 interact 过了，层级号要取入口处。
@@ -7913,46 +7931,56 @@ inline bool Ui::menu(const std::string& label, const std::vector<std::string>& i
     int chosen = -1;
     bool closing = false;
     if (open && !items.empty()) {
-        const float item_h = std::max(box.h, 24.0f);   // kit Menu/Height Medium = 24
+        const float item_h = std::max(fs + 10.0f, 24.0f);
         float list_w = box.w;
-        for (const auto& it : items) list_w = std::max(list_w, text_width(it, fs, 500) + 34.0f);
-        const float list_h = item_h * float(items.size()) + 8.0f;
+        const float label_padding = options.selected >= 0 ? 40.0f : 26.0f;
+        for (const auto& it : items) list_w = std::max(list_w, text_width(it, fs, 500) + label_padding);
+        float list_h = 8;
+        for (const auto& item : items) list_h += item.empty() ? 9.0f : item_h;
         float ly = box.bottom() + 4.0f;
         if (ly + list_h > height() - 4.0f) ly = std::max(4.0f, box.y - 4.0f - list_h);
-        const Rect list(box.x, ly, list_w, list_h);
+        const Rect list(detail::clampf(box.x, 4.0f, std::max(4.0f, width() - list_w - 4)), ly, list_w, list_h);
 
         // 打开时把"触发器 + 下拉列表"登记为可交互区，其余地方全被闸门挡住。
         // 触发器在普通层；列表帧末才画，层级用帧末基准（否则同帧后面画的控件会穿透）。
-        impl->gate_claim(box, z_first);
-        impl->gate_claim(list, Impl::Z_FRAME_END);
-
         std::vector<Rect>    rects;
         std::vector<uint64_t> ids;
         std::vector<uint8_t> hov;
+        std::vector<uint8_t> enabled_items;
         rects.reserve(items.size());
         ids.reserve(items.size());
         hov.reserve(items.size());
+        float row_y = list.y + 4;
         for (size_t i = 0; i < items.size(); ++i) {
-            const Rect r(list.x + 4.0f, list.y + 4.0f + item_h * float(i), list.w - 8.0f, item_h);
+            const float row_h = items[i].empty() ? 9.0f : item_h;
+            const Rect r(list.x + 4.0f, row_y, list.w - 8.0f, row_h);
+            row_y += row_h;
             rects.push_back(r);
             ids.push_back(impl->widget_id("menu_item", r, id + i));
             hov.push_back(0);
+            enabled_items.push_back(!items[i].empty() &&
+                std::find(options.disabled.begin(), options.disabled.end(), int(i)) == options.disabled.end());
         }
         {
         Impl::SeqFrameEnd guard(impl);   // 项在帧内交互、帧末绘制，序号算帧末层
         for (size_t i = 0; i < items.size(); ++i) {
-            detail::Interact ii = detail::interact(impl, ids[i], rects[i], true);
+            detail::Interact ii = detail::interact(impl, ids[i], rects[i], enabled_items[i] != 0);
             if (ii.hovered) { set_cursor(Cursor::Arrow); hov[i] = 1; }
             if (ii.clicked) chosen = int(i);
         }
         }
         const bool inside_list = list.contains(impl->input.mouse.x, impl->input.mouse.y);
-        closing = (impl->input.pressed[0] || impl->input.pressed[1]) && !inside_list
-               && !box.contains(impl->input.mouse.x, impl->input.mouse.y);
+        closing = impl->input.key_pressed[KEY_ESC] || ((impl->input.pressed[0] || impl->input.pressed[1]) && !inside_list
+               && !box.contains(impl->input.mouse.x, impl->input.mouse.y));
+        if (chosen < 0 && !closing) {
+            impl->gate_claim(box, z_first);
+            impl->gate_claim(list, Impl::Z_FRAME_END);
+        }
 
         std::vector<std::string> items_copy = items;
-        deferred([this, list, rects, ids, hov, items_copy, fs]() mutable {
-            detail::paint_menu(*this, list, items_copy, rects, ids, hov, -1, false, fs);
+        const int selected = options.selected;
+        if (chosen < 0 && !closing) deferred([this, list, rects, ids, hov, items_copy, fs, selected, enabled_items]() mutable {
+            detail::paint_menu(*this, list, items_copy, rects, ids, hov, selected, selected >= 0, fs, enabled_items);
         });
     }
 
@@ -8329,19 +8357,17 @@ inline bool group_cell(Ui& ui, Ui::Impl* im, uint64_t id, const Rect& r, const s
         ui.fill_rect(Rect(r.x, r.y + (r.h - dh) * 0.5f, 1.0f, dh), th.label3, 0.0f);
     }
 
-    // 分组按钮的选中面在浅色下加深、深色下提亮，以区别于轨道。
+    // 与单选分段一致：选中项使用主题色实底和白字。
     const Rect inner = r.inset(2.0f, 2.0f);
     const float ir = inner.h * 0.5f;
-    const Color pill = th.is_dark() ? Color::hex(0x3A3A3A) : Color::hex(0xE6E6E6);
+    const Color pill = !st.border_color.is_none() ? st.border_color : th.tint;
     if (t_on > 0.01f) {
         ui.fill_rect_s(inner, pill.scaled_alpha(t_on), ir, 0.35f);
     } else if (t_h > 0.01f) {
         ui.fill_rect(inner, th.fill4.scaled_alpha(t_h * 0.7f), ir);
     }
 
-    // 有选中语义的组：选中项 85%，其余 50%（参考资料 Segmented 就是这样分级的）；
-    // 一次性动作的按钮组没有"选中"，所有标签都是主标签色。
-    Color fg = !selectable ? th.foreground : (on ? th.label : th.label2);
+    Color fg = !selectable ? th.foreground : (on ? Color(255, 255, 255) : th.label);
     if (st.disabled) fg.a = uint8_t(float(fg.a) * 0.45f);
     Style ts;
     ts.font_size = fs;

@@ -77,6 +77,58 @@ static void linux_backend_checks() {
     renderer.release(); check(renderer.cache_stats().faces == 0, "shared font faces released once");
 }
 #endif
+static void menu_checks() {
+    using namespace aino;
+    for (const bool timer : {false, true}) {
+        Ui ui; auto& input = ui.impl->input;
+        const Rect trigger{350, 265, 30, 30};
+        const std::vector<std::string> items = timer
+            ? std::vector<std::string>{"Timer off", "", "15 min", "30 min", "60 min", "90 min", "After track", "", "Cancel"}
+            : std::vector<std::string>{"Sequential", "Shuffle", "Repeat all", "Repeat one"};
+        MenuOptions options; options.selected = timer ? 6 : 2;
+        if (timer) options.disabled = {0, 8};
+        int choice = -1, background_clicks = 0; bool pointer = true;
+        const Style style = Style().ghost().font(12).indicator(false);
+        auto draw = [&] {
+            ui.begin_frame(400, 300, .016f, 1);
+            pointer = ui.pointer_available();
+            if (detail::interact(ui.impl, 900, {0, 0, 340, 300}, true).clicked) ++background_clicks;
+            ui.menu("", items, &choice, trigger, style, options);
+            ui.end_frame();
+        };
+        auto press = [&](float x, float y) { input.mouse = {x, y}; input.down[0] = true; input.pressed[0] = true; draw(); };
+        auto release = [&] { input.down[0] = false; input.released[0] = true; draw(); };
+        auto open = [&] { press(trigger.cx(), trigger.cy()); release(); };
+        open();
+        check(ui.impl->gate_next_allow_n == 2, "menu registers trigger and overlay input regions");
+        const auto panel = ui.impl->gate_next_allow[1];
+        for (const auto& label : items) check(panel.w >= ui.text_width(label, 12, 500) + 40,
+              "checked menu reserves enough width for its check column and complete labels");
+        check(panel.h == (timer ? 194 : 104) && panel.right() <= 396 && panel.y >= 4,
+              "timer and playback menus use compact rows and stay inside the window");
+        if (timer) {
+            press(panel.cx(), panel.y + 16); release();
+            check(choice == -1 && !pointer && background_clicks == 0, "disabled status does not activate or click through");
+            press(panel.cx(), panel.y + 32); release();
+            check(choice == -1 && background_clicks == 0, "separator does not activate or click through");
+            press(panel.cx(), panel.bottom() - 16); release();
+            check(choice == -1 && background_clicks == 0, "disabled cancel remains blocked");
+        }
+        const float row_y = timer ? panel.y + 4 + 24 + 9 + 12 : panel.y + 4 + 24 + 12;
+        press(panel.cx(), row_y); release();
+        check(choice == (timer ? 2 : 1) && background_clicks == 0 && !pointer,
+              "menu selection activates only the selected row and blocks raw mouse readers");
+        draw();
+        press(10, 10); release();
+        check(background_clicks == 1 && pointer, "normal input resumes after closing menu");
+        choice = -1; open();
+        press(10, 10); release();
+        check(background_clicks == 1 && choice == -1, "outside click only dismisses menu");
+        draw(); open();
+        input.key_pressed[KEY_ESC] = true; draw(); draw();
+        check(!ui.impl->gate_on && choice == -1, "Escape dismisses menu and releases overlay gate");
+    }
+}
 int main(int argc, char** argv) {
     try {
         using namespace aino::detail;
@@ -122,6 +174,7 @@ int main(int argc, char** argv) {
         input.down[0] = false; input.released[0] = true;
         frame(); check(aino::detail::interact(ui.impl, 4, box, true).clicked, "drag releases normally"); ui.end_frame();
         click(5);
+        menu_checks();
         std::cout << "UI capture lifecycle regression checks passed\n";
         return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

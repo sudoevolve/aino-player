@@ -182,7 +182,7 @@ static SongMenuState song_menu;
 static void capture_song_menu(Ctx& c, const music::Track& track, const Rect& row, const Rect& viewport) {
     const auto& in = c.ui.input();
     const auto visible = row.intersect(viewport);
-    if (!song_menu.active && in.pressed[1] && visible.contains(in.mouse.x, in.mouse.y) && !track.variants.empty()) {
+    if (!song_menu.active && c.ui.pointer_available() && in.pressed[1] && visible.contains(in.mouse.x, in.mouse.y) && !track.variants.empty()) {
         // 菜单不依赖虚拟列表的行索引；滚动、搜索刷新后仍操作右键时的歌曲。
         song_menu = {true, track, visible, in.mouse};
     }
@@ -243,7 +243,9 @@ struct SeekBar {
 static bool seek_bar(Ctx& c, float value, float max_value, const Rect& box, SeekBar* st, float* committed) {
     const auto& in = c.ui.input();
     const bool enabled = max_value > 0.001f;
-    const bool inside = box.outset(6.0f).contains(in.mouse.x, in.mouse.y);
+    const bool available = c.ui.pointer_available();
+    const bool inside = available && box.outset(6.0f).contains(in.mouse.x, in.mouse.y);
+    if (!available || !enabled) st->dragging = false;
 
     // 按下的那一刻就按鼠标位置取值 —— 否则"按下"沿用旧值，
     // 快速点击（按下与松开之间没有拖动）会 seek 回原地，看起来像没反应。
@@ -414,7 +416,7 @@ static void result_row(Ctx& c, const music::Track& t, int index, const Rect& box
         dl_done = it->second.done;
         dl_failed = it->second.failed;
     }
-    const bool row_hover = box.contains(c.ui.input().mouse.x, c.ui.input().mouse.y);
+    const bool row_hover = c.ui.pointer_available() && box.contains(c.ui.input().mouse.x, c.ui.input().mouse.y);
     const bool dl_show = row_hover || dl_done || dl_failed || pct >= 0;
     bool dl_clicked = false;
     if (dl_show && c.ui.item("", "", "", dl, Style().corner(6))) dl_clicked = true;
@@ -562,7 +564,7 @@ static void playlist_row(Ctx& c, int site, int index, const Rect& box) {
     const Rect sync_btn{box.right() - 84, box.y + box.h * 0.5f - 13, 60, 26};
     const Rect save_btn{sync_btn.x - 88, sync_btn.y, 80, 26};
     const bool save_clicked = c.ui.button("保存到本地", save_btn, Style().font(10.5f));
-    const bool hover = box.contains(c.ui.input().mouse.x, c.ui.input().mouse.y);
+    const bool hover = c.ui.pointer_available() && box.contains(c.ui.input().mouse.x, c.ui.input().mouse.y);
     const bool sync_clicked = c.ui.item("", "", "", sync_btn, Style().corner(7));
 
     const bool row_clicked = c.ui.item("", "", "", box, Style().corner(8));
@@ -629,7 +631,7 @@ static void discover_chips(Ctx& c, const Rect& box, const disc::Heats& h, float*
         }
         if (y + row_h > max_y) break;
         const Rect chip{x, y, tw, 24.0f};
-        const bool hovered = chip.contains(c.ui.input().mouse.x, c.ui.input().mouse.y);
+        const bool hovered = c.ui.pointer_available() && chip.contains(c.ui.input().mouse.x, c.ui.input().mouse.y);
         // 顺序很重要：先画底色和字，最后再交给 item 认领按压。
         // 反过来（item 先、底色后）时按压会被随后绘制的填充层吃掉，点不动。
         c.ui.fill_rect(chip, hovered ? c.th.tint.scaled_alpha(0.18f) : c.th.fill3, 12.0f);
@@ -650,7 +652,7 @@ static void discover_chips(Ctx& c, const Rect& box, const disc::Heats& h, float*
 static void discover_card_row(Ctx& c, int index, const Rect& box) {
     const disc::Card& cd = c.model.discovery.cards[size_t(index)];
     const bool save_clicked = c.ui.button("保存", {box.right() - 110, box.y + box.h * 0.5f - 12, 52, 24}, Style().font(10.5f));
-    const bool hover = box.contains(c.ui.input().mouse.x, c.ui.input().mouse.y);
+    const bool hover = c.ui.pointer_available() && box.contains(c.ui.input().mouse.x, c.ui.input().mouse.y);
     const bool clicked = c.ui.item("", "", "", box, Style().corner(9));
     if (hover) c.ui.fill_rect(box, c.th.fill3.scaled_alpha(0.7f), 9.0f);
 
@@ -741,7 +743,7 @@ static void tab_discover(Ctx& c) {
 }
 
 static void queue_row(Ctx& c, const music::Track& track, int index, const Rect& box, bool current) {
-    const bool hover = box.contains(c.ui.input().mouse.x, c.ui.input().mouse.y);
+    const bool hover = c.ui.pointer_available() && box.contains(c.ui.input().mouse.x, c.ui.input().mouse.y);
     const Rect remove{box.right() - 28, box.y + 19, 22, 22};
     const Rect favorite{remove.x - 26, remove.y, 22, 22};
     const bool saved = c.model.library.contains(track);
@@ -944,7 +946,7 @@ static void tab_search(Ctx& c) {
                     Style().primary().font(12.5f))) {
         start_search();
     }
-    if (c.ui.input().key_pressed[KEY_ENTER]) start_search();
+    if (c.ui.pointer_available() && c.ui.input().key_pressed[KEY_ENTER]) start_search();
 
     // 音源筛选
     std::uint32_t mask = c.model.ui.src_mask;
@@ -1299,55 +1301,23 @@ static std::string sleep_timer_status(const UiState& state) {
 }
 
 static void playback_options(Ctx& c, const Rect& mode, const Rect& timer) {
-    auto* ui = &c.ui;
     auto* state = &c.model.ui;
-    // 弹层在帧末绘制，仅捕获生命周期稳定的 Ui 和 UiState，不引用帧内 Ctx。
-    const Style trigger = Style().ghost().indicator(false);
-    c.ui.popover("", &state->play_mode_menu_open, mode, {196, 180}, [ui, state](const Rect& box) {
-        const auto& theme = ui->theme();
-        ui->draw_text("播放模式", {box.x, box.y, box.w, 24}, theme.label, Style().font(13).weight(600));
-        for (int i = 0; i < 4; ++i) {
-            const auto value = PlayMode(i);
-            const bool selected = state->play_mode == value;
-            const Rect row{box.x - 8, box.y + 36 + i * 34, box.w + 16, 32};
-            if (ui->item("", "", "", row, Style().corner(6))) {
-                set_play_mode(value); state->play_mode_menu_open = false; ui->request_animation_frame();
-            }
-            ui->system_icon(play_mode_icon(value), {row.x + 10, row.y + 7, 18, 18}, theme.label2);
-            ui->draw_text(play_mode_name(value), {row.x + 40, row.y, row.w - 72, row.h}, theme.label, Style().font(12));
-            if (selected) ui->system_icon(SystemIcon::Check, {row.right() - 24, row.y + 9, 14, 14}, theme.tint);
-        }
-    }, trigger);
-    if (state->play_mode_menu_open) state->sleep_timer_menu_open = false;
-
+    const Style trigger = Style().ghost().font(12).indicator(false);
+    MenuOptions modes; modes.selected = int(state->play_mode);
+    int picked = -1;
+    if (c.ui.menu("", {"顺序播放", "随机播放", "列表循环", "单曲循环"}, &picked, mode, trigger, modes))
+        set_play_mode(PlayMode(picked));
     const bool timed = state->sleep_after_track || state->sleep_deadline;
-    c.ui.popover("", &state->sleep_timer_menu_open, timer, {216, 302}, [ui, state](const Rect& box) {
-        const auto& theme = ui->theme();
-        ui->draw_text("睡眠定时", {box.x, box.y, box.w, 24}, theme.label, Style().font(13).weight(600));
-        ui->muted_text(sleep_timer_status(*state), {box.x, box.y + 28, box.w, 22}, Style().font(11));
+    MenuOptions timers; timers.disabled = timed ? std::vector<int>{0} : std::vector<int>{0, 8};
+    if (state->sleep_after_track) timers.selected = 6;
+    picked = -1;
+    if (c.ui.menu("", {"睡眠定时 · " + sleep_timer_status(*state), "", "15 分钟后停止", "30 分钟后停止",
+            "60 分钟后停止", "90 分钟后停止", "播完当前歌曲", "", "取消定时"}, &picked, timer, trigger, timers)) {
         constexpr int minutes[] = {15, 30, 60, 90};
-        for (int i = 0; i < 4; ++i) {
-            const Rect row{box.x - 8, box.y + 62 + i * 32, box.w + 16, 30};
-            if (ui->item("", "", "", row, Style().corner(6))) {
-                set_sleep_timer(minutes[i]); state->sleep_timer_menu_open = false; ui->request_animation_frame();
-            }
-            ui->draw_text(std::to_string(minutes[i]) + " 分钟后停止", row.inset(10, 0), theme.label, Style().font(12));
-        }
-        ui->fill_rect({box.x, box.y + 198, box.w, 1}, theme.separator);
-        const Rect after{box.x - 8, box.y + 209, box.w + 16, 32};
-        if (ui->item("", "", "", after, Style().corner(6))) {
-            set_sleep_timer(0, true); state->sleep_timer_menu_open = false; ui->request_animation_frame();
-        }
-        ui->draw_text("当前歌曲结束后停止", {after.x + 10, after.y, after.w - 38, after.h}, theme.label, Style().font(12));
-        if (state->sleep_after_track) ui->system_icon(SystemIcon::Check, {after.right() - 24, after.y + 9, 14, 14}, theme.tint);
-        Style cancel = Style().ghost().font(12).color(theme.destructive);
-        cancel.disabled = !state->sleep_after_track && !state->sleep_deadline;
-        if (ui->button("取消定时", {box.x - 8, box.y + 260, box.w + 16, 32}, cancel)) {
-            set_sleep_timer(0); state->sleep_timer_menu_open = false; ui->request_animation_frame();
-        }
-    }, trigger);
-    if (state->sleep_timer_menu_open) state->play_mode_menu_open = false;
-
+        if (picked >= 2 && picked <= 5) set_sleep_timer(minutes[picked - 2]);
+        else if (picked == 6) set_sleep_timer(0, true);
+        else if (picked == 8) set_sleep_timer(0);
+    }
     c.ui.system_icon(play_mode_icon(state->play_mode), mode.center(20, 20),
         state->play_mode == PlayMode::Sequential ? c.th.label2 : c.th.tint);
     c.ui.system_icon(SystemIcon::Timer, timer.center(20, 20), timed ? c.th.tint : c.th.label2);
@@ -1600,6 +1570,7 @@ static void lyrics_panel(Ctx& c, const Rect& box) {
     // item 的 widget_id 含矩形位置，歌词每帧都在滚动 → id 每帧都变，
     // 点击后 active 常常清不掉，表现为"点十次能中一次"。
     static int press_line = -1;
+    if (!c.ui.pointer_available()) press_line = -1;
     for (int i = 0; i < nline; ++i) {
         const float ty = base_y + g_lyr_layout.top[size_t(i)];
         // 行高取到下一行的顶部：整段行距都可点，不用瞄准文字那一条
@@ -1610,7 +1581,7 @@ static void lyrics_panel(Ctx& c, const Rect& box) {
         const int sline = g_lyr_layout.src[size_t(i)];
         const bool active = (sline == cur_line);
         const Rect row{area.x + 4, ty - 3.0f, area.w - 8, row_h};
-        const bool row_hover = row.contains(c.ui.input().mouse.x, c.ui.input().mouse.y);
+        const bool row_hover = c.ui.pointer_available() && row.contains(c.ui.input().mouse.x, c.ui.input().mouse.y);
         if (row_hover && !active) c.ui.fill_rect(row, c.th.fill3, 7.0f);
 
         const bool has_time = doc->lines[size_t(sline)].ms >= 0;
