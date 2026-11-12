@@ -1,3 +1,5 @@
+# 你可以在issues提出任何需求，这是一个vibe coding项目，核心是跨平台超低占用的多源播放器
+
 # aino player
 
 用 [aino](https://github.com/sudoevolve/aino) 做的桌面播放器：网易云 / QQ 音乐 / 酷我 / B 站并发检索与聚合，含实验性的 YouTube Music 适配，

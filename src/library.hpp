@@ -78,7 +78,11 @@ inline bool parse_link(const std::string& input, music::Source& source, std::str
     std::smatch match;
     if (std::regex_match(text, match, netease)) source = music::Source::Netease;
     else if (std::regex_match(text, match, qq)) source = music::Source::QQ;
-    else return false;
+    else {
+        const std::regex youtube(R"(^https?://(?:music\.|www\.)?youtube\.com/(?:playlist|watch)\?(?:[^\s#]*&)?list=([A-Za-z0-9_-]{1,160})(?:[&#][^\s]*)?$)");
+        if (!std::regex_match(text, match, youtube)) return false;
+        source = music::Source::YouTube; id = match[1].str(); return true;
+    }
     id = match[1].str();
     return id.size() <= 24 && id.find_first_not_of('0') != std::string::npos;
 }

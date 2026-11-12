@@ -152,6 +152,7 @@ struct UiState {
     int pl_site = 2;
     std::string playlist_link;
     std::string local_name;
+    std::string youtube_playlist_name;
     std::string local_folder;
     bool scan_recursive = true;
     bool importing_playlist = false;
@@ -189,6 +190,11 @@ struct NeSnap {
     std::string nickname, err, uid;
     std::vector<ne::Playlist> playlists;
 };
+struct YouTubeSnap {
+    bool logged = false, loading = false, writing = false;
+    std::string nickname, err;
+    std::vector<music::YouTubePlaylist> playlists;
+};
 
 struct DiscSnap {
     bool loading = false;
@@ -215,9 +221,10 @@ struct ViewModel {
     const library::Library& library;
     const QqSnap& qq;
     const NeSnap& netease;
+    const YouTubeSnap& youtube;
     const DiscSnap& discovery;
     const std::map<std::string, DlItem>& downloads;
-    const std::array<LoginView, 2>& login;
+    const std::array<LoginView, 3>& login;
     const LyricView& lyrics;
     const StoragePaths& paths;
     const UpdateView& update;
@@ -288,6 +295,10 @@ void disc_open(int idx);
 void favorite_toggle(const music::Track& track);
 void library_open(size_t index);
 void library_save_current();
+void youtube_refresh();
+void youtube_open_playlist(int index);
+void youtube_create_playlist();
+void youtube_sync_queue(int index);
 void playlist_open_remote(library::Playlist playlist);
 void bilibili_open_parts(const music::Track& track);
 void playlist_close();
@@ -325,7 +336,7 @@ void load(UiState& state) {
     if (path.empty()) return;
     std::FILE* f = platform::fopen(path, "rb");  // 用户名可能是中文
     if (!f) return;
-    char buf[4096];
+    char buf[65536];
     bool has_version = false;
     while (std::fgets(buf, sizeof buf, f)) {
         std::string line(buf);
@@ -342,6 +353,14 @@ void load(UiState& state) {
         if (!v.empty()) state.settings.netease_cookie = v;
         v = read_line_value(line, "qq_cookie");
         if (!v.empty()) state.settings.qq_cookie = v;
+        v = read_line_value(line, "youtube_cookie");
+        if (!v.empty()) state.settings.youtube_cookie = v;
+        v = read_line_value(line, "youtube_authuser");
+        if (!v.empty() && v.size() <= 3 && v.find_first_not_of("0123456789") == std::string::npos) state.settings.youtube_authuser = v;
+        v = read_line_value(line, "youtube_delegated");
+        if (!v.empty()) state.settings.youtube_delegated_session = v;
+        v = read_line_value(line, "youtube_visitor");
+        if (!v.empty()) state.settings.youtube_visitor = v;
         v = read_line_value(line, "download_dir");
         if (!v.empty()) state.download_dir = v;
         v = read_line_value(line, "qq_uin");
@@ -386,6 +405,9 @@ bool save(UiState& state) {
     std::fprintf(f, "sources=%u\n", state.src_mask);
     std::fprintf(f, "netease_cookie=%s\n", state.settings.netease_cookie.c_str());
     std::fprintf(f, "qq_cookie=%s\n", state.settings.qq_cookie.c_str());
+    std::fprintf(f, "youtube_cookie=%s\nyoutube_authuser=%s\nyoutube_delegated=%s\nyoutube_visitor=%s\n",
+        state.settings.youtube_cookie.c_str(), state.settings.youtube_authuser.c_str(),
+        state.settings.youtube_delegated_session.c_str(), state.settings.youtube_visitor.c_str());
     std::fprintf(f, "download_dir=%s\n", state.download_dir.c_str());
     std::fprintf(f, "qq_uin=%s\n", state.qq_uin.c_str());
     std::fprintf(f, "netease_uid=%s\n", state.ne_uid.c_str());
@@ -450,6 +472,9 @@ static HostCallbacks* g_win = nullptr;
 
 static UiState g_ui;
 static Snapshot g_snapshot;
+static YouTubeSnap g_youtube;
+static unsigned g_youtube_generation = 0;
+static login::Site login_site(int site) { return site == 2 ? login::Site::YouTube : site == 1 ? login::Site::QQ : login::Site::NetEase; }
 static UpdateView g_update_view;
 static PlaylistView g_playlist_view;
 static unsigned g_playlist_generation = 0, g_library_revision = 0;
@@ -641,6 +666,7 @@ static void finish_play(HostCallbacks* win, const music::Variant& v, const std::
 // 取流 + 下载；失败沿其它源换源（跨源自动换源）
 //
 static void do_play(HostCallbacks* win, music::Track track, music::Settings st, int gen, int index) {
+    st.cancelled = [gen] { if (g_shutdown.load()) return true; std::lock_guard<std::mutex> lock(g_mu); return gen != g_as.gen; };
     std::shared_lock<std::shared_mutex> cache_write(g_play_cache_mutex);
     if (!track.variants.empty() && track.current().source == music::Source::Local) {
         const auto& v = track.current();
@@ -913,6 +939,7 @@ static void dl_set(const std::string& uid, int percent, int state, const std::st
 
 // 沿所有源试一遍，第一个"完整曲目"落盘；三源都只有试听片段就把最长的那段存下来并标注
 void start_download(music::Track track, music::Settings st) {
+    st.cancelled = [] { return g_shutdown.load(); };
     if (track.current().source == music::Source::Local) { toast("该歌曲已在本机：" + track.current().id, 6000); return; }
     const std::string uid = track_uid(track);
     if (uid.empty()) return;
@@ -1195,6 +1222,7 @@ void qq_open_playlist(int idx) {
 // site：0 = 网易云，1 = QQ —— 两个站点的写入接口完全不同，但外层流程一模一样
 // （取目标 → 挑同源的 id → 后台写 → toast 回显），所以合并成一个函数。
 void playlist_sync_to(int site, int idx) {
+    if (site == 3) { youtube_sync_queue(idx); return; }
     std::string cookie, uid, pid, name;
     if (site == 1) {
         std::lock_guard<std::mutex> lk(g_qq.m);
@@ -1719,7 +1747,7 @@ void playlist_open_remote(library::Playlist playlist) {
             playlist.tracks = std::move(parts.tracks);
             if (!parts.title.empty()) playlist.name = parts.title;
             if (!parts.cover.empty()) playlist.cover = parts.cover;
-        } else playlist.tracks = playlist.source == music::Source::Netease ?
+        } else playlist.tracks = playlist.source == music::Source::YouTube ? music::youtube_playlist_tracks(settings, playlist.remote_id, error) : playlist.source == music::Source::Netease ?
             ne::fetch_playlist(settings.netease_cookie, playlist.remote_id, error) :
             qq::fetch_playlist(settings.qq_cookie, playlist.remote_id, uin, error, 15000, playlist.remote_owner.empty());
         post_ui([playlist = std::move(playlist), error, generation]() mutable {
@@ -1837,17 +1865,18 @@ void library_fetch(library::Playlist playlist) {
         std::string error;
         ne::Playlist ne_metadata;
         qq::Playlist qq_metadata;
+        music::YouTubePlaylist youtube_metadata;
         std::vector<music::Track> tracks;
         if (playlist.source == music::Source::Bilibili) {
             auto parts = music::bilibili_parts(playlist.remote_id, error);
             tracks = std::move(parts.tracks);
             if (!parts.title.empty()) playlist.name = parts.title;
             if (!parts.cover.empty()) playlist.cover = parts.cover;
-        } else tracks = playlist.source == music::Source::Netease ?
+        } else tracks = playlist.source == music::Source::YouTube ? music::youtube_playlist_tracks(settings, playlist.remote_id, error, &youtube_metadata) : playlist.source == music::Source::Netease ?
             ne::fetch_playlist(settings.netease_cookie, playlist.remote_id, error, 15000, &ne_metadata) :
             qq::fetch_playlist(settings.qq_cookie, playlist.remote_id, uin, error, 15000, playlist.remote_owner.empty(), &qq_metadata);
-        const auto name = playlist.source == music::Source::Netease ? ne_metadata.name : qq_metadata.name;
-        const auto cover = playlist.source == music::Source::Netease ? ne_metadata.cover : qq_metadata.cover;
+        const auto name = playlist.source == music::Source::YouTube ? youtube_metadata.name : playlist.source == music::Source::Netease ? ne_metadata.name : qq_metadata.name;
+        const auto cover = playlist.source == music::Source::YouTube ? youtube_metadata.cover : playlist.source == music::Source::Netease ? ne_metadata.cover : qq_metadata.cover;
         if (!name.empty()) playlist.name = name;
         if (!cover.empty()) playlist.cover = cover;
         if (error.empty() && tracks.empty()) error = "歌单没有可读取的曲目";
@@ -1868,7 +1897,7 @@ void library_fetch(library::Playlist playlist) {
 void library_import_link() {
     library::Playlist playlist;
     if (!library::parse_link(g_ui.playlist_link, playlist.source, playlist.remote_id)) {
-        toast("请粘贴网易云或 QQ 的完整公开歌单链接（短链接请先在浏览器打开）", 6500); return;
+        toast("请粘贴网易云、QQ 或 YouTube 的完整歌单链接（短链接请先在浏览器打开）", 6500); return;
     }
     playlist.key = std::string(music::source_key(playlist.source)) + "#" + playlist.remote_id;
     playlist.name = std::string(music::source_name(playlist.source)) + "歌单 " + playlist.remote_id;
@@ -1876,7 +1905,12 @@ void library_import_link() {
 }
 void library_save_remote(int site, int index) {
     library::Playlist playlist;
-    if (site == 1) {
+    if (site == 3) {
+        if (index < 0 || index >= int(g_youtube.playlists.size())) return;
+        const auto& p = g_youtube.playlists[size_t(index)];
+        playlist.source = music::Source::YouTube; playlist.remote_id = p.id;
+        playlist.name = p.name; playlist.cover = p.cover;
+    } else if (site == 1) {
         if (index < 0 || index >= int(g_qq_snap.playlists.size())) return;
         const auto& p = g_qq_snap.playlists[size_t(index)];
         playlist.source = music::Source::QQ; playlist.remote_id = p.dirid;
@@ -1892,16 +1926,83 @@ void library_save_remote(int site, int index) {
     library_fetch(std::move(playlist));
 }
 
+void youtube_refresh() {
+    if (g_youtube.loading || g_youtube.writing || g_ui.settings.youtube_cookie.empty()) return;
+    const auto generation = ++g_youtube_generation;
+    const auto settings = g_ui.settings;
+    g_youtube.logged = true; g_youtube.loading = true; g_youtube.err.clear();
+    background::start([settings, generation] {
+        std::string name, error;
+        std::vector<music::YouTubePlaylist> playlists;
+        if (music::youtube_profile(settings, name, error)) playlists = music::youtube_playlists(settings, error);
+        post_ui([name, error, playlists = std::move(playlists), generation]() mutable {
+            if (generation != g_youtube_generation) return;
+            g_youtube.loading = false; g_youtube.err = error;
+            if (error.empty()) { g_youtube.nickname = name; g_youtube.playlists = std::move(playlists); }
+        });
+    });
+}
+void youtube_open_playlist(int index) {
+    if (index < 0 || index >= int(g_youtube.playlists.size())) return;
+    const auto& item = g_youtube.playlists[size_t(index)];
+    library::Playlist playlist; playlist.source = music::Source::YouTube;
+    playlist.name = item.name; playlist.cover = item.cover; playlist.remote_id = item.id;
+    playlist_open_remote(std::move(playlist));
+}
+void youtube_create_playlist() {
+    const auto name = music::text::trim(g_ui.youtube_playlist_name);
+    if (g_youtube.writing || g_youtube.loading || name.empty()) { toast("请先输入歌单名称，并等待当前操作完成"); return; }
+    if (g_ui.settings.youtube_cookie.empty()) { toast("请先登录 YouTube Music"); return; }
+    const auto settings = g_ui.settings;
+    const auto generation = g_youtube_generation;
+    g_youtube.writing = true;
+    background::start([settings, generation, name] {
+        std::string error;
+        const auto id = music::youtube_create_playlist(settings, name, error);
+        post_ui([id, error, generation] {
+            if (generation != g_youtube_generation) return;
+            g_youtube.writing = false;
+            if (id.empty()) { toast("创建 YouTube 歌单失败：" + error, 8000); return; }
+            g_ui.youtube_playlist_name.clear(); toast("YouTube 私人歌单已创建"); youtube_refresh();
+        });
+    });
+}
+void youtube_sync_queue(int index) {
+    if (g_youtube.writing || g_youtube.loading || index < 0 || index >= int(g_youtube.playlists.size())) return;
+    std::vector<std::string> ids; std::set<std::string> seen;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        for (const auto& track : g_as.tracks) for (const auto& variant : track.variants) {
+            if (variant.source == music::Source::YouTube && seen.insert(variant.id).second) { ids.push_back(variant.id); break; }
+        }
+    }
+    if (ids.empty()) { toast("播放队列中没有 YouTube 曲目，请先点播或加入队列", 6000); return; }
+    const auto playlist = g_youtube.playlists[size_t(index)];
+    const auto settings = g_ui.settings; const auto generation = g_youtube_generation;
+    g_youtube.writing = true;
+    background::start([settings, playlist, ids, generation] {
+        std::string error;
+        const bool ok = music::youtube_add_to_playlist(settings, playlist.id, ids, error);
+        post_ui([ok, error, generation, count = ids.size()] {
+            if (generation != g_youtube_generation) return;
+            g_youtube.writing = false;
+            toast(ok ? "已向 YouTube 歌单添加 " + std::to_string(count) + " 首歌曲" : "添加失败（已成功的批次可能已写入）：" + error, 8000);
+            if (ok) youtube_refresh();
+        });
+    });
+}
 void begin_login(int site) {
+    if (site < 0 || site >= 3) return;
     if (g_wait_login_site.load() >= 0) { toast("已有登录连接正在进行，请先完成或取消"); return; }
     g_wait_login_site.store(site);
-    login::start(site == 1 ? login::Site::QQ : login::Site::NetEase);
+    login::start(login_site(site));
 }
 
 void clear_data(ClearAction action) {
     if (action == ClearAction::Cookies) {
         g_wait_login_site.store(-1);
-        login::forget(login::Site::QQ); login::forget(login::Site::NetEase);
+        login::forget(login::Site::QQ); login::forget(login::Site::NetEase); login::forget(login::Site::YouTube);
+        ++g_youtube_generation; g_youtube = {};
         {
             std::lock_guard<std::mutex> lock(g_qq.m);
             g_qq.cookie.clear(); g_qq.uin.clear(); g_qq.nickname.clear(); g_qq.playlists.clear();
@@ -1913,9 +2014,11 @@ void clear_data(ClearAction action) {
             g_ne.err.clear(); g_ne.logged = false; g_ne.loading = false;
         }
         g_ui.settings.qq_cookie.clear(); g_ui.settings.netease_cookie.clear();
+        g_ui.settings.youtube_cookie.clear(); g_ui.settings.youtube_delegated_session.clear();
+        g_ui.settings.youtube_visitor.clear(); g_ui.settings.youtube_authuser = "0";
         g_ui.qq_uin.clear(); g_ui.ne_uid.clear();
         g_ui.config_dirty = true;
-        toast(save_config() ? "已清除两个账号的登录信息；浏览器中的登录不受影响" : "账号已退出，但配置文件保存失败，请检查配置目录权限", 6500);
+        toast(save_config() ? "已清除三个账号的登录信息；浏览器中的登录不受影响" : "账号已退出，但配置文件保存失败，请检查配置目录权限", 6500);
     } else if (action == ClearAction::Library) {
         library::Library empty;
         std::string error;
@@ -1968,11 +2071,11 @@ void open_update(bool download) {
     if (!platform::open_browser(url)) toast("无法打开默认浏览器，请检查浏览器设置");
 }
 
-static std::array<LoginView, 2> g_login_view;
+static std::array<LoginView, 3> g_login_view;
 static LyricView g_lyric_view;
 static StoragePaths g_paths;
 ViewModel view_model() {
-    return {g_ui, g_snapshot, g_library, g_qq_snap, g_ne_snap, g_disc_snap, g_dls_snap,
+    return {g_ui, g_snapshot, g_library, g_qq_snap, g_ne_snap, g_youtube, g_disc_snap, g_dls_snap,
         g_login_view, g_lyric_view, g_paths, g_update_view, g_playlist_view, g_sync_site.load(), g_sync_index.load(), g_toast_until.load()};
 }
 bool initialize(bool smoke_test) {
@@ -1990,6 +2093,7 @@ void start(HostCallbacks host) {
     g_host = std::move(host);
     g_win = &g_host;
     g_covers.set_notifier([] { if (g_win) g_win->wake(); });
+    if (!g_ui.settings.youtube_cookie.empty()) youtube_refresh();
     // 上次登录过就直接拉歌单（后台，不挡首屏）
     if (!g_ui.settings.qq_cookie.empty()) {
         {
@@ -2070,19 +2174,33 @@ void tick() {
 
         // 官网浏览器回传（QQ / 网易云各一套）：成功就保存 Cookie 并拉取歌单。
         if (const int site = g_wait_login_site.load(); site >= 0) {
-            const login::Site ls = (site == 1) ? login::Site::QQ : login::Site::NetEase;
+            const login::Site ls = login_site(site);
             auto& st = login::state(ls);
             if (st.done.load()) {
                 g_wait_login_site.store(-1);
-                std::string cookie, uid, note;
+                std::string cookie, uid, note, context;
                 {
                     std::lock_guard<std::mutex> lk(st.m);
                     cookie = st.cookie;
                     uid = st.uid;
                     note = st.note;
+                    context = st.context;
                 }
                 if (!cookie.empty()) {
-                    if (site == 1) {
+                    if (site == 2) {
+                        g_ui.settings.youtube_cookie = cookie;
+                        js::Value data;
+                        g_ui.settings.youtube_authuser = "0";
+                        g_ui.settings.youtube_delegated_session.clear(); g_ui.settings.youtube_visitor.clear();
+                        if (js::parse(context, data)) {
+                            const auto user = data["authuser"].str();
+                            if (!user.empty() && user.size() <= 3 && user.find_first_not_of("0123456789") == std::string::npos) g_ui.settings.youtube_authuser = user;
+                            g_ui.settings.youtube_delegated_session = data["delegated"].str();
+                            g_ui.settings.youtube_visitor = data["visitor"].str();
+                        }
+                        g_ui.src_mask |= 1u << int(music::Source::YouTube);
+                        g_ui.config_dirty = true; toast("YouTube Music 登录成功，正在读取账号歌单"); youtube_refresh();
+                    } else if (site == 1) {
                         {
                             std::lock_guard<std::mutex> lk(g_qq.m);
                             g_qq.cookie = cookie;
@@ -2114,7 +2232,7 @@ void tick() {
                 }
             }
         }
-        for (auto site : {login::Site::QQ, login::Site::NetEase})
+        for (auto site : {login::Site::QQ, login::Site::NetEase, login::Site::YouTube})
             if (login::state(site).return_requested.exchange(false)) g_host.activate();
         if (const int goto_tab = g_goto_tab.exchange(-1); goto_tab >= 0) g_ui.tab = goto_tab;
 
@@ -2165,8 +2283,8 @@ void tick() {
             }
         }
 
-        for (int site = 0; site < 2; ++site) {
-            auto& state = login::state(site == 1 ? login::Site::QQ : login::Site::NetEase);
+        for (int site = 0; site < 3; ++site) {
+            auto& state = login::state(login_site(site));
             g_login_view[size_t(site)].connecting = state.running.load() && !state.done.load();
             std::lock_guard<std::mutex> lock(state.m);
             g_login_view[size_t(site)].note = state.note;
@@ -2219,7 +2337,7 @@ void shutdown(bool smoke_test) {
     }
     g_win = nullptr;
 }
-void cancel_login(int site) { login::cancel(site == 1 ? login::Site::QQ : login::Site::NetEase); }
+void cancel_login(int site) { if (site >= 0 && site < 3) login::cancel(login_site(site)); }
 void seek_playback(int milliseconds) { g_player.seek_ms(milliseconds); }
 void choose_source(int index, int variant, bool replay) {
     {

@@ -510,7 +510,10 @@ static void result_row(Ctx& c, const music::Track& t, int index, const Rect& box
 static void playlist_row(Ctx& c, int site, int index, const Rect& box) {
     std::string name, cover;
     int count = 0;
-    if (site == 1) {
+    if (site == 3) {
+        const auto& pl = c.model.youtube.playlists[size_t(index)];
+        name = pl.name; cover = pl.cover; count = pl.count;
+    } else if (site == 1) {
         const qq::Playlist& pl = c.model.qq.playlists[size_t(index)];
         name = pl.name;
         cover = pl.cover;
@@ -521,7 +524,7 @@ static void playlist_row(Ctx& c, int site, int index, const Rect& box) {
         cover = pl.cover;
         count = pl.count;
     }
-    const bool sync_here = (c.model.sync_site == site && c.model.sync_index == index);
+    const bool sync_here = site == 3 ? c.model.youtube.writing : (c.model.sync_site == site && c.model.sync_index == index);
 
     // 同步按钮必须先于整行绘制：aino 的"按下"只归第一个包含指针的控件，
     // 整行先画的话这个按钮永远收不到点击（结果就是"点同步变成了打开歌单"）。
@@ -544,7 +547,7 @@ static void playlist_row(Ctx& c, int site, int index, const Rect& box) {
                    c.th.label, ts);
     Style ds;
     ds.font_size = 11.0f;
-    c.ui.draw_text(std::to_string(count) + " 首", {cov.right() + 12, box.y + 33, max_w, 16}, c.th.label2, ds);
+    c.ui.draw_text(site == 3 && !count ? "YouTube Music 歌单" : std::to_string(count) + " 首", {cov.right() + 12, box.y + 33, max_w, 16}, c.th.label2, ds);
 
     // 按钮常显（只悬停才显示的话根本没人知道能同步），悬停时描边加深
     c.ui.stroke_rect(sync_btn, sync_here ? c.th.tint.scaled_alpha(0.6f)
@@ -561,7 +564,8 @@ static void playlist_row(Ctx& c, int site, int index, const Rect& box) {
     if (save_clicked) library_save_remote(site, index);
     else if (sync_clicked) playlist_sync_to(site, index);
     else if (row_clicked) {
-        if (site == 1) qq_open_playlist(index);
+        if (site == 3) youtube_open_playlist(index);
+        else if (site == 1) qq_open_playlist(index);
         else ne_open_playlist(index);
     }
 }
@@ -868,10 +872,10 @@ static void tab_playlists(Ctx& c) {
 
     c.ui.heading("歌单", {mx, 20, mw, 30});
     int site = c.model.ui.pl_site;
-    if (c.ui.segmented({"网易云", "QQ", "本地"}, &site, {mx, 58, 240, 28}, Style().font(11.5f))) c.model.ui.pl_site = site;
+    if (c.ui.segmented({"网易云", "QQ", "本地", "YouTube"}, &site, {mx, 58, std::min(mw, 340.0f), 28}, Style().font(11.5f))) c.model.ui.pl_site = site;
 
     if (c.model.ui.pl_site == 2) {
-        c.ui.input(&c.model.ui.playlist_link, {mx, 102, mw - 106, 30}, Style().font(11.5f).hint("粘贴网易云 / QQ 公开歌单链接"));
+        c.ui.input(&c.model.ui.playlist_link, {mx, 102, mw - 106, 30}, Style().font(11.5f).hint("粘贴网易云 / QQ / YouTube 歌单链接"));
         if (c.ui.button(c.model.ui.importing_playlist ? "保存中…" : "保存在线歌单", {mx + mw - 100, 102, 100, 30}, Style().font(10.5f))) library_import_link();
         c.ui.input(&c.model.ui.local_name, {mx, 144, mw - 106, 30}, Style().font(11.5f).hint("输入名称，将播放队列保存为本地歌单"));
         if (c.ui.button("保存播放队列", {mx + mw - 100, 144, 100, 30}, Style().font(10.5f))) library_save_current();
@@ -897,13 +901,14 @@ static void tab_playlists(Ctx& c) {
     }
 
     const bool qq_side = (c.model.ui.pl_site == 1);
-    const bool logged = qq_side ? c.model.qq.logged : c.model.netease.logged;
-    const bool loading = qq_side ? c.model.qq.loading : c.model.netease.loading;
-    const std::string err = qq_side ? c.model.qq.err : c.model.netease.err;
-    const std::string nickname = qq_side ? c.model.qq.nickname : c.model.netease.nickname;
-    const std::string uid = qq_side ? c.model.ui.qq_uin : c.model.ui.ne_uid;
-    const int pl_count = int(qq_side ? c.model.qq.playlists.size() : c.model.netease.playlists.size());
-    const char* site_name = qq_side ? "QQ 音乐" : "网易云音乐";
+    const bool yt_side = c.model.ui.pl_site == 3;
+    const bool logged = yt_side ? c.model.youtube.logged : qq_side ? c.model.qq.logged : c.model.netease.logged;
+    const bool loading = yt_side ? c.model.youtube.loading : qq_side ? c.model.qq.loading : c.model.netease.loading;
+    const std::string err = yt_side ? c.model.youtube.err : qq_side ? c.model.qq.err : c.model.netease.err;
+    const std::string nickname = yt_side ? c.model.youtube.nickname : qq_side ? c.model.qq.nickname : c.model.netease.nickname;
+    const std::string uid = yt_side ? "" : qq_side ? c.model.ui.qq_uin : c.model.ui.ne_uid;
+    const int pl_count = int(yt_side ? c.model.youtube.playlists.size() : qq_side ? c.model.qq.playlists.size() : c.model.netease.playlists.size());
+    const char* site_name = yt_side ? "YouTube Music" : qq_side ? "QQ 音乐" : "网易云音乐";
 
     if (!logged) {
         const Rect card{mx, 102, mw, 112};
@@ -920,30 +925,36 @@ static void tab_playlists(Ctx& c) {
     c.ui.draw_text(nickname.empty() ? "已登录" : nickname, {mx, 100, mw - 220, 22}, c.th.label, nm);
     Style meta;
     meta.font_size = 10.5f;
-    c.ui.draw_text((qq_side ? "QQ " : "uid ") + uid + " · " + std::to_string(pl_count) + " 个歌单",
+    c.ui.draw_text((yt_side ? "YouTube Music" : (qq_side ? "QQ " : "uid ") + uid) + " · " + std::to_string(pl_count) + " 个歌单",
                    {mx, 122, mw - 220, 16}, c.th.label3, meta);
     if (c.ui.button("刷新", {mx + mw - 92, 102, 92, 28}, Style().font(11.5f))) {
-        if (qq_side) qq_refresh();
+        if (yt_side) youtube_refresh();
+        else if (qq_side) qq_refresh();
         else ne_refresh();
     }
 
+    if (yt_side) {
+        c.ui.input(&c.model.ui.youtube_playlist_name, {mx, 150, mw - 116, 28}, Style().hint("新建 YouTube 私人歌单名称").font(11.5f));
+        if (c.ui.button(c.model.youtube.writing ? "处理中…" : "创建歌单", {mx + mw - 108, 150, 108, 28}, Style().font(11.5f))) youtube_create_playlist();
+    }
     if (!err.empty()) {
         Style es;
         es.font_size = 11.0f;
         es.wrap_text();
-        c.ui.draw_text(err, {mx, 148, mw, 32}, c.th.destructive, es);
+        c.ui.draw_text(err, {mx, yt_side ? 188.0f : 148.0f, mw, 48}, c.th.destructive, es);
         return;
     }
     if (loading) {
-        c.ui.spinner({mx + mw * 0.5f - 11, 172, 22, 22});
+        c.ui.spinner({mx + mw * 0.5f - 11, yt_side ? 212.0f : 172.0f, 22, 22});
         return;
     }
     if (pl_count == 0) {
-        c.ui.empty_state("这个账号下没有歌单", std::string(), {mx, 176, mw, 110});
+        c.ui.empty_state("这个账号下没有歌单", std::string(), {mx, yt_side ? 216.0f : 176.0f, mw, 110});
         return;
     }
 
-    const Rect list{mx, 152, mw, c.H - kBarHeight - 152 - 12};
+    const float list_y = yt_side ? 190.0f : 152.0f;
+    const Rect list{mx, list_y, mw, c.H - kBarHeight - list_y - 12};
     if (list.h < 64) return;
     const int pl_site = c.model.ui.pl_site;
     c.ui.scroll(list, pl_count, 64, [&](int i, const Rect& row) { playlist_row(c, pl_site, i, row); });
@@ -1027,8 +1038,8 @@ static void tab_sources(Ctx& c) {
     const float mw = c.W - mx - 24.0f;
     c.ui.heading("音源", {mx, 20, mw, 30});
 
-    const char* cookie_hints[music::kSourceCount] = {"MUSIC_U=...", "qm_keyst=...", ""};
-    std::string* cookies[music::kSourceCount] = {&c.model.ui.settings.netease_cookie, &c.model.ui.settings.qq_cookie, nullptr};
+    const char* cookie_hints[music::kSourceCount] = {"MUSIC_U=...", "qm_keyst=...", "", "SAPISID=...; __Secure-3PSID=..."};
+    std::string* cookies[music::kSourceCount] = {&c.model.ui.settings.netease_cookie, &c.model.ui.settings.qq_cookie, nullptr, &c.model.ui.settings.youtube_cookie};
 
     c.ui.scroll({mx, 64, mw, c.bar_y - 76}, music::kSourceCount, 128, [&](int i, const Rect& row) {
         const bool has_cookie = cookies[i] != nullptr;
@@ -1105,28 +1116,30 @@ static void tab_sources(Ctx& c) {
 // 账号卡：site 0 = 网易云，1 = QQ
 static void account_card(Ctx& c, int site, const Rect& box) {
     const bool qq_side = (site == 1);
+    const bool yt_side = site == 2;
     c.ui.panel(box, Style().corner(12));
-    c.ui.subheading(qq_side ? "QQ 音乐" : "网易云音乐", {box.x + 20, box.y + 12, 240, 22});
+    c.ui.subheading(yt_side ? "YouTube Music" : qq_side ? "QQ 音乐" : "网易云音乐", {box.x + 20, box.y + 12, 240, 22});
 
     std::string note;
     const bool connecting = c.model.login[size_t(site)].connecting;
     note = c.model.login[size_t(site)].note;
 
-    const bool logged = qq_side ? c.model.qq.logged : c.model.netease.logged;
-    const std::string nickname = qq_side ? c.model.qq.nickname : c.model.netease.nickname;
-    const std::string uid = qq_side ? c.model.ui.qq_uin : c.model.ui.ne_uid;
-    const std::string err = qq_side ? c.model.qq.err : c.model.netease.err;
-    const int count = int(qq_side ? c.model.qq.playlists.size() : c.model.netease.playlists.size());
+    const bool logged = yt_side ? c.model.youtube.logged : qq_side ? c.model.qq.logged : c.model.netease.logged;
+    const std::string nickname = yt_side ? c.model.youtube.nickname : qq_side ? c.model.qq.nickname : c.model.netease.nickname;
+    const std::string uid = yt_side ? "" : qq_side ? c.model.ui.qq_uin : c.model.ui.ne_uid;
+    const std::string err = yt_side ? c.model.youtube.err : qq_side ? c.model.qq.err : c.model.netease.err;
+    const int count = int(yt_side ? c.model.youtube.playlists.size() : qq_side ? c.model.qq.playlists.size() : c.model.netease.playlists.size());
 
     if (logged) {
         Style nm;
         nm.font_size = 13.5f;
         nm.font_weight = 600;
         c.ui.draw_text(nickname.empty() ? "已登录" : nickname, {box.x + 20, box.y + 40, 300, 20}, c.th.label, nm);
-        c.ui.muted_text((qq_side ? "QQ " : "uid ") + uid + " · " + std::to_string(count) + " 个歌单",
+        c.ui.muted_text((yt_side ? "YouTube Music" : (qq_side ? "QQ " : "uid ") + uid) + " · " + std::to_string(count) + " 个歌单",
                         {box.x + 20, box.y + 62, 300, 18}, Style().font(10.5f));
         if (c.ui.button("刷新歌单", {box.right() - 200, box.y + 38, 84, 28}, Style().font(11.0f))) {
-            if (qq_side) qq_refresh();
+            if (yt_side) youtube_refresh();
+            else if (qq_side) qq_refresh();
             else ne_refresh();
         }
         if (c.ui.button(connecting ? "取消连接" : "重新登录", {box.right() - 108, box.y + 38, 88, 28}, Style().font(11.0f))) {
@@ -1178,7 +1191,7 @@ static void clear_data_dialog(Ctx& c) {
     const auto action = c.model.ui.clear_action;
     const char* title = "清除缓存？";
     const char* detail = "清理临时音频和内存封面。播放中、正在写入及其他运行实例使用的文件会保留。";
-    if (action == ClearAction::Cookies) { title = "清除登录信息？"; detail = "退出播放器中的网易云和 QQ 账号，清除本机保存的 Cookie。浏览器登录、本地歌单和其他设置不受影响。"; }
+    if (action == ClearAction::Cookies) { title = "清除登录信息？"; detail = "退出播放器中的网易云、QQ 和 YouTube 账号，清除本机保存的 Cookie。浏览器登录、本地歌单和其他设置不受影响。"; }
     else if (action == ClearAction::Library) { title = "清除本地收藏与歌单？"; detail = "删除本机全部收藏、命名歌单和保存的在线歌单快照。此操作无法撤销，不会修改音乐平台上的歌单。"; }
     else if (action == ClearAction::Queue) { title = "清空当前列表？"; detail = "清空当前列表及其重启恢复记录。正在播放的歌曲可继续播放，收藏和保存的歌单不受影响。"; }
     bool open = true;
@@ -1218,13 +1231,14 @@ static void tab_settings(Ctx& c) {
     if (c.ui.button(c.model.update.status == UpdateStatus::Available ? "发现新版" : "版本更新", {mx + mw - 224, 21, 100, 28}, Style().font(11.5f))) c.model.ui.update_settings = true;
     if (c.ui.button("数据与缓存", {mx + mw - 112, 21, 112, 28}, Style().font(11.5f))) c.model.ui.storage_settings = true;
 
-    c.ui.scroll({mx, 60, mw, c.bar_y - 72}, 1, 670, [&](int, const Rect& area) {
+    c.ui.scroll({mx, 60, mw, c.bar_y - 72}, 1, 792, [&](int, const Rect& area) {
     const float dy = area.y - 60;
     account_card(c, 0, {mx, 60 + dy, mw, 110});
     account_card(c, 1, {mx, 182 + dy, mw, 110});
+    account_card(c, 2, {mx, 304 + dy, mw, 110});
 
     // ---------------- 外观 ----------------
-    const Rect look{mx, 304 + dy, mw, 56};
+    const Rect look{mx, 426 + dy, mw, 56};
     c.ui.panel(look, Style().corner(12));
     Style lbl;
     lbl.font_size = 11.5f;
@@ -1237,7 +1251,7 @@ static void tab_settings(Ctx& c) {
     }
 
     // ---------------- 音质 ----------------
-    const Rect qcard{mx, 372 + dy, mw, 56};
+    const Rect qcard{mx, 494 + dy, mw, 56};
     c.ui.panel(qcard, Style().corner(12));
     c.ui.draw_text("默认音质", {qcard.x + 20, qcard.y + 18, 120, 20}, c.th.label2, lbl);
     int q = c.model.ui.settings.quality;
@@ -1248,7 +1262,7 @@ static void tab_settings(Ctx& c) {
     }
 
     // ---------------- 播放 ----------------
-    const Rect card{mx, 440 + dy, mw, 84};
+    const Rect card{mx, 562 + dy, mw, 84};
     c.ui.panel(card, Style().corner(12));
     c.ui.draw_text("默认音量", {card.x + 20, card.y + 12, 120, 16}, c.th.label2, Style().font(11.5f));
     static SeekBar set_vol_bar;
@@ -1262,7 +1276,7 @@ static void tab_settings(Ctx& c) {
     c.ui.muted_text(buf, {card.x + 20, card.y + 60, card.w - 40, 16}, Style().font(10.0f));
 
     // ---------------- 下载 ----------------
-    const Rect dlcard{mx, 536 + dy, mw, 110};
+    const Rect dlcard{mx, 658 + dy, mw, 110};
     c.ui.panel(dlcard, Style().corner(12));
     c.ui.draw_text("下载目录", {dlcard.x + 20, dlcard.y + 10, 160, 16}, c.th.label2, Style().font(11.5f));
     if (c.ui.input(&c.model.ui.download_dir, {dlcard.x + 20, dlcard.y + 30, dlcard.w - 40, 28},
@@ -1282,8 +1296,7 @@ static void tab_settings(Ctx& c) {
         c.model.ui.settings.embed_lyrics = emb_lyric;
         c.model.ui.config_dirty = true;
     }
-
-    c.ui.muted_text("音频解码：" + audio::decoder_info(), {mx + 20, 666 + dy, mw - 40, 20}, Style().font(10.5f));
+    c.ui.muted_text("音频解码：" + audio::decoder_info(), {mx + 20, 788 + dy, mw - 40, 20}, Style().font(10.5f));
     });
 }
 

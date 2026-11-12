@@ -17,7 +17,42 @@
 
 #include <cstddef>
 #include <cstring>
+#include <array>
+#include <cstdint>
+#include <string>
 namespace net {
+// YouTube 请求签名和本机 WebSocket 握手共用 SHA-1；不用于密码存储。
+inline std::array<unsigned char, 20> sha1(std::string input) {
+    const uint64_t bits = uint64_t(input.size()) * 8;
+    input += char(0x80);
+    while (input.size() % 64 != 56) input += '\0';
+    for (int i = 7; i >= 0; --i) input += char(bits >> (i * 8));
+    uint32_t hash[] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0};
+    const auto rotate = [](uint32_t value, int count) { return value << count | value >> (32 - count); };
+    for (size_t block = 0; block < input.size(); block += 64) {
+        uint32_t words[80]{};
+        for (int i = 0; i < 16; ++i) for (int j = 0; j < 4; ++j) words[i] = words[i] << 8 | uint8_t(input[block + i * 4 + j]);
+        for (int i = 16; i < 80; ++i) words[i] = rotate(words[i-3] ^ words[i-8] ^ words[i-14] ^ words[i-16], 1);
+        uint32_t a = hash[0], b = hash[1], c = hash[2], d = hash[3], e = hash[4];
+        for (int i = 0; i < 80; ++i) {
+            const uint32_t f = i < 20 ? (b & c) | (~b & d) : i < 40 ? b ^ c ^ d : i < 60 ? (b & c) | (b & d) | (c & d) : b ^ c ^ d;
+            const uint32_t k = i < 20 ? 0x5a827999 : i < 40 ? 0x6ed9eba1 : i < 60 ? 0x8f1bbcdc : 0xca62c1d6;
+            const uint32_t next = rotate(a, 5) + f + e + k + words[i];
+            e = d; d = c; c = rotate(b, 30); b = a; a = next;
+        }
+        hash[0] += a; hash[1] += b; hash[2] += c; hash[3] += d; hash[4] += e;
+    }
+    std::array<unsigned char, 20> digest{};
+    for (int i = 0; i < 20; ++i) digest[size_t(i)] = uint8_t(hash[i / 4] >> (24 - i % 4 * 8));
+    return digest;
+}
+inline std::string sha1_hex(const std::string& input) {
+    const auto digest = sha1(input);
+    const char* hex = "0123456789abcdef";
+    std::string out;
+    for (auto byte : digest) { out += hex[byte >> 4]; out += hex[byte & 15]; }
+    return out;
+}
 // 判断容器头而非只认 MP3；DASH 音轨通常是 M4A，YouTube 也可能返回 WebM。
 inline bool audio_prefix(const char* bytes, size_t size) {
     if (size >= 3 && !std::memcmp(bytes, "ID3", 3)) return true;
