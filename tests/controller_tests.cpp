@@ -105,6 +105,55 @@ int main(int argc, char** argv) {
         installers.body.insert(installers.body.rfind(']'), "," + portable_json.substr(asset_start, portable_json.rfind(']') - asset_start));
         check(updates::parse_release(installers, "1.0.0", "windows-x64.exe").installer, "installer choice independent of API ordering");
 
+        music::Track nav_a, nav_b, nav_c;
+        auto navigation_track = [](const char* name) {
+            music::Track value; value.title = name;
+            music::Variant variant; variant.source = music::Source::Local; variant.id = name;
+            value.variants.push_back(variant); return value;
+        };
+        nav_a = navigation_track("a"); nav_b = navigation_track("b"); nav_c = navigation_track("c");
+        queue_push(nav_a); queue_push(nav_b); queue_push(nav_c);
+        auto mark_current = [&](const music::Track& value, int index) {
+            std::lock_guard<std::mutex> lock(g_mu); g_as.now_uid = track_uid(value); g_as.playing = index;
+        };
+        mark_current(nav_a, 0); set_play_mode(PlayMode::RepeatOne);
+        check(next_queue_index(1, true) == 0 && next_queue_index(1, false) == 1, "repeat one only affects natural end");
+        queue_play_next(nav_c); tick();
+        check(model.playback.tracks.size() == 3 && model.playback.playing == 0 &&
+              track_uid(model.playback.tracks[1]) == track_uid(nav_c), "play next moves without duplicating or interrupting current");
+        check(next_queue_index(1, true) == 1, "explicit next overrides repeat one");
+        set_play_mode(PlayMode::Sequential); mark_current(nav_b, 2);
+        check(next_queue_index(1, true) == -1, "sequential mode stops at queue end");
+        set_play_mode(PlayMode::RepeatAll);
+        check(next_queue_index(1, true) == 0, "repeat all wraps at queue end");
+        set_play_mode(PlayMode::Shuffle); mark_current(nav_a, 0);
+        const int shuffled = next_queue_index(1, true);
+        check(shuffled != 0, "shuffle skips current when alternatives exist");
+        mark_current(shuffled == 1 ? nav_c : nav_b, shuffled);
+        const int shuffled_again = next_queue_index(1, true);
+        check(shuffled_again != 0 && shuffled_again != shuffled, "shuffle visits remaining songs without repetition");
+        { std::lock_guard<std::mutex> lock(g_mu);
+          g_shuffle_history = {track_uid(nav_a), track_uid(nav_c)}; g_shuffle_cursor = 1; }
+        mark_current(nav_c, 1);
+        check(next_queue_index(-1, false) == 0 && next_queue_index(1, false) == 1, "shuffle previous and forward follow actual playback history");
+        queue_play_next(nav_a);
+        const int explicit_next = next_queue_index(1, true);
+        { std::lock_guard<std::mutex> lock(g_mu);
+          check(explicit_next >= 0 && track_uid(g_as.tracks[size_t(explicit_next)]) == track_uid(nav_a), "explicit next overrides shuffle"); }
+        set_sleep_timer(15);
+        check(model.ui.sleep_remaining_seconds == 900 && model.ui.sleep_deadline && !model.ui.sleep_after_track, "timer preset armed");
+        set_sleep_timer(0); check(!model.ui.sleep_deadline && !g_sleep_deadline.load(), "timer cancellation");
+        int cancelled_generation;
+        { std::lock_guard<std::mutex> lock(g_mu); g_as.ps = PlayState::Resolving; cancelled_generation = g_as.gen; }
+        set_sleep_timer(0, true); check(model.ui.sleep_after_track, "stop after track is armed");
+        set_sleep_timer(15); model.ui.sleep_deadline = platform::ticks() - 1; tick();
+        check(model.playback.ps == PlayState::Idle && model.playback.gen > cancelled_generation &&
+              !model.ui.sleep_deadline && !model.ui.sleep_after_track && model.playback.pending_path.empty(),
+              "expired timer stops pending playback and invalidates old work");
+        queue_clear(); set_play_mode(PlayMode::RepeatAll);
+        { std::lock_guard<std::mutex> lock(g_mu); g_as.now_uid.clear(); }
+        tick();
+
         music::Track track;
         music::Track part1, part2;
         music::Variant part_variant; part_variant.source = music::Source::Bilibili; part_variant.id = "BV1fixture01";
@@ -186,7 +235,7 @@ int main(int argc, char** argv) {
         music::Track missing = scanned.tracks[0]; missing.variants[0].id += ".missing";
         int local_gen;
         { std::lock_guard<std::mutex> lock(g_mu); local_gen = ++g_as.gen; }
-        do_play(g_win, missing, model.ui.settings, local_gen, -1); tick();
+        do_play(g_win, missing, model.ui.settings, local_gen); tick();
         check(model.playback.ps == PlayState::Failed && model.playback.error.find("移动或删除") != std::string::npos,
             "missing local file fails offline without online substitution");
         { std::lock_guard<std::mutex> lock(g_mu); g_as.results = {track}; ++g_as.results_version; }
@@ -214,6 +263,7 @@ int main(int argc, char** argv) {
 
         model.ui.volume = 43;
         model.ui.dark = true;
+        set_play_mode(PlayMode::Shuffle);
         model.ui.download_dir = platform::join(model.paths.config, "downloads");
         platform::make_dirs(model.ui.download_dir);
         const auto downloaded = platform::join(model.ui.download_dir, "song.mp3");
@@ -233,6 +283,7 @@ int main(int argc, char** argv) {
         config::load(restored);
         check(restored.settings.netease_cookie.empty() && restored.settings.qq_cookie.empty() && restored.qq_uin.empty() && restored.ne_uid.empty(), "logout persists cleared credentials");
         check(restored.volume == 43 && restored.dark && restored.download_dir == model.ui.download_dir, "logout preserves unrelated settings");
+        check(restored.play_mode == PlayMode::Shuffle && !restored.sleep_deadline && !restored.sleep_after_track, "play mode persists without restoring a timer");
         check(model.library.contains(track), "logout preserves local library");
         clear_data(ClearAction::Queue);
         tick();

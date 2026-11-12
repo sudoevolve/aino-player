@@ -9,7 +9,9 @@
 
 - **搜索**：按开启的音源并发搜索，结果独立于歌单和播放队列，同一首自动合并成一行；药丸切源，hover 出「＋」加队列、「↓」下载
 - **发现**：三家热搜（点词直接搜）+ 热门歌单（网易云含飙升 / 新歌 / 原创榜）
-- **正在播放**：独立队列（点播 / 移除 / 清空 / 列表循环），跨重启保留；搜索和浏览歌单不会覆盖队列
+- **正在播放**：独立队列（点播 / 移除 / 清空），跨重启保留；底栏切换顺序、随机、列表循环、单曲循环，模式自动保存；搜索和浏览歌单不会覆盖队列
+- **歌曲右键菜单**：搜索、歌单详情和队列里的歌曲均可右键，选择下一首播放、添加到播放列表、收藏或下载；下一首播放保留当前曲目，优先于随机和单曲循环
+- **睡眠定时器**：底栏选择 15 / 30 / 60 / 90 分钟后停止，或播完当前歌曲；显示倒计时，可随时取消。计时不因暂停而暂停，重新启动不恢复定时器
 - **歌单**：本地、账号与发现页歌单均打开独立详情页，含返回、曲目列表和播放全部；点击歌曲后才建立播放队列，不改在线搜索词；「同步到此」写回账号
 - **歌词**：三源歌词，居中跟随、hover 高亮、点行跳转
 - **音质**：标准 / 高 / 无损；下载可内嵌封面与歌词（ID3v2.3 / MP4 ilst）
@@ -17,7 +19,8 @@
 - **本地歌单**：「歌单 → 本地」可导入音乐文件夹、把播放队列保存为命名歌单，也能保存发现页和账号中的歌单
 - **保存其他在线歌单**：在本地页粘贴网易云或 QQ 的公开歌单长链接，保存曲目快照并可手动刷新；刷新失败保留原快照
 - **官网登录**：默认 Chrome、Edge 或 Chromium 打开独立的外部官网窗口，由官网处理扫码、密码和验证码；登录态自动回传，无需扩展或内嵌 WebView
-- **GitHub 更新**：启动时在后台检查最新正式版；「设置 → 版本更新」可手动检查、打开发布说明及下载对应平台的 exe / deb
+- **GitHub 更新**：启动时在后台检查最新正式版；「设置 → 版本更新」可手动检查、打开发布说明。Windows 优先下载安装器，校验大小和 SHA-256 后正常退出、覆盖升级并重新打开；Linux 下载 deb
+- **关于**：「设置 → 关于」包含版本、作者 sudoevolve、Apache-2.0 协议、项目地址及第三方许可；使用黑白灰的几何 A / 播放箭头图标
 - 深色模式；音量使用统一矢量图标，区分静音、低音量和高音量
 
 本地收藏和保存歌单不要求登录播放器账号，但平台可能要求登录才能读取某些在线歌单。在线歌单保存曲目元数据和歌单引用，播放仍需联网；文件夹歌单只保存本地音频路径，可以离线播放。公开链接示例：
@@ -47,13 +50,17 @@ https://y.qq.com/n/ryqq/playlist/123
 
 ## 下载与安装
 
-正式版在 [GitHub Releases](https://github.com/sudoevolve/aino-player/releases)。Windows x64 下载 `.exe` 直接运行；Linux amd64 下载 `.deb` 并使用软件安装器，或执行：
+正式版在 [GitHub Releases](https://github.com/sudoevolve/aino-player/releases)。当前已发布版本为 v0.2.0；上述安装器、图标、关于页面、右键菜单、四种播放模式和定时器属于尚未发布的开发改动。
+
+下一次发布的 Windows x64 产物同时提供 `*-setup-windows-x64.exe` 安装器和 `*-windows-x64.exe` 便携版。安装器按当前用户安装到 `%LOCALAPPDATA%\Programs\Aino Player`，不需管理员权限，提供开始菜单、可选桌面快捷方式和卸载入口。后续从设置更新会通过安装器覆盖升级；首次从便携版迁移也使用该固定目录，原便携 exe 可自行移除。Linux amd64 下载 `.deb` 并使用软件安装器，或执行：
 
 ```bash
 sudo apt install ./aino-player_0.2.0_amd64.deb
 ```
 
-Linux 包面向 Ubuntu 22.04+ / Debian 12+；Wayland 桌面需要 XWayland。更新会保留用户配置和本地资料库。Windows 替换 exe 前先关闭旧程序。启动检查更新不阻塞播放，每次启动检查一次，网络失败可在设置重试，不需要 GitHub 令牌。
+Linux 包面向 Ubuntu 22.04+ / Debian 12+；Wayland 桌面需要 XWayland。更新和卸载保留用户配置、本地资料库及下载音乐；数据清理由播放器设置单独处理。启动检查更新不阻塞播放，每次启动检查一次，网络失败可在设置重试，不需要 GitHub 令牌。旧版更新器会在浏览器中下载安装包，新版才支持应用内下载并启动安装器。
+
+Windows exe 内含精简 FFmpeg，体积主要来自音频解码器和静态运行库；这是独立运行和支持 AAC/M4A 的代价。安装器采用 LZMA2 压缩，减少下载大小，不增加常驻更新进程或运行时依赖。
 
 ## 构建
 
@@ -85,6 +92,14 @@ ctest --test-dir build -C Release --output-on-failure
 ```
 
 Windows 需要 Windows SDK 或 mingw-w64 头文件。产物为 `build/aino_player.exe`（MSVC 为 `build/Release/aino_player.exe`），Linux 为 `build/aino_player`。Windows 静态链接 C/C++ 运行库；Linux 使用系统 libcurl、X11 和动态加载的字体/音频库。
+
+Windows 安装器使用构建时的 Inno Setup 6，不作为播放器运行依赖：
+
+```powershell
+python tools/build_installer.py --exe build/Release/aino_player.exe --output build/installer
+```
+
+脚本优先使用本机 ISCC；缺失时下载固定的官方编译器并校验 SHA-256，准备到 `build/tools/inno`。安装器版本来自 CMake，资源及压缩安装器由发布工作流一并打包。图标源文件为 `assets/aino.svg`；正常构建直接使用已生成资源，只有重生成时才需 Pillow 并运行 `python tools/build_icon.py`。
 
 精简 FFmpeg 只需首次构建，之后直接构建播放器。再次运行解码器脚本会复用相同源码版本、编译选项和工具链的配置，执行 GNU make 增量检查；产物不变时保留时间戳，不触发应用重新嵌入。已有构建目录如已开启测试，可用 `-DBUILD_TESTING=OFF` 关闭，或用 `cmake --build build --config Release --target aino_player --parallel 2` 只编译程序。
 

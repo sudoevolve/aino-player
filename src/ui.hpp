@@ -186,6 +186,45 @@ struct Ctx {
     ViewModel& model;
 };
 
+struct SongMenuState {
+    bool active = false;
+    music::Track track;
+    Rect anchor;
+    Vec2 position;
+};
+static SongMenuState song_menu;
+static void capture_song_menu(Ctx& c, const music::Track& track, const Rect& row, const Rect& viewport) {
+    const auto& in = c.ui.input();
+    const auto visible = row.intersect(viewport);
+    if (!song_menu.active && in.pressed[1] && visible.contains(in.mouse.x, in.mouse.y) && !track.variants.empty()) {
+        // 菜单不依赖虚拟列表的行索引；滚动、搜索刷新后仍操作右键时的歌曲。
+        song_menu = {true, track, visible, in.mouse};
+    }
+}
+static void draw_song_menu(Ctx& c) {
+    if (!song_menu.active) return;
+    const std::vector<std::string> items{"下一首播放", "添加到播放列表",
+        c.model.library.contains(song_menu.track) ? "取消收藏" : "收藏歌曲", "下载歌曲"};
+    int chosen = -1;
+    const bool picked = c.ui.context_menu(song_menu.anchor, items, &chosen, Style().font(12));
+    // 与原生菜单使用相同的边界，关闭后释放快照；不在按下菜单项时提前关闭。
+    float width = 120;
+    for (const auto& item : items) width = std::max(width, c.ui.text_width(item, 12, 500) + 36);
+    const float height = 24 * float(items.size()) + 8;
+    const Rect menu{std::clamp(song_menu.position.x, 4.0f, std::max(4.0f, c.W - width - 4)),
+                    std::clamp(song_menu.position.y, 4.0f, std::max(4.0f, c.H - height - 4)), width, height};
+    const auto& in = c.ui.input();
+    if (picked) {
+        const auto track = song_menu.track;
+        if (chosen == 0) queue_play_next(track);
+        else if (chosen == 1) toast(queue_push(track) ? "已添加到播放列表：" + track.title : "播放列表中已有这首歌曲");
+        else if (chosen == 2) favorite_toggle(track);
+        else if (chosen == 3) start_download(track, c.model.ui.settings);
+    }
+    if (picked || in.key_pressed[KEY_ESC] || ((in.pressed[0] || in.pressed[1]) && !menu.contains(in.mouse.x, in.mouse.y)))
+        song_menu.active = false;
+}
+
 // 没有封面图时的兜底：按歌名哈希生成的渐变 + 首字（纯程序化，零请求）
 static void procedural_cover(Ctx& c, const std::string& seed, const Rect& box, float radius) {
     const uint32_t h = fnv1a(seed);
@@ -786,20 +825,14 @@ static void tab_queue(Ctx& c) {
     c.ui.heading("正在播放", {mx, 20, mw, 30});
 
     std::string info = std::to_string(n) + " 首";
-    if (c.s.playing >= 0) info += " · 正在播第 " + std::to_string(c.s.playing + 1) + " 首";
+    for (int i = 0; i < n; ++i) if (track_uid(c.s.tracks[size_t(i)]) == c.s.now_uid) {
+        info += " · 当前第 " + std::to_string(i + 1) + " 首"; break;
+    }
     Style is;
     is.font_size = 11.0f;
     c.ui.draw_text(info, {mx, 54, 260, 18}, c.th.label3, is);
 
-    bool loop = c.model.ui.loop_list;
-    Style loop_s;
-    loop_s.font_size = 11.0f;
-    loop_s.valign = VAlign::Middle;
-    c.ui.draw_text("列表循环", {mx + mw - 220, 50, 70, 20}, c.th.label2, loop_s);
-    if (c.ui.toggle(&loop, {mx + mw - 144, 49, 38, 21})) {
-        c.model.ui.loop_list = loop;
-        c.model.ui.config_dirty = true;
-    }
+    c.ui.muted_text(play_mode_name(c.model.ui.play_mode), {mx + mw - 186, 53, 84, 20}, Style().font(11));
     if (c.ui.button("清空", {mx + mw - 92, 48, 92, 28}, Style().font(11.5f))) {
         if (n > 0) queue_clear();
     }
@@ -813,7 +846,10 @@ static void tab_queue(Ctx& c) {
     const Rect list{mx, top, mw, c.H - kBarHeight - top - 10};
     if (list.h < 50) return;
     c.ui.scroll(list, n, 56.0f,
-                [&](int i, const Rect& row) { queue_row(c, c.s.tracks[size_t(i)], i, row, c.s.playing == i); });
+                [&](int i, const Rect& row) {
+                    capture_song_menu(c, c.s.tracks[size_t(i)], row, list);
+                    queue_row(c, c.s.tracks[size_t(i)], i, row, track_uid(c.s.tracks[size_t(i)]) == c.s.now_uid);
+                });
 }
 
 static void local_playlist_row(Ctx& c, int index, const Rect& box) {
@@ -866,6 +902,7 @@ static void playlist_detail(Ctx& c) {
     if (list.h < kRowHeight) return;
     c.ui.scroll(list, int(playlist.tracks.size()), kRowHeight, [&](int i, const Rect& row) {
         const auto& track = playlist.tracks[size_t(i)];
+        capture_song_menu(c, track, row, list);
         result_row(c, track, i, row, track_uid(track) == c.s.now_uid, true);
     });
 }
@@ -1033,6 +1070,7 @@ static void tab_search(Ctx& c) {
 
     const int count = int(c.s.results.size());
     c.ui.scroll(list, count, kRowHeight, [&](int i, const Rect& row) {
+        capture_song_menu(c, c.s.results[size_t(i)], row, list);
         result_row(c, c.s.results[size_t(i)], i, row, track_uid(c.s.results[size_t(i)]) == c.s.now_uid);
     });
 }
@@ -1405,6 +1443,19 @@ static void player_bar(Ctx& c) {
     const Rect play{cx - 17.0f, ctrl_cy - 17.0f, 34.0f, 34.0f};
     const Rect next{cx + 26.0f, ctrl_cy - 14.0f, 28.0f, 28.0f};
 
+    int mode = -1;
+    if (c.ui.menu(play_mode_name(c.model.ui.play_mode), {"顺序播放", "随机播放", "列表循环", "单曲循环"},
+                  &mode, {cx - 164, ctrl_cy - 14, 98, 28}, Style().font(10.5f))) set_play_mode(PlayMode(mode));
+    int timer = -1;
+    const auto seconds = c.model.ui.sleep_remaining_seconds;
+    const auto timer_label = c.model.ui.sleep_after_track ? std::string("本首结束") : seconds ?
+        std::to_string(seconds / 60) + ":" + (seconds % 60 < 10 ? "0" : "") + std::to_string(seconds % 60) : "定时停止";
+    if (c.ui.menu(timer_label, {"15 分钟后停止", "30 分钟后停止", "60 分钟后停止", "90 分钟后停止", "播完当前歌曲", "取消定时"},
+                  &timer, {cx + 70, ctrl_cy - 14, 98, 28}, Style().font(10.5f))) {
+        constexpr int minutes[] = {15, 30, 60, 90, 0, 0};
+        if (timer >= 0 && timer < 6) set_sleep_timer(minutes[timer], timer == 4);
+    }
+
     if (c.ui.icon_button("", prev, Style().ghost())) play_step(-1);
     c.ui.system_icon(SystemIcon::Prev, prev.center(13, 13), c.th.label);
     if (c.ui.icon_button("", next, Style().ghost())) play_step(1);
@@ -1763,6 +1814,7 @@ static void compose(aino::Ui& ui, Ctx& c) {
         lyrics_panel(c, {c.W - kLyricsWidth, 0, kLyricsWidth, c.bar_y});
     }
     player_bar(c);
+    draw_song_menu(c);
     draw_toast(c);
     clear_data_dialog(c);
 }
