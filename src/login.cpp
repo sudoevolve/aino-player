@@ -48,6 +48,10 @@ State states[kSiteCount];
 std::array<std::atomic<bool>, kSiteCount> cancelled{};
 std::array<std::thread, kSiteCount> workers;
 std::mutex worker_mutex;
+// 仅输出阶段和错误说明，不输出 Cookie；用于隔离浏览器回归的故障诊断。
+void trace(const std::string& text) {
+    if (platform::env("AINO_LOGIN_TRACE") == "1") { std::fprintf(stderr, "login: %s\n", text.c_str()); std::fflush(stderr); }
+}
 std::string token() {
     std::random_device rd;
     std::string value;
@@ -56,6 +60,7 @@ std::string token() {
     return value;
 }
 void note(Site site, const std::string& text) {
+    trace(text);
     auto& s = state(site);
     std::lock_guard<std::mutex> lock(s.m); s.note = text;
 }
@@ -251,6 +256,7 @@ struct BrowserProcess {
 #endif
     }
     void stop() {
+        trace("stopping owned browser processes");
         // Browser.close 异步关闭；先等本次启动的进程退出，再兜底终止。
         for (int i = 0; i < 20 && running(); ++i) platform::sleep_ms(50);
 #ifdef _WIN32
@@ -281,6 +287,7 @@ struct BrowserProcess {
         }
         if (handle) { CloseHandle(handle); handle = nullptr; }
 #endif
+        trace("owned browser processes stopped");
     }
     ~BrowserProcess() { stop(); }
 };
@@ -420,7 +427,11 @@ public:
         return false;
     }
     bool healthy() const { return healthy_; }
-    void close_browser() { send_frame(1, "{\"id\":999999,\"method\":\"Browser.close\",\"params\":{}}"); }
+    void close_browser() {
+        trace("requesting Browser.close");
+        send_frame(1, "{\"id\":999999,\"method\":\"Browser.close\",\"params\":{}}");
+        trace("Browser.close sent");
+    }
 };
 bool browser_credentials(Site site, const js::Value& result, std::string& cookie, std::string& uid) {
     if (!result["cookies"].is_array()) return false;
@@ -453,6 +464,7 @@ void run_browser(Site site, BrowserOptions options) {
     struct ProfileCleanup {
         std::string path;
         ~ProfileCleanup() {
+            trace("removing owned browser profile");
             auto directory = platform::fs::u8path(path);
 #ifdef _WIN32
             // Chromium 的组件文件名可能使完整路径超过 MAX_PATH。
@@ -465,7 +477,7 @@ void run_browser(Site site, BrowserOptions options) {
             for (int i = 0; i < 40; ++i) {
                 std::error_code error;
                 platform::fs::remove_all(directory, error);
-                if (!error) return;
+                if (!error) { trace("owned browser profile removed"); return; }
                 platform::sleep_ms(100);
             }
         }
@@ -494,6 +506,7 @@ void run_browser(Site site, BrowserOptions options) {
     struct CloseBrowser { BrowserConnection& connection; ~CloseBrowser() { connection.close_browser(); } } close{connection};
     const auto endpoint = "ws://127.0.0.1:" + std::to_string(port) + websocket_path;
     if (options.on_ready) options.on_ready(endpoint);
+    trace("official browser connection ready");
     const auto deadline = platform::ticks() + 300000;
     std::string session;
     int retries = 0;
@@ -518,6 +531,7 @@ void run_browser(Site site, BrowserOptions options) {
         retries = 0;
         std::string cookie, uid;
         if (browser_credentials(site, result, cookie, uid)) {
+            trace("official credentials received");
             std::lock_guard<std::mutex> lock(s.m);
             if (cancel.load()) return;
             s.cookie = std::move(cookie); s.uid = std::move(uid); s.note = "官网登录成功，已返回播放器";

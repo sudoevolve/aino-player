@@ -81,9 +81,11 @@ class Probe:
         self.temporary = self.directory / "temp"
         self.temporary.mkdir()
         env = dict(os.environ, APPDATA=directory, XDG_CONFIG_HOME=directory,
-                   TEMP=str(self.temporary), TMP=str(self.temporary), TMPDIR=str(self.temporary))
+                   TEMP=str(self.temporary), TMP=str(self.temporary), TMPDIR=str(self.temporary), AINO_LOGIN_TRACE="1")
+        self.log_path = self.directory / "browser.log"
+        self.log = self.log_path.open("w", encoding="utf-8")
         self.process = subprocess.Popen([binary, "--browser-probe", site, browser],
-                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
                                         text=True, encoding="utf-8", env=env)
         self.lines = queue.Queue()
         def reader():
@@ -95,7 +97,10 @@ class Probe:
         self.cdp = None
 
     def line(self):
-        result = self.lines.get(timeout=25)
+        try:
+            result = self.lines.get(timeout=25)
+        except queue.Empty:
+            raise AssertionError("browser probe timed out:\n" + self.log_path.read_text(encoding="utf-8", errors="replace")[-8000:]) from None
         assert result is not None, f"probe exited unexpectedly: {self.process.poll()}"
         return result
 
@@ -141,6 +146,7 @@ class Probe:
             self.cdp.close()
         self.process.stdin.close()
         self.process.stdout.close()
+        self.log.close()
 
 
 def run(binary, browser):
