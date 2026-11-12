@@ -1,9 +1,13 @@
-## 未发布：内置精简音频解码器
+## 未发布：精简音频解码器、分 P 与 Linux 修复
 
 - Windows / Linux 构建默认嵌入精简 FFmpeg，无需另装系统 FFmpeg 即可播放 AAC/M4A、ALAC、Ogg/Opus、WebM；Windows 解码器约 2.97 MiB。
 - 保留 miniaudio 播放链路；原文件不改写，正常退出删除释放的解码器，缓存清理可移除已退出进程的残留。
 - 设置显示内置解码器信息，增加 `--codec-info` 和 `--ffmpeg-license`；支持 `AINO_FFMPEG` 替换。
 - 发布前自动验证在无系统 FFmpeg 环境下解码，并附带 FFmpeg 源码、构建信息与许可。
+- B 站结果增加独立的分 P 列表，逐 P 播放、收藏、入队、下载；可保存全部分 P 快照。使用所选 cid 取流，避免所有 P 都播放第一 P。
+- Linux 字体 face 跨字号共享，限制字形位图缓存；封面下载/解码最多并发两个，退出丢弃积压请求，失败封面也参与容量回收。
+- X11/XWayland 读取并监听桌面 DPI，统一窗口、文字与输入缩放；支持 AINO_SCALE 覆盖和 --diagnostics。本地尚无 Linux 实机验证，不宣称具体内存降幅或原生 Wayland 支持。
+- 普通构建默认不编译测试程序；测试和发布工作流仍显式开启回归。精简 FFmpeg 配置复用，避免重复 configure 和无变化产物触发播放器重编译。
 
 以下为已有版本说明；已有 v0.1.0 安装包未更新。
 

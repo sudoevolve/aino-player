@@ -38,7 +38,7 @@ https://y.qq.com/n/ryqq/playlist/123
 「音源」与搜索页可开启酷我、B 站、YouTube；旧配置的开关保持不变，新音源默认关闭。搜索结果、收藏、命名快照和队列可保存这些来源的曲目 ID，临时播放 URL 不持久化。
 
 - 酷我：优先使用 HTTPS `convert_url3` JSON 取流，回退旧的纯文本接口；不把请求的 320k 当成真实音质，受限曲目仍可能只有试听。
-- B 站：WBI 签名搜索公开的视频，补全第一 P 的 cid 后选择 DASH 音频轨；带站点 Referer 下载。普通视频音轨可以播放，付费、地区或登录限制仍按平台返回错误。低码率音轨不再误判为试听。
+- B 站：WBI 签名搜索公开的视频；结果行的「分 P」打开独立列表，可逐 P 播放、加入队列、收藏、下载，也可保存整份分 P 快照并刷新。取流使用所选 cid，不同 P 的状态独立；普通结果直接点播仍使用默认 P。下载带站点 Referer，付费、地区或登录限制仍按平台返回错误。
 - YouTube Music：**实验性适配**，解析 Music 搜索的歌曲列表与双行卡片，优先从官网读取客户端配置；取流只接受明文音轨地址。需要签名或平台验证时，可使用用户已安装、位于 PATH 的 `yt-dlp` 兜底，工具运行有超时，不自动安装，不要求浏览器扩展，也不读取日常浏览器 Cookie。网络、地区、反机器人验证及 PO Token 要求仍可能阻止播放；不承诺所有 YouTube 音乐可播。
 
 本机已实测 B 站搜索、音轨下载和完整解码，酷我搜索与取流正常但样本为试听；YouTube Music 在当前出口仅返回账号/播客，没有可播歌曲，因此未完成 YouTube 的真实播放验证。离线回归覆盖搜索结构、音轨选择、签名拒绝和无权限状态。新音源仅提供搜索与取流，在线歌单链接导入仍支持网易云和 QQ。
@@ -75,11 +75,29 @@ python3 tools/build_ffmpeg.py
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 
-# 回归检查；Linux 可加装 xvfb 运行窗口冒烟测试
+# 需要回归时显式开启；普通构建默认只编译播放器
+cmake -S . -B build -DBUILD_TESTING=ON
+cmake --build build --config Release --parallel 2
+# Linux 可加装 xvfb 运行窗口、DPI 与字体缓存检查
 ctest --test-dir build -C Release --output-on-failure
 ```
 
 Windows 需要 Windows SDK 或 mingw-w64 头文件。产物为 `build/aino_player.exe`（MSVC 为 `build/Release/aino_player.exe`），Linux 为 `build/aino_player`。Windows 静态链接 C/C++ 运行库；Linux 使用系统 libcurl、X11 和动态加载的字体/音频库。
+
+精简 FFmpeg 只需首次构建，之后直接构建播放器。再次运行解码器脚本会复用相同源码版本、编译选项和工具链的配置，执行 GNU make 增量检查；产物不变时保留时间戳，不触发应用重新嵌入。已有构建目录如已开启测试，可用 `-DBUILD_TESTING=OFF` 关闭，或用 `cmake --build build --config Release --target aino_player --parallel 2` 只编译程序。
+
+## Linux 缩放与内存诊断
+
+Linux 仍使用 X11/XWayland 后端，自动读取 XSETTINGS 的 DPI/窗口倍率及 Xft.dpi；运行中响应桌面设置变化。窗口、字体、尺寸约束和鼠标坐标统一缩放。优先级为 `AINO_SCALE`、`GDK_SCALE`、桌面设置、默认 1；前两项接受 0.5～4 的倍率。未使用 GDK_DPI_SCALE 放大整个窗口，以免把单独的字体设置重复应用。
+
+```bash
+# 桌面没有正确传递 X11 DPI 时，可手动覆盖（支持 1.25/1.5 等）
+AINO_SCALE=1.5 aino_player
+# 离线绘制一帧，输出倍率、物理/逻辑尺寸、字体缓存及进程 RSS 后退出
+aino_player --diagnostics
+```
+
+本轮将 FreeType face 改为按字体文件和索引共享，字形位图缓存限制为 4 MiB / 16384 项；封面最多两个后台下载/解码任务、32 个待处理请求，完成与失败条目均参与缓存回收。Linux 的 RSS、共享文件页和 Windows 的工作集统计不可直接等同；目前没有本机 Linux 实测，不能保证从反馈的 150 MB 降到 17 MB。XWayland 的混合 DPI、多显示器与合成器二次缩放仍需实机检查，本轮不宣称原生 Wayland 支持。
 
 MP3、FLAC、WAV 由 miniaudio 直接解码。**AAC/M4A、Ogg/Opus、WebM 使用内置精简 FFmpeg**：后台解码成缓存目录中的 PCM WAV，再交给 miniaudio 播放。Windows 精简解码器约 2.97 MiB；不包含网络、视频解码或额外外部库，不依赖 Windows Media Foundation。播放器仍先缓存、后解码，不做边下边播。
 
