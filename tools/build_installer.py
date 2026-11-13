@@ -54,7 +54,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("Windows installer compilation requires Windows")
-    version = re.search(r"project\(aino_player VERSION ([0-9]+\.[0-9]+\.[0-9]+)", (ROOT / "CMakeLists.txt").read_text()).group(1)
+    version = re.search(r"project\(aino_player VERSION ([0-9]+\.[0-9]+\.[0-9]+)", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")).group(1)
     if not args.exe.is_file():
         parser.error("Build the player before packaging")
     args.output.mkdir(parents=True, exist_ok=True)
