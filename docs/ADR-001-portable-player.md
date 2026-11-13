@@ -343,3 +343,7 @@ FFmpeg 精简构建新增 HTTP/TCP，继续不含 TLS、GPL/nonfree、外部库�
 Windows 定向 controller_test.py 复核通过。同步修正另两处旧场景前提：全音源关闭的 UI 搜索应被拒绝，离线调度改直接测试调度入口；缺失本地文件使用仅含该曲的明确队列，避免新自动跳过规则转而播放前组残留曲目。未删除断言或修改产品行为。README 精简为下载、功能、安装及必要提示，新增当前 UI 的浅色/深色示例曲目画面（离线绘制，不冒充真实账号），长构建与发布说明移入 BUILDING.md。
 
 发布检查 43378280471：Linux 8/8 回归通过，deb 正确生成，但 Ubuntu 22.04 自带 AppStream 不支持 vcs-browser URL 类型。移除重复的 VCS 链接，项目 homepage 仍指向仓库，不忽略元数据警告；保留未发布 v0.2.5 标签，正式版本顺延 v0.2.6。
+
+最终 v0.2.6 发布完成：Actions 43378694688 的 Windows 6/6、Linux 8/8 回归通过；Linux AppStream 校验、v0.2.3 → v0.2.6 apt --no-remove 覆盖升级、安装后 Xvfb 启动均通过。该工作流的 Windows 安装器步骤因 Python 默认 cp1252 读取含中文 CMake 注释失败，自动 publish 因此跳过。工具已在 master 显式使用 UTF-8 修正；未移动版本标签。为避免再重复两端构建，使用已通过 Linux 任务的原始附件及同一应用源码的本机 MSVC Release 构建完成 Windows 打包；本机构建内置 helper 的工具链与 runner 不同，最终 helper 另以 player_regressions / embedded_audio_decode 2/2 验证，版本、内置标识及 LGPL 通知均校验。Windows 构建信息随实际附件发布。
+
+GitHub Release v0.2.6 已设为 latest；Windows 安装器 3,798,969 字节、便携 EXE 6,457,856 字节、deb 2,405,090 字节。发布后通过 API 核对正文（归一化换行）、八个附件的大小及 GitHub SHA-256 digest，全部与本地发布文件一致。源代码与构建记录保留明确边界，未运行真实 YouTube/账号探测，未修改 IME。
