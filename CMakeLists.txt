@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(aino_player VERSION 0.2.6 LANGUAGES CXX)
+project(aino_player VERSION 0.2.6 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -89,9 +89,26 @@ else()
   target_link_libraries(player_login PUBLIC CURL::libcurl)
 endif()
 
+# ---- 落雪音源脚本运行时：嵌入 QuickJS（只用来跑音源 .js，不做别的）
+set(CMAKE_C_STANDARD 11)
+add_library(quickjs STATIC
+  vendor/quickjs/quickjs.c
+  vendor/quickjs/libregexp.c
+  vendor/quickjs/libunicode.c
+  vendor/quickjs/dtoa.c
+)
+target_include_directories(quickjs PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/vendor/quickjs)
+target_compile_definitions(quickjs PRIVATE _CRT_SECURE_NO_WARNINGS)
+if(WIN32)
+  target_link_libraries(quickjs PUBLIC winhttp)
+endif()
+if(MSVC)
+  target_compile_options(quickjs PRIVATE /W0)
+endif()
+
 add_executable(aino_player WIN32 src/main.cpp src/cover_decode.cpp)
 aino_attach_codec(aino_player)
-target_link_libraries(aino_player PRIVATE player_audio player_login player_desktop)
+target_link_libraries(aino_player PRIVATE player_audio player_login player_desktop quickjs)
 if(WIN32)
   enable_language(RC)
   configure_file(packaging/windows.rc.in generated/aino_player.rc @ONLY)
@@ -110,14 +127,26 @@ endif()
 
 foreach(target player_audio player_login player_desktop aino_player)
   target_compile_definitions(${target} PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN AINO_PLAYER_VERSION="${PROJECT_VERSION}")
+  # sources.hpp → lxsource.hpp → quickjs.h
+  target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vendor/quickjs)
   if(MSVC)
     target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
   endif()
 endforeach()
 
-option(BUILD_TESTING "Build the player regression executables" OFF)
-include(CTest)
-if(BUILD_TESTING)
+# 测试程序也会 include 到 business.hpp / sources.hpp 这条链（→ quickjs.h），
+# 所以必须给它们同样的头文件路径，并链接 quickjs（否则链接期 Engine 符号缺失）。
+function(aino_link_quickjs target)
+  target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vendor/quickjs)
+  target_link_libraries(${target} PRIVATE quickjs)
+endfunction()
+
+# 测试程序默认不构建。这里**故意不用 BUILD_TESTING**：CTest 模块和 VS/CMake Tools
+# 都会把 BUILD_TESTING 缓存写成 ON，导致"明明关掉了还在编测试"。
+# 用独立开关，日常构建永远不会带上 tests。
+option(AINO_BUILD_TESTS "Build the player regression executables (slow)" OFF)
+if(AINO_BUILD_TESTS)
+  enable_testing()
   add_executable(interaction_tests tests/interaction_tests.cpp)
   target_compile_definitions(interaction_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
   if(MSVC)
@@ -132,6 +161,7 @@ if(BUILD_TESTING)
   add_test(NAME ui_capture_lifecycle COMMAND interaction_tests)
   add_executable(player_tests tests/player_tests.cpp)
   aino_attach_codec(player_tests)
+  aino_link_quickjs(player_tests)
   target_link_libraries(player_tests PRIVATE player_audio player_login)
   if(MSVC)
     target_compile_options(player_tests PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
@@ -155,6 +185,7 @@ if(BUILD_TESTING)
     endif()
     add_executable(controller_tests tests/controller_tests.cpp src/cover_decode.cpp)
     aino_attach_codec(controller_tests)
+    aino_link_quickjs(controller_tests)
     target_link_libraries(controller_tests PRIVATE player_audio player_login player_desktop)
     if(WIN32)
       target_link_libraries(controller_tests PRIVATE windowscodecs advapi32 bcrypt)

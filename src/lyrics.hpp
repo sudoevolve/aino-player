@@ -365,7 +365,6 @@ inline Doc fetch(const music::Track& t, const music::Settings& st, int timeout_m
         switch (v.source) {
             case music::Source::Netease: d = fetch_netease_lyric(v.id, st, timeout_ms); break;
             case music::Source::QQ: d = fetch_qq_lyric(v.id, st.qq_cookie, timeout_ms); break;
-            case music::Source::Kuwo: d = fetch_kuwo_lyric(v.id, timeout_ms); break;
             default: continue;
         }
         if (!d.lines.empty()) return d;

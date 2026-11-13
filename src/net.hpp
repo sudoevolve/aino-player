@@ -147,6 +147,7 @@ struct Request {
     int timeout_ms = 8000;
     bool follow_redirects = true;
     size_t max_body = 8u * 1024 * 1024;
+    std::string method;              // 空值保留原来的 GET / 非空 body POST 推断。
 };
 
 namespace detail {
@@ -346,8 +347,8 @@ inline Response execute(const Request& req) {
         return out;
     }
     HINTERNET conn = nullptr;
-    const wchar_t* verb = req.body.empty() ? L"GET" : L"POST";
-    HINTERNET hreq = detail::send(s.h, req, verb, &conn, req.body.empty() ? nullptr : req.body.data(),
+    const auto verb = widen(req.method.empty() ? (req.body.empty() ? "GET" : "POST") : req.method);
+    HINTERNET hreq = detail::send(s.h, req, verb.c_str(), &conn, req.body.empty() ? nullptr : req.body.data(),
                                   DWORD(req.body.size()), out.error);
     if (!hreq) return out;
 
@@ -408,6 +409,7 @@ inline Response post(const std::string& url, const std::string& body,
     Request r;
     r.url = url;
     r.body = body;
+    r.method = "POST";
     r.headers = headers;
     r.timeout_ms = timeout_ms;
     return execute(r);
@@ -483,7 +485,7 @@ inline AudioProbe probe_audio(const std::string& url, const std::vector<std::str
                             out.content_type.find("mpeg") != std::string::npos ||
                             out.content_type.find("mp4") != std::string::npos ||
                             out.content_type.find("webm") != std::string::npos;
-    out.playable = (out.status == 200 || out.status == 206) && audio_type && looks_audio;
+    out.playable = (out.status == 200 || out.status == 206) && looks_audio;
     if (!out.playable) {
         if (out.status == 404) out.reason = "已下架 / 无版权";
         else if (out.status == 403) out.reason = "直链被拒（可能需要登录）";

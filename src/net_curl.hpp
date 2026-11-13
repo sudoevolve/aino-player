@@ -35,6 +35,7 @@ struct Request {
     int timeout_ms = 8000;
     bool follow_redirects = true;
     size_t max_body = 8u * 1024 * 1024;
+    std::string method;
 };
 namespace detail {
 struct Transfer {
@@ -68,6 +69,12 @@ struct Transfer {
             curl_easy_setopt(handle, CURLOPT_POSTFIELDS, req.body.data());
             curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE_LARGE, curl_off_t(req.body.size()));
         }
+        if (req.method == "POST" && req.body.empty()) {
+            curl_easy_setopt(handle, CURLOPT_POSTFIELDS, "");
+            curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE_LARGE, curl_off_t(0));
+        }
+        // POST 由 POSTFIELDS 设置，保留 libcurl 对 302/303 的正常方法切换。
+        if (!req.method.empty() && req.method != "POST") curl_easy_setopt(handle, CURLOPT_CUSTOMREQUEST, req.method.c_str());
         // 部分 libcurl 头文件把 setopt 定义为宏，不能把含逗号声明的 lambda 直接作为宏参数。
         const auto header_callback = +[](char* p, size_t a, size_t b, void* data) -> size_t {
             const size_t n = a * b;
@@ -123,7 +130,9 @@ inline Response get(const std::string& url, const std::vector<std::string>& head
 }
 inline Response post(const std::string& url, const std::string& body,
                      const std::vector<std::string>& headers = {}, int timeout_ms = 8000) {
-    return execute({url, body, headers, timeout_ms, true});
+    Request request{url, body, headers, timeout_ms, true};
+    request.method = "POST";
+    return execute(request);
 }
 struct AudioProbe {
     bool playable = false;
@@ -152,10 +161,8 @@ inline AudioProbe probe_audio(const std::string& url, const std::vector<std::str
     out.status = response.status; out.content_type = response.content_type; out.final_url = response.final_url;
     const auto slash = transfer.content_range.find('/');
     if (slash != std::string::npos) { try { out.total_bytes = std::stoll(transfer.content_range.substr(slash + 1)); } catch (...) {} }
-    const bool audio_type = out.content_type.find("audio") != std::string::npos || out.content_type.find("octet-stream") != std::string::npos ||
-        out.content_type.find("mpeg") != std::string::npos || out.content_type.find("mp4") != std::string::npos || out.content_type.find("webm") != std::string::npos;
     out.playable = (rc == CURLE_OK || rc == CURLE_WRITE_ERROR) && audio_prefix(first.data(), first.size()) &&
-        (out.status == 200 || out.status == 206) && audio_type;
+        (out.status == 200 || out.status == 206);
     if (!out.playable) out.reason = "取流失败 HTTP " + std::to_string(out.status);
     return out;
 }

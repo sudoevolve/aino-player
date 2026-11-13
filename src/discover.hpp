@@ -132,40 +132,10 @@ inline Heats heats_qq(int timeout_ms) {
     return h;
 }
 
-// 酷我这里是纯文本：第一行 "TEXT=第一个词"，之后每行一个词
-inline Heats heats_kuwo(int timeout_ms) {
-    Heats h;
-    const net::Response r =
-        net::get("http://hotword.kuwo.cn/hotword.s?prod=kwplayer_ar_5.1.0.0&corp=kuwo&province=bj&rank=hot&httpStatus=1",
-                 headers_of(music::Source::Kuwo, false), timeout_ms);
-    if (!r.ok()) {
-        h.err = "热搜接口失败（HTTP " + std::to_string(r.status) + "）";
-        return h;
-    }
-    size_t pos = 0;
-    const std::string& body = r.body;
-    while (pos < body.size()) {
-        size_t end = body.find('\n', pos);
-        if (end == std::string::npos) end = body.size();
-        std::string line = body.substr(pos, end - pos);
-        pos = end + 1;
-        if (line.rfind("TEXT=", 0) == 0) line = line.substr(5);
-        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
-        if (line.empty()) continue;
-        Word w;
-        w.text = music::text::decode_entities(line);
-        h.words.push_back(std::move(w));
-        if (h.words.size() >= 30) break;
-    }
-    if (h.words.empty()) h.err = "热搜是空的";
-    return h;
-}
-
 inline Heats heats(music::Source s, int timeout_ms = 8000) {
     switch (s) {
-        case music::Source::Netease: return heats_netease(timeout_ms);
         case music::Source::QQ: return heats_qq(timeout_ms);
-        default: return heats_kuwo(timeout_ms);
+        default: return heats_netease(timeout_ms);
     }
 }
 
@@ -265,11 +235,8 @@ inline std::vector<Card> playlists_qq(int limit, std::string& err, int timeout_m
 
 inline std::vector<Card> playlists(music::Source s, int limit, std::string& err, int timeout_ms = 10000) {
     switch (s) {
-        case music::Source::Netease: return playlists_netease(limit, err, timeout_ms);
         case music::Source::QQ: return playlists_qq(limit, err, timeout_ms);
-        default:
-            err = "酷我没有公开的歌单广场接口（web 端要 kw_token + csrf，匿名一律拒绝）";
-            return {};
+        default: return playlists_netease(limit, err, timeout_ms);
     }
 }
 

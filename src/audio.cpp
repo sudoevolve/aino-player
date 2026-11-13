@@ -404,8 +404,21 @@ struct Stream::Impl {
         args.insert(args.end(), {"-vn", "-acodec", "pcm_s16le", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"});
         if (!process.start(args)) { error = "无法启动流式解码器"; return false; }
         monitor = std::thread([this] {
+            auto last_progress = std::chrono::steady_clock::now();
+            uint64_t previous_written = 0;
             while (!decoded.load() && !stop.load()) {
                 if (stopped()) { stop.store(true); process.terminate(); cv.notify_all(); return; }
+                const auto produced = written.load();
+                const auto read = consumed.load();
+                const auto now = std::chrono::steady_clock::now();
+                // 只检测缺少 PCM 时的停滞；暂停造成的正常背压不会触发。
+                if (produced != previous_written || !waiting.load() || produced >= read + prebuffer)
+                    last_progress = now;
+                previous_written = produced;
+                if (waiting.load() && now - last_progress >= std::chrono::seconds(15)) {
+                    fail("音频缓冲超过 15 秒没有进展");
+                    input_abort.store(true); process.terminate(); cv.notify_all(); return;
+                }
                 platform::sleep_ms(20);
             }
         });

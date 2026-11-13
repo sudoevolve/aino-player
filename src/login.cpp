@@ -662,8 +662,7 @@ void run_manual(Site site, bool launch_browser) {
             if (!profile.ok() || profile.uid.empty()) error = "网易云登录态验证失败，请重新登录或导入完整 Cookie";
             else uid = profile.uid;
         } else {
-            music::Settings settings; settings.youtube_cookie = cookie;
-            music::youtube_profile(settings, uid, error);
+            error = "不再支持该平台";
         }
         if (!error.empty()) { note(site, error); respond(client.socket, 401, error); continue; }
         if (cancelled[idx].load()) break;
@@ -682,7 +681,9 @@ void run_manual(Site site, bool launch_browser) {
 Stream youtube_stream(const std::string& video_id, const std::string& cookie,
                       const std::function<bool()>& is_cancelled, const BrowserOptions& options) {
     Stream output;
-    if (!music::providers::valid_youtube_id(video_id)) { output.error = "无效的 YouTube 视频 ID"; return output; }
+    output.error = "YouTube 支持已移除";
+    return output;
+    if (false) { }
     const auto executable = options.executable.empty() ? default_browser() : options.executable;
     if (!chromium_browser(executable)) { output.error = "YouTube 签名解析需要系统 Chrome、Edge 或 Chromium"; return output; }
 #ifdef _WIN32

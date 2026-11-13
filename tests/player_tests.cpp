@@ -41,11 +41,7 @@ int main(int argc, char** argv) {
         }
         if (argc > 3 && std::string(argv[1]) == "--source-response") {
             net::Response response;
-            if (std::string(argv[2]) == "youtube") {
-                const auto config = music::providers::youtube_config(2000);
-                response = net::post("https://music.youtube.com/youtubei/v1/search?prettyPrint=false&key=" + net::url_encode(config.key),
-                    "{\"context\":" + music::providers::youtube_context(config) + ",\"query\":\"Hello Adele\"}", music::providers::youtube_headers(config), 6000);
-            } else {
+            {
                 std::string error;
                 const auto session = music::providers::bili_session(3000, error);
                 check(!session.key.empty(), error.c_str());
@@ -62,8 +58,7 @@ int main(int argc, char** argv) {
             std::string error;
             const std::string source = argv[2];
             music::Settings settings;
-            const auto tracks = source == "bilibili" ? music::search_bilibili("Hello Adele", 3, 12000, error) :
-                source == "kuwo" ? music::search_kuwo("Hello Adele", 3, 12000, error) : music::search_youtube("Hello Adele", 3, 9000, error);
+            const auto tracks = music::search_bilibili("Hello Adele", 3, 12000, error);
             std::cout << "source=" << source << " count=" << tracks.size() << " error=" << error << std::endl;
             if (tracks.empty()) return 2;
             auto stream = music::resolve(tracks.front(), settings);
@@ -91,8 +86,11 @@ int main(int argc, char** argv) {
         check(net::audio_prefix("\0\0\0\x20" "ftypisom", 12) && net::audio_prefix("fLaC", 4) &&
             net::audio_prefix("RIFF1234WAVE", 12) && net::audio_prefix("OggS", 4) &&
             net::audio_prefix("\x1a\x45\xdf\xa3", 4) && !net::audio_prefix("<html>login", 11), "audio container signatures reject login pages");
-        static_assert(int(music::Source::Netease) == 0 && int(music::Source::QQ) == 1 && int(music::Source::Kuwo) == 2);
-        static_assert(int(music::Source::Local) >= music::kSourceCount);
+        static_assert(int(music::Source::Netease) == 0 && int(music::Source::QQ) == 1 &&
+            int(music::Source::Bilibili) == 4 && int(music::Source::Local) == 5,
+            "source ids keep their historical values so old playlists do not switch platforms");
+        static_assert(int(music::Source::Local) < music::kSourceCount, "Local must stay a valid array index");
+        static_assert(music::kPlatformCount == 3, "only NetEase / QQ / Bilibili are searchable online platforms");
         check(Md5Hex("") == "d41d8cd98f00b204e9800998ecf8427e" && Md5Hex("abc") == "900150983cd24fb0d6963f7d28e17f72", "MD5 protocol vectors");
         const auto signed_query = wbi_query({{"foo", "a!b(c)*'"}, {"bar", "空 格"}}, "key", 123);
         check(signed_query.rfind("bar=%E7%A9%BA%20%E6%A0%BC&foo=abc&wts=123&w_rid=", 0) == 0, "WBI sorting encoding and character filtering");
@@ -122,9 +120,6 @@ int main(int argc, char** argv) {
             qq_catalog_song.duration_ms == 90000, "QQ catalog keeps mids and duration units");
         check(music::valid_catalog_id("UC_artist-123") && !music::valid_catalog_id("../../artist") &&
             !music::numeric_catalog_id("12&offset=0"), "catalog IDs cannot inject paths or query parameters");
-        check(js::parse(R"({"musicResponsiveListItemRenderer":{"playlistItemData":{"videoId":"abcdefghijk"},"flexColumns":[{"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Song"}]}}},{"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Singer","navigationEndpoint":{"browseEndpoint":{"browseId":"UC_artist"}}},{"text":"Album","navigationEndpoint":{"browseEndpoint":{"browseId":"MPRE_album"}}}]}}}]}})", fixture), "YouTube catalog links fixture");
-        const auto linked_youtube = music::providers::parse_youtube_search(fixture, 10);
-        check(linked_youtube.size() == 1 && linked_youtube[0].artists[0].id == "UC_artist" && linked_youtube[0].album_id == "MPRE_album", "YouTube renderer links identify artist and album separately");
         check(js::parse(R"({"data":{"result":[{"bvid":"BV1fixture01","title":"<em>Hello</em> &amp; world","author":"Artist","pic":"//cdn.test/a.jpg","duration":"1:02:03"}]}})", fixture), "Bilibili fixture JSON");
         auto videos = parse_bilibili_search(fixture, 2);
         check(videos.size() == 1 && videos[0].title == "Hello & world" && videos[0].duration_ms == 3723000 &&
@@ -150,17 +145,6 @@ int main(int argc, char** argv) {
         check(music::same_variant(qq_a, qq_b), "other sources retain existing identity semantics");
         auto default_part = parts.tracks[0].current(); default_part.native_id.clear();
         check(!music::same_variant(default_part, parts.tracks[1].current()), "legacy default video does not match another part");
-        check(js::parse(R"({"contents":[{"musicResponsiveListItemRenderer":{"playlistItemData":{"videoId":"abcdefghijk"},"flexColumns":[{"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Music title"}]}}},{"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Artist"},{"text":" • "},{"text":"3:24"}]}}}],"thumbnail":{"musicThumbnailRenderer":{"thumbnail":{"thumbnails":[{"url":"https://cdn.test/music.jpg"}]}}}}},{"musicTwoRowItemRenderer":{"title":{"runs":[{"text":"Other title"}]},"navigationEndpoint":{"watchEndpoint":{"videoId":"0123456789_"}}}},{"videoRenderer":{"videoId":"abcdefghijk","title":{"simpleText":"duplicate"}}}]})", fixture), "YouTube Music fixture");
-        auto music_results = parse_youtube_search(fixture, 10);
-        check(music_results.size() == 2 && music_results[0].artist == "Artist" && music_results[0].duration_ms == 204000 &&
-            music_results[0].cover_url == "https://cdn.test/music.jpg", "Music renderer parsing and deduplication");
-        check(parse_youtube_search(fixture, 1).size() == 1, "YouTube search limit");
-        check(js::parse(R"({"playabilityStatus":{"status":"OK"},"streamingData":{"adaptiveFormats":[{"mimeType":"video/mp4","url":"https://cdn.test/video","bitrate":900000},{"mimeType":"audio/webm","url":"https://cdn.test/webm","bitrate":160000},{"mimeType":"audio/mp4","url":"https://cdn.test/m4a","bitrate":128000},{"mimeType":"audio/mp4","signatureCipher":"url=untrusted&s=signature","bitrate":256000}]}})", fixture), "YouTube audio fixture");
-        check(parse_youtube_audio(fixture, {}, 1).url == "https://cdn.test/m4a", "prefer direct audio MP4 and never mistake cipher or video for audio");
-        check(js::parse(R"({"playabilityStatus":{"status":"LOGIN_REQUIRED","reason":"Sign in"}})", fixture) &&
-            !parse_youtube_audio(fixture, {}, 1).ok, "YouTube login errors stay explicit");
-        const auto page = youtube_page_config(R"(<script>ytcfg.set({"INNERTUBE_CLIENT_VERSION":"new","nested":{"quoted":"}\\\"{"}});</script>)");
-        check(page["INNERTUBE_CLIENT_VERSION"].str() == "new", "homepage config handles nested objects and escaped strings");
         }
         if (argc > 1 && std::string(argv[1]) == "--login-probe") {
             const auto site = argc > 2 && std::string(argv[2]) == "qq" ? login::Site::QQ : login::Site::NetEase;
@@ -403,6 +387,61 @@ int main(int argc, char** argv) {
             const auto truncated = write_metadata("broken.mp3",id3.substr(0,14));
             check(tag::read_metadata(truncated).title.empty(), "truncated metadata is ignored safely");
             for (const auto& path : {id3_path,ogg_path,truncated}) platform::remove(path);
+        }
+        {
+            // 离线脚本夹具；仅发版时执行，不访问真实音源或用户配置目录。
+            const auto scripts = platform::join(dir, "script-fixtures");
+            check(platform::make_dirs(scripts), "script fixture directory");
+            const auto preferences = platform::join(scripts, "removed.json");
+            const auto bad = platform::join(scripts, "01-bad.js");
+            const auto good = platform::join(scripts, "02-good.js");
+            const auto code = [](const char* suffix) {
+                return std::string("const lx = globalThis.lx; lx.send('inited', {sources:{wy:{actions:['musicUrl'],qualitys:['128k']}}});") +
+                    "lx.on('request', () => Promise.resolve('https://example.invalid/" + suffix + "'));";
+            };
+            for (const auto& entry : {std::make_pair(bad, code("bad")), std::make_pair(good, code("good"))}) {
+                auto* file = platform::fopen(entry.first, "wb"); check(file != nullptr, "script fixture file");
+                const bool written = std::fwrite(entry.second.data(), 1, entry.second.size(), file) == entry.second.size();
+                const bool closed = std::fclose(file) == 0;
+                check(written && closed, "script fixture contents");
+            }
+            {
+                lx::Engine engine(preferences);
+                check(engine.load_dir(scripts) == 2, "load isolated script fixtures");
+                std::string url, error;
+                int candidates = 0;
+                check(engine.resolve("wy", "320k", "{}", url, error, nullptr,
+                    [&](const auto& candidate, const auto&, const auto& quality, auto& reason) {
+                        ++candidates;
+                        check(quality == "128k", "script advertised quality fallback");
+                        if (candidate.find("/bad") != std::string::npos) { reason = "fixture rejects media"; return false; }
+                        return true;
+                    }) && candidates == 2 && url == "https://example.invalid/good", "rejected media advances to next script");
+                check(engine.remove_source(bad, error) && platform::exists(bad), "app removal preserves source file");
+                check(engine.entries().size() == 1 && engine.load_dir(scripts) == 1, "reload does not restore removed script");
+                lx::Engine restarted(preferences);
+                check(restarted.load_dir(scripts) == 1, "removed script survives application restart");
+                check(engine.load_files(scripts, {"01-bad.js"}) == 1 && engine.entries().size() == 2, "explicit import restores only selected script");
+                lx::Script script;
+                check(script.load(good, code("good"), error) && script.init(error), "standalone script fixture");
+                {
+                    net::CancelScope cancelled([] { return true; });
+                    check(!script.music_url("wy", "128k", "{}", url, error), "cancelled script request returns promptly");
+                }
+                check(script.music_url("wy", "128k", "{}", url, error), "cancelled request does not poison later calls");
+                std::atomic<bool> concurrent_ok{true};
+                auto request = [&] {
+                    std::string result, why;
+                    for (int i = 0; i < 20; ++i)
+                        if (!script.music_url("wy", "128k", "{}", result, why)) concurrent_ok.store(false);
+                };
+                std::thread first(request), second(request); first.join(); second.join();
+                check(concurrent_ok.load(), "concurrent consumers serialize the QuickJS runtime");
+                script.retire();
+                check(!script.music_url("wy", "128k", "{}", url, error), "removed script rejects new requests");
+            }
+            for (const auto& path : {bad, good, preferences}) platform::remove(path);
+            platform::remove(scripts);
         }
         const auto missing = platform::join(dir, "missing.wav");
         check(!audio::inspect_mp3(missing).valid, "missing audio rejected");

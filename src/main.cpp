@@ -16,6 +16,7 @@
 int main(int argc, char** argv) {
     if (const int code = aino::system_icon_worker_entry(argc, argv); code >= 0) return code;
     using namespace player;
+    std::setvbuf(stdout, nullptr, _IONBF, 0);  // 崩溃时也能看到进度
     if (argc > 1 && std::string(argv[1]) == "--version") {
         std::printf("aino player %s\n", kVersion); return 0;
     }
@@ -24,6 +25,79 @@ int main(int argc, char** argv) {
     }
     if (argc > 1 && std::string(argv[1]) == "--ffmpeg-license") {
         std::printf("%s\n", audio::decoder_license().c_str()); return 0;
+    }
+    if (argc > 1 && std::string(argv[1]) == "--search-test") {
+        // 检索链路自检：provider + 内置源各报一行
+        prov::Host::instance().load_dir(prov::default_dir());
+        const std::string kw = argc > 2 ? argv[2] : "周杰伦";
+        music::Settings st;
+        for (music::Source src : music::kPlatforms) st.enable[int(src)] = true;
+        const auto r = music::run_search(kw, st, 5, 12000);
+        std::printf("search \"%s\" -> %zu tracks in %d ms\n", kw.c_str(), r.tracks.size(), r.elapsed_ms);
+        for (const auto& rep : r.reports) {
+            if (!st.enable[int(rep.source)]) continue;
+            std::printf("  %-6s ok=%d n=%d %dms %s\n", music::source_name(rep.source), int(rep.ok), rep.count,
+                        rep.ms, rep.err.c_str());
+        }
+        for (size_t i = 0; i < r.tracks.size() && i < 5; ++i)
+            std::printf("  · %-30s %-16s [%s]\n", r.tracks[i].title.c_str(), r.tracks[i].artist.c_str(),
+                        music::source_name(r.tracks[i].current().source));
+        return r.tracks.empty() ? 1 : 0;
+    }
+    if (argc > 1 && std::string(argv[1]) == "--prov-test") {
+        // 渠道自检：列 provider / 音源 → 用一首歌分别试两条取流渠道
+        const std::string pdir = argc > 2 ? argv[2] : prov::default_dir();
+        const int pn = prov::Host::instance().load_dir(pdir);
+        std::printf("provider dir: %s\nloaded %d: ", pdir.c_str(), pn);
+        for (const auto& k : prov::Host::instance().keys()) std::printf("%s ", k.c_str());
+        std::printf("\n");
+        for (const auto& f : prov::Host::instance().failures())
+            std::printf("  fail %s: %s\n", f.first.c_str(), f.second.c_str());
+        std::printf("lx sources: %d\n", lx::Engine::instance().load_dir(lx::default_dir()));
+
+        if (argc <= 3) return pn > 0 ? 0 : 1;
+        // 参数：--prov-test <providers目录> <网易云歌曲ID>
+        music::Variant v;
+        v.source = music::Source::Netease;
+        v.id = argv[3];
+        v.title = "test";
+        v.artist = "test";
+        v.duration_ms = 240000;
+        music::Settings st;
+        st.quality = 1;
+
+        for (music::Lane lane : {music::Lane::JsSource, music::Lane::Builtin}) {
+            music::ResolveResult rr;
+            std::string why;
+            const bool ok = lane == music::Lane::JsSource ? music::resolve_via_source(v, st.quality, rr, &why)
+                                                          : music::resolve_via_builtin(v, st, rr, &why);
+            if (ok) std::printf("[%-12s] ok  %-22s %s\n", music::lane_full_name(lane), rr.detail.c_str(), rr.url.c_str());
+            else std::printf("[%-12s] 失败 %s\n", music::lane_full_name(lane), why.c_str());
+        }
+        return 0;
+    }
+    if (argc > 1 && std::string(argv[1]) == "--lx-test") {
+        // 不依赖窗口的自检：加载音源 → 走 aino 自己的 music::resolve()
+        const std::string dir = argc > 2 ? argv[2] : lx::default_dir();
+        const int loaded = lx::Engine::instance().load_dir(dir);
+        std::printf("lx dir: %s\nloaded %d source(s)\n", dir.c_str(), loaded);
+        for (const auto& name : lx::Engine::instance().names()) std::printf("  ok  %s\n", name.c_str());
+        for (const auto& f : lx::Engine::instance().failures())
+            std::printf("  fail %s: %s\n", f.first.c_str(), f.second.c_str());
+        if (argc <= 3) return loaded > 0 ? 0 : 1;
+        music::Variant v;
+        v.source = music::Source::Netease;
+        v.id = argv[3];
+        v.title = "test";
+        v.artist = "test";
+        v.duration_ms = 215000;
+        music::Settings st;
+        st.quality = 1;
+        std::printf("resolve wy/%s ...\n", v.id.c_str());
+        const auto rr = music::resolve(v, st);
+        std::printf("ok=%d reason=%s detail=%s\nurl=%s\n", int(rr.ok), rr.reason.c_str(),
+                    rr.detail.c_str(), rr.url.c_str());
+        return rr.ok ? 0 : 1;
     }
 #ifdef _WIN32
     // UI 线程先建立 STA，避免首帧 WIC 图标解码或音频初始化先选定 MTA，影响 TSF。
@@ -41,6 +115,13 @@ int main(int argc, char** argv) {
     // 后台任务调用 wake() 前，必须先初始化 Xlib 的线程支持。
     if (!XInitThreads()) { std::fprintf(stderr, "Xlib thread initialization failed\n"); return 1; }
 #endif
+    // provider（搜索脚本）放后台加载：纯本地解析、不联网，不影响首帧。
+    // 音源脚本【启动时绝不自动加载】——加载什么时候发生由用户按按钮决定
+    //（在线获取 / 导入音源 / 重新加载），不然按钮就没有存在的意义。
+    std::thread([] {
+        prov::Host::instance().load_dir(prov::default_dir());
+    }).detach();
+
     auto& startup_ui = view_model().ui;
     bool initial_search = argc > 1;
     bool smoke_test = argc > 1 && std::string(argv[1]) == "--smoke-test";

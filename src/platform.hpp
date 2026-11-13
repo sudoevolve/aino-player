@@ -504,7 +504,11 @@ inline void CALLBACK cancel_folder_picker(HWND window, UINT, UINT_PTR, DWORD) {
 #ifndef _WIN32
 std::string choose_desktop_file(bool folder, const std::atomic<bool>& cancelled, std::string& error);
 #endif
-inline std::string choose_music_folder(void* owner, const std::atomic<bool>& cancelled, std::string& error, bool folder = true) {
+// kind：0 普通（音乐文件夹 / lrc 歌词），2 音源脚本 .js
+// multi 非空时开启多选，所有选中的路径都填进去（selected 仍返回第一个，兼容旧调用）。
+inline std::string choose_music_folder(void* owner, const std::atomic<bool>& cancelled, std::string& error,
+                                       bool folder = true, int kind = 0,
+                                       std::vector<std::string>* multi = nullptr) {
     error.clear();
 #ifdef _WIN32
     const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -514,11 +518,19 @@ inline std::string choose_music_folder(void* owner, const std::atomic<bool>& can
     if (FAILED(result)) { CoUninitialize(); error = "无法创建文件夹选择器"; return {}; }
     DWORD options = 0;
     result = dialog->GetOptions(&options);
-    if (SUCCEEDED(result)) result = dialog->SetOptions(options | (folder ? FOS_PICKFOLDERS : FOS_FILEMUSTEXIST) | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR);
-    if (SUCCEEDED(result)) result = dialog->SetTitle(folder ? L"选择音乐文件夹" : L"选择本地歌词");
+    if (SUCCEEDED(result)) result = dialog->SetOptions(options | (folder ? FOS_PICKFOLDERS : FOS_FILEMUSTEXIST)
+        | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR
+        | (multi && !folder ? FOS_ALLOWMULTISELECT : 0));
+    if (SUCCEEDED(result)) result = dialog->SetTitle(folder ? L"选择音乐文件夹"
+                                                    : (kind == 2 ? L"选择音源脚本（.js）" : L"选择本地歌词"));
     if (!folder && SUCCEEDED(result)) {
-        const COMDLG_FILTERSPEC filters[]{{L"LRC 歌词", L"*.lrc"}, {L"所有文件", L"*.*"}};
-        result = dialog->SetFileTypes(2, filters);
+        if (kind == 2) {
+            const COMDLG_FILTERSPEC filters[]{{L"音源脚本 (*.js)", L"*.js"}, {L"所有文件", L"*.*"}};
+            result = dialog->SetFileTypes(2, filters);
+        } else {
+            const COMDLG_FILTERSPEC filters[]{{L"LRC 歌词", L"*.lrc"}, {L"所有文件", L"*.*"}};
+            result = dialog->SetFileTypes(2, filters);
+        }
     }
     const auto timer_window = CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
     FolderPickerCancel state{dialog, &cancelled};
@@ -528,13 +540,36 @@ inline std::string choose_music_folder(void* owner, const std::atomic<bool>& can
     std::string selected;
     if (SUCCEEDED(result) && !cancelled.load()) result = dialog->Show(static_cast<HWND>(owner));
     if (SUCCEEDED(result) && !cancelled.load()) {
-        IShellItem* item = nullptr;
-        result = dialog->GetResult(&item);
-        if (SUCCEEDED(result)) {
-            PWSTR path = nullptr;
-            result = item->GetDisplayName(SIGDN_FILESYSPATH, &path);
-            if (SUCCEEDED(result)) { selected = narrow(path); CoTaskMemFree(path); }
-            item->Release();
+        if (multi && !folder) {
+            IShellItemArray* items = nullptr;
+            result = dialog->GetResults(&items);
+            if (SUCCEEDED(result)) {
+                DWORD count = 0;
+                if (SUCCEEDED(items->GetCount(&count))) {
+                    for (DWORD i = 0; i < count; ++i) {
+                        IShellItem* item = nullptr;
+                        if (FAILED(items->GetItemAt(i, &item))) continue;
+                        PWSTR path = nullptr;
+                        if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+                            const std::string p = narrow(path);
+                            CoTaskMemFree(path);
+                            multi->push_back(p);
+                            if (selected.empty()) selected = p;
+                        }
+                        item->Release();
+                    }
+                }
+                items->Release();
+            }
+        } else {
+            IShellItem* item = nullptr;
+            result = dialog->GetResult(&item);
+            if (SUCCEEDED(result)) {
+                PWSTR path = nullptr;
+                result = item->GetDisplayName(SIGDN_FILESYSPATH, &path);
+                if (SUCCEEDED(result)) { selected = narrow(path); CoTaskMemFree(path); }
+                item->Release();
+            }
         }
     }
     if (timer) KillTimer(timer_window, timer);
@@ -547,6 +582,21 @@ inline std::string choose_music_folder(void* owner, const std::atomic<bool>& can
     (void)owner;
     return choose_desktop_file(folder, cancelled, error);
 #endif
+}
+// 音源脚本选择器（.js）
+inline std::string choose_js_file(void* owner, const std::atomic<bool>& cancelled, std::string& error) {
+    return choose_music_folder(owner, cancelled, error, /*folder=*/false, /*kind=*/2);
+}
+// 音源脚本选择器（.js，一次可选多个）
+inline std::vector<std::string> choose_js_files(void* owner, const std::atomic<bool>& cancelled, std::string& error) {
+    std::vector<std::string> out;
+#ifdef _WIN32
+    choose_music_folder(owner, cancelled, error, /*folder=*/false, /*kind=*/2, &out);
+#else
+    const auto single = choose_js_file(owner, cancelled, error);
+    if (!single.empty()) out.push_back(single);
+#endif
+    return out;
 }
 inline bool open_browser(const std::string& url) {
 #ifdef _WIN32

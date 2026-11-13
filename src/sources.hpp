@@ -23,6 +23,8 @@
 #include <vector>
 
 #include "json.hpp"
+#include "lxsource.hpp"
+#include "provider.hpp"
 #include "net.hpp"
 #include "platform.hpp"
 #include "login.h"
@@ -36,15 +38,42 @@ namespace music {
 
 // ---------------------------------------------------------------- 数据结构
 
-enum class Source { Netease = 0, QQ = 1, Kuwo = 2, YouTube = 3, Bilibili = 4, Local = 5 };
-constexpr int kSourceCount = 5;
+// 注意：这个枚举的数值会写进资料库（library.hpp 存的是 int），只能往后追加，
+// 不能插队改值，否则老用户的歌单会串源。
+// 只保留三个在线平台 + 本地库。
+//
+// 数值故意留空洞（Bilibili 仍是 4、Local 仍是 5）：资料库把 source 存成 int，
+// 重排数值会让老歌单串源。2/3/6 是已删除的酷我 / YouTube / 酷狗，不再使用。
+enum class Source { Netease = 0, QQ = 1, Bilibili = 4, Local = 5 };
+constexpr int kSourceCount = 6;  // 数组下标上限（Local = 5）
+
+// 在线平台，顺序即 UI 顺序。搜索 / 音源页 / 开关都只认这一张表。
+inline constexpr Source kPlatforms[] = {Source::Netease, Source::QQ, Source::Bilibili};
+constexpr int kPlatformCount = 3;
+
+inline bool is_platform(Source s) {
+    for (Source p : kPlatforms) if (p == s) return true;
+    return false;
+}
+
+// 渠道（Lane）—— 和平台（Source）正交的一维。
+//
+// 同一个"网易云"，可能有两条完全不同的取流路径：
+//   JsSource：第三方音源脚本（落雪/六音这类），免登录、能到无损，但随时可能失效
+//   Builtin ：自带接口（providers/*.js + C++ 兜底），可登录、音质上限由账号决定
+//
+// 检索/榜单只有 Builtin 能提供 —— 音源脚本的契约只有 musicUrl/pic/lyric，
+// 它不负责"从哪找歌"。这个区分以前被藏起来了，是 UI 混乱的根源。
+enum class Lane { JsSource = 0, Builtin = 1 };
+constexpr int kLaneCount = 2;
+
+inline const char* lane_name(Lane l) { return l == Lane::JsSource ? "音源" : "自带"; }
+inline const char* lane_full_name(Lane l) { return l == Lane::JsSource ? "第三方音源" : "自带接口"; }
 
 inline const char* source_name(Source s) {
     switch (s) {
         case Source::Netease: return "网易云";
         case Source::QQ: return "QQ";
-        case Source::Kuwo: return "酷我";
-        case Source::YouTube: return "YouTube";
         case Source::Bilibili: return "B 站";
         case Source::Local: return "本地";
         default: return "未知";
@@ -55,8 +84,6 @@ inline const char* source_key(Source s) {
     switch (s) {
         case Source::Netease: return "netease";
         case Source::QQ: return "qq";
-        case Source::Kuwo: return "kuwo";
-        case Source::YouTube: return "youtube";
         case Source::Bilibili: return "bilibili";
         case Source::Local: return "local";
         default: return "unknown";
@@ -73,6 +100,7 @@ struct CatalogTarget {
 
 struct Variant {  // 某一首歌在某个源上的一条结果
     Source source = Source::Netease;
+    Lane lane = Lane::Builtin;  // 这条结果由哪条渠道产出（检索永远是 Builtin）
     std::string id;
     std::string title;
     std::string artist;
@@ -114,6 +142,7 @@ struct Track {  // 合并后的"同一首歌"
 
 struct SourceReport {
     Source source = Source::Netease;
+    Lane lane = Lane::Builtin;  // 检索渠道：目前恒为 Builtin（音源脚本不提供检索）
     bool ok = false;
     bool pending = false, has_more = false;
     int count = 0;
@@ -132,21 +161,27 @@ struct SearchResult {
 struct Settings {
     std::string netease_cookie;  // MUSIC_U=...；留空则只用免费档
     std::string qq_cookie;       // qm_keyst=...
-    std::string youtube_cookie;
-    std::string youtube_authuser = "0";
-    std::string youtube_delegated_session;
-    std::string youtube_visitor;
     std::function<bool()> cancelled; // 当前播放/下载任务的取消信号，不持久化。
-    bool enable[kSourceCount] = {true, true, true, false, false};
+    bool enable[kSourceCount] = {true, true, /*2 已删*/ false, /*3 已删*/ false, /*B站*/ false, /*Local*/ false};
     // 音质：0 = 标准 128k，1 = 高 320k，2 = 无损
     // 能到哪一档由源决定：网易云要 Cookie（无损还要会员），QQ 要登录，
     // 酷我的直链跟资源走、没有档位参数（填了也忽略）。
     int quality = 1;
+    // 渠道：取流时先问谁。0 = 第三方音源优先（默认，免登录且能到无损），1 = 自带接口优先。
+    // 两条渠道可以单独关掉：关了音源就只剩自带，反之亦然。
+    int lane_pref = 0;
+    bool lane_enable[kLaneCount] = {true, true};
     // 下载时把封面 / 歌词写进文件（mp3 走 ID3v2.3，m4a 走 ilst）
     bool embed_cover = false;
     bool embed_lyrics = false;
 
     bool with_netease_cookie() const { return !netease_cookie.empty(); }
+    bool lane_on(Lane l) const { return lane_enable[int(l)]; }
+    // 按偏好排出的尝试顺序
+    std::array<Lane, kLaneCount> lane_order() const {
+        return lane_pref == 0 ? std::array<Lane, kLaneCount>{Lane::JsSource, Lane::Builtin}
+                              : std::array<Lane, kLaneCount>{Lane::Builtin, Lane::JsSource};
+    }
 };
 
 inline const char* quality_name(int q) {
@@ -167,14 +202,23 @@ inline const char* quality_short(int q) {
 
 struct ResolveResult {
     bool ok = false;
+    Lane lane = Lane::Builtin;         // 成功时：链接由哪条渠道给出
+    std::string engine;                // 具体是谁给的：音源脚本名 / provider 文件名 / "内置"
     std::string url;
     std::vector<std::string> headers;  // 下载/探测时要带的头
     std::string reason;                // 结构化原因（失败时）
-    std::string detail;                // 人话补充
+    std::string detail;                // 人话补充（渠道 · 实现 · 音质 · 容器）
 };
+// 消费端确认候选能实际使用后才结束取流；拒绝时将原因交给下一候选。
+using ResolveAccept = std::function<bool(const ResolveResult&, std::string&)>;
+inline bool accept_resolved(const ResolveResult& candidate, const ResolveAccept& accept, std::string& error) {
+    if (net::cancelled()) { error = "取流已取消"; return false; }
+    try { return !accept || accept(candidate, error); }
+    catch (const std::exception& exception) { error = exception.what(); return false; }
+    catch (...) { error = "准备候选音频失败"; return false; }
+}
 
 inline std::vector<Variant> search_bilibili(const std::string&, int, int, std::string&, int = 0);
-inline std::vector<Variant> search_youtube(const std::string&, int, int, std::string&, const Settings& = {}, const std::string& = {}, std::string* = nullptr);
 
 // ---------------------------------------------------------------- 小工具
 
@@ -415,10 +459,6 @@ inline void attach_catalog_metadata(Variant& v, const js::Value& song) {
             if (!name.empty()) v.artists.push_back({a["mid"].str(), name});
         }
         v.album_id = song["album"]["mid"].str(song["albummid"].str());
-    } else if (v.source == Source::Kuwo) {
-        const auto id = catalog_id(song["ARTISTID"].is_null() ? song["artistid"] : song["ARTISTID"]);
-        if (!v.artist.empty()) v.artists.push_back({id, v.artist});
-        v.album_id = catalog_id(song["ALBUMID"].is_null() ? song["albumid"] : song["ALBUMID"]);
     }
 }
 inline std::vector<ArtistRef> track_artists(const Track& track) {
@@ -568,80 +608,6 @@ inline ResolveResult resolve_netease(const Variant& v, const Settings& st) {
         (v.needs_login ? "请先登录并确认账号播放权限" : "免费外链不可用");
     if (!account_error.empty() && !p.reason.empty()) rr.reason += "；免费外链：" + p.reason;
     rr.detail = p.reason;
-    return rr;
-}
-
-// ---------------------------------------------------------------- 适配器：酷我
-
-inline std::vector<Variant> search_kuwo(const std::string& keyword, int limit, int timeout_ms,
-                                        std::string& err, int page = 0) {
-    std::vector<Variant> out;
-    const std::string url =
-        "https://search.kuwo.cn/r.s?all=" + net::url_encode(keyword) +
-        "&ft=music&itemset=web_2013&client=kt&pn=" + std::to_string(std::max(0, page)) + "&rn=" + std::to_string(limit) +
-        "&rformat=json&encoding=utf8&vipver=1&show_copyright_off=1&newver=1";
-    const net::Response r =
-        net::get(url, {"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout_ms);
-    if (!r.ok()) {
-        err = r.error.empty() ? ("HTTP " + std::to_string(r.status)) : r.error;
-        return out;
-    }
-    js::Value root;
-    if (!js::parse(r.body, root, /*lenient=*/true)) {
-        err = "响应解析失败（酷我返回单引号 JSON）";
-        return out;
-    }
-    const js::Value& list = root["abslist"];
-    if (!list.is_array()) {
-        err = "接口未返回 abslist";
-        return out;
-    }
-    for (size_t i = 0; i < list.size(); ++i) {
-        const js::Value& s = list[i];
-        Variant v;
-        v.source = Source::Kuwo;
-        std::string rid = s["MUSICRID"].str();
-        if (rid.rfind("MUSIC_", 0) == 0) rid = rid.substr(6);
-        v.id = rid;
-        v.title = text::decode_entities(s["SONGNAME"].str(s["NAME"].str()));
-        v.artist = text::decode_entities(s["ARTIST"].str());
-        v.album = text::decode_entities(s["ALBUM"].str());
-        v.duration_ms = int(s["DURATION"].integer()) * 1000;
-        attach_catalog_metadata(v, s);
-        // MINFO 里的档位表：取最大 mp3 码率当标称
-        const std::string minfo = s["MINFO"].str();
-        int best = 0;
-        size_t pos = 0;
-        while ((pos = minfo.find("bitrate:", pos)) != std::string::npos) {
-            pos += 8;
-            int br = 0;
-            while (pos < minfo.size() && minfo[pos] >= '0' && minfo[pos] <= '9') br = br * 10 + (minfo[pos++] - '0');
-            const size_t comma = minfo.find(',', pos);
-            const std::string fmt = minfo.substr(pos, comma == std::string::npos ? 8 : comma - pos);
-            if (fmt.find("mp3") != std::string::npos && br > best) best = br;
-        }
-        v.bitrate = best * 1000;
-        if (v.id.empty() || v.title.empty() || v.id == "0") continue;
-        out.push_back(std::move(v));
-    }
-    return out;
-}
-
-inline ResolveResult resolve_kuwo(const Variant& v) {
-    ResolveResult rr;
-    rr.headers = {"User-Agent: Mozilla/5.0", "Referer: https://www.kuwo.cn/"};
-    const auto response = net::get("https://antiserver.kuwo.cn/anti.s?type=convert_url3&format=mp3&br=320kmp3&rid=MUSIC_" +
-        net::url_encode(v.id), rr.headers, 5000);
-    js::Value root;
-    if (response.ok() && js::parse(response.body, root)) rr.url = root["url"].str();
-    if (rr.url.rfind("https://", 0) != 0 && rr.url.rfind("http://", 0) != 0) {
-        const auto fallback = net::get("https://antiserver.kuwo.cn/anti.s?type=convert_url&format=mp3&response=url&rid=MUSIC_" +
-            net::url_encode(v.id), rr.headers, 5000);
-        rr.url = text::trim(fallback.body);
-    }
-    rr.ok = rr.url.rfind("https://", 0) == 0 || rr.url.rfind("http://", 0) == 0;
-    rr.reason = rr.ok ? "ok" : "酷我未返回可用直链";
-    rr.detail = rr.ok ? "实际音质以音频为准，受限曲目可能仅试听" : "平台版权、网络或取流限制";
     return rr;
 }
 
@@ -864,10 +830,16 @@ inline ResolveResult resolve_qq(const Variant& v, const Settings& st) {
     rr.reason = "ok";
     if (!used.empty() && used.size() > 4) {
         const std::string ext = used.substr(used.size() - 5);
-        std::string q = "128k";
+        const std::string container = ext == ".flac" ? "flac" : (ext == ".mflac" ? "mflac" : (ext == ".m4a" ? "AAC/m4a" : "mp3"));
+        // 前缀就是 QQ 的档位编码，如实翻出来。C400 是最后那条 96k AAC 兜底，
+        // 以前把它一并写成 "128k · mp3"，听起来发闷却显示得挺好，等于骗人。
+        std::string q;
         if (used.rfind("F000", 0) == 0 || used.rfind("F0M0", 0) == 0) q = "无损";
         else if (used.rfind("M800", 0) == 0) q = "320k";
-        rr.detail = q + " · " + (ext == ".flac" ? "flac" : (ext == ".mflac" ? "mflac" : "mp3"));
+        else if (used.rfind("M500", 0) == 0) q = "128k";
+        else if (used.rfind("C400", 0) == 0) q = "96k（平台最低档兜底）";
+        else q = "码率未知";
+        rr.detail = q + " · " + container;
     } else {
         rr.detail = "登录态取流";
     }
@@ -963,6 +935,12 @@ inline std::vector<Variant> interleave(std::vector<std::vector<Variant>> per_sou
 
 }  // namespace detail
 
+// 定义在下面（provider 桥接段），这里先声明给 run_search 用
+inline bool search_via_provider(Source src, const std::string& keyword, int limit, int page,
+                                std::vector<Variant>& out, std::string& err);
+inline bool board_via_provider(Source src, const std::string& board_id, int page, int limit,
+                               std::vector<Variant>& out, std::string& err);
+
 struct Job {
     std::mutex m;
     std::condition_variable cv;
@@ -980,6 +958,8 @@ inline SearchResult run_search(const std::string& keyword, const Settings& st, i
                                 const std::array<int, kSourceCount>* pages = nullptr) {
     using clock = std::chrono::steady_clock;
     const auto t_start = clock::now();
+    // provider 读不到应用设置，登录态得在这儿塞进去
+    prov::Host::instance().set_credentials(st.netease_cookie, st.qq_cookie);
     auto job = std::make_shared<Job>();
     job->per_source.resize(kSourceCount); job->reports.resize(kSourceCount); job->finished.assign(kSourceCount, 0);
     std::array<std::string, kSourceCount> next;
@@ -987,6 +967,13 @@ inline SearchResult run_search(const std::string& keyword, const Settings& st, i
     std::atomic<bool> stopped{false};
     for (int i = 0; i < kSourceCount; ++i) {
         job->reports[size_t(i)].source = Source(i);
+        // 已删除的平台（酷我/YouTube/酷狗）只在下标里留了空位，不参与检索
+        if (!is_platform(Source(i)) && Source(i) != Source::Local) {
+            job->reports[size_t(i)].pending = false;
+            job->reports[size_t(i)].err = "已移除";
+            job->finished[size_t(i)] = 1; ++job->done;
+            continue;
+        }
         job->reports[size_t(i)].pending = st.enable[i];
         job->reports[size_t(i)].err = st.enable[i] ? "检索中" : "已关闭";
         if (!st.enable[i]) continue;
@@ -997,16 +984,20 @@ inline SearchResult run_search(const std::string& keyword, const Settings& st, i
             const int source_page = pages ? (*pages)[size_t(i)] : page;
             const auto began = clock::now();
             try {
-                if (i == int(Source::Netease)) got = search_netease(keyword, limit_per_source, 8000, error, st, source_page);
+                std::string perr;
+                const bool via_provider =
+                    search_via_provider(Source(i), keyword, limit_per_source, source_page, got, perr);
+                if (!via_provider && !perr.empty()) error = perr;
+                if (via_provider) { /* provider 已经给了结果，不再打内置接口 */ }
+                else if (i == int(Source::Netease)) got = search_netease(keyword, limit_per_source, 8000, error, st, source_page);
                 else if (i == int(Source::QQ)) got = search_qq(keyword, limit_per_source, 8000, error, st, source_page);
-                else if (i == int(Source::Kuwo)) got = search_kuwo(keyword, limit_per_source, 8000, error, source_page);
                 else if (i == int(Source::Bilibili)) got = search_bilibili(keyword, limit_per_source, 8000, error, source_page);
-                else if (i == int(Source::YouTube)) got = search_youtube(keyword, limit_per_source, 8000, error, st, continuations[size_t(i)], &cursor);
+                else if (i == int(Source::Local)) { /* 本地库不参与在线检索 */ }
             } catch (...) { error = "适配器异常"; }
             std::lock_guard<std::mutex> lock(job->m);
             auto& report = job->reports[size_t(i)];
             report.pending = false; report.count = int(got.size()); report.ok = !got.empty() || error.empty(); report.err = error;
-            report.has_more = i == int(Source::YouTube) ? !cursor.empty() : int(got.size()) >= limit_per_source;
+            report.has_more = int(got.size()) >= limit_per_source;
             report.ms = int(std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - began).count());
             job->per_source[size_t(i)] = std::move(got); next[size_t(i)] = std::move(cursor);
             job->finished[size_t(i)] = 1; ++job->done; job->cv.notify_all();
@@ -1057,23 +1048,11 @@ inline SearchResult run_search(const std::string& keyword, const Settings& st, i
 
 // ---------------------------------------------------------------- 封面
 
-// 酷我：pic.web 返回的是一行纯文本 URL（不是 302），要再取一次
-inline std::string kuwo_cover_url(const std::string& rid) {
-    const std::string api = "http://artistpicserver.kuwo.cn/pic.web?corp=kuwo&type=rid_pic&pictype=500"
-                            "&size=500&rid=" + rid;
-    const net::Response r = net::get(api, {"User-Agent: Mozilla/5.0"}, 6000);
-    if (!r.ok()) return std::string();
-    const std::string body = text::trim(r.body);
-    if (body.rfind("http", 0) != 0) return std::string();
-    return body;
-}
-
 // 给合并后的曲目补封面：
 //   1. 有 QQ 变体的，pmid 直链直接用（零请求）
 //   2. 其余用网易云的 song/detail 批量查（一次请求覆盖所有网易云 id）
-//   3. 还没有的，按酷我 rid 问一次 pic.web（最贵，限流到前 20 首）
 // 全失败就保持空，界面回落到"程序化渐变封面"。
-inline void fill_covers(std::vector<Track>& tracks, const Settings& st, int kuwo_budget = 20) {
+inline void fill_covers(std::vector<Track>& tracks, const Settings& st) {
     if (st.cancelled && st.cancelled()) return;
     std::vector<std::string> netease_ids;
     for (Track& t : tracks) {
@@ -1121,19 +1100,6 @@ inline void fill_covers(std::vector<Track>& tracks, const Settings& st, int kuwo
         }
     }
 
-    for (Track& t : tracks) {
-        if (st.cancelled && st.cancelled()) return;
-        if (!t.cover_url.empty() || kuwo_budget <= 0) continue;
-        for (const auto& v : t.variants) {
-            if (v.source != Source::Kuwo) continue;
-            const std::string url = kuwo_cover_url(v.id);
-            if (!url.empty()) {
-                t.cover_url = url;
-                --kuwo_budget;
-            }
-            break;
-        }
-    }
 }
 
 // 新适配器复用 net/js/platform；不依赖参考工程的 Windows 专属网络层。
@@ -1396,423 +1362,247 @@ inline ResolveResult resolve_bilibili(const Variant& v, const Settings& st) {
     return providers::parse_bilibili_audio(streams, st.quality);
 }
 
-namespace providers {
-inline std::string runs_text(const js::Value& text) {
-    std::string out = text["simpleText"].str();
-    if (out.empty()) for (const auto& run : text["runs"].array) out += run["text"].str();
-    return out;
-}
-inline std::string video_id(const js::Value& node, int depth = 0) {
-    if (depth > 10) return {};
-    auto id = node["videoId"].str();
-    if (!id.empty()) return id;
-    for (const auto& pair : node.object) {
-        id = video_id(pair.second, depth + 1); if (!id.empty()) return id;
+// ---------------------------------------------------------------- 平台 provider（JS）
+//
+// 各平台接口的易变部分都在 providers/*.js 里；C++ 只负责调用和类型转换。
+// 拿不到 provider 时返回 false，调用方回落到内置实现（迁移期并存，不是永久的）。
+inline const char* provider_key_of(Source s) {
+    switch (s) {
+        case Source::Netease: return "netease";
+        case Source::QQ: return "qq";
+        default: return nullptr;   // B 站没有 JS provider（见 builtin::bili）
     }
-    for (const auto& item : node.array) {
-        id = video_id(item, depth + 1); if (!id.empty()) return id;
-    }
-    return {};
 }
-inline bool valid_youtube_id(const std::string& id) {
-    return id.size() == 11 && id.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") == std::string::npos;
-}
-inline void youtube_catalog_metadata(Variant& v, const js::Value& node, int depth = 0) {
-    if (depth > 24) return;
-    const auto& endpoint = node["navigationEndpoint"]["browseEndpoint"];
-    const auto id = endpoint["browseId"].str();
-    const auto name = node["text"].str();
-    if (!name.empty() && id.rfind("UC", 0) == 0 && v.artists.size() < 32) {
-        if (std::none_of(v.artists.begin(), v.artists.end(), [&](const auto& a) { return a.id == id; }))
-            v.artists.push_back({id, name});
-    } else if (!name.empty() && id.rfind("MPRE", 0) == 0) { v.album_id = id; v.album = name; }
-    for (const auto& pair : node.object) youtube_catalog_metadata(v, pair.second, depth + 1);
-    for (const auto& item : node.array) youtube_catalog_metadata(v, item, depth + 1);
-}
-inline std::vector<Variant> parse_youtube_search(const js::Value& root, int limit) {
-    std::vector<Variant> out; std::set<std::string> seen;
-    std::function<void(const js::Value&, int)> walk;
-    walk = [&](const js::Value& node, int depth) {
-        if (depth > 64 || int(out.size()) >= limit) return;
-        const auto& responsive = node["musicResponsiveListItemRenderer"];
-        const auto& two_row = node["musicTwoRowItemRenderer"];
-        const auto& video = node["videoRenderer"];
-        const js::Value* item = nullptr;
-        Variant v; v.source = Source::YouTube;
-        if (responsive.is_object()) {
-            item = &responsive;
-            const auto& columns = responsive["flexColumns"];
-            v.id = responsive["playlistItemData"]["videoId"].str();
-            v.native_id = responsive["playlistItemData"]["playlistSetVideoId"].str(responsive["playlistItemData"]["setVideoId"].str());
-            if (v.id.empty()) v.id = video_id(columns[size_t(0)]);
-            v.title = runs_text(columns[size_t(0)]["musicResponsiveListItemFlexColumnRenderer"]["text"]);
-            const auto& metadata = columns[size_t(1)]["musicResponsiveListItemFlexColumnRenderer"]["text"];
-            for (const auto& run : metadata["runs"].array) {
-                const auto text = run["text"].str();
-                if (clock_ms(text) > 0) v.duration_ms = clock_ms(text);
-                else if (v.artist.empty() && text != " • " && text != " · ") v.artist = text;
-            }
-            for (const auto& fixed : responsive["fixedColumns"].array) {
-                const auto duration = clock_ms(runs_text(fixed["musicResponsiveListItemFixedColumnRenderer"]["text"]));
-                if (duration) v.duration_ms = duration;
-            }
-        } else if (two_row.is_object()) {
-            item = &two_row; v.id = video_id(two_row["navigationEndpoint"]);
-            v.title = runs_text(two_row["title"]); v.artist = runs_text(two_row["subtitle"]);
-        } else if (video.is_object()) {
-            item = &video; v.id = video["videoId"].str(); v.title = runs_text(video["title"]);
-            v.artist = runs_text(video["ownerText"]); v.duration_ms = clock_ms(runs_text(video["lengthText"]));
-        }
-        if (item) {
-            youtube_catalog_metadata(v, (*item)["flexColumns"]);
-            youtube_catalog_metadata(v, (*item)["subtitle"]);
-            youtube_catalog_metadata(v, (*item)["ownerText"]);
-            if (!v.artists.empty()) {
-                v.artist.clear();
-                for (const auto& artist : v.artists) { if (!v.artist.empty()) v.artist += " / "; v.artist += artist.name; }
-            }
-            const auto& thumbs = (*item)["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"].is_array() ?
-                (*item)["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"] : (*item)["thumbnail"]["thumbnails"];
-            if (!thumbs.array.empty()) v.cover_url = thumbs.array.back()["url"].str();
-            if (valid_youtube_id(v.id) && !v.title.empty() && seen.insert(v.id).second) out.push_back(std::move(v));
-            return;
-        }
-        for (const auto& pair : node.object) walk(pair.second, depth + 1);
-        for (const auto& child : node.array) walk(child, depth + 1);
-    };
-    walk(root, 0); return out;
-}
-// 只接受明确直链；signatureCipher 需要解签，不能把其 URL 直接当成可播地址。
-inline ResolveResult parse_youtube_audio(const js::Value& root, const std::vector<std::string>& headers, int quality) {
-    ResolveResult rr; rr.headers = headers;
-    const auto status = root["playabilityStatus"]["status"].str();
-    if (status != "OK") { rr.reason = root["playabilityStatus"]["reason"].str("YouTube " + status); return rr; }
-    long long best = -1; bool best_mp4 = false, cipher = false;
-    for (const auto& format : root["streamingData"]["adaptiveFormats"].array) {
-        const auto mime = format["mimeType"].str();
-        if (mime.rfind("audio/", 0) != 0) continue;
-        if (!format["signatureCipher"].str().empty() || !format["cipher"].str().empty()) { cipher = true; continue; }
-        const auto url = format["url"].str();
-        if (!http_url(url)) continue;
-        const bool mp4 = mime.find("mp4") != std::string::npos;
-        const auto bitrate = format["bitrate"].integer();
-        if (best < 0 || (mp4 && !best_mp4) || (mp4 == best_mp4 && (quality == 0 ? bitrate < best : bitrate > best))) {
-            best = bitrate; best_mp4 = mp4; rr.url = url;
-        }
-    }
-    rr.ok = !rr.url.empty(); rr.reason = rr.ok ? "ok" : cipher ? "YouTube 音轨需要签名解析" : "YouTube 未提供直接音轨";
-    if (rr.ok) rr.detail = std::to_string(best / 1000) + "kbps · YouTube Music";
-    return rr;
-}
-inline js::Value youtube_page_config(const std::string& page) {
-    const auto begin = page.find("ytcfg.set({");
-    if (begin == std::string::npos) return {};
-    const auto start = page.find('{', begin);
-    bool quoted = false, escaped = false; int depth = 0;
-    for (size_t i = start; i < page.size(); ++i) {
-        const char c = page[i];
-        if (quoted) {
-            if (escaped) escaped = false; else if (c == '\\') escaped = true; else if (c == '"') quoted = false;
-        } else {
-            if (c == '"') quoted = true; else if (c == '{') ++depth; else if (c == '}' && --depth == 0) {
-                js::Value config; js::parse(page.substr(start, i - start + 1), config); return config;
-            }
-        }
-    }
-    return {};
-}
-struct YouTubeConfig {
-    // yt-dlp WEB_REMIX 后备值；有网络时优先读取官网当前 ytcfg。
-    std::string version = "1.20260707.12.00";
-    std::string key = "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w";
-    std::string visitor;
-};
-inline YouTubeConfig youtube_config(int timeout) {
-    static std::mutex mutex; static YouTubeConfig cached; static std::time_t expires = 0;
-    std::lock_guard<std::mutex> lock(mutex);
-    if (expires > std::time(nullptr)) return cached;
-    const auto response = net::get("https://music.youtube.com/", {"User-Agent: Mozilla/5.0"}, timeout);
-    const auto config = response.ok() && response.body.size() < 8 * 1024 * 1024 ? youtube_page_config(response.body) : js::Value();
-    const auto& client = config["INNERTUBE_CONTEXT"]["client"];
-    cached.version = client["clientVersion"].str(config["INNERTUBE_CLIENT_VERSION"].str(cached.version));
-    cached.key = config["INNERTUBE_API_KEY"].str(cached.key); cached.visitor = client["visitorData"].str();
-    expires = std::time(nullptr) + (config.is_object() ? 3600 : 60); return cached;
-}
-inline std::string youtube_context(const YouTubeConfig& config, const Settings& st = {}) {
-    return "{\"client\":{\"clientName\":\"WEB_REMIX\",\"clientVersion\":" + quote(config.version) +
-        ",\"hl\":\"zh-CN\",\"gl\":\"US\",\"visitorData\":" + quote(st.youtube_visitor.empty() ? config.visitor : st.youtube_visitor) + "}" +
-        (st.youtube_delegated_session.empty() ? "" : ",\"user\":{\"onBehalfOfUser\":" + quote(st.youtube_delegated_session) + "}") + "}";
-}
-inline std::string youtube_authorization(const std::string& cookie, long long timestamp) {
-    auto secret = cookie_value(cookie, "SAPISID");
-    if (secret.empty()) secret = cookie_value(cookie, "__Secure-3PAPISID");
-    if (secret.empty()) return {};
-    const auto time = std::to_string(timestamp);
-    return "SAPISIDHASH " + time + "_" + net::sha1_hex(time + " " + secret + " https://music.youtube.com");
-}
-inline std::vector<std::string> youtube_headers(const YouTubeConfig& config, const Settings& st = {}) {
-    auto headers = std::vector<std::string>{"Content-Type: application/json", "User-Agent: Mozilla/5.0",
-        "Origin: https://music.youtube.com", "Referer: https://music.youtube.com/", "X-YouTube-Client-Name: 67",
-        "X-Origin: https://music.youtube.com", "X-Goog-Api-Format-Version: 1", "X-YouTube-Client-Version: " + config.version};
-    const auto visitor = st.youtube_visitor.empty() ? config.visitor : st.youtube_visitor;
-    if (!visitor.empty()) headers.push_back("X-Goog-Visitor-Id: " + visitor);
-    if (!st.youtube_cookie.empty()) {
-        headers.push_back("Cookie: " + st.youtube_cookie);
-        const auto authorization = youtube_authorization(st.youtube_cookie, std::time(nullptr));
-        if (!authorization.empty()) headers.push_back("Authorization: " + authorization);
-        headers.push_back("X-Goog-AuthUser: " + st.youtube_authuser);
-        if (!st.youtube_delegated_session.empty()) headers.push_back("X-Goog-PageId: " + st.youtube_delegated_session);
-    }
-    return headers;
-}
-} // namespace providers
 
-inline std::vector<Variant> search_youtube(const std::string& keyword, int limit, int timeout, std::string& error, const Settings& st, const std::string& continuation, std::string* next) {
-    const auto config = providers::youtube_config(std::max(1000, timeout / 3));
-    const auto body = "{\"context\":" + providers::youtube_context(config, st) +
-        (continuation.empty() ? ",\"query\":" + providers::quote(keyword) + ",\"params\":\"EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D\"}" : ",\"continuation\":" + providers::quote(continuation) + "}");
-    const auto response = net::post("https://music.youtube.com/youtubei/v1/search?prettyPrint=false&key=" + net::url_encode(config.key),
-        body, providers::youtube_headers(config, st), timeout * 2 / 3);
-    js::Value root;
-    if (!providers::json_response(response, root, error)) { error = "YouTube Music 网络/接口不可用：" + error; return {}; }
-    if (next) {
-        next->clear();
-        std::function<void(const js::Value&, int)> find = [&](const js::Value& value, int depth) {
-            if (depth > 40 || !next->empty()) return;
-            if (value.is_object()) {
-                const auto token = value["nextContinuationData"]["continuation"].str(value["continuationCommand"]["token"].str());
-                if (!token.empty()) { *next = token; return; }
-                for (const auto& item : value.object) find(item.second, depth + 1);
-            } else if (value.is_array()) for (const auto& item : value.array) find(item, depth + 1);
-        };
-        find(root, 0);
+inline void attach_provider_song(Variant& v, const prov::Song& s) {
+    v.id = s.id;
+    v.title = s.title;
+    v.artist = s.artist;
+    v.album = s.album;
+    v.duration_ms = s.duration_ms;
+    v.bitrate = s.bitrate;
+    v.native_id = s.native_id;
+    v.cover_url = s.cover;
+}
+
+inline bool search_via_provider(Source src, const std::string& keyword, int limit, int page,
+                                std::vector<Variant>& out, std::string& err) {
+    const char* key = provider_key_of(src);
+    if (!key || !prov::Host::instance().has(key)) return false;
+    std::vector<prov::Song> songs;
+    if (!prov::Host::instance().search(key, keyword, page, limit, songs, err)) return false;
+    out.clear();
+    for (const auto& song : songs) {
+        if (song.id.empty() || song.title.empty()) continue;
+        Variant v;
+        v.source = src;
+        attach_provider_song(v, song);
+        out.push_back(std::move(v));
     }
-    // continuation 已经消费一整页，不能截掉本页剩余项后直接跳到下一页。
-    auto out = providers::parse_youtube_search(root, next ? 500 : limit);
-    if (out.empty()) error = "YouTube Music 无可用结果（可能需要验证）";
+    return true;
+}
+
+inline bool board_via_provider(Source src, const std::string& board_id, int page, int limit,
+                               std::vector<Variant>& out, std::string& err) {
+    const char* key = provider_key_of(src);
+    if (!key || !prov::Host::instance().has(key)) return false;
+    std::vector<prov::Song> songs;
+    if (!prov::Host::instance().board(key, board_id, page, limit, songs, err)) return false;
+    out.clear();
+    for (const auto& song : songs) {
+        if (song.id.empty() || song.title.empty()) continue;
+        Variant v;
+        v.source = src;
+        attach_provider_song(v, song);
+        out.push_back(std::move(v));
+    }
+    return true;
+}
+
+// 榜单：provider 给的 Variant 直接包成 Track（榜单内不需要跨源合并）
+inline std::vector<Track> board_tracks(Source src, const std::string& board_id, int limit, std::string& err) {
+    std::vector<Variant> variants;
+    std::vector<Track> out;
+    if (!board_via_provider(src, board_id, 0, limit, variants, err)) return out;
+    out.reserve(variants.size());
+    for (auto& v : variants) {
+        Track t;
+        t.title = v.title;
+        t.artist = v.artist;
+        t.album = v.album;
+        t.duration_ms = v.duration_ms;
+        t.cover_url = v.cover_url;
+        t.chosen = 0;
+        t.variants.push_back(std::move(v));
+        out.push_back(std::move(t));
+    }
     return out;
 }
 
-// 可选系统工具兜底签名，不自动下载、不装浏览器扩展、不读用户浏览器 Cookie。
-inline ResolveResult resolve_youtube_tool(const Variant& v) {
+// ---------------------------------------------------------------- 落雪音源取流
+//
+// 策略：先让落雪音源试，失败再回落内置实现。
+// 音源只负责"给一条能用的直链"，歌还是 aino 自己搜的 —— 这样两边的 id 体系天然对齐。
+inline const char* lx_platform_key(Source s) {
+    switch (s) {
+        case Source::Netease: return "wy";
+        case Source::QQ: return "tx";
+        default: return nullptr;   // 落雪音源没有 B 站平台
+    }
+}
+
+inline std::string lx_interval(int ms) {
+    if (ms <= 0) return "00:00";
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%02d:%02d", ms / 60000, (ms / 1000) % 60);
+    return buf;
+}
+
+// 拼成 lx 音源认得的 musicInfo：各平台字段名不一样，别想当然用同一套
+inline std::string lx_music_info(const Variant& v, const char* key) {
+    std::string s = "{\"songmid\":" + lx::detail::js_quote(v.id);
+    s += ",\"name\":" + lx::detail::js_quote(v.title);
+    s += ",\"singer\":" + lx::detail::js_quote(v.artist);
+    s += ",\"albumName\":" + lx::detail::js_quote(v.album);
+    s += ",\"interval\":" + lx::detail::js_quote(lx_interval(v.duration_ms));
+    s += ",\"source\":" + lx::detail::js_quote(key);
+    s += ",\"img\":null,\"lrc\":null}";
+    return s;
+}
+
+// ============================================================================
+//  渠道一：第三方音源脚本（sources/*.js）
+//
+//  契约只有 musicUrl —— 它不管"从哪找歌"，只负责把 (平台, songmid) 换成直链。
+//  免登录，档位由脚本自己决定（多源聚合脚本通常 320k / 无损都能给）。
+// ============================================================================
+inline bool resolve_via_source(const Variant& v, int quality, ResolveResult& out, std::string* why,
+                               const ResolveAccept& accept = {}) {
+    const char* key = lx_platform_key(v.source);
+    if (!key) {
+        if (why) *why = std::string(source_name(v.source)) + " 不在音源支持的平台内";
+        return false;
+    }
+    auto& engine = lx::Engine::instance();
+    if (!engine.supports(key)) {
+        if (why) *why = std::string("没有音源声明支持 ") + key;
+        return false;
+    }
+    const std::string q = lx::quality_key(quality);
+    const std::string info = lx_music_info(v, key);
+    std::string url, err, by;
+    if (!engine.resolve(key, q, info, url, err, &by,
+        [&](const std::string& candidate, const std::string& name, const std::string& actual_quality, std::string& error) {
+            ResolveResult rr;
+            rr.ok = true; rr.lane = Lane::JsSource; rr.engine = name; rr.url = candidate;
+            rr.headers = {"User-Agent: Mozilla/5.0"}; rr.reason = "ok";
+            rr.detail = "音源 · " + name + " · " + actual_quality;
+            if (!accept_resolved(rr, accept, error)) return false;
+            out = std::move(rr);
+            return true;
+        })) {
+        if (why) *why = err.empty() ? "音源没有返回链接" : err;
+        return false;
+    }
+    return true;
+}
+
+// ============================================================================
+//  渠道二：自带接口（providers/*.js → C++ 内置兜底）
+//
+//  平台接口的易变部分在 providers/*.js；这里只做调用与兜底。
+//  登录态从这里注入，音质上限由账号决定。
+// ============================================================================
+inline bool resolve_via_builtin(const Variant& v, const Settings& st, ResolveResult& out, std::string* why,
+                                const ResolveAccept& accept = {}) {
+    if (net::cancelled()) { if (why) *why = "已取消"; return false; }
+    const std::string q = lx::quality_key(st.quality);
+
+    // 1) 平台自己的 provider（酷我 / 酷狗 有直链接口）
+    if (const char* pkey = provider_key_of(v.source)) {
+        if (prov::Host::instance().has(pkey)) {
+            prov::Song song;
+            song.id = v.id;
+            song.title = v.title;
+            song.artist = v.artist;
+            song.album = v.album;
+            song.native_id = v.native_id;
+            song.duration_ms = v.duration_ms;
+            std::string url, perr;
+            if (prov::Host::instance().resolve(pkey, song, q, url, perr)) {
+                out.ok = true;
+                out.lane = Lane::Builtin;
+                out.engine = std::string(pkey) + ".js";
+                out.url = url;
+                out.headers = {"User-Agent: Mozilla/5.0"};
+                out.reason = "ok";
+                out.detail = std::string("自带 · ") + out.engine + " · " + q;
+                if (accept_resolved(out, accept, perr)) return true;
+            }
+            if (why) *why = perr;
+        }
+    }
+
+    // 2) C++ 内置实现
+    if (net::cancelled()) { if (why) *why = "已取消"; return false; }
     ResolveResult rr;
-    static std::atomic<unsigned> serial{0};
-    const auto file = platform::join(platform::temp_dir(), "yt-resolve-" + std::to_string(platform::process_id()) + "-" + std::to_string(++serial) + ".json");
-    const int rc = platform::run_process({"yt-dlp", "--ignore-config", "--no-playlist", "--skip-download", "--quiet", "--no-warnings",
-        "--no-cache-dir", "--socket-timeout", "8", "--retries", "0", "--extractor-retries", "0", "-f", "bestaudio[ext=m4a]/bestaudio",
-        "--print-to-file", "%()j", file, "--", "https://music.youtube.com/watch?v=" + v.id}, 25000, [] { return net::cancelled(); });
-    if (rc != 0 || platform::file_size(file) > 8 * 1024 * 1024) {
-        platform::remove(file);
-        rr.reason = rc == -1 ? "可选 yt-dlp 未安装" : rc == 124 ? "yt-dlp 解析超时" : "yt-dlp 无法取得音轨（网络或平台验证）";
-        return rr;
-    }
-    std::ifstream input(platform::fs::u8path(file), std::ios::binary);
-    std::string text((std::istreambuf_iterator<char>(input)), {}); input.close(); platform::remove(file);
-    js::Value info;
-    if (!js::parse(text, info)) { rr.reason = "yt-dlp 返回无效数据"; return rr; }
-    const auto* selected = &info;
-    if (!info["requested_downloads"].array.empty()) selected = &info["requested_downloads"].array.front();
-    rr.url = (*selected)["url"].str();
-    const auto protocol = (*selected)["protocol"].str();
-    rr.ok = providers::http_url(rr.url) && (protocol.empty() || protocol == "https" || protocol == "http");
-    for (const auto& pair : (*selected)["http_headers"].object) {
-        const auto value = pair.second.str();
-        if (pair.first.find_first_of("\r\n:") == std::string::npos && value.find_first_of("\r\n") == std::string::npos)
-            rr.headers.push_back(pair.first + ": " + value);
-    }
-    rr.reason = rr.ok ? "ok" : "yt-dlp 未返回直接音轨"; rr.detail = "YouTube Music · yt-dlp"; return rr;
-}
-inline ResolveResult resolve_youtube(const Variant& v, const Settings& st) {
-    ResolveResult rr;
-    if (!providers::valid_youtube_id(v.id)) { rr.reason = "无效的 YouTube 曲目 ID"; return rr; }
-    const auto config = providers::youtube_config(2000);
-    const auto headers = providers::youtube_headers(config, st);
-    const auto body = "{\"context\":" + providers::youtube_context(config, st) + ",\"videoId\":" + providers::quote(v.id) +
-        ",\"contentCheckOk\":true,\"racyCheckOk\":true}";
-    js::Value root; std::string error;
-    const auto response = net::post("https://music.youtube.com/youtubei/v1/player?prettyPrint=false&key=" + net::url_encode(config.key), body, headers, 5000);
-    if (providers::json_response(response, root, error)) {
-        rr = providers::parse_youtube_audio(root, {"User-Agent: Mozilla/5.0", "Referer: https://music.youtube.com/"}, st.quality);
-        if (rr.ok) {
-            const auto probe = net::probe_audio(rr.url, rr.headers, 4000);
-            if (probe.playable) return rr;
-            rr.reason = "YouTube 音轨被拒（需要签名或平台验证）";
-        }
-    } else rr.reason = error;
-    if (st.cancelled && st.cancelled()) { rr.ok = false; rr.url.clear(); rr.reason = "YouTube 解析已取消"; return rr; }
-    const auto browser = login::youtube_stream(v.id, st.youtube_cookie, st.cancelled);
-    if (!browser.url.empty()) {
-        const auto probe = net::probe_audio(browser.url, browser.headers, 4000);
-        if (probe.playable) { rr.ok = true; rr.url = browser.url; rr.headers = browser.headers; rr.reason = "ok"; rr.detail = "YouTube Music · 官网音轨"; return rr; }
-    }
-    if (st.cancelled && st.cancelled()) { rr.ok = false; rr.url.clear(); rr.reason = "YouTube 解析已取消"; return rr; }
-    auto fallback = resolve_youtube_tool(v);
-    if (fallback.ok) return fallback;
-    rr.ok = false; rr.url.clear(); rr.reason += "；" + browser.error + "；" + fallback.reason; return rr;
-}
-
-struct YouTubePlaylist {
-    std::string id, name, cover;
-    int count = 0;
-    bool editable = false;
-};
-namespace providers {
-inline const js::Value* youtube_member(const js::Value& node, const std::string& key, int depth = 0) {
-    if (depth > 64) return nullptr;
-    if (!node[key.c_str()].is_null()) return &node[key.c_str()];
-    for (const auto& pair : node.object) if (const auto* found = youtube_member(pair.second, key, depth + 1)) return found;
-    for (const auto& item : node.array) if (const auto* found = youtube_member(item, key, depth + 1)) return found;
-    return nullptr;
-}
-inline bool valid_youtube_playlist(const std::string& id) {
-    return !id.empty() && id.size() <= 160 && id.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") == std::string::npos;
-}
-inline std::string youtube_thumbnail(const js::Value& node) {
-    const auto* thumbnails = youtube_member(node, "thumbnails");
-    return thumbnails && !thumbnails->array.empty() ? thumbnails->array.back()["url"].str() : "";
-}
-inline std::string youtube_continuation(const js::Value& root) {
-    if (const auto* command = youtube_member(root, "continuationCommand")) return (*command)["token"].str();
-    if (const auto* next = youtube_member(root, "nextContinuationData")) return (*next)["continuation"].str();
-    return {};
-}
-inline std::vector<YouTubePlaylist> parse_youtube_playlists(const js::Value& root) {
-    std::vector<YouTubePlaylist> out; std::set<std::string> seen;
-    std::function<void(const js::Value&, int)> visit = [&](const js::Value& node, int depth) {
-        if (depth > 64) return;
-        const auto& two = node["musicTwoRowItemRenderer"];
-        const auto& row = node["musicResponsiveListItemRenderer"];
-        const auto* item = two.is_object() ? &two : row.is_object() ? &row : nullptr;
-        if (item) {
-            const auto* browse = youtube_member((*item)["navigationEndpoint"], "browseId");
-            if (!browse) browse = youtube_member((*item)["flexColumns"], "browseId");
-            auto id = browse ? browse->str() : "";
-            if (id.rfind("VL", 0) != 0) return;
-            id.erase(0, 2);
-            if (!valid_youtube_playlist(id) || !seen.insert(id).second) return;
-            YouTubePlaylist playlist; playlist.id = id;
-            playlist.name = two.is_object() ? runs_text(two["title"]) : runs_text(row["flexColumns"][size_t(0)]["musicResponsiveListItemFlexColumnRenderer"]["text"]);
-            playlist.cover = youtube_thumbnail(*item);
-            playlist.editable = youtube_member(*item, "playlistEditEndpoint") != nullptr;
-            if (!playlist.name.empty()) out.push_back(std::move(playlist));
-            return;
-        }
-        for (const auto& pair : node.object) visit(pair.second, depth + 1);
-        for (const auto& item : node.array) visit(item, depth + 1);
-    };
-    visit(root, 0); return out;
-}
-inline bool youtube_request(const std::string& endpoint, const std::string& fields, const Settings& st,
-                            js::Value& root, std::string& error, int timeout = 10000) {
-    const auto config = youtube_config(std::min(timeout, 2000));
-    const auto response = net::post("https://music.youtube.com/youtubei/v1/" + endpoint + "?prettyPrint=false&key=" + net::url_encode(config.key),
-        "{\"context\":" + youtube_context(config, st) + (fields.empty() ? "" : "," + fields) + "}", youtube_headers(config, st), timeout);
-    if (!json_response(response, root, error)) return false;
-    if (!root["error"].is_null()) { error = "YouTube: " + root["error"]["message"].str("账号或接口请求被拒绝"); return false; }
-    return true;
-}
-inline std::string youtube_add_actions(const std::vector<std::string>& ids) {
-    std::string out = "[";
-    for (const auto& id : ids) {
-        if (!valid_youtube_id(id)) continue;
-        if (out.size() > 1) out += ',';
-        out += "{\"action\":\"ACTION_ADD_VIDEO\",\"addedVideoId\":" + quote(id) + "}";
-    }
-    return out + ']';
-}
-} // namespace providers
-
-inline bool youtube_profile(const Settings& st, std::string& name, std::string& error) {
-    js::Value root;
-    if (st.youtube_cookie.empty()) { error = "请先登录 YouTube Music"; return false; }
-    if (!providers::youtube_request("account/account_menu", "", st, root, error)) return false;
-    const auto* account = providers::youtube_member(root, "activeAccountHeaderRenderer");
-    if (!account) { error = "YouTube 登录态未生效，请重新登录或切换账号"; return false; }
-    name = providers::runs_text((*account)["accountName"]);
-    if (name.empty()) name = "YouTube Music";
-    return true;
-}
-inline std::vector<YouTubePlaylist> youtube_playlists(const Settings& st, std::string& error) {
-    std::vector<YouTubePlaylist> out; std::set<std::string> ids, tokens;
-    std::string continuation;
-    for (int page = 0; page < 50; ++page) {
-        js::Value root;
-        if (!providers::youtube_request("browse", continuation.empty() ? "\"browseId\":\"FEmusic_liked_playlists\"" :
-            "\"continuation\":" + providers::quote(continuation), st, root, error)) return {};
-        for (auto& playlist : providers::parse_youtube_playlists(root)) if (ids.insert(playlist.id).second) out.push_back(std::move(playlist));
-        continuation = providers::youtube_continuation(root);
-        if (continuation.empty()) return out;
-        if (!tokens.insert(continuation).second) { error = "YouTube 歌单分页重复，旧列表已保留"; return {}; }
-    }
-    error = "YouTube 歌单分页超过上限，旧列表已保留"; return {};
-}
-inline std::vector<Track> youtube_playlist_tracks(const Settings& st, const std::string& id, std::string& error,
-                                                 YouTubePlaylist* metadata = nullptr) {
-    if (!providers::valid_youtube_playlist(id)) { error = "无效的 YouTube 歌单 ID"; return {}; }
-    std::vector<Track> out; std::set<std::string> ids, tokens;
-    std::string continuation;
-    for (int page = 0; page < 50; ++page) {
-        js::Value root;
-        if (!providers::youtube_request("browse", continuation.empty() ? "\"browseId\":" + providers::quote("VL" + id) :
-            "\"continuation\":" + providers::quote(continuation), st, root, error)) return {};
-        if (metadata && page == 0) {
-            metadata->id = id;
-            auto* header = providers::youtube_member(root, "musicResponsiveHeaderRenderer");
-            if (!header) header = providers::youtube_member(root, "musicDetailHeaderRenderer");
-            if (header) { metadata->name = providers::runs_text((*header)["title"]); metadata->cover = providers::youtube_thumbnail(*header); }
-            metadata->editable = providers::youtube_member(root, "musicEditablePlaylistDetailHeaderRenderer") != nullptr;
-        }
-        const js::Value* shelf = providers::youtube_member(root, "musicPlaylistShelfRenderer");
-        if (!shelf) shelf = providers::youtube_member(root, "musicPlaylistShelfContinuation");
-        if (!shelf) shelf = providers::youtube_member(root, "appendContinuationItemsAction");
-        if (!shelf) shelf = providers::youtube_member(root, "musicShelfContinuation");
-        if (shelf) for (auto& variant : providers::parse_youtube_search(*shelf, 5000)) {
-            if (!ids.insert(variant.id).second) continue;
-            Track track; track.title = variant.title; track.artist = variant.artist; track.album = variant.album;
-            track.duration_ms = variant.duration_ms; track.cover_url = variant.cover_url;
-            track.variants.push_back(std::move(variant)); out.push_back(std::move(track));
-        }
-        continuation = shelf ? providers::youtube_continuation(*shelf) : "";
-        if (continuation.empty()) {
-            if (metadata) metadata->count = int(out.size());
-            if (out.empty()) error = "YouTube 歌单为空、不可用或需要登录";
-            return out;
-        }
-        if (!tokens.insert(continuation).second || out.size() >= 5000) { error = "YouTube 歌单分页异常或超过 5000 首，旧快照已保留"; return {}; }
-    }
-    error = "YouTube 歌单分页超过上限，旧快照已保留"; return {};
-}
-inline std::string youtube_create_playlist(const Settings& st, const std::string& name, std::string& error) {
-    js::Value root;
-    if (name.empty() || name.size() > 300 || st.youtube_cookie.empty()) { error = "请先登录并输入歌单名称"; return {}; }
-    if (!providers::youtube_request("playlist/create", "\"title\":" + providers::quote(name) + ",\"privacyStatus\":\"PRIVATE\"", st, root, error)) return {};
-    const auto id = root["playlistId"].str();
-    if (!providers::valid_youtube_playlist(id)) { error = "YouTube 未确认创建歌单"; return {}; }
-    return id;
-}
-inline bool youtube_add_to_playlist(const Settings& st, const std::string& id, const std::vector<std::string>& video_ids, std::string& error) {
-    if (st.youtube_cookie.empty() || !providers::valid_youtube_playlist(id)) { error = "请先登录 YouTube 并选择可编辑歌单"; return false; }
-    for (size_t at = 0; at < video_ids.size(); at += 100) {
-        const auto end = std::min(at + 100, video_ids.size());
-        const std::vector<std::string> batch(video_ids.begin() + at, video_ids.begin() + end);
-        js::Value root;
-        if (!providers::youtube_request("browse/edit_playlist", "\"playlistId\":" + providers::quote(id) +
-            ",\"actions\":" + providers::youtube_add_actions(batch), st, root, error)) return false;
-        if (root["status"].str() != "STATUS_SUCCEEDED") { error = "YouTube 未确认添加歌曲（歌单可能为只读）"; return false; }
-    }
-    return true;
-}
-
-// 取流：按当前选中源解析，失败就沿"其它源"换源
-inline ResolveResult resolve(const Variant& v, const Settings& st) {
     switch (v.source) {
-        case Source::Netease: return resolve_netease(v, st);
-        case Source::Kuwo: return resolve_kuwo(v);
-        case Source::QQ: return resolve_qq(v, st);
-        case Source::Bilibili: return resolve_bilibili(v, st);
-        case Source::YouTube: return resolve_youtube(v, st);
-        default: { ResolveResult rr; rr.reason = "此音源暂不支持网络取流"; return rr; }
+        case Source::Netease: rr = resolve_netease(v, st); break;
+        case Source::QQ: rr = resolve_qq(v, st); break;
+        case Source::Bilibili: rr = resolve_bilibili(v, st); break;
+        default:
+            if (why) *why = std::string("自带接口不提供 ") + source_name(v.source) + " 的取流";
+            return false;
     }
+    if (!rr.ok) {
+        if (why) *why = rr.reason.empty() ? (rr.detail.empty() ? "自带接口没有返回链接" : rr.detail) : rr.reason;
+        return false;
+    }
+    rr.lane = Lane::Builtin;
+    if (rr.engine.empty()) rr.engine = "内置";
+    // 内置实现自己给的是 "128k · mp3" 这种音质描述，补上前面的渠道与实现
+    rr.detail = "自带 · " + rr.engine + (rr.detail.empty() ? " · " + q : " · " + rr.detail);
+    out = std::move(rr);
+    std::string error;
+    if (!accept_resolved(out, accept, error)) { if (why) *why = error; return false; }
+    return true;
+}
+
+// ============================================================================
+//  渠道编排
+//
+//  按 Settings::lane_pref 的顺序依次尝试；两条渠道关掉的就不再问。
+//  都失败时把两条的原因分别带回去 —— 不然用户只看到一句"失败了"，
+//  根本不知道是音源没覆盖、还是登录态过期。
+// ============================================================================
+inline ResolveResult resolve(const Variant& v, const Settings& st, const ResolveAccept& accept = {}) {
+    net::CancelScope network([parent = net::cancel_current, cancelled = st.cancelled] {
+        return (parent && parent()) || (cancelled && cancelled());
+    });
+    std::string why[2];
+    for (Lane lane : st.lane_order()) {
+        if (net::cancelled()) { ResolveResult fail; fail.reason = "取流已取消"; return fail; }
+        if (!st.lane_on(lane)) {
+            why[int(lane)] = "已关闭";
+            continue;
+        }
+        ResolveResult rr;
+        std::string reason;
+        const bool ok = lane == Lane::JsSource ? resolve_via_source(v, st.quality, rr, &reason, accept)
+                                               : resolve_via_builtin(v, st, rr, &reason, accept);
+        if (ok) return rr;
+        why[int(lane)] = reason;
+    }
+
+    ResolveResult fail;
+    fail.ok = false;
+    if (st.lane_on(Lane::JsSource) && st.lane_on(Lane::Builtin) && !why[0].empty() && !why[1].empty()) {
+        fail.reason = "音源：" + why[0] + "；自带：" + why[1];
+    } else {
+        fail.reason = why[0].empty() ? why[1] : why[0];
+    }
+    if (fail.reason.empty()) fail.reason = "没有可用的取流渠道";
+    return fail;
 }
 
 // ---------------------------------------------------------------- 跨源补位
@@ -1836,8 +1626,6 @@ inline bool find_on_source(Source src, const Track& t, const Settings& st, Varia
     std::vector<Variant> got;
     if (src == Source::Netease) got = search_netease(kw, 10, 6000, err, st);
     else if (src == Source::QQ) got = search_qq(kw, 10, 6000, err, st);
-    else if (src == Source::Kuwo) got = search_kuwo(kw, 10, 6000, err);
-    else if (src == Source::YouTube) got = search_youtube(kw, 10, 6000, err, st);
     else if (src == Source::Bilibili) got = search_bilibili(kw, 10, 6000, err);
 
     if (got.empty()) {
@@ -1859,6 +1647,15 @@ inline bool find_on_source(Source src, const Track& t, const Settings& st, Varia
         else if (have == want) s += 20.0;
         else if (have.find(want) != std::string::npos || want.find(have) != std::string::npos) s += 6.0;
         else continue;
+        if (have_raw != want_raw) {
+            // 标题不完全一样时，明写翻唱/伴奏/纯音乐的直接跳过：
+            // 补位宁可失败，也不能把网友翻唱当成原曲放出来。
+            static const char* kFake[] = {"cover", "翻唱", "伴奏", "纯音乐", "karaoke", "instrumental", "remix"};
+            const std::string low = text::lower_ascii(have_raw);
+            bool fake = false;
+            for (const char* k : kFake) if (low.find(k) != std::string::npos) { fake = true; break; }
+            if (fake) continue;
+        }
 
         if (t.duration_ms > 0 && v.duration_ms > 0) {
             const double diff = double(v.duration_ms > t.duration_ms ? v.duration_ms - t.duration_ms
@@ -1869,7 +1666,9 @@ inline bool find_on_source(Source src, const Track& t, const Settings& st, Varia
         }
         if (!want_artist.empty() && text::normalize_title(v.artist).find(want_artist) != std::string::npos)
             s += 20.0;
-        if (!v.needs_login) s += 6.0;  // 不用会员的那条优先：点了就能听
+        // 这里曾经写 `if (!v.needs_login) s += 6.0;`（优先不用会员的那条）。
+        // 后果是：正版原曲需要会员，而同名翻唱/网友上传版免费，于是补位经常落到翻唱上，
+        // 用户听到的是"盗版"。宁可取不到流如实报错，也不能用免费与否来挑版本。
         if (s > best) {
             best = s;
             best_i = i;
@@ -1927,15 +1726,6 @@ inline Track catalog_track(Source source, const js::Value& input) {
         const auto mid = song["album"]["mid"].str(song["albummid"].str());
         if (!mid.empty()) v.cover_url = "https://y.gtimg.cn/music/photo_new/T002R300x300M000" + mid + ".jpg";
         v.needs_login = song["pay"]["pay_play"].integer() != 0;
-    } else if (source == Source::Kuwo) {
-        v.id = song["MUSICRID"].str(catalog_id(song["musicrid"]));
-        if (v.id.empty()) v.id = catalog_id(song["rid"].is_null() ? song["id"] : song["rid"]);
-        if (v.id.rfind("MUSIC_", 0) == 0) v.id.erase(0, 6);
-        v.title = text::decode_entities(song["SONGNAME"].str(song["NAME"].str(song["name"].str())));
-        v.artist = text::decode_entities(song["ARTIST"].str(song["artist"].str()));
-        v.album = text::decode_entities(song["ALBUM"].str(song["album"].str()));
-        v.duration_ms = int(song["DURATION"].integer(song["duration"].integer())) * 1000;
-        v.cover_url = song["pic"].str(song["pic120"].str());
     }
     attach_catalog_metadata(v, song);
     Track track; track.title = v.title; track.artist = v.artist; track.album = v.album;
@@ -1970,21 +1760,6 @@ inline bool hydrate_catalog_variant(Variant& variant, const Settings& st, std::s
         auto track = catalog_track(variant.source, root["track_info"]);
         if (track.variants.empty() || track.current().id != variant.id) { error = "QQ 未返回这首歌的资料"; return false; }
         variant = track.current();
-    } else if (variant.source == Source::Kuwo) {
-        const auto found = search_kuwo(variant.title + " " + variant.artist, 30, 8000, error);
-        for (const auto& item : found) if (item.id == variant.id) { variant = item; return true; }
-        if (error.empty()) error = "酷我未返回这首歌的歌手或专辑 ID";
-        return false;
-    } else if (variant.source == Source::YouTube) {
-        if (!providers::youtube_request("next", "\"videoId\":" + providers::quote(variant.id), st, root, error)) return false;
-        const auto* panel = providers::youtube_member(root, "playlistPanelRenderer");
-        if (panel) for (const auto& item : (*panel)["contents"].array) {
-            const auto& video = item["playlistPanelVideoRenderer"];
-            if (video["videoId"].str() != variant.id) continue;
-            providers::youtube_catalog_metadata(variant, video["longBylineText"]);
-            providers::youtube_catalog_metadata(variant, video["shortBylineText"]);
-            break;
-        }
     } else if (variant.source == Source::Bilibili) {
         if (!providers::json_response(net::get("https://api.bilibili.com/x/web-interface/view?bvid=" + net::url_encode(variant.id),
             {"Referer: https://www.bilibili.com/", "User-Agent: Mozilla/5.0"}, 8000), root, error)) return false;
@@ -2069,68 +1844,6 @@ inline CatalogPage fetch_catalog(CatalogTarget target, const Settings& st, bool 
             out.description = root["singer_brief"].str(root["desc"].str());
             t.cover = "https://y.gtimg.cn/music/photo_new/T001R300x300M000" + t.id + ".jpg";
         }
-    } else if (t.source == Source::Kuwo) {
-        if (!numeric_catalog_id(t.id)) { out.error = "酷我目录 ID 无效"; return out; }
-        const bool album = t.kind == CatalogKind::Album;
-        const auto url = "https://search.kuwo.cn/r.s?encoding=utf8&ft=music&rn=50&pn=" + std::to_string(offset / 50) +
-            "&stype=" + (album ? std::string("albuminfo&albumid=") : albums ? "albumlist&artistid=" : "artist2music&artistid=") + t.id;
-        const auto response = net::get(url, {"Referer: https://www.kuwo.cn/", "User-Agent: Mozilla/5.0"}, 10000);
-        if (!response.ok()) { out.error = response.error.empty() ? "HTTP " + std::to_string(response.status) : response.error; return out; }
-        if (!js::parse(response.body, root, true) || !root.is_object()) { out.error = "酷我目录响应不是 JSON"; return out; }
-        list = albums ? &root["albumlist"] : &root["musiclist"];
-        if (!list->is_array()) list = &root["abslist"];
-        const auto total = root["TOTAL"].integer(root["total"].integer(-1));
-        out.more = !album && (total >= 0 ? offset + int(list->size()) < total : list->size() == 50);
-        if (album) {
-            if (!root["name"].str().empty()) t.name = text::decode_entities(root["name"].str());
-            if (!root["hts_img"].str().empty()) t.cover = root["hts_img"].str();
-            out.description = root["info"].str();
-        }
-    } else if (t.source == Source::YouTube) {
-        if (!providers::youtube_request("browse", continuation.empty() ? "\"browseId\":" + providers::quote(t.id) :
-            "\"continuation\":" + providers::quote(continuation), st, root, out.error)) return out;
-        const js::Value* header = providers::youtube_member(root, "musicImmersiveHeaderRenderer");
-        if (!header) header = providers::youtube_member(root, "musicResponsiveHeaderRenderer");
-        if (!header) header = providers::youtube_member(root, "musicDetailHeaderRenderer");
-        if (header) {
-            const auto name = providers::runs_text((*header)["title"]); if (!name.empty()) t.name = name;
-            const auto cover = providers::youtube_thumbnail(*header); if (!cover.empty()) t.cover = cover;
-            out.description = providers::runs_text((*header)["description"]);
-        }
-        if (albums) {
-            std::set<std::string> ids;
-            std::function<void(const js::Value&, int)> walk = [&](const js::Value& node, int depth) {
-                if (depth > 64 || out.albums.size() >= 5000) return;
-                const auto& item = node["musicTwoRowItemRenderer"];
-                const auto id = item["navigationEndpoint"]["browseEndpoint"]["browseId"].str();
-                if (id.rfind("MPRE", 0) == 0 && ids.insert(id).second) {
-                    CatalogTarget album; album.source = t.source; album.kind = CatalogKind::Album; album.id = id;
-                    album.name = providers::runs_text(item["title"]); album.cover = providers::youtube_thumbnail(item);
-                    album.subtitle = providers::runs_text(item["subtitle"]); out.albums.push_back(std::move(album));
-                }
-                for (const auto& pair : node.object) walk(pair.second, depth + 1);
-                for (const auto& item : node.array) walk(item, depth + 1);
-            }; walk(root, 0);
-        } else {
-            // 仅跟随歌曲 shelf 的 continuation，不能误用相关推荐或专辑架的 token。
-            const auto* shelf = providers::youtube_member(root, "musicPlaylistShelfRenderer");
-            if (!shelf) shelf = providers::youtube_member(root, "musicShelfRenderer");
-            if (!shelf) shelf = providers::youtube_member(root, "musicShelfContinuation");
-            if (!shelf) shelf = providers::youtube_member(root, "musicPlaylistShelfContinuation");
-            auto variants = providers::parse_youtube_search(shelf ? *shelf : root, 5000);
-            for (auto& v : variants) {
-                if (t.kind == CatalogKind::Album) {
-                    v.album_id = t.id; v.album = t.name;
-                    if (v.cover_url.empty()) v.cover_url = t.cover;
-                }
-                Track track; track.title = v.title; track.artist = v.artist; track.album = v.album;
-                track.cover_url = v.cover_url; track.duration_ms = v.duration_ms; track.variants.push_back(std::move(v));
-                out.tracks.push_back(std::move(track));
-            }
-            if (shelf) out.continuation = providers::youtube_continuation(*shelf);
-            out.more = !out.continuation.empty() && out.continuation != continuation;
-        }
-        out.next_offset = offset + int(albums ? out.albums.size() : out.tracks.size()); return out;
     } else if (t.source == Source::Bilibili && !albums && t.kind == CatalogKind::Artist) {
         if (!numeric_catalog_id(t.id)) { out.error = "B 站 UP 主 ID 无效"; return out; }
         const auto session = providers::bili_session(3000, out.error); if (session.key.empty()) return out;
