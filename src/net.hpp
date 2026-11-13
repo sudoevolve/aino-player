@@ -136,6 +136,7 @@ struct Response {
     std::string error;   // 非空 = 传输层失败
     std::vector<std::string> set_cookies;
     std::string location;
+    std::string content_range;
     bool ok() const { return error.empty() && status >= 200 && status < 300; }
 };
 
@@ -145,6 +146,7 @@ struct Request {
     std::vector<std::string> headers; // "Key: Value"
     int timeout_ms = 8000;
     bool follow_redirects = true;
+    size_t max_body = 8u * 1024 * 1024;
 };
 
 namespace detail {
@@ -359,6 +361,7 @@ inline Response execute(const Request& req) {
     WinHttpQueryHeaders(hreq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                         WINHTTP_HEADER_NAME_BY_INDEX, &status, &slen, WINHTTP_NO_HEADER_INDEX);
     out.status = int(status);
+    out.content_range = detail::query_header(hreq, WINHTTP_QUERY_CONTENT_RANGE);
     out.content_type = detail::query_header(hreq, WINHTTP_QUERY_CONTENT_TYPE);
     out.final_url = detail::final_url_of(hreq);
     out.location = detail::query_header(hreq, WINHTTP_QUERY_LOCATION);
@@ -381,8 +384,8 @@ inline Response execute(const Request& req) {
         DWORD read = 0;
         if (!detail::read(hreq, buf.data(), avail, &read)) { out.error = detail::last_error_text("读取响应"); break; }
         if (!read) break;
+        if (out.body.size() > req.max_body || read > req.max_body - out.body.size()) { out.error = "接口响应过大"; break; }
         out.body.append(buf.data(), read);
-        if (out.body.size() > 8u * 1024 * 1024) { out.error = "接口响应过大"; break; }  // 接口响应不可能这么大
     }
     detail::close_request(hreq);
     WinHttpCloseHandle(conn);

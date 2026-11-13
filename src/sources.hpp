@@ -1,6 +1,6 @@
 // sources.hpp —— 多音源适配 + 聚合
 //
-// 每个源一个适配器，只暴露 search / resolve 两件事；
+// 每个源适配搜索、取流及歌手/专辑目录；
 // 聚合层负责并发扇出、超时隔离、跨源同曲合并、相关性排序。
 //
 // 与参考实现的差别（这份代码是 C++ 重写的，不是移植 Rust）：
@@ -63,6 +63,14 @@ inline const char* source_key(Source s) {
     }
 }
 
+struct ArtistRef { std::string id, name; };
+enum class CatalogKind { Artist, Album };
+struct CatalogTarget {
+    Source source = Source::Netease;
+    CatalogKind kind = CatalogKind::Artist;
+    std::string id, name, cover, subtitle;
+};
+
 struct Variant {  // 某一首歌在某个源上的一条结果
     Source source = Source::Netease;
     std::string id;
@@ -74,6 +82,8 @@ struct Variant {  // 某一首歌在某个源上的一条结果
     bool needs_login = false; // 该源自己说"要登录"，取流时会明确拒绝
     std::string cover_url;    // 该源能直接给出的封面（QQ 有 pmid，网易云要批量查）
     std::string native_id;    // 源内部 ID：QQ songid、B 站分 P cid 等。
+    std::vector<ArtistRef> artists;
+    std::string album_id;
 };
 
 inline bool same_variant(const Variant& a, const Variant& b) {
@@ -382,6 +392,55 @@ inline bool same_song(const Track& t, const Variant& v) {
 
 // ---------------------------------------------------------------- 适配器：网易云
 
+inline std::string catalog_id(const js::Value& value) {
+    const auto text = value.str();
+    if (!text.empty()) return text == "0" ? std::string() : text;
+    const auto number = value.integer();
+    return number > 0 ? std::to_string(number) : std::string();
+}
+inline void attach_catalog_metadata(Variant& v, const js::Value& song) {
+    if (v.source == Source::Netease) {
+        const auto& artists = song["ar"].is_array() ? song["ar"] : song["artists"];
+        for (const auto& a : artists.array) {
+            if (v.artists.size() >= 32) break;
+            const auto name = text::decode_entities(a["name"].str());
+            if (!name.empty()) v.artists.push_back({catalog_id(a["id"]), name});
+        }
+        const auto& album = song["al"].is_object() ? song["al"] : song["album"];
+        v.album_id = catalog_id(album["id"]);
+    } else if (v.source == Source::QQ) {
+        for (const auto& a : song["singer"].array) {
+            if (v.artists.size() >= 32) break;
+            const auto name = text::decode_entities(a["name"].str());
+            if (!name.empty()) v.artists.push_back({a["mid"].str(), name});
+        }
+        v.album_id = song["album"]["mid"].str(song["albummid"].str());
+    } else if (v.source == Source::Kuwo) {
+        const auto id = catalog_id(song["ARTISTID"].is_null() ? song["artistid"] : song["ARTISTID"]);
+        if (!v.artist.empty()) v.artists.push_back({id, v.artist});
+        v.album_id = catalog_id(song["ALBUMID"].is_null() ? song["albumid"] : song["ALBUMID"]);
+    }
+}
+inline std::vector<ArtistRef> track_artists(const Track& track) {
+    const auto& v = track.current();
+    if (!v.artists.empty()) return v.artists;
+    const auto raw = v.artist.empty() ? track.artist : v.artist;
+    std::vector<ArtistRef> out;
+    // With no structured metadata, only split the separators emitted by our parsers.
+    size_t begin = 0;
+    while (begin < raw.size() && out.size() < 32) {
+        const auto end = raw.find(" / ", begin);
+        auto name = text::trim(raw.substr(begin, end == std::string::npos ? std::string::npos : end - begin));
+        if (!name.empty()) out.push_back({{}, std::move(name)});
+        if (end == std::string::npos) break;
+        begin = end + 3;
+    }
+    return out;
+}
+inline std::string track_album(const Track& track) {
+    return track.current().album.empty() ? track.album : track.current().album;
+}
+
 inline std::vector<Variant> search_netease(const std::string& keyword, int limit, int timeout_ms,
                                            std::string& err, const Settings& st, int page = 0) {
     std::vector<Variant> out;
@@ -423,6 +482,7 @@ inline std::vector<Variant> search_netease(const std::string& keyword, int limit
         v.artist = artists;
         v.album = text::decode_entities(s["album"]["name"].str());
         v.duration_ms = int(s["duration"].integer());
+        attach_catalog_metadata(v, s);
         const long long fee = s["fee"].integer(1);
         // fee: 0 免费 / 8 免费低音质 / 1 会员 / 4 付费专辑
         v.bitrate = (fee == 1 || fee == 4) ? 128000 : 128000;
@@ -547,6 +607,7 @@ inline std::vector<Variant> search_kuwo(const std::string& keyword, int limit, i
         v.artist = text::decode_entities(s["ARTIST"].str());
         v.album = text::decode_entities(s["ALBUM"].str());
         v.duration_ms = int(s["DURATION"].integer()) * 1000;
+        attach_catalog_metadata(v, s);
         // MINFO 里的档位表：取最大 mp3 码率当标称
         const std::string minfo = s["MINFO"].str();
         int best = 0;
@@ -648,6 +709,7 @@ inline std::vector<Variant> search_qq(const std::string& keyword, int limit, int
         if (!pmid.empty())
             v.cover_url = "https://y.gtimg.cn/music/photo_new/T002R300x300M000" + pmid + ".jpg";
         v.duration_ms = int(s["interval"].integer()) * 1000;
+        attach_catalog_metadata(v, s);
         const long long pay_play = s["pay"]["pay_play"].integer(1);
         v.needs_login = pay_play != 0;
         v.bitrate = 128000;
@@ -1212,6 +1274,7 @@ inline std::vector<Variant> parse_bilibili_search(const js::Value& root, int lim
         Variant v; v.source = Source::Bilibili; v.id = item["bvid"].str();
         v.title = strip_tags(item["title"].str()); v.artist = music::text::decode_entities(item["author"].str());
         v.duration_ms = clock_ms(item["duration"].str()); v.cover_url = item["pic"].str();
+        v.artists.push_back({catalog_id(item["mid"]), v.artist});
         if (v.cover_url.rfind("//", 0) == 0) v.cover_url = "https:" + v.cover_url;
         if (v.id.rfind("BV", 0) != 0 || v.title.empty()) continue;
         out.push_back(std::move(v)); if (int(out.size()) >= limit) break;
@@ -1292,6 +1355,7 @@ inline BilibiliParts parse_bilibili_parts(const js::Value& root, const std::stri
         Variant v; v.source = Source::Bilibili; v.id = bvid; v.native_id = cid;
         v.title = "P" + std::to_string(page["page"].integer(out.tracks.size() + 1)) + " · " + page["part"].str(out.title);
         v.artist = data["owner"]["name"].str(); v.album = out.title; v.cover_url = out.cover;
+        v.artists.push_back({catalog_id(data["owner"]["mid"]), v.artist});
         v.duration_ms = int(std::clamp<long long>(page["duration"].integer(), 0, 2147483) * 1000);
         Track t; t.title = v.title; t.artist = v.artist; t.album = v.album;
         t.duration_ms = v.duration_ms; t.cover_url = v.cover_url; t.variants.push_back(std::move(v));
@@ -1353,6 +1417,18 @@ inline std::string video_id(const js::Value& node, int depth = 0) {
 inline bool valid_youtube_id(const std::string& id) {
     return id.size() == 11 && id.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") == std::string::npos;
 }
+inline void youtube_catalog_metadata(Variant& v, const js::Value& node, int depth = 0) {
+    if (depth > 24) return;
+    const auto& endpoint = node["navigationEndpoint"]["browseEndpoint"];
+    const auto id = endpoint["browseId"].str();
+    const auto name = node["text"].str();
+    if (!name.empty() && id.rfind("UC", 0) == 0 && v.artists.size() < 32) {
+        if (std::none_of(v.artists.begin(), v.artists.end(), [&](const auto& a) { return a.id == id; }))
+            v.artists.push_back({id, name});
+    } else if (!name.empty() && id.rfind("MPRE", 0) == 0) { v.album_id = id; v.album = name; }
+    for (const auto& pair : node.object) youtube_catalog_metadata(v, pair.second, depth + 1);
+    for (const auto& item : node.array) youtube_catalog_metadata(v, item, depth + 1);
+}
 inline std::vector<Variant> parse_youtube_search(const js::Value& root, int limit) {
     std::vector<Variant> out; std::set<std::string> seen;
     std::function<void(const js::Value&, int)> walk;
@@ -1388,6 +1464,13 @@ inline std::vector<Variant> parse_youtube_search(const js::Value& root, int limi
             v.artist = runs_text(video["ownerText"]); v.duration_ms = clock_ms(runs_text(video["lengthText"]));
         }
         if (item) {
+            youtube_catalog_metadata(v, (*item)["flexColumns"]);
+            youtube_catalog_metadata(v, (*item)["subtitle"]);
+            youtube_catalog_metadata(v, (*item)["ownerText"]);
+            if (!v.artists.empty()) {
+                v.artist.clear();
+                for (const auto& artist : v.artists) { if (!v.artist.empty()) v.artist += " / "; v.artist += artist.name; }
+            }
             const auto& thumbs = (*item)["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"].is_array() ?
                 (*item)["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"] : (*item)["thumbnail"]["thumbnails"];
             if (!thumbs.array.empty()) v.cover_url = thumbs.array.back()["url"].str();
@@ -1799,6 +1882,290 @@ inline bool find_on_source(Source src, const Track& t, const Settings& st, Varia
     out = got[size_t(best_i)];
     err.clear();
     return true;
+}
+
+
+// 目录浏览只读取平台实体，不借用在线搜索结果或播放队列。
+struct CatalogPage {
+    CatalogTarget target;
+    std::vector<Track> tracks;
+    std::vector<CatalogTarget> albums;
+    std::string description, error, continuation;
+    int next_offset = 0;
+    bool more = false;
+};
+inline bool valid_catalog_id(const std::string& id) {
+    return !id.empty() && id.size() <= 160 &&
+        id.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") == std::string::npos;
+}
+inline bool numeric_catalog_id(const std::string& id) {
+    return !id.empty() && id.size() <= 24 && id.find_first_not_of("0123456789") == std::string::npos;
+}
+inline Track catalog_track(Source source, const js::Value& input) {
+    const auto& song = input["musicData"].is_object() ? input["musicData"] :
+        input["songInfo"].is_object() ? input["songInfo"] : input;
+    Variant v; v.source = source;
+    if (source == Source::Netease) {
+        v.id = catalog_id(song["id"]); v.native_id = v.id;
+        v.title = text::decode_entities(song["name"].str());
+        const auto& artists = song["ar"].is_array() ? song["ar"] : song["artists"];
+        for (const auto& artist : artists.array) {
+            if (!v.artist.empty()) v.artist += " / "; v.artist += text::decode_entities(artist["name"].str());
+        }
+        const auto& album = song["al"].is_object() ? song["al"] : song["album"];
+        v.album = text::decode_entities(album["name"].str()); v.cover_url = album["picUrl"].str();
+        v.duration_ms = int(song["dt"].integer(song["duration"].integer()));
+        const int fee = int(song["fee"].integer()); v.needs_login = fee == 1 || fee == 4;
+    } else if (source == Source::QQ) {
+        v.id = song["mid"].str(song["songmid"].str()); v.native_id = catalog_id(song["id"]);
+        v.title = text::decode_entities(song["name"].str(song["songname"].str(song["title"].str())));
+        for (const auto& artist : song["singer"].array) {
+            if (!v.artist.empty()) v.artist += " / "; v.artist += text::decode_entities(artist["name"].str());
+        }
+        v.album = text::decode_entities(song["album"]["name"].str(song["albumname"].str()));
+        v.duration_ms = int(song["interval"].integer()) * 1000;
+        const auto mid = song["album"]["mid"].str(song["albummid"].str());
+        if (!mid.empty()) v.cover_url = "https://y.gtimg.cn/music/photo_new/T002R300x300M000" + mid + ".jpg";
+        v.needs_login = song["pay"]["pay_play"].integer() != 0;
+    } else if (source == Source::Kuwo) {
+        v.id = song["MUSICRID"].str(catalog_id(song["musicrid"]));
+        if (v.id.empty()) v.id = catalog_id(song["rid"].is_null() ? song["id"] : song["rid"]);
+        if (v.id.rfind("MUSIC_", 0) == 0) v.id.erase(0, 6);
+        v.title = text::decode_entities(song["SONGNAME"].str(song["NAME"].str(song["name"].str())));
+        v.artist = text::decode_entities(song["ARTIST"].str(song["artist"].str()));
+        v.album = text::decode_entities(song["ALBUM"].str(song["album"].str()));
+        v.duration_ms = int(song["DURATION"].integer(song["duration"].integer())) * 1000;
+        v.cover_url = song["pic"].str(song["pic120"].str());
+    }
+    attach_catalog_metadata(v, song);
+    Track track; track.title = v.title; track.artist = v.artist; track.album = v.album;
+    track.duration_ms = v.duration_ms; track.cover_url = v.cover_url;
+    if (!v.id.empty() && !v.title.empty()) track.variants.push_back(std::move(v));
+    return track;
+}
+inline bool catalog_qq_request(const Settings& st, const std::string& module, const std::string& method,
+                              const std::string& params, js::Value& data, std::string& error) {
+    js::Value root;
+    const auto body = "{\"comm\":{\"ct\":24,\"cv\":0,\"format\":\"json\"},\"req\":{\"module\":" + providers::quote(module) +
+        ",\"method\":" + providers::quote(method) + ",\"param\":" + params + "}}";
+    if (!providers::json_response(net::post("https://u.y.qq.com/cgi-bin/musicu.fcg", body,
+        {"Content-Type: application/json", "Referer: https://y.qq.com/", "User-Agent: Mozilla/5.0", "Cookie: " + st.qq_cookie}, 10000), root, error)) return false;
+    if (root["req"]["code"].integer(-1) != 0) { error = "QQ 目录接口拒绝（code " + std::to_string(root["req"]["code"].integer(-1)) + "）"; return false; }
+    data = root["req"]["data"]; return true;
+}
+inline bool hydrate_catalog_variant(Variant& variant, const Settings& st, std::string& error) {
+    js::Value root;
+    if (!valid_catalog_id(variant.id)) { error = "歌曲 ID 无效，无法读取目录资料"; return false; }
+    if (variant.source == Source::Netease) {
+        if (!numeric_catalog_id(variant.id)) { error = "网易云歌曲 ID 无效"; return false; }
+        if (!providers::json_response(net::get("https://music.163.com/api/song/detail?ids=" + net::url_encode("[" + variant.id + "]"),
+            {"Referer: https://music.163.com/", "User-Agent: Mozilla/5.0", "Cookie: " + st.netease_cookie}, 8000), root, error)) return false;
+        if (root["code"].integer() != 200 || root["songs"].array.empty()) { error = "网易云未返回这首歌的资料"; return false; }
+        const auto track = catalog_track(variant.source, root["songs"][size_t(0)]);
+        if (track.variants.empty() || track.current().id != variant.id) { error = "网易云歌曲资料不完整或身份不符"; return false; }
+        variant = track.current();
+    } else if (variant.source == Source::QQ) {
+        if (!catalog_qq_request(st, "music.pf_song_detail_svr", "get_song_detail_yqq",
+            "{\"song_mid\":" + providers::quote(variant.id) + ",\"song_type\":0}", root, error)) return false;
+        auto track = catalog_track(variant.source, root["track_info"]);
+        if (track.variants.empty() || track.current().id != variant.id) { error = "QQ 未返回这首歌的资料"; return false; }
+        variant = track.current();
+    } else if (variant.source == Source::Kuwo) {
+        const auto found = search_kuwo(variant.title + " " + variant.artist, 30, 8000, error);
+        for (const auto& item : found) if (item.id == variant.id) { variant = item; return true; }
+        if (error.empty()) error = "酷我未返回这首歌的歌手或专辑 ID";
+        return false;
+    } else if (variant.source == Source::YouTube) {
+        if (!providers::youtube_request("next", "\"videoId\":" + providers::quote(variant.id), st, root, error)) return false;
+        const auto* panel = providers::youtube_member(root, "playlistPanelRenderer");
+        if (panel) for (const auto& item : (*panel)["contents"].array) {
+            const auto& video = item["playlistPanelVideoRenderer"];
+            if (video["videoId"].str() != variant.id) continue;
+            providers::youtube_catalog_metadata(variant, video["longBylineText"]);
+            providers::youtube_catalog_metadata(variant, video["shortBylineText"]);
+            break;
+        }
+    } else if (variant.source == Source::Bilibili) {
+        if (!providers::json_response(net::get("https://api.bilibili.com/x/web-interface/view?bvid=" + net::url_encode(variant.id),
+            {"Referer: https://www.bilibili.com/", "User-Agent: Mozilla/5.0"}, 8000), root, error)) return false;
+        if (root["code"].integer(-1) != 0) { error = root["message"].str("B 站视频资料不可用"); return false; }
+        const auto& owner = root["data"]["owner"];
+        variant.artists = {{catalog_id(owner["mid"]), owner["name"].str()}};
+    }
+    return true;
+}
+inline bool catalog_target_from_track(const Track& track, CatalogKind kind, int artist_index, const Settings& st,
+                                      CatalogTarget& target, std::string& error) {
+    if (track.variants.empty()) { error = "没有曲目资料"; return false; }
+    auto variant = track.current();
+    const auto displayed = track_artists(track);
+    const auto wanted = artist_index >= 0 && artist_index < int(displayed.size()) ? displayed[size_t(artist_index)].name : std::string();
+    target.source = variant.source; target.kind = kind;
+    const bool missing = kind == CatalogKind::Album ? variant.album_id.empty() :
+        artist_index < 0 || artist_index >= int(variant.artists.size()) || variant.artists[size_t(artist_index)].id.empty();
+    if (variant.source != Source::Local && missing && !hydrate_catalog_variant(variant, st, error)) return false;
+    if (kind == CatalogKind::Album) {
+        target.id = variant.album_id; target.name = variant.album.empty() ? track.album : variant.album;
+        target.cover = variant.cover_url.empty() ? track.cover_url : variant.cover_url;
+        target.subtitle = variant.artist.empty() ? track.artist : variant.artist;
+    } else {
+        const auto exact = std::find_if(variant.artists.begin(), variant.artists.end(), [&](const auto& a) { return a.name == wanted; });
+        if (exact != variant.artists.end()) { target.id = exact->id; target.name = exact->name; }
+        else if (variant.source == Source::Local) target.name = wanted;
+        else { error = "未能确认这位歌手的资料，未打开其他同名结果"; return false; }
+    }
+    if (target.name.empty()) { error = kind == CatalogKind::Artist ? "没有歌手信息" : "没有专辑信息"; return false; }
+    if (target.source == Source::Local && kind == CatalogKind::Artist) target.id = target.name;
+    if (target.source == Source::Local && kind == CatalogKind::Album) target.id = platform::fs::u8path(variant.id).parent_path().u8string();
+    if (target.source != Source::Local && !valid_catalog_id(target.id)) { error = "平台没有提供可浏览的歌手或专辑 ID"; return false; }
+    return true;
+}
+inline CatalogTarget catalog_album(Source source, const js::Value& album) {
+    CatalogTarget out; out.source = source; out.kind = CatalogKind::Album;
+    out.id = source == Source::QQ ? album["albumMid"].str(album["album_mid"].str(album["mid"].str())) :
+        catalog_id(album["id"].is_null() ? album["albumid"] : album["id"]);
+    out.name = text::decode_entities(album["name"].str(album["albumName"].str(album["album_name"].str())));
+    out.cover = album["picUrl"].str(album["pic"].str(album["pic120"].str()));
+    if (source == Source::QQ && !out.id.empty()) out.cover = "https://y.gtimg.cn/music/photo_new/T002R300x300M000" + out.id + ".jpg";
+    out.subtitle = album["publishTime"].str(album["pubTime"].str(album["releaseDate"].str(album["pub_time"].str())));
+    return out;
+}
+inline CatalogPage fetch_catalog(CatalogTarget target, const Settings& st, bool albums = false, int offset = 0,
+                                 const std::string& continuation = {}) {
+    CatalogPage out; out.target = std::move(target);
+    auto& t = out.target;
+    if (!valid_catalog_id(t.id) || offset < 0 || offset > 5000) { out.error = "目录参数无效或超过 5000 条"; return out; }
+    js::Value root; const js::Value* list = nullptr;
+    if (t.source == Source::Netease) {
+        if (!numeric_catalog_id(t.id)) { out.error = "网易云目录 ID 无效"; return out; }
+        const auto path = t.kind == CatalogKind::Album ? "album/" : albums ? "artist/albums/" : "artist/";
+        if (!providers::json_response(net::get("https://music.163.com/api/" + std::string(path) + t.id +
+            "?limit=50&offset=" + std::to_string(offset), {"Referer: https://music.163.com/", "User-Agent: Mozilla/5.0", "Cookie: " + st.netease_cookie}, 10000), root, out.error)) return out;
+        if (root["code"].integer() != 200) { out.error = "网易云目录接口拒绝（code " + std::to_string(root["code"].integer()) + "）"; return out; }
+        const auto& header = t.kind == CatalogKind::Album ? root["album"] : root["artist"];
+        if (!header["name"].str().empty()) t.name = text::decode_entities(header["name"].str());
+        if (!header["picUrl"].str().empty()) t.cover = header["picUrl"].str();
+        out.description = header["briefDesc"].str(header["description"].str());
+        if (albums) { list = &root["hotAlbums"]; out.more = root["more"].truthy(); }
+        else list = t.kind == CatalogKind::Album ? &root["songs"] : &root["hotSongs"];
+    } else if (t.source == Source::QQ) {
+        if (t.kind == CatalogKind::Album) {
+            if (!providers::json_response(net::get("https://c.y.qq.com/v8/fcg-bin/fcg_v8_album_info_cp.fcg?format=json&albummid=" + net::url_encode(t.id),
+                {"Referer: https://y.qq.com/", "User-Agent: Mozilla/5.0", "Cookie: " + st.qq_cookie}, 10000), root, out.error)) return out;
+            if (root["code"].integer(-1) != 0) { out.error = "QQ 专辑接口拒绝"; return out; }
+            const auto& data = root["data"];
+            if (!data["name"].str().empty()) t.name = text::decode_entities(data["name"].str());
+            out.description = data["desc"].str(); list = &data["list"];
+        } else {
+            const auto params = "{\"singermid\":" + providers::quote(t.id) + (albums ? ",\"begin\":" : ",\"sin\":") +
+                std::to_string(offset) + (albums ? ",\"num\":50,\"order\":\"time\",\"exstatus\":1}" : ",\"num\":50,\"sort\":5}");
+            if (!catalog_qq_request(st, "music.web_singer_info_svr",
+                albums ? "get_singer_album" : "get_singer_detail_info", params, root, out.error)) return out;
+            list = albums ? &root["list"] : &root["songlist"];
+            const auto total = (albums ? root["total"] : root["total_song"]).integer(-1);
+            out.more = total >= 0 ? offset + int(list->size()) < total : list->size() == 50;
+            const auto name = albums ? root["singer_name"].str() : root["singer_info"]["name"].str();
+            if (!name.empty()) t.name = text::decode_entities(name);
+            out.description = root["singer_brief"].str(root["desc"].str());
+            t.cover = "https://y.gtimg.cn/music/photo_new/T001R300x300M000" + t.id + ".jpg";
+        }
+    } else if (t.source == Source::Kuwo) {
+        if (!numeric_catalog_id(t.id)) { out.error = "酷我目录 ID 无效"; return out; }
+        const bool album = t.kind == CatalogKind::Album;
+        const auto url = "https://search.kuwo.cn/r.s?encoding=utf8&ft=music&rn=50&pn=" + std::to_string(offset / 50) +
+            "&stype=" + (album ? std::string("albuminfo&albumid=") : albums ? "albumlist&artistid=" : "artist2music&artistid=") + t.id;
+        const auto response = net::get(url, {"Referer: https://www.kuwo.cn/", "User-Agent: Mozilla/5.0"}, 10000);
+        if (!response.ok()) { out.error = response.error.empty() ? "HTTP " + std::to_string(response.status) : response.error; return out; }
+        if (!js::parse(response.body, root, true) || !root.is_object()) { out.error = "酷我目录响应不是 JSON"; return out; }
+        list = albums ? &root["albumlist"] : &root["musiclist"];
+        if (!list->is_array()) list = &root["abslist"];
+        const auto total = root["TOTAL"].integer(root["total"].integer(-1));
+        out.more = !album && (total >= 0 ? offset + int(list->size()) < total : list->size() == 50);
+        if (album) {
+            if (!root["name"].str().empty()) t.name = text::decode_entities(root["name"].str());
+            if (!root["hts_img"].str().empty()) t.cover = root["hts_img"].str();
+            out.description = root["info"].str();
+        }
+    } else if (t.source == Source::YouTube) {
+        if (!providers::youtube_request("browse", continuation.empty() ? "\"browseId\":" + providers::quote(t.id) :
+            "\"continuation\":" + providers::quote(continuation), st, root, out.error)) return out;
+        const js::Value* header = providers::youtube_member(root, "musicImmersiveHeaderRenderer");
+        if (!header) header = providers::youtube_member(root, "musicResponsiveHeaderRenderer");
+        if (!header) header = providers::youtube_member(root, "musicDetailHeaderRenderer");
+        if (header) {
+            const auto name = providers::runs_text((*header)["title"]); if (!name.empty()) t.name = name;
+            const auto cover = providers::youtube_thumbnail(*header); if (!cover.empty()) t.cover = cover;
+            out.description = providers::runs_text((*header)["description"]);
+        }
+        if (albums) {
+            std::set<std::string> ids;
+            std::function<void(const js::Value&, int)> walk = [&](const js::Value& node, int depth) {
+                if (depth > 64 || out.albums.size() >= 5000) return;
+                const auto& item = node["musicTwoRowItemRenderer"];
+                const auto id = item["navigationEndpoint"]["browseEndpoint"]["browseId"].str();
+                if (id.rfind("MPRE", 0) == 0 && ids.insert(id).second) {
+                    CatalogTarget album; album.source = t.source; album.kind = CatalogKind::Album; album.id = id;
+                    album.name = providers::runs_text(item["title"]); album.cover = providers::youtube_thumbnail(item);
+                    album.subtitle = providers::runs_text(item["subtitle"]); out.albums.push_back(std::move(album));
+                }
+                for (const auto& pair : node.object) walk(pair.second, depth + 1);
+                for (const auto& item : node.array) walk(item, depth + 1);
+            }; walk(root, 0);
+        } else {
+            // 仅跟随歌曲 shelf 的 continuation，不能误用相关推荐或专辑架的 token。
+            const auto* shelf = providers::youtube_member(root, "musicPlaylistShelfRenderer");
+            if (!shelf) shelf = providers::youtube_member(root, "musicShelfRenderer");
+            if (!shelf) shelf = providers::youtube_member(root, "musicShelfContinuation");
+            if (!shelf) shelf = providers::youtube_member(root, "musicPlaylistShelfContinuation");
+            auto variants = providers::parse_youtube_search(shelf ? *shelf : root, 5000);
+            for (auto& v : variants) {
+                if (t.kind == CatalogKind::Album) {
+                    v.album_id = t.id; v.album = t.name;
+                    if (v.cover_url.empty()) v.cover_url = t.cover;
+                }
+                Track track; track.title = v.title; track.artist = v.artist; track.album = v.album;
+                track.cover_url = v.cover_url; track.duration_ms = v.duration_ms; track.variants.push_back(std::move(v));
+                out.tracks.push_back(std::move(track));
+            }
+            if (shelf) out.continuation = providers::youtube_continuation(*shelf);
+            out.more = !out.continuation.empty() && out.continuation != continuation;
+        }
+        out.next_offset = offset + int(albums ? out.albums.size() : out.tracks.size()); return out;
+    } else if (t.source == Source::Bilibili && !albums && t.kind == CatalogKind::Artist) {
+        if (!numeric_catalog_id(t.id)) { out.error = "B 站 UP 主 ID 无效"; return out; }
+        const auto session = providers::bili_session(3000, out.error); if (session.key.empty()) return out;
+        const auto query = providers::wbi_query({{"mid", t.id}, {"pn", std::to_string(offset / 30 + 1)}, {"ps", "30"}, {"order", "pubdate"}}, session.key, std::time(nullptr));
+        if (!providers::json_response(net::get("https://api.bilibili.com/x/space/wbi/arc/search?" + query,
+            {"Referer: https://www.bilibili.com/", "User-Agent: Mozilla/5.0", "Cookie: " + session.cookie}, 10000), root, out.error)) return out;
+        if (root["code"].integer(-1) != 0) { out.error = root["message"].str("B 站 UP 主作品暂不可用"); return out; }
+        list = &root["data"]["list"]["vlist"];
+        for (const auto& item : list->array) {
+            Variant v; v.source = t.source; v.id = item["bvid"].str(); v.title = providers::strip_tags(item["title"].str());
+            v.artist = t.name; v.artists = {{t.id, t.name}}; v.cover_url = item["pic"].str();
+            if (v.cover_url.rfind("//", 0) == 0) v.cover_url = "https:" + v.cover_url;
+            v.duration_ms = providers::clock_ms(item["length"].str());
+            Track track; track.title = v.title; track.artist = v.artist; track.cover_url = v.cover_url; track.duration_ms = v.duration_ms;
+            if (!v.id.empty() && !v.title.empty()) { track.variants = {std::move(v)}; out.tracks.push_back(std::move(track)); }
+        }
+        out.next_offset = offset + int(list->size()); out.more = out.next_offset < root["data"]["page"]["count"].integer(); return out;
+    } else { out.error = "此音源未提供这个目录"; return out; }
+    if (!list || !list->is_array()) { out.error = "平台未返回目录列表，请稍后重试"; return out; }
+    out.next_offset = offset + int(list->size()); out.more = out.more && !list->array.empty() && out.next_offset < 5000;
+    for (const auto& row : list->array) {
+        if (albums) {
+            auto album = catalog_album(t.source, row);
+            if (valid_catalog_id(album.id) && !album.name.empty()) out.albums.push_back(std::move(album));
+        } else {
+            auto track = catalog_track(t.source, row);
+            if (track.variants.empty()) continue;
+            if (t.kind == CatalogKind::Album) {
+                auto& v = track.variants.front(); v.album_id = t.id; v.album = t.name; track.album = t.name;
+                if (v.cover_url.empty()) { v.cover_url = t.cover; track.cover_url = t.cover; }
+            }
+            out.tracks.push_back(std::move(track));
+        }
+    }
+    return out;
 }
 
 }  // namespace music

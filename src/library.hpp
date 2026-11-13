@@ -8,6 +8,8 @@
 #include <regex>
 #include <functional>
 #include <cctype>
+#include <map>
+#include <cmath>
 
 namespace library {
 inline std::string quote(const std::string& text) {
@@ -37,7 +39,13 @@ inline std::string encode_track(const music::Track& t) {
             ",\"native_id\":" + quote(v.native_id) + ",\"title\":" + quote(v.title) +
             ",\"artist\":" + quote(v.artist) + ",\"album\":" + quote(v.album) +
             ",\"cover\":" + quote(v.cover_url) + ",\"duration_ms\":" + std::to_string(v.duration_ms) +
-            ",\"bitrate\":" + std::to_string(v.bitrate) + ",\"needs_login\":" + (v.needs_login ? "true" : "false") + "}";
+            ",\"bitrate\":" + std::to_string(v.bitrate) + ",\"needs_login\":" + (v.needs_login ? "true" : "false") +
+            ",\"album_id\":" + quote(v.album_id) + ",\"artists\":[";
+        for (size_t i = 0; i < v.artists.size(); ++i) {
+            if (i) out += ',';
+            out += "{\"id\":" + quote(v.artists[i].id) + ",\"name\":" + quote(v.artists[i].name) + "}";
+        }
+        out += "]}";
     }
     return out + "]}";
 }
@@ -52,6 +60,11 @@ inline bool decode_track(const js::Value& value, music::Track& t) {
         if (source < 0 || source > int(music::Source::Local) || id.empty()) continue;
         music::Variant v;
         v.source = music::Source(source); v.id = id; v.native_id = row["native_id"].str();
+        v.album_id = row["album_id"].str();
+        if (row["artists"].size() > 32) return false;
+        for (const auto& a : row["artists"].array) {
+            if (!a["name"].str().empty()) v.artists.push_back({a["id"].str(), a["name"].str()});
+        }
         v.title = row["title"].str(t.title); v.artist = row["artist"].str(t.artist);
         v.album = row["album"].str(t.album); v.cover_url = row["cover"].str(t.cover_url);
         v.duration_ms = int(row["duration_ms"].integer(t.duration_ms));
@@ -146,8 +159,16 @@ inline Playlist scan_folder(const std::string& input, bool recursive, std::strin
 class Library {
 public:
     std::vector<Playlist> playlists;
+    struct LyricPreference { int offset_ms = 0; std::string path; };
+    std::vector<music::Track> recent;
+    std::map<std::string, LyricPreference> lyric_preferences;
     Library() { reset(); }
-    void reset() { playlists = {{"favorites", "本地收藏", {}, {}, music::Source::Netease, {}}}; }
+    void reset() { playlists = {{"favorites", "本地收藏", {}, {}, music::Source::Netease, {}}}; recent.clear(); lyric_preferences.clear(); }
+    void remember(const music::Track& track) {
+        recent.erase(std::remove_if(recent.begin(), recent.end(), [&](const auto& t) { return same_track(t, track); }), recent.end());
+        recent.insert(recent.begin(), track);
+        if (recent.size() > 200) recent.resize(200);
+    }
     bool contains(const music::Track& track) const {
         for (const auto& t : playlists.front().tracks) if (same_track(t, track)) return true;
         return false;
@@ -180,6 +201,14 @@ public:
                 first_track = false; out += encode_track(t);
             }
             out += "]}";
+        }
+        out += "],\"recent\":[";
+        first = true;
+        for (const auto& track : recent) { if (!first) out += ','; first = false; out += encode_track(track); }
+        out += "],\"lyrics\":["; first = true;
+        for (const auto& entry : lyric_preferences) {
+            if (!first) out += ','; first = false;
+            out += "{\"uid\":" + quote(entry.first) + ",\"offset\":" + std::to_string(entry.second.offset_ms) + ",\"path\":" + quote(entry.second.path) + "}";
         }
         out += "]}\n";
         if (out.size() > 64 * 1024 * 1024) { err = "本地资料库超过 64 MiB，原文件已保留"; return false; }
@@ -223,7 +252,19 @@ public:
             if (p.key == "favorites") loaded.playlists.front() = std::move(p);
             else loaded.upsert(std::move(p));
         }
-        playlists = std::move(loaded.playlists); return true;
+        if ((!root["recent"].is_null() && !root["recent"].is_array()) ||
+            (!root["lyrics"].is_null() && !root["lyrics"].is_array())) { err = "本地记录格式损坏"; return false; }
+        if (root["recent"].size() > 200 || root["lyrics"].size() > 4096) { err = "本地记录超过容量限制"; return false; }
+        for (const auto& row : root["recent"].array) {
+            music::Track track; if (!decode_track(row, track)) { err = "最近播放记录损坏"; return false; }
+            loaded.recent.push_back(std::move(track));
+        }
+        for (const auto& row : root["lyrics"].array) {
+            const auto uid = row["uid"].str(), path = row["path"].str();
+            if (uid.empty() || uid.size() > 8192 || path.size() > 8192 || !std::isfinite(row["offset"].num())) { err = "歌词配置损坏"; return false; }
+            loaded.lyric_preferences[uid] = {int(std::clamp(row["offset"].num(), -60000.0, 60000.0)), path};
+        }
+        *this = std::move(loaded); return true;
     }
 };
 } // namespace library

@@ -229,6 +229,7 @@ inline std::vector<music::Track> fetch_playlist(const std::string& cookie, const
             v.duration_ms = t.duration_ms;
             v.cover_url = t.cover_url;
             v.native_id = std::to_string(s["id"].integer());
+            music::attach_catalog_metadata(v, s);
             t.variants.push_back(v);
             out.push_back(std::move(t));
         }

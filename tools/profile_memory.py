@@ -124,6 +124,11 @@ def prepare(source):
     source = Path(source)
     main = source / 'src/main.cpp'
     text = main.read_text(encoding='utf-8')
+    # 兼容历史快照；内存专项关闭桌面集成以维持相同测量场景。
+    if '    platform::Desktop desktop;' in text:
+        text = text.replace('    if (!smoke_test) {\n#ifdef _WIN32\n        desktop.start', '    if (false) {\n#ifdef _WIN32\n        desktop.start', 1)
+        text = text.replace('        if (!smoke_test) {\n            const auto& playing', '        if (false) {\n            const auto& playing', 1)
+        text = text.replace('        if (!desktop.hidden()) ui::draw(ui, model);', '        ui::draw(ui, model);', 1)
     replacements = {
         '#include "ui.hpp"': '#include "ui.hpp"\n#include "memory_probe.hpp"',
         '    using namespace player;': '    using namespace player;\n    if (argc > 1 && std::string(argv[1]) == "--memory-assets") return memory_probe::assets();',

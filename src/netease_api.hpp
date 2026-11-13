@@ -203,6 +203,7 @@ inline std::vector<music::Track> fetch_playlist(const std::string& cookie, const
         const int fee = int(s["fee"].integer(1));
         v.bitrate = 128000;
         v.needs_login = (fee == 1 || fee == 4);
+        music::attach_catalog_metadata(v, s);
         t.variants.push_back(std::move(v));
         if (t.title.empty()) continue;
         out.push_back(std::move(t));

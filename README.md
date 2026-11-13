@@ -15,13 +15,18 @@
 - **歌曲右键菜单**：搜索、歌单详情和队列里的歌曲均可右键，选择下一首播放、添加到播放列表、收藏或下载；下一首播放保留当前曲目，优先于随机和单曲循环
 - **睡眠定时器**：底栏选择 15 / 30 / 60 / 90 分钟后停止，或播完当前歌曲；紧凑菜单显示状态和剩余时间，禁用不可用的取消项。计时不因暂停而暂停，重新启动不恢复定时器
 - **歌单**：本地、账号与发现页歌单均打开独立详情页，含返回、曲目列表和播放全部；点击歌曲后才建立播放队列，不改在线搜索词；「同步到此」写回账号
-- **歌词**：三源歌词，居中跟随、hover 高亮、点行跳转
+- **系统媒体控制**：Windows SMTC、Linux MPRIS，支持桌面媒体面板、媒体键、播放/暂停、切歌和定位
+- **后台播放**：关闭窗口默认询问「到托盘 / 退出 / 取消」，可记住选择，也可在「设置 → 通用」修改；隐藏时停止绘制业务界面，继续播放和计时。Linux 使用 StatusNotifierItem / DBusMenu，无托盘宿主时禁用隐藏选项
+- **下载管理**：左侧「下载管理」查看本次运行的等待、下载、失败和完成记录；支持单项/全部取消、失败重试、清理记录和打开文件位置，清理记录不会删除音乐
+- **最近播放**：左侧「最近播放」保存最近 200 首，播放至 5 秒后去重记录，可直接重播、右键操作或清空；与本地资料库一起保存及备份
+- **输出设备**：「设置 → 播放」刷新并选择音频输出，保存选择；切换时保留位置及暂停状态，设备失效时恢复系统默认输出
+- **歌词**：三源歌词，居中跟随、hover 高亮、点行跳转；「校准」按歌曲保存提前/延后偏移，也可选择 UTF-8 本地 LRC 或恢复默认
 - **音质**：标准 / 高 / 无损；下载可内嵌封面与歌词（ID3v2.3 / MP4 ilst）
 - **本地收藏**：单个后台写入任务合并连续操作，保存成功后发布新资料库，写失败保留原文件并提示；歌曲行、队列和播放条都能收藏；播放条的收藏按钮位于歌词按钮左侧，已收藏时高亮
 - **本地歌单**：「歌单 → 本地」可导入音乐文件夹、把播放队列保存为命名歌单，也能保存发现页和账号中的歌单
 - **保存其他在线歌单**：在本地页粘贴网易云或 QQ 的公开歌单长链接，保存曲目快照并可手动刷新；刷新失败保留原快照
 - **官网登录**：默认 Chrome、Edge 或 Chromium 打开独立的外部官网窗口，由官网处理扫码、密码和验证码；登录态自动回传，无需扩展或内嵌 WebView
-- **GitHub 更新**：启动时在后台检查最新正式版；「设置 → 通用 → 检查更新」可手动检查、打开发布说明。Windows 优先下载安装器，校验大小和 SHA-256 后正常退出、覆盖升级并重新打开；Linux 下载 deb
+- **GitHub 更新**：启动时在后台检查最新正式版；「设置 → 通用 → 检查更新」可手动检查，并在应用内阅读从 GitHub Release 读取的更新内容。Windows 优先下载安装器，校验大小和 SHA-256 后正常退出、覆盖升级并重新打开；Linux 经系统授权覆盖安装 deb，无需卸载
 - **关于**：「设置 → 关于」包含版本、作者 sudoevolve、Apache-2.0 协议、项目地址及第三方许可；使用黑白灰的几何 A / 播放箭头图标
 - 深色模式；音量使用统一矢量图标，区分静音、低音量和高音量
 - 设置按通用、账号、播放、下载、数据和关于分类；底栏采用播放控制、居中曲目信息与进度、音量及工具三个区域
@@ -36,9 +41,9 @@ https://y.qq.com/n/ryqq/playlist/123
 
 ## 导入本地音乐
 
-打开「歌单 → 本地」，在第三行选择音乐文件夹（Windows）或粘贴路径（Windows / Linux），点击「导入文件夹」。默认包含子文件夹，可以关闭。支持 MP3、FLAC、WAV、M4A、AAC、Ogg、Opus、WebM；AAC/M4A（含 ALAC）、Ogg/Opus 和 WebM 由内置精简 FFmpeg 解码，无需用户安装系统 FFmpeg。
+打开「歌单 → 本地」，在第三行选择音乐文件夹或粘贴路径（Windows / Linux），点击「导入文件夹」。默认包含子文件夹，可以关闭。支持 MP3、FLAC、WAV、M4A、AAC、Ogg、Opus、WebM；AAC/M4A（含 ALAC）、Ogg/Opus 和 WebM 由内置精简 FFmpeg 解码，无需用户安装系统 FFmpeg。
 
-Windows 文件夹选择器在独立 STA 任务打开，关闭应用会取消选择器，重复点击不会叠加窗口。导入后点击歌单进入独立详情，点击一首或「播放全部」开始播放。「管理」默认折叠，展开后可歌单内搜索、按歌名/歌手/专辑/时长排序、重命名、多选移除以及导出；播放按当前筛选与排序建立队列。扫描优先读取 ID3v2、FLAC/Vorbis、Ogg/Opus、MP4 ilst、WAV INFO 中的标题、歌手和专辑，并提取支持的内嵌封面；无标签时回退文件名 `歌手 - 标题` 和父目录。读取有容量上限，损坏或不支持的字段会忽略；并非支持所有标签变体。原生解码格式会在后台扫描时读取时长。与音频同名的 UTF-8 `.lrc` 自动作为本地歌词（支持 BOM），不会向在线歌词接口提交本地路径。
+Windows 文件夹选择器在独立 STA 任务打开，Linux 通过桌面文件门户打开；门户不可用时可粘贴路径。关闭应用会取消选择器，重复点击不会叠加窗口。导入后点击歌单进入独立详情，点击一首或「播放全部」开始播放。「管理」默认折叠，展开后可歌单内搜索、按歌名/歌手/专辑/时长排序、重命名、多选移除以及导出；播放按当前筛选与排序建立队列。扫描优先读取 ID3v2、FLAC/Vorbis、Ogg/Opus、MP4 ilst、WAV INFO 中的标题、歌手和专辑，并提取支持的内嵌封面；无标签时回退文件名 `歌手 - 标题` 和父目录。读取有容量上限，损坏或不支持的字段会忽略；并非支持所有标签变体。原生解码格式会在后台扫描时读取时长。与音频同名的 UTF-8 `.lrc` 自动作为本地歌词（支持 BOM），不会向在线歌词接口提交本地路径。
 
 文件夹歌单的「更新」按钮重新扫描；重复导入同一个规范路径会更新原歌单，扫描失败保留旧列表。移动或删除文件后需重新扫描；失效文件会明确提示，不会自动换成同名在线音乐。删除歌单、清除资料库和清理缓存只移除播放器记录或生成的缓存，均不删除原音乐；转码产物保存在播放器临时缓存目录。
 
@@ -60,19 +65,19 @@ Windows 文件夹选择器在独立 STA 任务打开，关闭应用会取消选�
 
 ## 下载与安装
 
-正式版在 [GitHub Releases](https://github.com/sudoevolve/aino-player/releases)。本次版本 v0.2.3 包含 Windows 搜索输入法及滑条反馈修复、流式播放、任务取消、渐进搜索、本地歌单管理和 Linux 资源开销优化；继续提供安装器、便携版和 deb。
+正式版在 [GitHub Releases](https://github.com/sudoevolve/aino-player/releases)。本次版本 v0.2.4 新增系统托盘、媒体键与系统媒体控制、输出设备切换、最近播放、歌手与专辑浏览及应用内更新说明；优化前三页交互、不可用歌曲自动跳过、流式缓冲恢复和 Linux 覆盖升级。继续提供安装器、便携版和 deb。
 
 Windows x64 产物同时提供 `*-setup-windows-x64.exe` 安装器和 `*-windows-x64.exe` 便携版。安装器按当前用户安装到 `%LOCALAPPDATA%\Programs\Aino Player`，不需管理员权限，提供开始菜单、可选桌面快捷方式和卸载入口。后续从设置更新会通过安装器覆盖升级；首次从便携版迁移也使用该固定目录，原便携 exe 可自行移除。Linux amd64 下载 `.deb` 并使用软件安装器，或执行：
 
 ```bash
-sudo apt install ./aino-player_0.2.3_amd64.deb
+sudo apt install ./aino-player_0.2.4_amd64.deb
 ```
 
 Linux 包面向 Ubuntu 22.04+ / Debian 12+；Wayland 桌面需要 XWayland。更新和卸载保留用户配置、本地资料库及下载音乐；数据清理由播放器设置单独处理。启动检查更新不阻塞播放，每次启动检查一次，网络失败可在设置重试，不需要 GitHub 令牌。旧版更新器会在浏览器中下载安装包，新版才支持应用内下载并启动安装器。
 
-如果 Ubuntu 双击新版 deb 后只显示灰色“已安装”，无需先卸载旧版；可在下载目录执行 `sudo apt install --no-remove ./aino-player_0.2.3_amd64.deb` 直接覆盖安装。应用文件升级不会删除用户目录中的配置和歌单。
+如果 Ubuntu 双击新版 deb 后只显示灰色“已安装”，无需先卸载旧版；可在下载目录执行 `sudo apt install --no-remove ./aino-player_0.2.4_amd64.deb` 直接覆盖安装。应用文件升级不会删除用户目录中的配置和歌单。
 
-本地待发布的 Linux 更新改动：设置中的“下载并安装”会校验 GitHub 附件大小与 SHA-256，再通过系统 pkexec 授权调用 apt-get 覆盖安装；成功后手动重启播放器。需要 apt-get、pkexec 和正在运行的桌面授权代理。授权取消不会安装，安装失败保留错误信息以供排查；详细输出写入配置目录的 `update-install.log`，不强杀安装中的 dpkg。deb 维护者补为 `sudoevolve <sudoevolve@gmail.com>`，AppStream 作者显示 `sudoevolve@gmail.com`，并补充项目、许可和版本资料。此改动尚未包含在 v0.2.3 安装包中。
+本地待发布的 Linux 更新改动：设置中的“下载并安装”会校验 GitHub 附件大小与 SHA-256，再通过系统 pkexec 授权调用 apt-get 覆盖安装；成功后手动重启播放器。需要 apt-get、pkexec 和正在运行的桌面授权代理。授权取消不会安装，安装失败保留错误信息以供排查；详细输出写入配置目录的 `update-install.log`，不强杀安装中的 dpkg。deb 维护者补为 `sudoevolve <sudoevolve@gmail.com>`，AppStream 作者显示 `sudoevolve@gmail.com`，并补充项目、许可和版本资料。此改动尚未包含在 v0.2.4 安装包中。
 
 Windows exe 内含精简 FFmpeg，体积主要来自音频解码器和静态运行库；这是独立运行和支持 AAC/M4A 的代价。安装器采用 LZMA2 压缩，减少下载大小，不增加常驻更新进程或运行时依赖。
 
@@ -84,16 +89,12 @@ Windows exe 内含精简 FFmpeg，体积主要来自音频解码器和静态运�
 # 首次构建解码器；生成 build/codec/ffmpeg.exe（Windows）或 ffmpeg（Linux）
 python tools/build_ffmpeg.py
 
-# MinGW-w64（GCC 12+，UCRT；需要 CMake 和 Ninja）
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-
-# MSVC：使用本机已安装的 Visual Studio 生成器
+# Windows 播放器：MSVC + Windows SDK（含 C++/WinRT）；解码器仍用 GCC 构建
 cmake -S . -B build -A x64
 cmake --build build --config Release
 
 # Ubuntu / Debian（Linux 使用 X11，Wayland 桌面需 XWayland）
-sudo apt-get install build-essential python3 cmake libx11-dev libcurl4-openssl-dev libfreetype6 libfontconfig1 libgdk-pixbuf-2.0-0 librsvg2-common adwaita-icon-theme fonts-noto-cjk xdg-utils
+sudo apt-get install build-essential python3 cmake pkg-config libdbus-1-dev libx11-dev libcurl4-openssl-dev libfreetype6 libfontconfig1 libgdk-pixbuf-2.0-0 librsvg2-common adwaita-icon-theme fonts-noto-cjk xdg-utils xdg-desktop-portal
 python3 tools/build_ffmpeg.py
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
@@ -105,7 +106,7 @@ cmake --build build --config Release --parallel 2
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-Windows 需要 Windows SDK 或 mingw-w64 头文件。产物为 `build/aino_player.exe`（MSVC 为 `build/Release/aino_player.exe`），Linux 为 `build/aino_player`。Windows 静态链接 C/C++ 运行库；Linux 使用系统 libcurl、X11 和动态加载的字体/音频库。
+Windows 桌面媒体接入使用 Windows SDK 自带 C++/WinRT，需要 MSVC；仅桌面接入编译单元启用 C++20，其余为 C++17。产物为 `build/aino_player.exe`（MSVC 为 `build/Release/aino_player.exe`），Linux 为 `build/aino_player`。Windows 静态链接 C/C++ 运行库；Linux 使用系统 libcurl、X11、libdbus-1 和动态加载的字体/音频库；系统媒体与托盘不加载 GTK/Qt。文件选择器使用系统 xdg-desktop-portal，未安装时仍可输入路径。
 
 Windows 安装器使用构建时的 Inno Setup 6，不作为播放器运行依赖：
 
@@ -136,7 +137,7 @@ aino_player --diagnostics
 
 后续本地待发布优化：封面由最多 160 项、按 URL 顺序清理，改为最多 160 项且缓存像素总量不超过 12 MiB，按最近访问时间回收；不改变封面尺寸或歌词画面。预算仅约束缓存持有的 RGBA 像素，不包括解码中间图、外部仍持有的图片和系统库。主线程在 tick 中回收已完成后台线程，不再只等下一次创建任务才 join。尚未在用户反馈的 Ubuntu 场景测量，不能将这些上限等同于整个进程内存或声称已从 86 MB 降至 30 MB。
 
-随后按用户明确要求运行了独立的 GitHub Actions 持续播放内存诊断：Ubuntu 22.04/Xvfb、相同歌词与音频，分别对比 v0.2.3 和内存优化版的 100%/200% 缩放。200% 下封面压力 RSS 峰值为 84.29 → 74.52 MiB；无封面 AAC 播放基本不变，为 61.28 → 61.49 MiB。该次未执行整套回归或发布，未改变画面，也不代表用户 Wayland 桌面已验证。[完整方法、数据与局限](docs/Linux-memory-profile.md)。
+随后按用户明确要求运行了独立的 GitHub Actions 持续播放内存诊断：Ubuntu 22.04/Xvfb、相同歌词与音频，分别对比 v0.2.4 和内存优化版的 100%/200% 缩放。200% 下封面压力 RSS 峰值为 84.29 → 74.52 MiB；无封面 AAC 播放基本不变，为 61.28 → 61.49 MiB。该次未执行整套回归或发布，未改变画面，也不代表用户 Wayland 桌面已验证。[完整方法、数据与局限](docs/Linux-memory-profile.md)。
 
 进一步的图标隔离和字体冷资源回收已完成专项实测：100% AAC 主进程 RSS 49.08 → 34.96 MiB（含 FFmpeg 的进程树 54.84 → 40.85）；200% 为 59.56 → 45.59 MiB。图标和中文字重画布逐字节一致。空缓存首帧多约 0.12～0.16 秒，短时进程树启动峰值升高；详见上述报告。已接入 aino 底层修复 `f8943c2`，待后续发布；不代表真实 Wayland 桌面已验证。
 
@@ -146,7 +147,7 @@ aino_player --diagnostics
 
 网络拖动进度会重新连接并从头解码丢弃至目标，保留暂停状态，等待时显示缓冲；不承诺 HTTP Range 快速随机定位。尾部 moov 等不能通过单向管道读取的容器会退回整首缓存和 WAV 解码；起播后断流也尝试完整文件恢复。尚未实现无缝切歌。内置 FFmpeg 只启用本地文件和管道协议，不包含网络、视频解码或额外外部库；无需 Windows Media Foundation。
 
-上述流式播放、管理与输入法修复纳入 v0.2.3，Windows 搜索中文输入已由用户实机确认恢复正常。用户明确要求发布后，由发布流程统一执行 Windows/Linux 编译和回归，通过后打包发布；不将 CI 或 Xvfb 检查视为反馈者 Ubuntu 播放场景的实机验证。YouTube 实网测试继续暂停。
+上述流式播放、管理与输入法修复纳入 v0.2.4，Windows 搜索中文输入已由用户实机确认恢复正常。用户明确要求发布后，由发布流程统一执行 Windows/Linux 编译和回归，通过后打包发布；不将 CI 或 Xvfb 检查视为反馈者 Ubuntu 播放场景的实机验证。YouTube 实网测试继续暂停。
 解码器字节嵌入播放器可执行文件，首次需要时释放到本进程的私有临时缓存；正常退出删除，异常退出的旧文件可通过「设置 → 数据与缓存 → 清除缓存」清理，运行中的实例会保留。原音乐文件不改写；完整文件回退解码有 120 秒上限，取消会终止子进程，失败的临时输出会清理。Linux 临时目录需允许执行程序。
 
 「设置」底部显示解码器版本、体积和许可。命令行 `--codec-info` 查看内置信息，`--ffmpeg-license` 输出完整许可、源码校验值和编译选项；`AINO_FFMPEG` 可指定替代解码器路径。默认构建必须带解码器，缺失时 CMake 明确报错；仅开发时可显式使用 `-DAINO_BUNDLE_FFMPEG=OFF`，此时才依赖系统 FFmpeg。外部精简产物可用 `-DAINO_FFMPEG_EXECUTABLE=/absolute/path/to/ffmpeg` 指定。
@@ -223,7 +224,7 @@ Apache-2.0。`src/aino.hpp` 版权归 sudoevolve，见 `LICENSE-aino`。
 
 ## 发布流程
 
-`CMakeLists.txt` 中的项目版本是版本号来源。仅在明确要求发布新版本时运行回归，普通提交不触发 CI。推送对应 `v*` 标签后，`release.yml` 分别在 Windows 和 Ubuntu 编译精简 FFmpeg、嵌入播放器并运行无系统解码器的回归；Linux 生成 deb 后验证安装与 Xvfb 启动。两端成功后发布 exe、deb、FFmpeg 官方原始源码包、构建信息、许可及 `SHA256SUMS.txt`。当前 `0.2.3` 对应标签 `v0.2.3`，标签与程序版本不符或缺少内置解码器会中止发布；不会覆盖旧版标签或安装包。
+`CMakeLists.txt` 中的项目版本是版本号来源。仅在明确要求发布新版本时运行回归，普通提交不触发 CI。推送对应 `v*` 标签后，`release.yml` 分别在 Windows 和 Ubuntu 编译精简 FFmpeg、嵌入播放器并运行无系统解码器的回归；Linux 生成 deb 后验证安装与 Xvfb 启动。两端成功后发布 exe、deb、FFmpeg 官方原始源码包、构建信息、许可及 `SHA256SUMS.txt`。当前 `0.2.4` 对应标签 `v0.2.4`，标签与程序版本不符或缺少内置解码器会中止发布；不会覆盖旧版标签或安装包。
 
 本地 Debian 打包：
 
@@ -234,3 +235,9 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 cpack --config build/CPackConfig.cmake -G DEB -B dist
 ```
+
+## 流式播放与定位
+
+在线音频优先通过有界 PCM 缓冲边解码边播放。远端正确支持 HTTP Range 时，播放器以随机路径的本机 HTTP 地址提供经过范围校验的数据，FFmpeg 按容器索引读取和定位；远端 HTTPS、Cookie 和请求头仍由播放器处理，不交给 FFmpeg。每连接数据块上限 256 KiB，最多四个连接；PCM 缓冲仍为三秒。定位速度取决于容器索引和远端响应，不支持 Range 或解码失败时保留顺序管道/完整文件回退。
+
+Linux 使用 X11 或 Wayland 下的 XWayland。桌面媒体控制需要会话 D-Bus；托盘需要 StatusNotifier 宿主，纯 GNOME 未启用托盘支持时不会隐藏窗口。源码编译通过不等于真实耳机、热插拔、桌面托盘和网络定位均已实机验证；发布时再统一回归。

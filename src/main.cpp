@@ -64,6 +64,7 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     SetCurrentProcessExplicitAppUserModelID(L"sudoevolve.AinoPlayer");
 #endif
+    platform::Desktop desktop;
     aino::WindowConfig cfg;
     cfg.width = 1180;
     cfg.height = 760;
@@ -71,6 +72,15 @@ int main(int argc, char** argv) {
     cfg.min_height = 640;
     cfg.title = "aino player";
     cfg.center = true;
+    cfg.close_requested = [&] {
+        if (smoke_test || startup_ui.close_behavior == 2) return true;
+        if (startup_ui.close_behavior == 1 && startup_ui.tray_enabled && desktop.tray_available()) {
+            desktop.hide(); startup_ui.window_hidden = desktop.hidden(); return !desktop.hidden();
+        }
+        startup_ui.close_dialog = true; startup_ui.close_remember = false;
+        if (g_host.wake) g_host.wake();
+        return false;
+    };
     aino::Window win(cfg);
     if (!win.ok()) {
         std::fprintf(stderr, "Cannot create aino player window\n");
@@ -113,20 +123,35 @@ int main(int argc, char** argv) {
         }
     }
 #endif
+    if (!smoke_test) {
+#ifdef _WIN32
+        desktop.start(window_handle, nullptr, 0, [&win] { win.wake(); });
+#else
+        desktop.start(nullptr, native->dpy, native->win, [&win] { win.wake(); });
+#endif
+        const auto& image = brand_icon(); desktop.set_icon(image.w, image.h, image.rgba);
+    }
     bool theme_dark = startup_ui.dark;
     win.set_theme(theme_dark ? aino::Theme::dark() : aino::Theme::light());
     win.set_anim_fps(60.0f);
 
-    start({[&win] { win.wake(); }, [&win] { win.activate(); }, [&win] { win.close(); }, [&win]() -> void* {
+    start({[&win] { win.wake(); }, [&win, &desktop] { desktop.show(); win.activate(); }, [&win] { win.close(); }, [&win]() -> void* {
 #ifdef _WIN32
         return static_cast<aino::detail::Win32State*>(win.impl->native)->hwnd;
 #else
         return nullptr;
 #endif
-    }});
+    }, [&desktop] { desktop.hide(); return desktop.hidden(); }});
     bool autostart = true;
     win.run([&](aino::Ui& ui) {
         const auto begin = std::chrono::steady_clock::now();
+        for (const auto& event : desktop.events()) {
+            if (event.action == platform::MediaAction::Show) { desktop.show(); win.activate(); }
+            else if (event.action == platform::MediaAction::Quit) win.close();
+            else media_action(event);
+        }
+        startup_ui.window_hidden = desktop.hidden();
+        startup_ui.media_available = desktop.media_available(); startup_ui.tray_available = desktop.tray_available();
         tick();
         auto model = view_model();
         if (model.ui.dark != theme_dark) {
@@ -134,7 +159,19 @@ int main(int argc, char** argv) {
             ui.set_theme(theme_dark ? aino::Theme::dark() : aino::Theme::light());
         }
         if (autostart) { autostart = false; bootstrap(initial_search, smoke_test); }
-        ui::draw(ui, model);
+        if (!smoke_test) {
+            const auto& playing = model.playback;
+            platform::MediaState state;
+            state.uid = playing.now_uid; state.title = playing.now_title; state.artist = playing.now_artist;
+            state.album = playing.now_track.album; state.artwork = playing.now_cover;
+            state.position_ms = static_cast<long long>(model.ui.pos_ms); state.duration_ms = static_cast<long long>(model.ui.dur_ms);
+            state.playing = playing.ps == PlayState::Playing; state.paused = playing.ps == PlayState::Paused;
+            state.volume = int(model.ui.volume); state.shuffle = model.ui.play_mode == PlayMode::Shuffle;
+            state.loop = model.ui.play_mode == PlayMode::RepeatOne ? 2 : model.ui.play_mode == PlayMode::RepeatAll ? 1 : 0;
+            state.can_seek = !state.uid.empty() && state.duration_ms > 0;
+            desktop.update(state, model.ui.tray_enabled);
+        }
+        if (!desktop.hidden()) ui::draw(ui, model);
 #ifdef AINO_PLATFORM_X11
         if (diagnostics) {
             const auto stats = static_cast<aino::detail::X11TextRenderer*>(win.impl->text)->cache_stats();
@@ -156,6 +193,7 @@ int main(int argc, char** argv) {
         const float elapsed = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - begin).count();
         finish_frame(elapsed);
     });
+    desktop.stop();
     shutdown(smoke_test);
     return 0;
 }

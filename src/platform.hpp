@@ -16,6 +16,7 @@
 #include <locale>
 #include <mutex>
 #include <algorithm>
+#include <memory>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -40,7 +41,40 @@ extern char** environ;
 #endif
 
 namespace platform {
+enum class MediaAction { Toggle, Play, Pause, Stop, Next, Previous, SeekRelative, SeekAbsolute, Volume, Show, Quit, Shuffle, Loop };
+struct MediaEvent { MediaAction action; long long value = 0; std::string track; };
+struct MediaState {
+    std::string uid, title, artist, album, artwork;
+    long long position_ms = 0, duration_ms = 0;
+    int volume = 70, loop = 0;
+    bool playing = false, paused = false, shuffle = false, can_seek = false;
+};
+/** @brief 桌面媒体与托盘边界；只向 UI 线程排事件，不从系统回调直接操作播放器。 */
+class Desktop {
+public:
+    Desktop();
+    ~Desktop();
+    Desktop(const Desktop&) = delete;
+    Desktop& operator=(const Desktop&) = delete;
+    void start(void* window, void* display, unsigned long xid, std::function<void()> wake);
+    void stop();
+    void update(const MediaState& state, bool tray_enabled);
+    std::vector<MediaEvent> events();
+    bool tray_available() const;
+    bool media_available() const;
+    bool hidden() const;
+    void hide();
+    void show();
+    void set_icon(int width, int height, const std::vector<uint8_t>& rgba);
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 namespace fs = std::filesystem;
+inline std::string path_utf8(const fs::path& path) {
+    const auto bytes = path.u8string();
+    return std::string(bytes.begin(), bytes.end());
+}
 inline std::wstring widen(const std::string& s) {
 #ifdef _WIN32
     return fs::u8path(s).wstring();
@@ -50,7 +84,7 @@ inline std::wstring widen(const std::string& s) {
 }
 inline std::string narrow(const std::wstring& s) {
 #ifdef _WIN32
-    return fs::path(s).u8string();
+    return path_utf8(fs::path(s));
 #else
     return std::wstring_convert<std::codecvt_utf8<wchar_t>>{}.to_bytes(s);
 #endif
@@ -78,7 +112,7 @@ inline std::string env(const char* key) {
 #endif
 }
 inline std::string join(const std::string& a, const std::string& b) {
-    return (fs::u8path(a) / fs::u8path(b)).u8string();
+    return path_utf8(fs::u8path(a) / fs::u8path(b));
 }
 inline bool make_dirs(const std::string& path) {
     std::error_code ec;
@@ -177,11 +211,11 @@ inline std::string cache_root() {
 #else
     const auto base = root / ("aino-player-" + std::to_string(getuid()));
 #endif
-    if (!make_dirs(base.u8string())) return {};
+    if (!make_dirs(path_utf8(base))) return {};
 #ifndef _WIN32
     ::chmod(base.c_str(), 0700);
 #endif
-    return base.u8string();
+    return path_utf8(base);
 }
 inline std::string temp_dir() {
     const auto base = cache_root();
@@ -467,7 +501,10 @@ inline void CALLBACK cancel_folder_picker(HWND window, UINT, UINT_PTR, DWORD) {
     if (state && state->cancelled->load()) state->dialog->Close(HRESULT_FROM_WIN32(ERROR_CANCELLED));
 }
 #endif
-inline std::string choose_music_folder(void* owner, const std::atomic<bool>& cancelled, std::string& error) {
+#ifndef _WIN32
+std::string choose_desktop_file(bool folder, const std::atomic<bool>& cancelled, std::string& error);
+#endif
+inline std::string choose_music_folder(void* owner, const std::atomic<bool>& cancelled, std::string& error, bool folder = true) {
     error.clear();
 #ifdef _WIN32
     const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -477,8 +514,12 @@ inline std::string choose_music_folder(void* owner, const std::atomic<bool>& can
     if (FAILED(result)) { CoUninitialize(); error = "无法创建文件夹选择器"; return {}; }
     DWORD options = 0;
     result = dialog->GetOptions(&options);
-    if (SUCCEEDED(result)) result = dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR);
-    if (SUCCEEDED(result)) result = dialog->SetTitle(L"选择音乐文件夹");
+    if (SUCCEEDED(result)) result = dialog->SetOptions(options | (folder ? FOS_PICKFOLDERS : FOS_FILEMUSTEXIST) | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR);
+    if (SUCCEEDED(result)) result = dialog->SetTitle(folder ? L"选择音乐文件夹" : L"选择本地歌词");
+    if (!folder && SUCCEEDED(result)) {
+        const COMDLG_FILTERSPEC filters[]{{L"LRC 歌词", L"*.lrc"}, {L"所有文件", L"*.*"}};
+        result = dialog->SetFileTypes(2, filters);
+    }
     const auto timer_window = CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
     FolderPickerCancel state{dialog, &cancelled};
     if (timer_window) SetWindowLongPtrW(timer_window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&state));
@@ -500,12 +541,11 @@ inline std::string choose_music_folder(void* owner, const std::atomic<bool>& can
     if (timer_window) DestroyWindow(timer_window);
     dialog->Release();
     CoUninitialize();
-    if (FAILED(result) && result != HRESULT_FROM_WIN32(ERROR_CANCELLED) && !cancelled.load()) error = "无法打开或读取音乐文件夹，请直接粘贴路径";
+    if (FAILED(result) && result != HRESULT_FROM_WIN32(ERROR_CANCELLED) && !cancelled.load()) error = "无法打开或读取文件选择结果，请直接粘贴路径";
     return selected;
 #else
-    (void)owner; (void)cancelled;
-    error = "请粘贴音乐文件夹路径";
-    return {};
+    (void)owner;
+    return choose_desktop_file(folder, cancelled, error);
 #endif
 }
 inline bool open_browser(const std::string& url) {

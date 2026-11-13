@@ -108,6 +108,23 @@ int main(int argc, char** argv) {
         check(js::parse(R"({"code":200,"data":[]})", fixture) && !music::parse_netease_audio(fixture).ok, "NetEase rejects missing audio data");
         check(js::parse(R"({"code":200,"data":[{"code":200,"url":"https://cdn.test/song.flac","br":0,"type":"flac"}]})", fixture) && music::parse_netease_audio(fixture).ok, "NetEase accepts address when bitrate metadata is unknown");
         check(js::parse(R"({"code":200,"data":[{"code":200,"url":"file:///untrusted"}]})", fixture) && !music::parse_netease_audio(fixture).ok, "NetEase only accepts network playback addresses");
+        check(js::parse(R"({"id":12,"name":"Song","ar":[{"id":1,"name":"AC/DC"},{"id":2,"name":"Guest"}],"al":{"id":22,"name":"Album","picUrl":"https://cdn.test/cover"},"dt":120000})", fixture), "catalog song fixture");
+        const auto catalog_song = music::catalog_track(music::Source::Netease, fixture);
+        check(catalog_song.current().artists.size() == 2 && catalog_song.current().artists[0].name == "AC/DC" &&
+            catalog_song.current().artists[1].id == "2" && catalog_song.current().album_id == "22", "catalog retains exact artist and album identities");
+        js::Value catalog_saved; music::Track catalog_restored;
+        check(js::parse(library::encode_track(catalog_song), catalog_saved) && library::decode_track(catalog_saved, catalog_restored) &&
+            catalog_restored.current().artists[0].id == "1" && catalog_restored.current().album_id == "22", "catalog metadata survives library and queue persistence");
+        check(music::track_artists(catalog_restored)[0].name == "AC/DC", "structured artist names are not split on punctuation");
+        check(js::parse(R"({"mid":"songMid","name":"QQ Song","singer":[{"mid":"artistMid","name":"Singer"}],"album":{"mid":"albumMid","name":"Album"},"interval":90})", fixture), "QQ catalog fixture");
+        const auto qq_catalog_song = music::catalog_track(music::Source::QQ, fixture);
+        check(qq_catalog_song.current().artists[0].id == "artistMid" && qq_catalog_song.current().album_id == "albumMid" &&
+            qq_catalog_song.duration_ms == 90000, "QQ catalog keeps mids and duration units");
+        check(music::valid_catalog_id("UC_artist-123") && !music::valid_catalog_id("../../artist") &&
+            !music::numeric_catalog_id("12&offset=0"), "catalog IDs cannot inject paths or query parameters");
+        check(js::parse(R"({"musicResponsiveListItemRenderer":{"playlistItemData":{"videoId":"abcdefghijk"},"flexColumns":[{"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Song"}]}}},{"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Singer","navigationEndpoint":{"browseEndpoint":{"browseId":"UC_artist"}}},{"text":"Album","navigationEndpoint":{"browseEndpoint":{"browseId":"MPRE_album"}}}]}}}]}})", fixture), "YouTube catalog links fixture");
+        const auto linked_youtube = music::providers::parse_youtube_search(fixture, 10);
+        check(linked_youtube.size() == 1 && linked_youtube[0].artists[0].id == "UC_artist" && linked_youtube[0].album_id == "MPRE_album", "YouTube renderer links identify artist and album separately");
         check(js::parse(R"({"data":{"result":[{"bvid":"BV1fixture01","title":"<em>Hello</em> &amp; world","author":"Artist","pic":"//cdn.test/a.jpg","duration":"1:02:03"}]}})", fixture), "Bilibili fixture JSON");
         auto videos = parse_bilibili_search(fixture, 2);
         check(videos.size() == 1 && videos[0].title == "Hello & world" && videos[0].duration_ms == 3723000 &&
@@ -261,11 +278,16 @@ int main(int argc, char** argv) {
         check(platform::make_dirs(dir), "test directory");
         const auto file = platform::join(dir, "资料库.json");
         std::string err;
+        lib.remember(track); lib.remember(track);
+        lib.lyric_preferences["test-song"] = {1250, "中文歌词.lrc"};
         check(lib.save(file, err), "library save");
         library::Library loaded;
         check(loaded.load(file, err), "library load");
         const auto& saved = loaded.playlists.front().tracks.front();
         check(saved.title == track.title && saved.chosen == 1 && saved.variants.size() == 2, "roundtrip metadata");
+        check(loaded.recent.size() == 1 && loaded.recent.front().chosen == 1, "recent history deduplicates and preserves variants");
+        check(loaded.lyric_preferences.at("test-song").offset_ms == 1250 &&
+            loaded.lyric_preferences.at("test-song").path == "中文歌词.lrc", "lyric preferences persist with history");
         check(!loaded.toggle(track) && loaded.playlists.front().tracks.empty(), "favorite remove");
         library::Playlist playlist;
         playlist.key = "netease#99"; playlist.name = "在线歌单"; playlist.remote_id = "99"; playlist.tracks.push_back(track);
@@ -275,6 +297,13 @@ int main(int argc, char** argv) {
         check(loaded.playlists[1].remote_id == "99", "remote id persistence");
         auto* broken = platform::fopen(file, "wb"); std::fputs("{broken", broken); std::fclose(broken);
         check(!loaded.load(file, err) && loaded.playlists.size() == 2, "corrupt file preserves state");
+        auto write_library = [&](const char* text) { auto* output = platform::fopen(file, "wb"); check(output != nullptr, "open library fixture"); std::fputs(text, output); std::fclose(output); };
+        write_library("{\"version\":1,\"playlists\":[],\"recent\":{}}");
+        check(!loaded.load(file, err) && loaded.recent.size() == 1, "invalid optional records preserve prior library");
+        write_library("{\"version\":1,\"playlists\":[],\"lyrics\":[{\"uid\":\"large-offset\",\"offset\":1e100,\"path\":\"\"}]}");
+        check(loaded.load(file, err) && loaded.lyric_preferences.at("large-offset").offset_ms == 60000, "lyric offset clamps before integer conversion");
+        write_library("{\"version\":1,\"playlists\":[]}");
+        check(loaded.load(file, err) && loaded.recent.empty() && loaded.lyric_preferences.empty(), "legacy library without optional records remains readable");
         music::Source source; std::string id;
         check(library::parse_link("https://music.163.com/#/playlist?id=123&userid=456", source, id) && id == "123" && source == music::Source::Netease, "netease url");
         check(library::parse_link("https://y.qq.com/n/ryqq/playlist/123", source, id) && source == music::Source::QQ, "qq url");

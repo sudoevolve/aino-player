@@ -22,7 +22,11 @@ struct StreamSpec {
     std::string url, local_path;
     std::vector<std::string> headers;
     long long duration_ms = 0, start_ms = 0;
+    bool range_allowed = true;
 };
+struct OutputDevice { std::string id, name; bool is_default = false; };
+/** @brief 枚举系统播放设备；应在后台执行，返回的 ID 可供 Player 选择。 */
+std::vector<OutputDevice> output_devices(std::string& error);
 /**
  * @brief 后台网络/解码管线，PCM 容量固定为三秒，音频回调只读取原子环形缓冲。
  *
@@ -65,6 +69,11 @@ public:
     long long duration_ms() const;
     void seek_ms(long long ms);
     void set_volume(int volume);
+    /** @brief 关闭当前引擎并选择设备；空 ID 跟随系统默认，下次 open 时初始化。 */
+    void set_device(const std::string& id);
+    /** @brief 读取设备通知，UI 线程据此恢复播放，音频回调不接触业务状态。 */
+    bool take_device_change();
+    bool take_device_fallback();
     const std::string& error() const;
 private:
     struct Impl;

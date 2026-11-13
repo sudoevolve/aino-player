@@ -1,4 +1,4 @@
-"""Build the small, local file/pipe FFmpeg helper, or embed it for CMake."""
+"""Build the small file/pipe/loopback HTTP FFmpeg helper, or embed it for CMake."""
 import argparse
 import hashlib
 import json
@@ -19,8 +19,8 @@ def embed(binary, header):
     if not build_info.startswith(f"ffmpeg version {VERSION} ") or any(flag in build_info for flag in ("--enable-gpl", "--enable-nonfree")):
         raise RuntimeError(f"Expected LGPL FFmpeg {VERSION}, without GPL or nonfree components")
     options = build_info.replace("'", "").replace('"', "")
-    if not all(flag in options for flag in ("--disable-everything", "--disable-network", "--disable-autodetect", "--enable-small", "--enable-protocol=file,pipe", "--enable-muxer=wav,pcm_s16le")):
-        raise RuntimeError("Expected the minimal local file/pipe FFmpeg build")
+    if not all(flag in options for flag in ("--disable-everything", "--enable-network", "--disable-autodetect", "--enable-small", "--enable-protocol=file,pipe,http,tcp", "--enable-muxer=wav,pcm_s16le")):
+        raise RuntimeError("Expected the minimal local file/pipe/loopback HTTP FFmpeg build")
     data = binary.read_bytes()
     if not data or len(data) > 12 * 1024 * 1024:
         raise RuntimeError("Expected a minimal FFmpeg helper smaller than 12 MiB")
@@ -78,12 +78,12 @@ def build(output, jobs):
     if windows:
         # mingw32-make may launch mkdir/sed directly instead of going through Bash.
         environment["PATH"] = os.pathsep.join((str(Path(bash).parent), str(Path(bash).parent.parent / "usr/bin"), environment.get("PATH", "")))
-    flags = ["--disable-everything", "--disable-autodetect", "--disable-network", "--disable-doc", "--disable-debug",
+    flags = ["--disable-everything", "--disable-autodetect", "--enable-network", "--disable-doc", "--disable-debug",
              "--disable-programs", "--enable-ffmpeg", "--disable-avdevice", "--disable-swscale", "--disable-shared",
              "--enable-static", "--enable-small", "--disable-x86asm", "--cc=gcc", "--host-cc=gcc",
              "--enable-decoder=aac,alac,opus,vorbis,flac,mp3,mp3float,pcm_s16le", "--enable-demuxer=aac,mov,ogg,matroska,mp3,wav,flac",
              "--enable-muxer=wav,pcm_s16le", "--enable-encoder=pcm_s16le", "--enable-parser=aac,aac_latm,opus,vorbis",
-             "--enable-protocol=file,pipe", "--enable-filter=aresample,aformat,anull",
+             "--enable-protocol=file,pipe,http,tcp", "--enable-filter=aresample,aformat,anull",
              "--extra-cflags=-Os -ffunction-sections -fdata-sections",
              "--extra-ldflags=" + ("-static " if windows else "") + "-Wl,--gc-sections"]
     if windows:

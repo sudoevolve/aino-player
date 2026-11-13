@@ -14,7 +14,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Build prerequisites
-        run: sudo apt-get update && sudo apt-get install -y build-essential python3 libx11-dev libgdk-pixbuf-2.0-0 librsvg2-common adwaita-icon-theme libcurl4-openssl-dev libfreetype6 libfontconfig1 fonts-noto-cjk xvfb ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y build-essential python3 libx11-dev libdbus-1-dev pkg-config libgdk-pixbuf-2.0-0 librsvg2-common adwaita-icon-theme libcurl4-openssl-dev libfreetype6 libfontconfig1 fonts-noto-cjk xvfb ffmpeg
       - run: python3 tools/build_ffmpeg.py --jobs 2
       - run: python3 tools/profile_memory.py fixtures build/fixtures
       - name: Prepare before, icons-only, and complete builds

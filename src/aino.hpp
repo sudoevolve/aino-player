@@ -1229,6 +1229,8 @@ struct WindowConfig {
     // Windows：关掉后不声明进程 DPI 感知，由系统缩放；只有第一个窗口说了算。
     // X11：关掉后固定使用 1 倍逻辑像素，不读取桌面 DPI 或缩放环境变量。
     bool high_dpi = true;
+    /** @brief UI 线程收到系统关闭请求时调用；返回 false 取消关闭（例如隐藏到托盘）。 */
+    std::function<bool()> close_requested;
 };
 
 class Window {
@@ -10814,6 +10816,7 @@ inline LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
 
     case WM_CLOSE:
+        if (s->owner->cfg.close_requested && !s->owner->cfg.close_requested()) return 0;
         s->owner->running = false;
         PostQuitMessage(0);
         return 0;
@@ -12523,7 +12526,10 @@ inline bool x11_handle(X11State* s, XEvent& e) {
         if (e.xclient.message_type == s->manager && e.xclient.format == 32 && Atom(e.xclient.data.l[1]) == s->settings_selection) {
             x11_refresh_scale(s); break;
         }
-        if (Atom(e.xclient.data.l[0]) == s->wm_delete) { o->running = false; return false; }
+        if (Atom(e.xclient.data.l[0]) == s->wm_delete) {
+            if (o->cfg.close_requested && !o->cfg.close_requested()) return true;
+            o->running = false; return false;
+        }
         o->need_frame = true; // wake() 只投消息，绘制标志由 UI 线程更新。
         break;
     case PropertyNotify:

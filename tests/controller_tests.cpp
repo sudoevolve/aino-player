@@ -97,6 +97,19 @@ int main(int argc, char** argv) {
             check(updates::parse_release(response("v1.10.0", suffix), "1.10.0", suffix).status == UpdateStatus::Current, "same version is current");
             check(updates::parse_release(response("v1.9.0", suffix), "1.10.0", suffix).status == UpdateStatus::Current, "no downgrade prompt");
         }
+        auto with_notes = response("v2.0.0", "_amd64.deb");
+        const std::string notes = "## 更新内容\n\n- **修复** 中文与流式播放\n[发布页](https://github.com/sudoevolve/aino-player)";
+        with_notes.body.insert(1, "\"body\":" + library::quote(notes) + ",");
+        check(updates::parse_release(with_notes, "1.0.0", "_amd64.deb").release_notes == notes &&
+            updates::parse_release(with_notes, "2.0.0", "_amd64.deb").release_notes == notes,
+            "release body preserves Unicode and Markdown for new and installed versions");
+        check(updates::parse_release(response("v2.0.0", "_amd64.deb"), "1.0.0", "_amd64.deb").release_notes.empty(),
+            "missing release notes leave updates available");
+        auto long_notes = response("v2.0.0", "_amd64.deb");
+        long_notes.body.insert(1, "\"body\":" + library::quote(std::string(65535, 'a') + "中文") + ",");
+        const auto bounded_notes = updates::parse_release(long_notes, "1.0.0", "_amd64.deb").release_notes;
+        check(bounded_notes.substr(0, 65535) == std::string(65535, 'a') && bounded_notes[65535] == '\n' &&
+            bounded_notes.size() < 66000, "long release notes are bounded without splitting UTF-8 characters");
         auto deb = response("v2.0.0", "_amd64.deb");
         deb.body.insert(deb.body.rfind("}]"), ",\"size\":123456,\"digest\":\"sha256:" + std::string(64, 'a') + "\"");
         const auto deb_update = updates::parse_release(deb, "1.0.0", "_amd64.deb");
@@ -184,6 +197,26 @@ int main(int argc, char** argv) {
             value.variants.push_back(variant); return value;
         };
         nav_a = navigation_track("a"); nav_b = navigation_track("b"); nav_c = navigation_track("c");
+        auto local_a = navigation_track("/music/one/a.mp3");
+        local_a.artist = "Artist"; local_a.album = "Same title";
+        local_a.variants[0].artist = local_a.artist; local_a.variants[0].album = local_a.album;
+        auto local_b = local_a; local_b.variants[0].id = "/music/two/b.mp3";
+        library::Library catalog_library;
+        catalog_library.playlists.front().tracks = {local_a, local_b, local_a};
+        music::CatalogTarget local_artist; local_artist.source = music::Source::Local;
+        local_artist.kind = music::CatalogKind::Artist; local_artist.name = "Artist";
+        const auto local_songs = local_catalog(local_artist, catalog_library, {}, {}, false);
+        const auto local_albums = local_catalog(local_artist, catalog_library, {}, {}, true);
+        check(local_songs.tracks.size() == 2 && local_albums.albums.size() == 2, "local artist browsing deduplicates songs and keeps same-name albums in distinct folders");
+        const auto local_album = local_catalog(local_albums.albums.front(), catalog_library, {}, {}, false);
+        check(local_album.tracks.size() == 1, "local album browsing is scoped to its folder");
+        g_ui.tab = 0; g_playlist_view = {}; g_detail_history.clear();
+        detail_begin(); g_playlist_view.playlist.name = "First page";
+        g_ui.playlist_filter = "saved filter";
+        detail_begin(); g_playlist_view.playlist.name = "Second page";
+        playlist_close();
+        check(g_playlist_view.playlist.name == "First page" && g_ui.playlist_filter == "saved filter", "detail back restores its page and filter");
+        playlist_close(); check(!g_playlist_view.open && g_ui.tab == 0, "detail back returns to original search page");
         queue_push(nav_a); queue_push(nav_b); queue_push(nav_c);
         auto mark_current = [&](const music::Track& value, int index) {
             std::lock_guard<std::mutex> lock(g_mu); g_as.now_uid = track_uid(value); g_as.playing = index;
@@ -215,6 +248,31 @@ int main(int argc, char** argv) {
         const int explicit_next = next_queue_index(1, true);
         { std::lock_guard<std::mutex> lock(g_mu);
           check(explicit_next >= 0 && track_uid(g_as.tracks[size_t(explicit_next)]) == track_uid(nav_a), "explicit next overrides shuffle"); }
+        // 失败跳过使用同一队列规则，但不重试本轮失败曲，也不受单曲循环困住。
+        std::set<std::string> failed{track_uid(nav_a)};
+        mark_current(nav_a, 0); set_play_mode(PlayMode::RepeatOne);
+        check(next_queue_index(1, false, true, &failed) == 1, "failed song bypasses repeat one");
+        failed.insert(track_uid(nav_c));
+        check(next_queue_index(1, false, true, &failed) == 2, "consecutive failed songs are excluded");
+        failed.insert(track_uid(nav_b));
+        check(next_queue_index(1, false, true, &failed) == -1, "all unavailable songs terminate repeat loop");
+        set_play_mode(PlayMode::Shuffle);
+        check(next_queue_index(1, false, true, &failed) == -1, "all unavailable songs terminate shuffle loop");
+        failed.erase(track_uid(nav_c));
+        check(next_queue_index(1, false, true, &failed) == 1, "shuffle chooses only an unfailed candidate");
+        mark_current(nav_b, 2); set_play_mode(PlayMode::Sequential);
+        check(next_queue_index(1, false, true, &failed) == -1, "failed sequential tail does not wrap");
+        set_play_mode(PlayMode::RepeatAll);
+        check(next_queue_index(1, false, true, &failed) == 1, "repeat all wraps past failed candidates");
+        int pending_gen;
+        { std::lock_guard<std::mutex> lock(g_mu); pending_gen = g_as.gen; g_as.ps = PlayState::Buffering; g_play_ready_paused = false; }
+        toggle_pause();
+        { std::lock_guard<std::mutex> lock(g_mu);
+          check(g_as.gen == pending_gen && g_as.ps == PlayState::Buffering && g_play_ready_paused,
+                "pause while buffering preserves the pending request"); }
+        toggle_pause();
+        { std::lock_guard<std::mutex> lock(g_mu);
+          check(g_as.gen == pending_gen && !g_play_ready_paused, "resume pending playback does not resolve again"); }
         set_sleep_timer(15);
         check(model.ui.sleep_remaining_seconds == 900 && model.ui.sleep_deadline && !model.ui.sleep_after_track, "timer preset armed");
         set_sleep_timer(0); check(!model.ui.sleep_deadline && !g_sleep_deadline.load(), "timer cancellation");
