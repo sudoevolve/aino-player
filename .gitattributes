@@ -15,3 +15,7 @@ vendor/miniaudio/miniaudio.h whitespace=-blank-at-eol
 *.lib binary
 *.png binary
 *.bmp binary
+
+# APT public trust files must keep their published bytes.
+packaging/apt/*.sources text eol=lf
+packaging/apt/*.gpg binary

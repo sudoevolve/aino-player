@@ -31,13 +31,13 @@
 | Windows x64                      | `setup-windows-x64.exe` 安装器；也提供便携 EXE |
 | Ubuntu 22.04+ / Debian 12+ amd64 | `.deb` 安装包                                  |
 
-Linux 推荐添加一次 [APT 软件源](docs/APT.md)，之后直接安装和更新：
+Linux 一键安装（Ubuntu 22.04+ / Debian 12+，amd64）：
 
 ```bash
-sudo apt install aino-player
+curl -fsSL https://sudoevolve.github.io/aino-player/install.sh | bash
 ```
 
-也可下载 deb 直接安装。设置 → 通用 → 版本更新可查看更新内容；升级保留配置、收藏和歌单。
+自动添加签名 [APT 软件源](docs/APT.md) 并安装；之后可用 `sudo apt install aino-player` 和系统更新器。也可下载 deb 直接安装。升级保留配置、收藏和歌单。
 
 ## 使用提示
 

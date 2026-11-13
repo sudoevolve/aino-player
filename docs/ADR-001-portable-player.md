@@ -357,3 +357,11 @@ GitHub Release v0.2.6 已设为 latest；Windows 安装器 3,798,969 字节、�
 
 
 部署验收：Publish APT repository 工作流 43391708355 成功，隔离 APT 索引读取显示 Candidate: 0.2.6；保留 0.2.6、0.2.3、0.2.1 三个经过 GitHub digest 与 SHA256SUMS 双重核验的正式 deb。GitHub Pages 已以 Actions 模式启用，公网 https://sudoevolve.github.io/aino-player/apt/ 可访问。另从公网下载公钥、源配置、InRelease、Packages/Packages.gz 与最新 deb：公钥及配置与仓库一致，gpgv 验签成功，两个索引符合签名 Release 的摘要/大小，最新 deb 符合 Packages 摘要并逐字节等于原 v0.2.6 Release 附件。本轮未构建、安装、启动播放器或运行回归，没有创建新播放器版本。
+
+### 2026-11-13：APT 一键安装与私有云端密钥恢复
+
+用户要求多电脑可恢复私钥并在 README 提供一键安装。密钥恢复包仅上传到维护者独立私有仓库的 Release 附件，已核对仓库可见性及附件 SHA-256；公共仓库和所有 Git 历史均不写入私钥。现有 Actions secret 继续负责自动签名，其他电脑日常部署只需 GitHub 登录。
+
+安装器由现有 Pages 发布工具复制到站点根目录及 apt 目录，先校验 amd64、所需命令及下载公钥/源配置的固定 SHA-256，再申请 sudo 并交由 APT 安装。使用独立 Signed-By keyring、受限临时目录与显式文件权限，不新增运行时依赖。README 和源首页提供相同入口，完整手动步骤保留在 APT.md。审查时保留已有 gitattributes 规则，并在进入 APT 前恢复调用方 umask。
+
+本轮只检查 Bash/Python 语法、公开资源摘要及差异，部署仅生成并验签现有 deb 索引；不执行安装器，不编译、安装、启动播放器，不运行回归或发布新播放器版本。

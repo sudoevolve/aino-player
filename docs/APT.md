@@ -4,7 +4,15 @@
 
 ## 首次安装
 
-需要 `curl` 和 `ca-certificates`。添加一次源，以后由 APT 管理安装和更新：
+需要 `curl` 和 `ca-certificates`。一键添加签名源并安装：
+
+```bash
+curl -fsSL https://sudoevolve.github.io/aino-player/install.sh | bash
+```
+
+脚本先验证架构、公钥和源配置的固定 SHA-256，再请求 sudo 权限，添加源并通过 APT 安装。不支持的架构不会修改系统配置。
+
+如果缺少 curl，先执行 `sudo apt install curl ca-certificates`。也可手动添加一次源，以后由 APT 管理安装和更新：
 
 ```bash
 sudo install -d -m 0755 /etc/apt/keyrings
@@ -51,11 +59,13 @@ sudo apt update
 - 从正式 `vX.Y.Z` Release 选择最高的三个兼容 deb 版本，拒绝草稿、预发行、错误包身份、附件大小或校验不符。新版本必须提供真实 deb 和 `SHA256SUMS.txt`。
 - 同时比对 GitHub 附件 digest 和 `SHA256SUMS.txt`，再以 `dpkg-deb` 检查包名、版本和架构。
 - 通过 `apt-ftparchive` 生成索引，包含按 SHA-256 寻址的索引副本；保留上一代索引，降低部署时客户端读取不一致的概率。
-- 专用 Ed25519 公钥位于 `packaging/apt/`；私钥仅存 GitHub Actions secret `APT_SIGNING_PRIVATE_KEY` 及维护者本机受限目录，不能提交到 Git。签名固定到仓库内的完整公钥指纹。
+- 专用 Ed25519 公钥位于 `packaging/apt/`；私钥保存在 GitHub Actions secret `APT_SIGNING_PRIVATE_KEY`、维护者本机受限目录及独立私有仓库的恢复附件中，不能提交到 Git。签名固定到仓库内的完整公钥指纹。
 - `InRelease` / `Release.gpg` 使用 SHA-256；索引有效期 30 天，每周重新签发。GitHub 若因仓库长期不活跃而停用定时工作流，需要重新启用并手动运行；签名过期时不应关闭 APT 校验。
 - 部署前用 `gpgv` 验签，并在临时 APT 配置中执行索引读取，确认有安装候选；不改 runner 的软件源，也不安装播放器。
 - GitHub Pages 使用 Actions 部署。没有改播放器版本、移动已发布标签或替换 Release 附件。
 
 私钥备份位置为维护者本机 `C:/Users/admin/.codex/keys/aino-player-apt/`，包含导出的私钥和撤销证书，应保留至完成有计划的密钥轮换。公钥有效期至 2029-11-12；轮换时需保留旧密钥到用户取得新 keyring，不能直接重生成并静默替换指纹。
+
+维护者已在独立私有 GitHub 仓库保留私钥、公钥、撤销证书及恢复说明的云端备份，不进入任何 Git 提交。其他电脑日常更新软件源只需登录 GitHub 运行工作流，无需下载私钥；恢复签名环境时再取回备份。GitHub Actions secret 供工作流使用，不能作为可下载的备份。
 
 手动重新部署：GitHub → Actions → **Publish APT repository** → Run workflow，选择 `master`。

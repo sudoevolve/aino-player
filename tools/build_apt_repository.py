@@ -155,6 +155,10 @@ def build(output, fingerprint, check):
     shutil.copy2(key, apt / KEY_NAME)
     shutil.copy2(ROOT / "packaging/apt/signing-key-fingerprint.txt", apt / "signing-key-fingerprint.txt")
     shutil.copy2(ROOT / "packaging/apt/aino-player.sources", apt / "aino-player.sources")
+    installer = ROOT / "packaging/apt/install.sh"
+    subprocess.run(["bash", "-n", str(installer)], check=True)
+    shutil.copy2(installer, output / "install.sh")
+    shutil.copy2(installer, apt / "install.sh")
     subprocess.run(["gpgv", "--keyring", str(apt / KEY_NAME), str(release.parent / "InRelease")], check=True)
     if check:
         verify_apt(apt)
