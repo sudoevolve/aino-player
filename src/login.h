@@ -9,8 +9,8 @@
 
 namespace login {
 
-enum class Site { QQ = 0, NetEase = 1, YouTube = 2 };
-constexpr int kSiteCount = 3;
+enum class Site { QQ = 0, NetEase = 1 };
+constexpr int kSiteCount = 2;
 
 struct State {
     std::mutex m;
@@ -21,7 +21,6 @@ struct State {
     std::string uid;                    // 成功时：QQ 号 / 网易云 userId（拿不到就空着）
     std::string note;                   // 阶段说明，给界面显示
     std::string portal_url;
-    std::string context;                // YouTube 当前频道、访客和账号索引，不含额外站点凭据。
 };
 
 State& state(Site s);
@@ -41,13 +40,5 @@ void shutdown();
 
 // 纯解析；不回显凭据，返回缺失字段信息。
 bool parse_credentials(Site s, const std::string& input, std::string& cookie, std::string& uid, std::string& error);
-
-struct Stream {
-    std::string url, error;
-    std::vector<std::string> headers;
-};
-// 由系统浏览器的官网播放器处理签名与平台校验，只返回音轨地址；不嵌入 WebView。
-Stream youtube_stream(const std::string& video_id, const std::string& cookie,
-                      const std::function<bool()>& cancel = {}, const BrowserOptions& options = {});
 
 }  // namespace login

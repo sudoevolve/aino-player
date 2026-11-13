@@ -3,11 +3,10 @@
 // 干什么：把 lx-music 的 .js 音源脚本跑起来，用它的 musicUrl 解析播放直链。
 // 怎么跑：嵌入 QuickJS（vendor/quickjs），注入一个最小的 `globalThis.lx`
 //         （on / send / request / utils / EVENT_NAMES），脚本里的 HTTP 请求
-//         同步交给 aino 自己的 net::get / net::post，回调立即返回。
+//         排入运行时任务队列，再交给 aino 自己的 HTTP 后端。
 //
 // 设计取舍：
-//   * HTTP 走同步。音源脚本对 request 的调用本来就是"发出去等回调"，
-//     同步实现省掉一整层事件循环，也不会和 UI 线程抢资源（解析在后台线程做）。
+//   * HTTP 在独立网络任务中并行执行，JS 回调、microtask 与到期定时器由运行时线程推进。
 //   * 每个脚本一个独立 JSRuntime。脚本之间状态互不污染，坏掉的源不会拖垮别的。
 //   * 只实现脚本真正用得到的 API（md5 / base64 / buffer）。aes、rsa 明确抛错，
 //     而不是静默返回垃圾数据——出问题要能一眼看出来。
@@ -27,6 +26,7 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <future>
 #include <set>
 #include <string>
 #include <thread>
@@ -302,6 +302,7 @@ public:
     const std::string& path() const { return info_.file; }
     void retire() { retired_.store(true); }
     bool retired() const { return retired_.load(); }
+    bool playback_waiting() const { return foreground_.load() != 0; }
 
     const Decl* find(const std::string& key) const {
         for (const auto& d : sources_)
@@ -329,11 +330,42 @@ public:
     }
 
     void on_send(const std::string& event, const std::string& json);
+    unsigned start_http(net::Request request) {
+        for (auto it = http_.begin(); it != http_.end();) {
+            if (it->second.cancel->load() && it->second.result.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+                it = http_.erase(it);
+            else ++it;
+        }
+        if (http_.size() >= 16) return 0;
+        auto cancel = std::make_shared<std::atomic<bool>>(false);
+        const auto id = next_http_++;
+        auto result = std::async(std::launch::async, [request = std::move(request), cancel] {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(request.timeout_ms);
+            // 网络线程不持有 QuickJS 或调用栈中的 Operation，取消状态独立存活。
+            net::CancelScope cancellation([cancel, deadline] { return cancel->load() || std::chrono::steady_clock::now() >= deadline; });
+            return net::execute(request);
+        });
+        http_.emplace(id, HttpTask{std::move(cancel), std::move(result)});
+        return id;
+    }
+    bool poll_http(unsigned id, net::Response& response) {
+        const auto it = http_.find(id);
+        if (it == http_.end()) { response.error = "请求已取消"; return true; }
+        if (it->second.result.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) return false;
+        try { response = it->second.result.get(); }
+        catch (const std::exception& e) { response.error = e.what(); }
+        http_.erase(it);
+        return true;
+    }
+    void cancel_http(unsigned id) {
+        const auto it = http_.find(id);
+        if (it != http_.end()) it->second.cancel->store(true);
+    }
 
     bool load(const std::string& path, const std::string& script, std::string& err);
     bool init(std::string& err);
     bool music_url(const std::string& platform, const std::string& quality,
-                   const std::string& music_info_json, std::string& url, std::string& err);
+                   const std::string& music_info_json, std::string& url, std::string& err, bool background = false);
     void close();
 
     // 调试用：在脚本上下文里跑一段代码，把结果当字符串返回（失败返回错误文本）
@@ -377,11 +409,23 @@ private:
         ~Operation() { detail::current = previous; }
     };
     bool eval(const std::string& code, const char* name, std::string& err);
+    int pump(std::string& err);
+    void clear_tasks() {
+        // 仅结束当前取流作用域，保留脚本初始化创建的令牌和更新任务。
+        const char* code = "globalThis.__lxClearTasks && __lxClearTasks()";
+        // 清理有独立预算，取消原请求也必须能清掉它留下的定时器。
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
+        net::CancelScope cleanup([deadline] { return std::chrono::steady_clock::now() >= deadline; });
+        JSValue r = JS_Eval(ctx_, code, std::strlen(code), "<clear-tasks>", JS_EVAL_TYPE_GLOBAL);
+        if (JS_IsException(r)) { JSValue e = JS_GetException(ctx_); JS_FreeValue(ctx_, e); }
+        JS_FreeValue(ctx_, r);
+    }
     bool call_handler(const std::string& event, JSValueConst arg, JSValue& out, std::string& err);
     bool settle(JSValue& value, std::string& err);
 
     std::timed_mutex execution_;
     std::atomic<bool> retired_{false};
+    std::atomic<unsigned> foreground_{0};
     JSRuntime* rt_ = nullptr;
     JSContext* ctx_ = nullptr;
     JSValue handlers_ = JS_UNDEFINED;
@@ -390,6 +434,12 @@ private:
     std::string error_;
     bool inited_ = false;
     bool declarations_frozen_ = false;
+    struct HttpTask {
+        std::shared_ptr<std::atomic<bool>> cancel;
+        std::future<net::Response> result;
+    };
+    unsigned next_http_ = 1;
+    std::map<unsigned, HttpTask> http_;
 };
 
 // ---------------------------------------------------------------- C 回调
@@ -420,35 +470,25 @@ inline JSValue to_js_value(JSContext* ctx, const js::Value& v) {
     return JS_NULL;
 }
 
-inline JSValue cb_http(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
-    JSValue out = JS_NewObject(ctx);
-    if (argc < 2) {
-        JS_DefinePropertyValueStr(ctx, out, "error", to_js(ctx, "lx.http: 参数不足"), JS_PROP_C_W_E);
-        return out;
-    }
-    const std::string url = from_js(ctx, argv[0]);
-    const std::string opt = from_js(ctx, argv[1]);
-
+inline bool http_request(JSContext* ctx, int argc, JSValueConst* argv, net::Request& request) {
+    if (argc < 2) return false;
     js::Value options;
-    if (!js::parse(opt, options) || !options.is_object()) {
-        JS_FreeValue(ctx, out);
-        return JS_ThrowTypeError(ctx, "lx.request options must be an object");
-    }
+    if (!js::parse(from_js(ctx, argv[1]), options) || !options.is_object()) return false;
     std::string method = options["method"].str("GET");
     for (char& c : method) if (c >= 'a' && c <= 'z') c = char(c - 'a' + 'A');
-    net::Request request;
-    request.url = url;
+    request.url = from_js(ctx, argv[0]);
     request.method = method;
     request.body = options["body"].str();
+    if (options["bodyBase64"].type == js::Type::String) request.body = base64_decode(options["bodyBase64"].string);
     request.timeout_ms = int(std::clamp(options["timeout"].num(8000), 100.0, 12000.0));
     for (const auto& header : options["headers"].object)
         if (header.second.type == js::Type::String)
             request.headers.push_back(header.first + ": " + header.second.string);
-    net::Response r = net::execute(request);
-    if (std::getenv("LX_TRACE")) {
-        std::fprintf(stderr, "[lx][http] %s %s -> status=%d err=%s body=%.200s\n", method.c_str(),
-                     url.c_str(), r.status, r.error.c_str(), r.body.c_str());
-    }
+    return true;
+}
+
+inline JSValue http_response(JSContext* ctx, const net::Response& r) {
+    JSValue out = JS_NewObject(ctx);
     if (!r.error.empty()) {
         JS_DefinePropertyValueStr(ctx, out, "error", to_js(ctx, r.error), JS_PROP_C_W_E);
         return out;
@@ -459,8 +499,7 @@ inline JSValue cb_http(JSContext* ctx, JSValueConst, int argc, JSValueConst* arg
     JS_DefinePropertyValueStr(ctx, out, "statusMessage", to_js(ctx, "OK"), JS_PROP_C_W_E);
     {
         js::Value parsed;
-        const bool looks_json = !r.body.empty() && (r.body.front() == '{' || r.body.front() == '[');
-        if (looks_json && js::parse(r.body, parsed)) {
+        if (js::parse(r.body, parsed, true)) {
             JS_DefinePropertyValueStr(ctx, out, "body", to_js_value(ctx, parsed), JS_PROP_C_W_E);
         } else {
             JS_DefinePropertyValueStr(ctx, out, "body", to_js(ctx, r.body), JS_PROP_C_W_E);
@@ -469,10 +508,57 @@ inline JSValue cb_http(JSContext* ctx, JSValueConst, int argc, JSValueConst* arg
     JS_DefinePropertyValueStr(ctx, out, "bytes", JS_NewInt32(ctx, int(r.body.size())), JS_PROP_C_W_E);
     // 原始文本也留一份：有些接口返回单引号 JSON，严格解析会失败，脚本可以自己兜
     JS_DefinePropertyValueStr(ctx, out, "bodyText", to_js(ctx, r.body), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, out, "raw", JS_NewUint8ArrayCopy(ctx,
+        reinterpret_cast<const uint8_t*>(r.body.data()), r.body.size()), JS_PROP_C_W_E);
     JSValue h = JS_NewObject(ctx);
+    for (const auto& field : r.headers) JS_SetPropertyStr(ctx, h, field.first.c_str(), to_js(ctx, field.second));
+    if (!r.set_cookies.empty()) {
+        JSValue cookies = JS_NewArray(ctx);
+        for (size_t i = 0; i < r.set_cookies.size(); ++i) JS_SetPropertyUint32(ctx, cookies, uint32_t(i), to_js(ctx, r.set_cookies[i]));
+        JS_SetPropertyStr(ctx, h, "set-cookie", cookies);
+    }
     JS_DefinePropertyValueStr(ctx, h, "content-type", to_js(ctx, r.content_type), JS_PROP_C_W_E);
     JS_DefinePropertyValueStr(ctx, out, "headers", h, JS_PROP_C_W_E);
     return out;
+}
+
+// 平台目录仍提供同步 ctx.http；LX 的 request 单独使用异步桥接，支持 Promise.any / all。
+inline JSValue cb_http(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    net::Request request;
+    if (!http_request(ctx, argc, argv, request)) return JS_ThrowTypeError(ctx, "invalid HTTP options");
+    return http_response(ctx, net::execute(request));
+}
+inline JSValue cb_http_start(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    net::Request request;
+    if (!current || !http_request(ctx, argc, argv, request)) return JS_ThrowTypeError(ctx, "invalid LX request");
+    js::Value options;
+    js::parse(from_js(ctx, argv[1]), options);
+    request.timeout_ms = int(std::clamp(options["timeout"].num(60000), 100.0, 60000.0));
+    try {
+        const auto id = current->start_http(std::move(request));
+        if (!id) return JS_ThrowTypeError(ctx, "too many pending LX requests");
+        return JS_NewUint32(ctx, id);
+    } catch (const std::exception& e) { return JS_ThrowTypeError(ctx, "%s", e.what()); }
+}
+inline JSValue cb_http_poll(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    uint32_t id = 0;
+    if (!current || argc < 1 || JS_ToUint32(ctx, &id, argv[0]) < 0) return JS_UNDEFINED;
+    net::Response response;
+    return current->poll_http(id, response) ? http_response(ctx, response) : JS_UNDEFINED;
+}
+inline JSValue cb_http_cancel(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    uint32_t id = 0;
+    if (current && argc && JS_ToUint32(ctx, &id, argv[0]) == 0) current->cancel_http(id);
+    return JS_UNDEFINED;
+}
+
+inline JSValue cb_binary(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv, int magic) {
+    if (!argc) return JS_NULL;
+    size_t size = 0;
+    const auto* data = JS_GetUint8Array(ctx, &size, argv[0]);
+    if (!data) return JS_EXCEPTION;
+    const std::string bytes(reinterpret_cast<const char*>(data), size);
+    return to_js(ctx, magic ? md5_hex(bytes) : base64_encode(bytes));
 }
 
 inline JSValue cb_md5(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
@@ -506,7 +592,7 @@ inline JSValue cb_log(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv
     return JS_UNDEFINED;
 }
 
-// 脚本死循环的兜底：超过 20 秒直接中断
+// 脚本死循环使用当前操作的实际时间截止点中断。
 inline int interrupt_cb(JSContext*, void* opaque) {
     (void)opaque;
     return net::cancelled() ? 1 : 0;
@@ -522,6 +608,40 @@ inline const char* bootstrap_js() {
   if (globalThis.lx) return;
   const EN = { request: 'request', inited: 'inited', updateAlert: 'updateAlert' };
   const handlers = Object.create(null);
+  const timers = new Map();
+  const requests = new Map();
+  let nextTimer = 1;
+  let scope = 0, nextScope = 1, initialized = false;
+  function schedule(fn, delay, args, repeat) {
+    if (typeof fn !== 'function') throw new TypeError('timer callback must be a function');
+    if (timers.size >= 1024) throw new Error('too many pending timers');
+    const id = nextTimer++;
+    const ms = Math.max(repeat ? 1 : 0, Math.min(2147483647, Number(delay) || 0));
+    timers.set(id, { fn, args, due: Date.now() + ms, repeat: repeat ? ms : 0, scope });
+    return id;
+  }
+  // 每次执行一个到期任务，随后由宿主排空 microtask，保持 Promise / 定时器顺序。
+  globalThis.__lxRunNext = function () {
+    let chosen, task;
+    for (const [id, timer] of timers) {
+      if (!task || timer.due < task.due) { chosen = id; task = timer; }
+    }
+    if (!task) return -1;
+    const wait = task.due - Date.now();
+    if (wait > 0) return Math.min(wait, 20);
+    if (task.repeat) task.due = Date.now() + task.repeat;
+    else timers.delete(chosen);
+    const previous = scope;
+    scope = task.scope;
+    try { task.fn.apply(undefined, task.args); } finally { scope = previous; }
+    return 0;
+  };
+  globalThis.__lxBeginRequest = function () { scope = nextScope++; };
+  globalThis.__lxClearTasks = function () {
+    for (const [id, request] of requests) if (request.scope === scope) request.abort();
+    for (const [id, timer] of timers) if (timer.scope === scope) timers.delete(id);
+    scope = 0;
+  };
 
   function utf8Encode(str) {
     const out = [];
@@ -550,6 +670,8 @@ inline const char* bootstrap_js() {
   function bytesOf(input, encoding) {
     const enc = (encoding || 'utf8').toLowerCase();
     if (input instanceof Uint8Array) return input;
+    if (input instanceof ArrayBuffer) return new Uint8Array(input);
+    if (ArrayBuffer.isView(input)) return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
     if (Array.isArray(input)) return new Uint8Array(input);
     const s = String(input == null ? '' : input);
     if (enc === 'base64') return __lx.b64decode(s);
@@ -573,7 +695,7 @@ inline const char* bootstrap_js() {
   }
   function textOf(bytes, encoding) {
     const enc = (encoding || 'utf8').toLowerCase();
-    if (enc === 'base64') return __lx.b64encode(binOf(bytes));
+    if (enc === 'base64') return __lx.b64bytes(bytes);
     if (enc === 'hex') return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
     if (enc === 'binary' || enc === 'latin1') return binOf(bytes);
     return utf8Decode(bytes);
@@ -581,11 +703,11 @@ inline const char* bootstrap_js() {
 
   const utils = {
     buffer: {
-      from: function (input, encoding) { return bytesOf(input, encoding); },
+      from: function (input, encoding) { return new Uint8Array(bytesOf(input, encoding)); },
       bufToString: function (buf, encoding) { return textOf(bytesOf(buf), encoding); }
     },
     crypto: {
-      md5: function (s) { return __lx.md5(String(s)); },
+      md5: function (s) { return __lx.md5bytes(bytesOf(s)); },
       randomBytes: function (n) {
         const a = new Uint8Array(n | 0);
         for (let i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 256);
@@ -599,29 +721,68 @@ inline const char* bootstrap_js() {
 
   const lx = {
     EVENT_NAMES: EN,
-    version: (typeof __lx.lxVersion === 'string' ? __lx.lxVersion : '2.12.6'),
+    version: '2.0.0',
     currentScriptInfo: (function () { try { return JSON.parse(__lx.scriptInfo); } catch (e) { return {}; } })(),
     env: 'desktop',
     on: function (name, fn) {
       if (__lx.debug) __lx.log('TRACE on(' + name + ') fn=' + (typeof fn));
-      if (typeof fn === 'function') handlers[name] = fn;
+      if (typeof fn !== 'function') return Promise.reject(new TypeError('event handler must be a function'));
+      handlers[name] = fn;
+      return Promise.resolve();
     },
     send: function (name, data) {
       if (__lx.debug) __lx.log('TRACE send(' + name + ')');
-      try { __lx.send(String(name), JSON.stringify(data)); }
-      catch (e) { __lx.log('send(' + name + ') 失败: ' + e); }
+      return new Promise(function (resolve, reject) {
+        if (name !== EN.inited && name !== EN.updateAlert) return reject(new Error('unknown event: ' + name));
+        if (name === EN.inited) {
+          if (initialized) return reject(new Error('already initialized'));
+          initialized = true;
+        }
+        __lx.send(String(name), JSON.stringify(data));
+        resolve();
+      });
     },
     request: function (url, options, callback) {
       if (typeof options === 'function') { callback = options; options = {}; }
-      let res;
+      let aborted = false, id = 0, timer = 0;
+      const requestScope = scope;
+      const abort = function () {
+        aborted = true; timers.delete(timer);
+        if (id) { __lx.httpCancel(id); requests.delete(id); }
+      };
+      abort.abort = abort;
       try {
         const opts = Object.assign({}, options || {});
-        if (opts.body && typeof opts.body === 'object') opts.body = JSON.stringify(opts.body);
-        res = __lx.http(String(url), JSON.stringify(opts));
+        if (opts.headers) {
+          opts.headers = Object.assign({}, opts.headers);
+          Object.keys(opts.headers).forEach(k => { opts.headers[k] = String(opts.headers[k]); });
+        }
+        if (opts.form && typeof opts.form === 'object') {
+          opts.body = Object.keys(opts.form).map(k => encodeURIComponent(k) + '=' + encodeURIComponent(opts.form[k])).join('&');
+          opts.headers = Object.assign({}, opts.headers || {});
+          if (!Object.keys(opts.headers).some(k => k.toLowerCase() === 'content-type'))
+            opts.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+          if (!opts.method) opts.method = 'POST';
+        }
+        if (ArrayBuffer.isView(opts.body) || opts.body instanceof ArrayBuffer) {
+          opts.bodyBase64 = textOf(bytesOf(opts.body), 'base64'); delete opts.body;
+        } else if (opts.body && typeof opts.body === 'object') {
+          opts.body = JSON.stringify(opts.body);
+          opts.headers = Object.assign({'Content-Type': 'application/json'}, opts.headers || {});
+        }
+        id = __lx.httpStart(String(url), JSON.stringify(opts));
+        requests.set(id, {scope: requestScope, abort});
+      } catch (e) { schedule(function () { if (!aborted && callback) callback(e); }, 0, [], false); return abort; }
+      function poll() {
+        if (aborted) return;
+        const res = __lx.httpPoll(id);
+        if (res === undefined) { timer = schedule(poll, 5, [], false); return; }
+        requests.delete(id);
+        if (res && res.error) { if (callback) callback(new Error(String(res.error))); return; }
+        if (callback) callback(null, res, res && res.body);
       }
-      catch (e) { if (callback) callback(e); return; }
-      if (res && res.error) { if (callback) callback(new Error(String(res.error))); return; }
-      if (callback) callback(null, res);
+      timer = schedule(poll, 0, [], false);
+      return abort;
     },
     utils: utils
   };
@@ -705,10 +866,12 @@ inline const char* bootstrap_js() {
   }
   globalThis.__lxDomEvents = domDoc;   // 脚本加载完后由宿主派发事件（顺序关键）
 
-  globalThis.setTimeout = function (fn) { try { fn(); } catch (e) { __lx.log('setTimeout: ' + e); } return 0; };
-  globalThis.clearTimeout = function () {};
-  globalThis.setInterval = function () { return 0; };
-  globalThis.clearInterval = function () {};
+  globalThis.setTimeout = function (fn, delay, ...args) { return schedule(fn, delay, args, false); };
+  globalThis.clearTimeout = function (id) { timers.delete(id); };
+  globalThis.setInterval = function (fn, delay, ...args) { return schedule(fn, delay, args, true); };
+  globalThis.clearInterval = globalThis.clearTimeout;
+  globalThis.atob = function (s) { return binOf(__lx.b64decode(String(s))); };
+  globalThis.btoa = function (s) { return __lx.b64encode(String(s)); };
 })();
 )JS";
 }
@@ -755,6 +918,8 @@ inline void Script::on_send(const std::string& event, const std::string& json) {
 
 inline void Script::close() {
     std::lock_guard<std::timed_mutex> lock(execution_);
+    for (auto& task : http_) task.second.cancel->store(true);
+    http_.clear(); // 网络线程只持有自身请求，退出后再释放运行时。
     if (ctx_) {
         JS_UpdateStackTop(rt_);
         // 销毁不再执行用户任务：挂起任务可能再次联网，移除和退出不能因此阻塞。
@@ -807,18 +972,22 @@ inline bool Script::load(const std::string& path, const std::string& script, std
     JSValue gl = JS_GetGlobalObject(ctx_);
     JSValue api = JS_NewObject(ctx_);
     JS_SetPropertyStr(ctx_, api, "http", JS_NewCFunction(ctx_, detail::cb_http, "http", 2));
+    JS_SetPropertyStr(ctx_, api, "httpStart", JS_NewCFunction(ctx_, detail::cb_http_start, "httpStart", 2));
+    JS_SetPropertyStr(ctx_, api, "httpPoll", JS_NewCFunction(ctx_, detail::cb_http_poll, "httpPoll", 1));
+    JS_SetPropertyStr(ctx_, api, "httpCancel", JS_NewCFunction(ctx_, detail::cb_http_cancel, "httpCancel", 1));
+    JS_SetPropertyStr(ctx_, api, "b64bytes", JS_NewCFunctionMagic(ctx_, detail::cb_binary, "b64bytes", 1, JS_CFUNC_generic_magic, 0));
+    JS_SetPropertyStr(ctx_, api, "md5bytes", JS_NewCFunctionMagic(ctx_, detail::cb_binary, "md5bytes", 1, JS_CFUNC_generic_magic, 1));
     JS_SetPropertyStr(ctx_, api, "md5", JS_NewCFunction(ctx_, detail::cb_md5, "md5", 1));
     JS_SetPropertyStr(ctx_, api, "b64encode", JS_NewCFunction(ctx_, detail::cb_b64e, "b64encode", 1));
     JS_SetPropertyStr(ctx_, api, "b64decode", JS_NewCFunction(ctx_, detail::cb_b64d, "b64decode", 1));
     JS_SetPropertyStr(ctx_, api, "send", JS_NewCFunction(ctx_, detail::cb_send, "send", 2));
     JS_SetPropertyStr(ctx_, api, "log", JS_NewCFunction(ctx_, detail::cb_log, "log", 1));
     JS_SetPropertyStr(ctx_, api, "debug", JS_NewBool(ctx_, std::getenv("LX_TRACE") != nullptr));
-    if (const char* v = std::getenv("LX_VERSION")) JS_SetPropertyStr(ctx_, api, "lxVersion", detail::to_js(ctx_, v));
     {
         const std::string json = "{\"name\":" + detail::js_quote(info_.name) + ",\"version\":" +
             detail::js_quote(info_.version) + ",\"author\":" + detail::js_quote(info_.author) +
             ",\"description\":" + detail::js_quote(info_.description) + ",\"homepage\":" +
-            detail::js_quote(info_.homepage) + "}";
+            detail::js_quote(info_.homepage) + ",\"rawScript\":" + detail::js_quote(script) + "}";
         JS_SetPropertyStr(ctx_, api, "scriptInfo", detail::to_js(ctx_, json));
     }
     JS_SetPropertyStr(ctx_, gl, "__lx", api);
@@ -833,10 +1002,28 @@ inline bool Script::load(const std::string& path, const std::string& script, std
     eval("try{__lxDomEvents.dispatch('DOMContentLoaded');__lxDomEvents.dispatch('load');"
          "__lxDomEvents.dispatch('readystatechange');}catch(e){__lx.log('dom dispatch: '+e)}",
          "<lx-dom>", err);
-    JSContext* jc = nullptr;
-    for (int i = 0; i < 256 && JS_ExecutePendingJob(rt_, &jc) > 0; ++i) {}
     if (net::cancelled()) { err = "脚本加载已取消或超时"; return false; }
     return true;
+}
+
+// 1=处理了任务或等待到下一定时器，0=无任务，-1=执行异常。
+inline int Script::pump(std::string& err) {
+    JSContext* context = nullptr;
+    const int jobs = JS_ExecutePendingJob(rt_, &context);
+    if (jobs < 0) { err = detail::take_exception(context ? context : ctx_); return -1; }
+    if (jobs > 0) return 1;
+    JSValue global = JS_GetGlobalObject(ctx_);
+    JSValue fn = JS_GetPropertyStr(ctx_, global, "__lxRunNext");
+    JS_FreeValue(ctx_, global);
+    JSValue result = JS_Call(ctx_, fn, JS_UNDEFINED, 0, nullptr);
+    JS_FreeValue(ctx_, fn);
+    if (JS_IsException(result)) { err = detail::take_exception(ctx_); JS_FreeValue(ctx_, result); return -1; }
+    int32_t wait = -1;
+    JS_ToInt32(ctx_, &wait, result);
+    JS_FreeValue(ctx_, result);
+    if (wait < 0) return 0;
+    if (wait > 0) std::this_thread::sleep_for(std::chrono::milliseconds(std::min(wait, 20)));
+    return 1;
 }
 
 inline bool Script::call_handler(const std::string& event, JSValueConst arg, JSValue& out, std::string& err) {
@@ -861,11 +1048,12 @@ inline bool Script::call_handler(const std::string& event, JSValueConst arg, JSV
 
 inline bool Script::settle(JSValue& value, std::string& err) {
     if (!JS_IsPromise(value)) return true;
-    for (int i = 0; i < 100000; ++i) {
+    for (;;) {
         if (net::cancelled()) break;
         if (JS_PromiseState(ctx_, value) != JS_PROMISE_PENDING) break;
-        JSContext* c = nullptr;
-        if (JS_ExecutePendingJob(rt_, &c) <= 0) break;  // 没有待执行任务，promise 卡住
+        const int step = pump(err);
+        if (step < 0) { JS_FreeValue(ctx_, value); value = JS_UNDEFINED; return false; }
+        if (!step) break;
     }
     const JSPromiseStateEnum st = JS_PromiseState(ctx_, value);
     if (st == JS_PROMISE_REJECTED) {
@@ -926,30 +1114,47 @@ inline bool Script::init(std::string& err) {
     JS_FreeValue(ctx_, fn);
     JS_FreeValue(ctx_, arg);
 
-    // 把加载阶段挂起的 microtask 跑完（有的源在 Promise 里才 send）
-    JSContext* c = nullptr;
-    for (int i = 0; i < 512 && JS_ExecutePendingJob(rt_, &c) > 0; ++i) {}
+    // 已声明就绪的脚本不必等待可选的更新检查；异步初始化则处理网络任务和真实定时器。
+    // send(inited).then(() => on(request)) 也合法，先排空 microtask 再判断是否初始化完成。
+    while (!net::cancelled()) {
+        JSContext* job_context = nullptr;
+        const int jobs = JS_ExecutePendingJob(rt_, &job_context);
+        if (jobs < 0) { call_err = detail::take_exception(job_context ? job_context : ctx_); break; }
+        if (jobs > 0) continue;
+        fn = JS_GetPropertyStr(ctx_, handlers_, "request");
+        const bool complete = ready() && JS_IsFunction(ctx_, fn);
+        JS_FreeValue(ctx_, fn);
+        if (complete) break;
+        if (pump(call_err) <= 0) break;
+    }
     if (net::cancelled()) { err = "脚本初始化已取消或超时"; return false; }
 
-    if (sources_.empty()) {
+    if (!ready()) {
         err = !error_.empty() ? error_ : (call_err.empty() ? "脚本没有声明任何平台" : call_err);
         return false;
     }
+    fn = JS_GetPropertyStr(ctx_, handlers_, "request");
+    const bool has_request = JS_IsFunction(ctx_, fn);
+    JS_FreeValue(ctx_, fn);
+    if (!has_request) { err = "脚本未注册取流处理器"; return false; }
     inited_ = true;
     declarations_frozen_ = true;
     return true;
 }
 
 inline bool Script::music_url(const std::string& platform, const std::string& quality,
-                              const std::string& music_info_json, std::string& url, std::string& err) {
-    Operation operation(*this, 8000);
+                              const std::string& music_info_json, std::string& url, std::string& err, bool background) {
+    struct Priority {
+        std::atomic<unsigned>& counter; bool active;
+        Priority(std::atomic<unsigned>& c, bool a) : counter(c), active(a) { if (active) ++counter; }
+        ~Priority() { if (active) --counter; }
+    } priority(foreground_, !background);
+    Operation operation(*this, background ? 6500 : 12000);
     if (!operation) { err = "脚本繁忙、已移除或取流超时"; return false; }
     if (!ctx_ || !inited_) { err = "脚本未就绪"; return false; }
     JS_UpdateStackTop(rt_);   // 同上：解析常常发生在别的线程
-    detail::current = this;
-    struct Guard {
-        ~Guard() { detail::current = nullptr; }
-    } guard;
+    if (!eval("__lxBeginRequest()", "<begin-request>", err)) return false;
+    struct Tasks { Script& script; ~Tasks() { script.clear_tasks(); } } tasks{*this};
 
     const std::string payload = "{\"source\":" + detail::js_quote(platform) + ",\"action\":\"musicUrl\",\"info\":{\"type\":" +
         detail::js_quote(quality) + ",\"musicInfo\":" + (music_info_json.empty() ? "{}" : music_info_json) + "}}";
@@ -973,7 +1178,7 @@ inline bool Script::music_url(const std::string& platform, const std::string& qu
     }
     JS_FreeValue(ctx_, out);
 
-    if (net::cancelled()) { err = "脚本请求已取消或超过 8 秒"; return false; }
+    if (net::cancelled()) { err = "脚本请求已取消或超过 12 秒"; return false; }
     if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) {
         if (err.empty()) err = url.empty() ? "脚本没有返回直链" : ("无效直链: " + url);
         return false;
@@ -982,18 +1187,20 @@ inline bool Script::music_url(const std::string& platform, const std::string& qu
 }
 
 
-// 音源脚本目录：AINO_LX_DIR 优先，否则用可执行文件旁边的 sources/
+// 音源脚本目录：AINO_LX_DIR 优先；Windows 使用 EXE 旁目录，Linux 使用用户配置目录。
 inline std::string default_dir() {
     if (const char* e = std::getenv("AINO_LX_DIR")) {
         if (*e) return e;
     }
 #ifdef _WIN32
-    char buf[MAX_PATH]{};
-    if (GetModuleFileNameA(nullptr, buf, MAX_PATH)) {
-        std::string p(buf);
-        const size_t cut = p.find_last_of("\\/");
-        if (cut != std::string::npos) return p.substr(0, cut) + "\\sources";
+    wchar_t buf[32768]{};
+    if (GetModuleFileNameW(nullptr, buf, 32768)) {
+        return (std::filesystem::path(buf).parent_path() / "sources").u8string();
     }
+#endif
+#ifndef _WIN32
+    // 商店 / deb 从只读目录启动时，音源仍需放在用户可写目录。
+    return platform::join(platform::config_dir(), "sources");
 #endif
     return "sources";
 }
@@ -1003,6 +1210,13 @@ inline std::string default_dir() {
 // 一个目录里的音源脚本；运行时逐个串行执行，集合支持后台热替换与应用内移除。
 class Engine {
 public:
+    struct Check { std::string platform, info; };
+    struct Health {
+        // 0 等待检测，1 检测中，2 样本通过，3 样本失败，4 未声明支持，5 超时未完成。
+        int state = 0;
+        std::string reason;
+    };
+    using Checks = std::map<std::string, Health>;
     explicit Engine(std::string preferences_file = {}) : preferences_file_(std::move(preferences_file)) {}
     static Engine& instance() {
         static Engine e;
@@ -1040,6 +1254,12 @@ public:
         return load_files_impl(dir, std::move(files), false);
     }
 
+    // 普通刷新不解除移除记录；用户主动获取和导入走 load_files。
+    int refresh_files(const std::string& dir, std::vector<std::string> files) {
+        if (!read_preferences()) return -1;
+        return files.empty() ? 0 : load_files_impl(dir, std::move(files), false);
+    }
+
     // 只移除应用里的登记。持久化成功后立刻摘下，绝不删除 JS 或等待全目录初始化。
     bool remove_source(const std::string& file, std::string& error) {
         if (!read_preferences()) { error = preferences_error(); return false; }
@@ -1055,6 +1275,7 @@ public:
             removed_ = std::move(next);
             ++revision_;
             runtime_errors_.erase(name);
+            health_.erase(name);
             for (auto it = list_.begin(); it != list_.end();) {
                 if (file_key((*it)->path()) == name) {
                     (*it)->retire(); retired.push_back(std::move(*it)); it = list_.erase(it);
@@ -1073,9 +1294,77 @@ public:
         return preferences_error_;
     }
     unsigned revision() const { return revision_.load(); }
-    std::map<std::string, std::string> runtime_errors() const {
+    std::map<std::string, std::map<std::string, std::string>> runtime_errors() const {
         std::lock_guard<std::mutex> lock(mu_);
         return runtime_errors_;
+    }
+    std::map<std::string, Checks> health() const {
+        std::lock_guard<std::mutex> lock(mu_); return health_;
+    }
+    std::vector<std::string> removed_files() const {
+        std::lock_guard<std::mutex> lock(mu_); return {removed_.begin(), removed_.end()};
+    }
+
+    // 由应用后台任务调用；直接检查各脚本，绝不经过会切到其它源的 resolve()。
+    void check_sources(const std::vector<Check>& cases, bool force,
+                       const std::function<bool()>& cancel, const std::function<void()>& wake) {
+        const unsigned epoch = ++check_epoch_;
+        std::lock_guard<std::mutex> checking(check_mu_);
+        if (epoch != check_epoch_.load() || (cancel && cancel())) return;
+        std::vector<std::shared_ptr<Script>> scripts;
+        { std::lock_guard<std::mutex> lock(mu_); scripts = list_; }
+        std::atomic<size_t> next{0};
+        auto worker = [&] {
+            for (;;) {
+                const size_t i = next.fetch_add(1);
+                if (i >= scripts.size()) return;
+                const auto s = scripts[i];
+                const auto file = file_key(s->path());
+                const auto stopped = [&] { return epoch != check_epoch_.load() || s->retired() || (cancel && cancel()); };
+                for (const auto& sample : cases) {
+                    if (stopped()) return;
+                    auto publish = [&](Health state) {
+                        { std::lock_guard<std::mutex> lock(mu_);
+                          if (stopped() || std::find(list_.begin(), list_.end(), s) == list_.end()) return;
+                          health_[file][sample.platform] = std::move(state); ++revision_; }
+                        if (wake) wake();
+                    };
+                    if (!s->supports(sample.platform, "musicUrl")) { publish({4, "未声明支持"}); continue; }
+                    { std::lock_guard<std::mutex> lock(mu_);
+                      const auto it = health_[file].find(sample.platform);
+                      if (!force && it != health_[file].end() && (it->second.state == 2 || it->second.state == 3)) continue; }
+                    // 点播优先。检测被打断后保留“待检测”，不会把抢占记成失败。
+                    if (s->playback_waiting()) { publish({0, "等待播放请求完成"}); continue; }
+                    publish({1, "静默请求播放地址并探测音频头"});
+                    std::string url, error;
+                    bool playable = false;
+                    std::atomic<bool> preempted{false};
+                    bool timed_out = false;
+                    {
+                        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+                        net::CancelScope budget([&] {
+                            if (s->playback_waiting()) preempted.store(true);
+                            timed_out = std::chrono::steady_clock::now() >= deadline;
+                            return stopped() || preempted.load() || timed_out;
+                        });
+                        const auto q = s->pick_quality(sample.platform, 1);
+                        if (q.empty()) error = "未声明标准或高品质音质";
+                        else if (s->music_url(sample.platform, q, sample.info, url, error, true)) {
+                            const auto probe = net::probe_audio(url, {"User-Agent: Mozilla/5.0"}, 2500);
+                            playable = probe.playable;
+                            if (!playable) error = probe.reason;
+                        }
+                    }
+                    if (stopped()) return;
+                    timed_out = timed_out || error.find("超时") != std::string::npos || error.find("timeout") != std::string::npos;
+                    if (preempted.load() || s->playback_waiting()) publish({0, "检测让位于播放，可重新检测"});
+                    else publish({playable ? 2 : timed_out ? 5 : 3, playable ? "样本音频头有效" : error.empty() ? "样本请求失败" : error});
+                }
+            }
+        };
+        std::vector<std::thread> pool;
+        for (size_t i = 0; i < std::min<size_t>(2, scripts.size()); ++i) pool.emplace_back(worker);
+        for (auto& thread : pool) thread.join();
     }
 
 private:
@@ -1247,9 +1536,11 @@ private:
             std::sort(new_failed.begin(), new_failed.end(),
                       [](const auto& a, const auto& b) { return a.first < b.first; });
             list_.swap(new_list);
+            for (const auto& old : new_list)
+                if (std::find(list_.begin(), list_.end(), old) == list_.end()) old->retire();
             ++revision_;
             failed_.swap(new_failed);
-            for (const auto& file : files) runtime_errors_.erase(file_key(file));
+            for (const auto& file : files) { runtime_errors_.erase(file_key(file)); health_.erase(file_key(file)); }
         }
         // 被替换的运行时在 mu_ 锁外释放，避免清理脚本时阻塞界面读取状态。
         return ok_count.load();
@@ -1303,6 +1594,14 @@ public:
             std::lock_guard<std::mutex> lock(mu_);
             for (auto& s : list_)
                 if (!s->retired() && s->supports(key, "musicUrl")) order.push_back(s);
+            // 按当前平台的实测结果排序；明确选中的音源仍优先。
+            const auto rank = [&](const auto& s) {
+                const auto h = health_.find(file_key(s->path()));
+                if (h == health_.end()) return 1;
+                const auto p = h->second.find(key);
+                return p == h->second.end() ? 1 : p->second.state == 2 ? 0 : p->second.state == 3 ? 2 : 1;
+            };
+            std::stable_sort(order.begin(), order.end(), [&](const auto& a, const auto& b) { return rank(a) < rank(b); });
             const std::string preferred = preferred_;
             if (!preferred.empty()) {
                 std::stable_sort(order.begin(), order.end(), [&preferred](const std::shared_ptr<Script>& a,
@@ -1314,10 +1613,10 @@ public:
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
         const auto report = [&](const std::shared_ptr<Script>& script, const std::string& error) {
             std::lock_guard<std::mutex> lock(mu_);
-            const auto key = file_key(script->path());
-            if (!removed_.count(key)) {
-                if (error.empty()) runtime_errors_.erase(key);
-                else runtime_errors_[key] = error;
+            const auto file = file_key(script->path());
+            if (!removed_.count(file) && std::find(list_.begin(), list_.end(), script) != list_.end()) {
+                if (error.empty()) runtime_errors_[file].erase(key);
+                else runtime_errors_[file][key] = error;
             }
         };
         std::string last;
@@ -1373,7 +1672,10 @@ private:
     std::set<std::string> removed_;
     std::string preferences_error_;
     std::string preferences_file_;
-    std::map<std::string, std::string> runtime_errors_;
+    std::map<std::string, std::map<std::string, std::string>> runtime_errors_;
+    std::map<std::string, Checks> health_;
+    std::mutex check_mu_;
+    std::atomic<unsigned> check_epoch_{0};
     bool preferences_valid_ = true;
     std::atomic<unsigned> revision_{0};
     std::mutex load_mu_;             // 串行化 load_dir（网络在锁外，见 load_dir 注释）

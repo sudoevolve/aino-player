@@ -40,7 +40,13 @@ inline std::string encode_track(const music::Track& t) {
             ",\"artist\":" + quote(v.artist) + ",\"album\":" + quote(v.album) +
             ",\"cover\":" + quote(v.cover_url) + ",\"duration_ms\":" + std::to_string(v.duration_ms) +
             ",\"bitrate\":" + std::to_string(v.bitrate) + ",\"needs_login\":" + (v.needs_login ? "true" : "false") +
-            ",\"album_id\":" + quote(v.album_id) + ",\"artists\":[";
+            ",\"album_id\":" + quote(v.album_id) + ",\"album_audio_id\":" + quote(v.album_audio_id) + ",\"quality_hashes\":{";
+        bool first_hash = true;
+        for (const auto& h : v.quality_hashes) {
+            if (!first_hash) out += ','; first_hash = false;
+            out += quote(h.first) + ":" + quote(h.second);
+        }
+        out += "},\"artists\":[";
         for (size_t i = 0; i < v.artists.size(); ++i) {
             if (i) out += ',';
             out += "{\"id\":" + quote(v.artists[i].id) + ",\"name\":" + quote(v.artists[i].name) + "}";
@@ -49,7 +55,7 @@ inline std::string encode_track(const music::Track& t) {
     }
     return out + "]}";
 }
-// dropped：变体全都属于已移除的平台（酷我/YouTube/酷狗），这首直接丢弃。
+// dropped：变体全都属于已移除的平台，这首直接丢弃。
 // 这和"文件损坏"必须区分开 —— 否则一次升级就把用户整个资料库判成损坏。
 inline bool decode_track(const js::Value& value, music::Track& t, bool* dropped = nullptr) {
     t.title = value["title"].str(); t.artist = value["artist"].str(); t.album = value["album"].str();
@@ -64,6 +70,9 @@ inline bool decode_track(const js::Value& value, music::Track& t, bool* dropped 
         music::Variant v;
         v.source = music::Source(source); v.id = id; v.native_id = row["native_id"].str();
         v.album_id = row["album_id"].str();
+        v.album_audio_id = row["album_audio_id"].str();
+        if (row["quality_hashes"].size() > 12) return false;
+        for (const auto& h : row["quality_hashes"].object) v.quality_hashes[h.first] = h.second.str();
         if (row["artists"].size() > 32) return false;
         for (const auto& a : row["artists"].array) {
             if (!a["name"].str().empty()) v.artists.push_back({a["id"].str(), a["name"].str()});
@@ -99,7 +108,7 @@ inline bool parse_link(const std::string& input, music::Source& source, std::str
     if (std::regex_match(text, match, netease)) source = music::Source::Netease;
     else if (std::regex_match(text, match, qq)) source = music::Source::QQ;
     else {
-        return false;   // YouTube 支持已移除
+        return false;
     }
     id = match[1].str();
     return id.size() <= 24 && id.find_first_not_of('0') != std::string::npos;

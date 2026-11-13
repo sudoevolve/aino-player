@@ -2,7 +2,7 @@
 //
 // 只做播放器需要的事：把接口返回的 JSON 解析成可查询的树。
 // 特点：
-//   * lenient 模式能吃下酷我那种单引号"JSON"（{'NAME':'花海',...}）
+//   * lenient 模式能吃下接口返回的单引号"JSON"（{'NAME':'花海',...}）
 //   * \uXXXX 与 UTF-16 代理对都转 UTF-8
 //   * 解析失败返回 false + 错误位置，不抛异常
 #pragma once
@@ -93,7 +93,7 @@ struct Parser {
         while (p < end) {
             const char c = *p;
             if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { ++p; continue; }
-            // 酷我接口会在 JSON 里塞注释？没见过，但 \xEF\xBB\xBF 的 BOM 见过
+            // 兼容接口响应中的 UTF-8 BOM。
             if ((unsigned char)c == 0xEF && end - p >= 3 && (unsigned char)p[1] == 0xBB &&
                 (unsigned char)p[2] == 0xBF) { p += 3; continue; }
             break;

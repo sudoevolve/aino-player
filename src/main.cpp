@@ -118,9 +118,7 @@ int main(int argc, char** argv) {
     // provider（搜索脚本）放后台加载：纯本地解析、不联网，不影响首帧。
     // 音源脚本【启动时绝不自动加载】——加载什么时候发生由用户按按钮决定
     //（在线获取 / 导入音源 / 重新加载），不然按钮就没有存在的意义。
-    std::thread([] {
-        prov::Host::instance().load_dir(prov::default_dir());
-    }).detach();
+    background::start([] { prov::Host::instance().ensure_loaded(); });
 
     auto& startup_ui = view_model().ui;
     bool initial_search = argc > 1;

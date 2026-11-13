@@ -8,6 +8,7 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include <utility>
 #include "platform.hpp"
 
 namespace net {
@@ -26,6 +27,7 @@ struct Response {
     int status = 0;
     std::string body, content_type, final_url, error, content_range;
     std::vector<std::string> set_cookies;
+    std::vector<std::pair<std::string, std::string>> headers;
     std::string location;
     bool ok() const { return error.empty() && status >= 200 && status < 300; }
 };
@@ -43,6 +45,7 @@ struct Transfer {
     curl_slist* headers = nullptr;
     std::string content_range;
     std::vector<std::string> set_cookies;
+    std::vector<std::pair<std::string, std::string>> response_headers;
     std::string location;
     Transfer() {
         static const auto init = curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -80,6 +83,10 @@ struct Transfer {
             const size_t n = a * b;
             std::string line(p, n), lower = line;
             std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+            auto& transfer = *static_cast<Transfer*>(data);
+            if (lower.rfind("http/", 0) == 0) {
+                transfer.response_headers.clear();
+            }
             if (lower.rfind("content-range:", 0) == 0) static_cast<Transfer*>(data)->content_range = line.substr(14);
             auto value = [&](size_t offset) {
                 auto text = line.substr(offset);
@@ -89,6 +96,8 @@ struct Transfer {
             };
             if (lower.rfind("set-cookie:", 0) == 0) static_cast<Transfer*>(data)->set_cookies.push_back(value(11));
             if (lower.rfind("location:", 0) == 0) static_cast<Transfer*>(data)->location = value(9);
+            const auto colon = lower.find(':');
+            if (colon != std::string::npos) transfer.response_headers.emplace_back(lower.substr(0, colon), value(colon + 1));
             return n;
         };
         curl_easy_setopt(handle, CURLOPT_HEADERFUNCTION, header_callback);
@@ -103,6 +112,7 @@ struct Transfer {
         curl_easy_getinfo(handle, CURLINFO_EFFECTIVE_URL, &url);
         out.status = int(status); out.content_range = content_range;
         out.set_cookies = set_cookies; out.location = location;
+        out.headers = response_headers;
         if (type) out.content_type = type;
         if (url) out.final_url = url;
     }

@@ -3,13 +3,11 @@
 // 每个源适配搜索、取流及歌手/专辑目录；
 // 聚合层负责并发扇出、超时隔离、跨源同曲合并、相关性排序。
 //
-// 与参考实现的差别（这份代码是 C++ 重写的，不是移植 Rust）：
-//   * 没有 async 运行时，用「每个源一个 std::thread + shared_ptr 结果槽 + 9s 软超时」
-//   * 取流只做一次 Range 探测（2 字节），不预先下载，也不需要回环代理
-//     —— 播放走本地文件，Referer 由我们自己发，绕开了 WebView 拿不到请求头的问题
+// 检索由平台提供；播放地址由独立渠道解析，播放业务决定流式或文件播放。
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -40,21 +38,45 @@ namespace music {
 
 // 注意：这个枚举的数值会写进资料库（library.hpp 存的是 int），只能往后追加，
 // 不能插队改值，否则老用户的歌单会串源。
-// 只保留三个在线平台 + 本地库。
+// 平台编号持久化后固定；3 是已移除平台的历史编号，不复用。
 //
 // 数值故意留空洞（Bilibili 仍是 4、Local 仍是 5）：资料库把 source 存成 int，
-// 重排数值会让老歌单串源。2/3/6 是已删除的酷我 / YouTube / 酷狗，不再使用。
-enum class Source { Netease = 0, QQ = 1, Bilibili = 4, Local = 5 };
-constexpr int kSourceCount = 6;  // 数组下标上限（Local = 5）
+// 重排数值会让老歌单串源。恢复平台使用原编号，新平台只在末尾追加。
+enum class Source { Netease = 0, QQ = 1, Kuwo = 2, Bilibili = 4, Local = 5, Kugou = 6, Migu = 7 };
+constexpr int kSourceCount = 8;  // Migu = 7，3 保留空位。
 
-// 在线平台，顺序即 UI 顺序。搜索 / 音源页 / 开关都只认这一张表。
-inline constexpr Source kPlatforms[] = {Source::Netease, Source::QQ, Source::Bilibili};
-constexpr int kPlatformCount = 3;
-
-inline bool is_platform(Source s) {
-    for (Source p : kPlatforms) if (p == s) return true;
-    return false;
+// 平台身份与能力在这里集中登记；协议 URL 和响应解析归 providers/*.js。
+struct PlatformInfo {
+    Source source;
+    const char *name, *key, *lx_key;
+    bool discovery, script_playback;
+};
+inline constexpr PlatformInfo kPlatformInfo[] = {
+    {Source::Netease, "网易云", "netease", "wy", true, false},
+    {Source::QQ, "QQ", "qq", "tx", true, false},
+    {Source::Kuwo, "酷我", "kuwo", "kw", true, true},
+    {Source::Kugou, "酷狗", "kugou", "kg", true, true},
+    {Source::Migu, "咪咕", "migu", "mg", true, true},
+    {Source::Bilibili, "B 站", "bilibili", nullptr, false, false},
+};
+constexpr int kPlatformCount = int(sizeof(kPlatformInfo) / sizeof(kPlatformInfo[0]));
+inline constexpr auto kPlatforms = [] {
+    std::array<Source, kPlatformCount> out{};
+    for (int i = 0; i < kPlatformCount; ++i) out[i] = kPlatformInfo[i].source;
+    return out;
+}();
+constexpr int kDiscoveryCount = [] { int n = 0; for (const auto& p : kPlatformInfo) if (p.discovery) ++n; return n; }();
+inline constexpr auto kDiscoveryPlatforms = [] {
+    std::array<Source, kDiscoveryCount> out{}; int n = 0;
+    for (const auto& p : kPlatformInfo) if (p.discovery) out[n++] = p.source;
+    return out;
+}();
+inline const PlatformInfo* platform_info(Source source) {
+    for (const auto& p : kPlatformInfo) if (p.source == source) return &p;
+    return nullptr;
 }
+inline bool is_platform(Source source) { return platform_info(source) != nullptr; }
+inline bool script_platform(Source source) { const auto* p = platform_info(source); return p && p->script_playback; }
 
 // 渠道（Lane）—— 和平台（Source）正交的一维。
 //
@@ -70,24 +92,13 @@ constexpr int kLaneCount = 2;
 inline const char* lane_name(Lane l) { return l == Lane::JsSource ? "音源" : "自带"; }
 inline const char* lane_full_name(Lane l) { return l == Lane::JsSource ? "第三方音源" : "自带接口"; }
 
-inline const char* source_name(Source s) {
-    switch (s) {
-        case Source::Netease: return "网易云";
-        case Source::QQ: return "QQ";
-        case Source::Bilibili: return "B 站";
-        case Source::Local: return "本地";
-        default: return "未知";
-    }
+inline const char* source_name(Source source) {
+    const auto* p = platform_info(source);
+    return p ? p->name : source == Source::Local ? "本地" : "未知";
 }
-
-inline const char* source_key(Source s) {
-    switch (s) {
-        case Source::Netease: return "netease";
-        case Source::QQ: return "qq";
-        case Source::Bilibili: return "bilibili";
-        case Source::Local: return "local";
-        default: return "unknown";
-    }
+inline const char* source_key(Source source) {
+    const auto* p = platform_info(source);
+    return p ? p->key : source == Source::Local ? "local" : "unknown";
 }
 
 struct ArtistRef { std::string id, name; };
@@ -112,6 +123,8 @@ struct Variant {  // 某一首歌在某个源上的一条结果
     std::string native_id;    // 源内部 ID：QQ songid、B 站分 P cid 等。
     std::vector<ArtistRef> artists;
     std::string album_id;
+    std::string album_audio_id; // 酷狗混合歌曲编号，与普通 Audioid 分开。
+    std::map<std::string, std::string> quality_hashes; // 酷狗各音质对应的 hash。
 };
 
 inline bool same_variant(const Variant& a, const Variant& b) {
@@ -162,10 +175,9 @@ struct Settings {
     std::string netease_cookie;  // MUSIC_U=...；留空则只用免费档
     std::string qq_cookie;       // qm_keyst=...
     std::function<bool()> cancelled; // 当前播放/下载任务的取消信号，不持久化。
-    bool enable[kSourceCount] = {true, true, /*2 已删*/ false, /*3 已删*/ false, /*B站*/ false, /*Local*/ false};
+    bool enable[kSourceCount] = {true, true, false, false, false, false, false, false};
     // 音质：0 = 标准 128k，1 = 高 320k，2 = 无损
-    // 能到哪一档由源决定：网易云要 Cookie（无损还要会员），QQ 要登录，
-    // 酷我的直链跟资源走、没有档位参数（填了也忽略）。
+    // 可用档位由平台和账号权限决定：网易云无损需要会员，QQ 取流需要登录。
     int quality = 1;
     // 渠道：取流时先问谁。0 = 第三方音源优先（默认，免登录且能到无损），1 = 自带接口优先。
     // 两条渠道可以单独关掉：关了音源就只剩自带，反之亦然。
@@ -481,57 +493,20 @@ inline std::string track_album(const Track& track) {
     return track.current().album.empty() ? track.album : track.current().album;
 }
 
-inline std::vector<Variant> search_netease(const std::string& keyword, int limit, int timeout_ms,
+inline bool search_via_provider(Source src, const std::string& keyword, int limit, int page,
+                                std::vector<Variant>& out, std::string& err);
+inline std::vector<Variant> search_platform(Source src, const std::string& keyword, int limit, int timeout_ms,
                                            std::string& err, const Settings& st, int page = 0) {
+    prov::ExecutionTime budget(timeout_ms);
+    prov::Host::instance().set_credentials(st.netease_cookie, st.qq_cookie);
     std::vector<Variant> out;
-    const std::string url = "http://music.163.com/api/search/get/web?s=" + net::url_encode(keyword) +
-                            "&type=1&limit=" + std::to_string(limit) + "&offset=" + std::to_string(std::max(0, page) * limit);
-    std::vector<std::string> headers = {"Referer: https://music.163.com/",
-                                        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                                        "Cookie: appver=2.0.2; os=pc" +
-                                            (st.netease_cookie.empty() ? std::string()
-                                                                       : "; " + st.netease_cookie)};
-
-    const net::Response r = net::get(url, headers, timeout_ms);
-    if (!r.ok()) {
-        err = r.error.empty() ? ("HTTP " + std::to_string(r.status)) : r.error;
-        return out;
-    }
-    js::Value root;
-    if (!js::parse(r.body, root, true)) {
-        err = "响应不是 JSON";
-        return out;
-    }
-    const js::Value& songs = root["result"]["songs"];
-    if (!songs.is_array()) {
-        err = "接口未返回 songs（可能是风控）";
-        return out;
-    }
-    for (size_t i = 0; i < songs.size(); ++i) {
-        const js::Value& s = songs[i];
-        Variant v;
-        v.source = Source::Netease;
-        v.id = std::to_string(s["id"].integer());
-        v.title = text::decode_entities(s["name"].str());
-        std::string artists;
-        const js::Value& arr = s["artists"];
-        for (size_t k = 0; k < arr.size(); ++k) {
-            if (k) artists += "/";
-            artists += text::decode_entities(arr[k]["name"].str());
-        }
-        v.artist = artists;
-        v.album = text::decode_entities(s["album"]["name"].str());
-        v.duration_ms = int(s["duration"].integer());
-        attach_catalog_metadata(v, s);
-        const long long fee = s["fee"].integer(1);
-        // fee: 0 免费 / 8 免费低音质 / 1 会员 / 4 付费专辑
-        v.bitrate = (fee == 1 || fee == 4) ? 128000 : 128000;
-        v.needs_login = (fee == 1 || fee == 4);
-        if (v.id.empty() || v.title.empty()) continue;
-        // 去掉网易云标题里自带的 "(Live)" 之类留给合并层处理，展示时保留原样
-        out.push_back(std::move(v));
-    }
+    if (!search_via_provider(src, keyword, limit, page, out, err) && err.empty())
+        err = std::string(source_name(src)) + " 平台脚本未加载，请检查 providers 目录";
     return out;
+}
+inline std::vector<Variant> search_netease(const std::string& keyword, int limit, int timeout_ms,
+                                      std::string& err, const Settings& st, int page = 0) {
+    return search_platform(Source::Netease, keyword, limit, timeout_ms, err, st, page);
 }
 
 /** @brief 解析网易云播放地址，保留服务端拒绝码；码率仅作展示，不决定播放权限。 */
@@ -615,74 +590,7 @@ inline ResolveResult resolve_netease(const Variant& v, const Settings& st) {
 
 inline std::vector<Variant> search_qq(const std::string& keyword, int limit, int timeout_ms,
                                       std::string& err, const Settings& st, int page = 0) {
-    std::vector<Variant> out;
-    // QQ 搜索的请求体是 musicu.fcg 的固定信封
-    std::string q;
-    for (unsigned char c : keyword) {
-        if (c == '"' || c == '\\') { q += '\\'; q += char(c); }
-        else if (c < 0x20) { q += ' '; }
-        else q += char(c);
-    }
-    const std::string body =
-        std::string("{\"comm\":{\"ct\":\"19\",\"cv\":\"1859\",\"uin\":\"0\"},") +
-        "\"req\":{\"method\":\"DoSearchForQQMusicDesktop\",\"module\":\"music.search.SearchCgiService\"," +
-        "\"param\":{\"grp\":1,\"num_per_page\":" + std::to_string(limit) +
-        ",\"page_num\":" + std::to_string(std::max(0, page) + 1) + ",\"query\":\"" + q + "\",\"search_type\":0}}}";
-    std::vector<std::string> headers = {"Content-Type: application/json",
-                                        "Referer: https://y.qq.com/",
-                                        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)"};
-    if (!st.qq_cookie.empty()) headers.push_back("Cookie: " + st.qq_cookie);
-
-    const net::Response r = net::post("https://u.y.qq.com/cgi-bin/musicu.fcg", body, headers, timeout_ms);
-    if (!r.ok()) {
-        err = r.error.empty() ? ("HTTP " + std::to_string(r.status)) : r.error;
-        return out;
-    }
-    js::Value root;
-    if (!js::parse(r.body, root, true)) {
-        err = "响应不是 JSON";
-        return out;
-    }
-    if (root["req"]["code"].integer() != 0) {
-        const long long code = root["req"]["code"].integer();
-        // 2001 = 搜索接口要求登录态（匿名请求的固定表现），不是"没搜到"
-        err = st.qq_cookie.empty() ? ("需登录（code " + std::to_string(code) + "）")
-                                   : ("接口返回 code " + std::to_string(code));
-        return out;
-    }
-    const js::Value& list = root["req"]["data"]["body"]["song"]["list"];
-    if (!list.is_array() || list.size() == 0) {
-        // 匿名请求会拿到空列表，登录页地址就在 feedbackURL 里 —— 这是"需登录"，不是"没结果"
-        err = st.qq_cookie.empty() ? "需登录（匿名搜索被拒）" : "无结果";
-        return out;
-    }
-    for (size_t i = 0; i < list.size(); ++i) {
-        const js::Value& s = list[i];
-        Variant v;
-        v.source = Source::QQ;
-        v.id = s["mid"].str(s["songmid"].str());
-        v.title = text::decode_entities(s["name"].str(s["songname"].str()));
-        std::string artists;
-        const js::Value& singers = s["singer"];
-        for (size_t k = 0; k < singers.size(); ++k) {
-            if (k) artists += "/";
-            artists += text::decode_entities(singers[k]["name"].str());
-        }
-        v.artist = artists;
-        v.album = text::decode_entities(s["album"]["name"].str(s["albumname"].str()));
-        // QQ 的专辑封面有稳定的直链模板，pmid 在搜索结果里就有，不用再请求
-        const std::string pmid = s["album"]["pmid"].str();
-        if (!pmid.empty())
-            v.cover_url = "https://y.gtimg.cn/music/photo_new/T002R300x300M000" + pmid + ".jpg";
-        v.duration_ms = int(s["interval"].integer()) * 1000;
-        attach_catalog_metadata(v, s);
-        const long long pay_play = s["pay"]["pay_play"].integer(1);
-        v.needs_login = pay_play != 0;
-        v.bitrate = 128000;
-        if (v.id.empty() || v.title.empty()) continue;
-        out.push_back(std::move(v));
-    }
-    return out;
+    return search_platform(Source::QQ, keyword, limit, timeout_ms, err, st, page);
 }
 
 // 从 cookie 里取一个键（QQ 的 uin / authst 都靠它）
@@ -958,8 +866,6 @@ inline SearchResult run_search(const std::string& keyword, const Settings& st, i
                                 const std::array<int, kSourceCount>* pages = nullptr) {
     using clock = std::chrono::steady_clock;
     const auto t_start = clock::now();
-    // provider 读不到应用设置，登录态得在这儿塞进去
-    prov::Host::instance().set_credentials(st.netease_cookie, st.qq_cookie);
     auto job = std::make_shared<Job>();
     job->per_source.resize(kSourceCount); job->reports.resize(kSourceCount); job->finished.assign(kSourceCount, 0);
     std::array<std::string, kSourceCount> next;
@@ -967,7 +873,7 @@ inline SearchResult run_search(const std::string& keyword, const Settings& st, i
     std::atomic<bool> stopped{false};
     for (int i = 0; i < kSourceCount; ++i) {
         job->reports[size_t(i)].source = Source(i);
-        // 已删除的平台（酷我/YouTube/酷狗）只在下标里留了空位，不参与检索
+        // 历史平台编号只留空位，不参与检索
         if (!is_platform(Source(i)) && Source(i) != Source::Local) {
             job->reports[size_t(i)].pending = false;
             job->reports[size_t(i)].err = "已移除";
@@ -984,15 +890,8 @@ inline SearchResult run_search(const std::string& keyword, const Settings& st, i
             const int source_page = pages ? (*pages)[size_t(i)] : page;
             const auto began = clock::now();
             try {
-                std::string perr;
-                const bool via_provider =
-                    search_via_provider(Source(i), keyword, limit_per_source, source_page, got, perr);
-                if (!via_provider && !perr.empty()) error = perr;
-                if (via_provider) { /* provider 已经给了结果，不再打内置接口 */ }
-                else if (i == int(Source::Netease)) got = search_netease(keyword, limit_per_source, 8000, error, st, source_page);
-                else if (i == int(Source::QQ)) got = search_qq(keyword, limit_per_source, 8000, error, st, source_page);
-                else if (i == int(Source::Bilibili)) got = search_bilibili(keyword, limit_per_source, 8000, error, source_page);
-                else if (i == int(Source::Local)) { /* 本地库不参与在线检索 */ }
+                if (i == int(Source::Bilibili)) got = search_bilibili(keyword, limit_per_source, 8000, error, source_page);
+                else if (is_platform(Source(i))) got = search_platform(Source(i), keyword, limit_per_source, 8000, error, st, source_page);
             } catch (...) { error = "适配器异常"; }
             std::lock_guard<std::mutex> lock(job->m);
             auto& report = job->reports[size_t(i)];
@@ -1365,30 +1264,34 @@ inline ResolveResult resolve_bilibili(const Variant& v, const Settings& st) {
 // ---------------------------------------------------------------- 平台 provider（JS）
 //
 // 各平台接口的易变部分都在 providers/*.js 里；C++ 只负责调用和类型转换。
-// 拿不到 provider 时返回 false，调用方回落到内置实现（迁移期并存，不是永久的）。
-inline const char* provider_key_of(Source s) {
-    switch (s) {
-        case Source::Netease: return "netease";
-        case Source::QQ: return "qq";
-        default: return nullptr;   // B 站没有 JS provider（见 builtin::bili）
-    }
+// 同平台搜索只有一份 JS 实现，失败直接报告，不再隐式重复请求。
+inline const char* provider_key_of(Source source) {
+    const auto* p = platform_info(source);
+    return p && p->lx_key ? p->key : nullptr; // B 站的 WBI / 分 P 适配保留在 C++。
 }
 
 inline void attach_provider_song(Variant& v, const prov::Song& s) {
     v.id = s.id;
-    v.title = s.title;
-    v.artist = s.artist;
-    v.album = s.album;
+    v.title = text::decode_entities(s.title);
+    v.artist = text::decode_entities(s.artist);
+    v.album = text::decode_entities(s.album);
     v.duration_ms = s.duration_ms;
     v.bitrate = s.bitrate;
     v.native_id = s.native_id;
     v.cover_url = s.cover;
+    v.album_id = s.metadata["album_id"].str();
+    v.album_audio_id = s.metadata["album_audio_id"].str();
+    v.needs_login = s.metadata["needs_login"].truthy();
+    for (const auto& a : s.metadata["artists"].array)
+        if (v.artists.size() < 32 && !a["name"].str().empty()) v.artists.push_back({a["id"].str(), text::decode_entities(a["name"].str())});
+    for (const auto& item : s.metadata["quality_hashes"].object)
+        v.quality_hashes[item.first] = item.second.str();
 }
 
 inline bool search_via_provider(Source src, const std::string& keyword, int limit, int page,
                                 std::vector<Variant>& out, std::string& err) {
     const char* key = provider_key_of(src);
-    if (!key || !prov::Host::instance().has(key)) return false;
+    if (!key) { err = "平台不支持此目录接口"; return false; }
     std::vector<prov::Song> songs;
     if (!prov::Host::instance().search(key, keyword, page, limit, songs, err)) return false;
     out.clear();
@@ -1405,7 +1308,7 @@ inline bool search_via_provider(Source src, const std::string& keyword, int limi
 inline bool board_via_provider(Source src, const std::string& board_id, int page, int limit,
                                std::vector<Variant>& out, std::string& err) {
     const char* key = provider_key_of(src);
-    if (!key || !prov::Host::instance().has(key)) return false;
+    if (!key) { err = "平台不支持此目录接口"; return false; }
     std::vector<prov::Song> songs;
     if (!prov::Host::instance().board(key, board_id, page, limit, songs, err)) return false;
     out.clear();
@@ -1443,12 +1346,8 @@ inline std::vector<Track> board_tracks(Source src, const std::string& board_id, 
 //
 // 策略：先让落雪音源试，失败再回落内置实现。
 // 音源只负责"给一条能用的直链"，歌还是 aino 自己搜的 —— 这样两边的 id 体系天然对齐。
-inline const char* lx_platform_key(Source s) {
-    switch (s) {
-        case Source::Netease: return "wy";
-        case Source::QQ: return "tx";
-        default: return nullptr;   // 落雪音源没有 B 站平台
-    }
+inline const char* lx_platform_key(Source source) {
+    const auto* p = platform_info(source); return p ? p->lx_key : nullptr;
 }
 
 inline std::string lx_interval(int ms) {
@@ -1466,7 +1365,21 @@ inline std::string lx_music_info(const Variant& v, const char* key) {
     s += ",\"albumName\":" + lx::detail::js_quote(v.album);
     s += ",\"interval\":" + lx::detail::js_quote(lx_interval(v.duration_ms));
     s += ",\"source\":" + lx::detail::js_quote(key);
-    s += ",\"img\":null,\"lrc\":null}";
+    if (v.source == Source::Kugou) {
+        s += ",\"hash\":" + lx::detail::js_quote(v.native_id);
+        s += ",\"albumId\":" + lx::detail::js_quote(v.album_id);
+        s += ",\"albumAudioId\":" + lx::detail::js_quote(v.album_audio_id);
+        s += ",\"_types\":{";
+        bool first = true;
+        for (const auto& h : v.quality_hashes) {
+            if (!first) s += ","; first = false;
+            s += lx::detail::js_quote(h.first) + ":{\"hash\":" + lx::detail::js_quote(h.second) + "}";
+        }
+        s += "}";
+    } else if (v.source == Source::Migu) {
+        s += ",\"copyrightId\":" + lx::detail::js_quote(v.native_id);
+    }
+    s += ",\"img\":" + lx::detail::js_quote(v.cover_url) + ",\"lrc\":null}";
     return s;
 }
 
@@ -1516,9 +1429,10 @@ inline bool resolve_via_source(const Variant& v, int quality, ResolveResult& out
 inline bool resolve_via_builtin(const Variant& v, const Settings& st, ResolveResult& out, std::string* why,
                                 const ResolveAccept& accept = {}) {
     if (net::cancelled()) { if (why) *why = "已取消"; return false; }
+    prov::Host::instance().set_credentials(st.netease_cookie, st.qq_cookie);
     const std::string q = lx::quality_key(st.quality);
 
-    // 1) 平台自己的 provider（酷我 / 酷狗 有直链接口）
+    // 1) 平台 provider 的可选取流入口（随附脚本未实现，继续走内置接口）
     if (const char* pkey = provider_key_of(v.source)) {
         if (prov::Host::instance().has(pkey)) {
             prov::Song song;
@@ -1624,9 +1538,8 @@ inline bool find_on_source(Source src, const Track& t, const Settings& st, Varia
     }
     const std::string kw = t.title + " " + main_artist(t.artist);
     std::vector<Variant> got;
-    if (src == Source::Netease) got = search_netease(kw, 10, 6000, err, st);
-    else if (src == Source::QQ) got = search_qq(kw, 10, 6000, err, st);
-    else if (src == Source::Bilibili) got = search_bilibili(kw, 10, 6000, err);
+    if (src == Source::Bilibili) got = search_bilibili(kw, 10, 6000, err);
+    else if (is_platform(src)) got = search_platform(src, kw, 10, 6000, err, st);
 
     if (got.empty()) {
         if (err.empty()) err = std::string(source_name(src)) + " 没搜到";
@@ -1772,6 +1685,7 @@ inline bool hydrate_catalog_variant(Variant& variant, const Settings& st, std::s
 inline bool catalog_target_from_track(const Track& track, CatalogKind kind, int artist_index, const Settings& st,
                                       CatalogTarget& target, std::string& error) {
     if (track.variants.empty()) { error = "没有曲目资料"; return false; }
+    if (script_platform(track.current().source)) { error = "该平台目前支持搜索和榜单，尚未接入歌手与专辑目录"; return false; }
     auto variant = track.current();
     const auto displayed = track_artists(track);
     const auto wanted = artist_index >= 0 && artist_index < int(displayed.size()) ? displayed[size_t(artist_index)].name : std::string();

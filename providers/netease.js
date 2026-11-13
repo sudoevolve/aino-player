@@ -2,7 +2,7 @@
 // 搜索走 music.163.com 的只读接口。
 //
 // 取流不在这里实现，交给 C++ 的 resolve_netease：它按数字 song id 精确取，不会串歌。
-// 曾经这里用 ctx.lxUrl('wy', ...) 转手问音源，音源按歌名匹配会命中同名翻唱，
+// 平台脚本反向调用第三方音源时，按歌名匹配可能命中同名翻唱，
 // 而链路被标成 builtin 显示成"自带"，等于把翻唱冒充成平台原曲。
 // 规则：自带渠道只用自己的接口；音源渠道（Lane::JsSource）才允许问脚本。
 
@@ -40,7 +40,10 @@ function songFrom(item) {
     // fee: 0 免费 / 8 免费低音质 / 1 会员 / 4 付费专辑
     bitrate: 128000,
     native_id: id,
-    cover: ''
+    needs_login: fee === 1 || fee === 4,
+    album_id: String(((item.album || item.al || {}).id) || ''),
+    artists: artists.map(a => ({id: String(a.id || ''), name: a.name || ''})),
+    cover: (item.album || item.al || {}).picUrl || ''
   }
 }
 
@@ -69,3 +72,24 @@ globalThis.provider = {
     return out
   }
 }
+
+provider.heats = function () {
+  const r = http('https://music.163.com/api/search/hot?type=1111');
+  if (r.error || !r.body || !r.body.result) throw new Error(r.error || '热搜响应无效');
+  return (r.body.result.hots || []).map(w => ({text: w.first || ''}));
+};
+provider.playlists = function (args) {
+  const headers = {Referer: 'https://music.163.com/'};
+  const top = http('https://music.163.com/api/toplist', {headers});
+  const cards = (((top.body || {}).list) || []).slice(0, 3).map(p =>
+    ({id: String(p.id), name: p.name, cover: p.coverImgUrl, official: true}));
+  const r = http('https://music.163.com/api/playlist/list?cat=' + encodeURIComponent('全部') +
+    '&order=hot&offset=0&limit=' + (args.limit || 30), {headers});
+  if (r.error || !r.body || !Array.isArray(r.body.playlists)) {
+    if (cards.length) return cards;
+    throw new Error(r.error || '歌单响应无效');
+  }
+  return cards.concat(r.body.playlists.map(p => ({id: String(p.id), name: p.name,
+    cover: p.coverImgUrl || p.picUrl || '', creator: (p.creator || {}).nickname || '',
+    plays: p.playCount || p.subscribedCount || 0, count: p.trackCount || 0})));
+};

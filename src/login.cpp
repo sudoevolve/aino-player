@@ -146,7 +146,7 @@ std::string json_string(const std::string& value) {
     return out + '"';
 }
 const char* official_url(Site site) {
-    return site == Site::YouTube ? "https://music.youtube.com/" : site == Site::QQ ? "https://y.qq.com/" : "https://music.163.com/";
+    return site == Site::QQ ? "https://y.qq.com/" : "https://music.163.com/";
 }
 
 // 只连接自己启动的独立浏览器会话，不读取用户日常浏览器的配置或 Cookie 数据库。
@@ -452,8 +452,7 @@ bool browser_credentials(Site site, const js::Value& result, std::string& cookie
         auto domain = item["domain"].str();
         if (!domain.empty() && domain.front() == '.') domain.erase(0, 1);
         // Network.getCookies 已按官网 URL 限定，额外校验域名，防止伪造同名 Cookie。
-        const bool allowed = site == Site::YouTube ? domain == "youtube.com" || domain == "music.youtube.com" || domain == "www.youtube.com" :
-            site == Site::QQ ? domain == "qq.com" || domain == "y.qq.com" : domain == "music.163.com" || domain == "163.com";
+        const bool allowed = site == Site::QQ ? domain == "qq.com" || domain == "y.qq.com" : domain == "music.163.com" || domain == "163.com";
         const auto name = item["name"].str(), value = item["value"].str();
         if (!allowed || name.empty() || name.find_first_of(";=\r\n\0", 0, 5) != std::string::npos || value.find_first_of(";\r\n\0", 0, 4) != std::string::npos) continue;
         if (!cookie.empty()) cookie += "; "; cookie += name + "=" + value;
@@ -550,15 +549,8 @@ void run_browser(Site site, BrowserOptions options) {
         std::string cookie, uid;
         if (browser_credentials(site, result, cookie, uid)) {
             trace("official credentials received");
-            std::string context;
-            if (site == Site::YouTube) {
-                const std::string expression = "JSON.stringify({authuser:String(window.ytcfg?.get('SESSION_INDEX')??0),delegated:String(window.ytcfg?.get('DELEGATED_SESSION_ID')??''),visitor:String(window.ytcfg?.get('VISITOR_DATA')??'')})";
-                if (connection.call("Runtime.evaluate", "{\"expression\":" + json_string(expression) + ",\"returnByValue\":true}", result, cancel, session))
-                    context = result["result"]["value"].str();
-            }
             std::lock_guard<std::mutex> lock(s.m);
             if (cancel.load()) return;
-            s.context = std::move(context);
             s.cookie = std::move(cookie); s.uid = std::move(uid); s.note = "官网登录成功，已返回播放器";
             s.return_requested.store(true); s.done.store(true); return;
         }
@@ -567,7 +559,7 @@ void run_browser(Site site, BrowserOptions options) {
     note(site, cancel.load() ? "登录已取消" : platform::ticks() >= deadline ? "官网登录等待超时，请重试" : "官网登录窗口已关闭或连接中断，请重试");
 }
 std::string page(Site site) {
-    const std::string name = site == Site::YouTube ? "YouTube Music" : site == Site::QQ ? "QQ 音乐" : "网易云音乐";
+    const std::string name = site == Site::QQ ? "QQ 音乐" : "网易云音乐";
     return R"HTML(<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'">
 <title>aino player 官网登录</title><style>body{font:16px system-ui,sans-serif;background:#f5f5f7;color:#222;max-width:620px;margin:40px auto;padding:24px}section{background:white;padding:28px;border-radius:16px}button,a{display:inline-block;margin:8px 12px 8px 0;padding:10px;border-radius:8px}button{cursor:pointer}textarea{box-sizing:border-box;width:100%;padding:12px;font:14px system-ui;height:120px}p{line-height:1.7}#status{white-space:pre-wrap}</style><section>
@@ -678,149 +670,6 @@ void run_manual(Site site, bool launch_browser) {
     note(site, cancelled[idx].load() ? "登录已取消" : "登录连接已超时，请重试");
 }
 } // namespace
-Stream youtube_stream(const std::string& video_id, const std::string& cookie,
-                      const std::function<bool()>& is_cancelled, const BrowserOptions& options) {
-    Stream output;
-    output.error = "YouTube 支持已移除";
-    return output;
-    if (false) { }
-    const auto executable = options.executable.empty() ? default_browser() : options.executable;
-    if (!chromium_browser(executable)) { output.error = "YouTube 签名解析需要系统 Chrome、Edge 或 Chromium"; return output; }
-#ifdef _WIN32
-    static const bool initialized = [] { WSADATA data; return WSAStartup(MAKEWORD(2,2), &data) == 0; }();
-    if (!initialized) { output.error = "无法初始化官网播放器连接"; return output; }
-#endif
-    const auto parent = platform::temp_dir();
-    if (parent.empty()) { output.error = "无法创建官网播放器临时目录"; return output; }
-    const auto profile = platform::join(parent, "browser-stream-" + token());
-    if (!platform::make_dirs(profile)) { output.error = "无法创建官网播放器临时目录"; return output; }
-    ProfileCleanup cleanup{profile};
-    BrowserProcess browser;
-    if (!browser.launch({executable, "--user-data-dir=" + profile, "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0",
-        "--no-first-run", "--no-default-browser-check", "--disable-background-mode", "--headless=new", "--disable-gpu",
-        "--autoplay-policy=no-user-gesture-required", "--mute-audio", "about:blank"})) {
-        output.error = "无法启动系统浏览器进行 YouTube 音轨解析"; return output;
-    }
-    std::atomic<bool> cancel{false};
-    auto cancelled_now = [&] { const bool value = is_cancelled && is_cancelled(); cancel.store(value); return value; };
-    const auto startup_deadline = platform::ticks() + 10000;
-    int port = 0; std::string socket_path;
-    while (!cancelled_now() && browser.running() && platform::ticks() < startup_deadline) {
-        std::ifstream file(platform::fs::u8path(platform::join(profile, "DevToolsActivePort")));
-        std::string number;
-        if (std::getline(file, number) && std::getline(file, socket_path)) {
-            try { port = std::stoi(number); } catch (...) { port = 0; }
-            if (port > 0 && port <= 65535) break;
-        }
-        platform::sleep_ms(100);
-    }
-    BrowserConnection connection;
-    if (!port || !connection.connect(port, socket_path, cancel)) { output.error = "官网播放器连接失败或已取消"; return output; }
-    struct CloseBrowser { BrowserConnection& connection; ~CloseBrowser() { connection.close_browser(); } } close{connection};
-    if (options.on_ready) options.on_ready("ws://127.0.0.1:" + std::to_string(port) + socket_path);
-    js::Value result;
-    if (!connection.call("Target.getTargets", "{}", result, cancel)) { output.error = "无法访问官网播放器页面"; return output; }
-    std::string target;
-    for (const auto& page : result["targetInfos"].array) if (page["type"].str() == "page") { target = page["targetId"].str(); break; }
-    if (target.empty() || !connection.call("Target.attachToTarget", "{\"targetId\":" + json_string(target) + ",\"flatten\":true}", result, cancel)) {
-        output.error = "无法连接官网播放器页面"; return output;
-    }
-    const auto session = result["sessionId"].str();
-    if (session.empty()) { output.error = "官网播放器会话无效"; return output; }
-    if (!cookie.empty()) {
-        std::string cookies = "[";
-        for (size_t at = 0; at < cookie.size();) {
-            const auto end = cookie.find(';', at);
-            const auto pair = music::text::trim(cookie.substr(at, end == std::string::npos ? cookie.size() - at : end - at));
-            const auto equal = pair.find('=');
-            if (equal != std::string::npos) {
-                const auto name = pair.substr(0, equal), value = pair.substr(equal + 1);
-                if (!name.empty() && name.find_first_of("\r\n \t") == std::string::npos && value.find_first_of("\r\n") == std::string::npos) {
-                    if (cookies.size() > 1) cookies += ',';
-                    cookies += "{\"name\":" + json_string(name) + ",\"value\":" + json_string(value) +
-                        ",\"url\":\"https://music.youtube.com/\",\"path\":\"/\",\"secure\":true" +
-                        (name.rfind("__Host-", 0) == 0 ? "" : ",\"domain\":\".youtube.com\"") + "}";
-                }
-            }
-            if (end == std::string::npos) break;
-            at = end + 1;
-        }
-        cookies += ']';
-        if (!connection.call("Network.setCookies", "{\"cookies\":" + cookies + "}", result, cancel, session)) {
-            output.error = "无法为官网播放器恢复 YouTube 登录态"; return output;
-        }
-    }
-    std::map<std::string, js::Value> requests, completed;
-    const auto audio_url = [](const std::string& url) {
-        if (url.rfind("https://", 0) != 0) return false;
-        const auto slash = url.find('/', 8);
-        if (slash == std::string::npos) return false;
-        const auto host = url.substr(8, slash - 8);
-        return host.size() > 16 && host.compare(host.size() - 16, 16, ".googlevideo.com") == 0 &&
-            url.compare(slash, 15, "/videoplayback?") == 0 && url.find("sabr=1") == std::string::npos && url.find("ump=1") == std::string::npos &&
-            url.find("&sq=") == std::string::npos;
-    };
-    connection.on_event = [&](const js::Value& event) {
-        if (event["sessionId"].str() != session) return;
-        const auto id = event["params"]["requestId"].str();
-        if (event["method"].str() == "Network.requestWillBeSent") {
-            const auto& request = event["params"]["request"];
-            if (request["method"].str() == "GET" && audio_url(request["url"].str()) && requests.size() < 64) requests[id] = request;
-        } else if (event["method"].str() == "Network.responseReceived") {
-            const auto& response = event["params"]["response"];
-            const auto found = requests.find(id);
-            const auto status = response["status"].integer();
-            if (found == requests.end() || (status != 200 && status != 206) || response["mimeType"].str().rfind("audio/", 0) != 0) return;
-            completed[id] = found->second;
-        }
-    };
-    const auto accept = [&](const js::Value& request) {
-            output.url = request["url"].str();
-            // 浏览器的 range 是一段缓存请求；移除后交给原生下载器读取整条音轨。
-            const auto query = output.url.find('?');
-            std::string full = output.url.substr(0, query + 1);
-            for (size_t at = query + 1; at < output.url.size();) {
-                const auto end = output.url.find('&', at);
-                const auto pair = output.url.substr(at, end == std::string::npos ? output.url.size() - at : end - at);
-                if (pair.rfind("range=", 0) != 0) { if (full.back() != '?') full += '&'; full += pair; }
-                if (end == std::string::npos) break;
-                at = end + 1;
-            }
-            output.url = std::move(full);
-            output.headers = {"Referer: https://music.youtube.com/", "Origin: https://music.youtube.com"};
-            for (const auto& pair : request["headers"].object) {
-                const auto value = pair.second.str();
-                if ((pair.first == "User-Agent" || pair.first == "user-agent") && value.find_first_of("\r\n") == std::string::npos)
-                    output.headers.push_back("User-Agent: " + value);
-            }
-    };
-    if (!connection.call("Network.enable", "{}", result, cancel, session) ||
-        !connection.call("Page.navigate", "{\"url\":" + json_string("https://music.youtube.com/watch?v=" + video_id) + "}", result, cancel, session)) {
-        output.error = "无法打开官网播放器"; return output;
-    }
-    const auto deadline = platform::ticks() + 30000;
-    while (!cancelled_now() && browser.running() && platform::ticks() < deadline && output.url.empty()) {
-        const std::string expression = "(()=>{let v=document.querySelector('video');if(v){v.muted=true;v.play().catch(()=>{});}let p=document.getElementById('movie_player')||document.querySelector('ytmusic-player')?.playerApi;let r=p?.getPlayerResponse?.()||window.ytInitialPlayerResponse;if(p?.playVideo){p.mute?.();p.playVideo();}return {video:r?.videoDetails?.videoId||p?.getVideoData?.()?.video_id,ad:!!document.querySelector('.ad-showing,.ad-interrupting'),reason:r?.playabilityStatus?.reason,ids:(r?.streamingData?.adaptiveFormats||[]).filter(f=>f.mimeType?.startsWith('audio/')).map(f=>{try{return encodeURIComponent(new URL(f.url||new URLSearchParams(f.signatureCipher||f.cipher).get('url')).searchParams.get('id')||'')}catch(e){return ''}}).filter(Boolean)};})()";
-        if (!connection.call("Runtime.evaluate", "{\"expression\":" + json_string(expression) + ",\"returnByValue\":true}", result, cancel, session)) break;
-        const auto& playing = result["result"]["value"];
-        if (playing["video"].str() == video_id && !playing["ad"].truthy()) {
-            for (const auto& pair : completed) {
-                const auto url = pair.second["url"].str();
-                auto begin = url.find("?id=");
-                if (begin == std::string::npos) begin = url.find("&id=");
-                if (begin == std::string::npos) continue;
-                begin += 4; const auto end = url.find('&', begin);
-                const auto id = url.substr(begin, end == std::string::npos ? url.size() - begin : end - begin);
-                bool matches = false;
-                for (const auto& expected : playing["ids"].array) if (expected.str() == id) matches = true;
-                if (matches) { accept(pair.second); break; }
-            }
-        }
-        if (output.url.empty()) platform::sleep_ms(200);
-    }
-    if (output.url.empty()) output.error = cancel.load() ? "YouTube 音轨解析已取消" : "YouTube 官网未提供可下载音轨，请检查账号、地区、网络或平台验证";
-    return output;
-}
 State& state(Site s) { return states[int(s)]; }
 bool parse_credentials(Site site, const std::string& input, std::string& cookie, std::string& uid, std::string& error) {
     cookie.clear(); uid.clear(); error.clear();
@@ -833,11 +682,6 @@ bool parse_credentials(Site site, const std::string& input, std::string& cookie,
     }
     if (site == Site::NetEase) {
         if (ne::cookie_value(cookie, "MUSIC_U").empty()) { error = "缺少 MUSIC_U，请先在官网登录"; return false; }
-    } else if (site == Site::YouTube) {
-        const bool secret = !music::cookie_value(cookie, "SAPISID").empty() || !music::cookie_value(cookie, "__Secure-3PAPISID").empty();
-        const bool session = !music::cookie_value(cookie, "SID").empty() || !music::cookie_value(cookie, "__Secure-1PSID").empty() ||
-            !music::cookie_value(cookie, "__Secure-3PSID").empty();
-        if (!secret || !session) { error = "缺少 YouTube 账号登录凭据，请在官网完成 Google 登录"; return false; }
     } else {
         uid = qq::cookie_value(cookie, "uin");
         if (uid.empty()) uid = qq::cookie_value(cookie, "p_uin");
@@ -859,7 +703,7 @@ static void begin_work(Site site, std::function<void()> action) {
     if (workers[int(site)].joinable()) workers[int(site)].join();
     s.running.store(true);
     cancelled[int(site)].store(false); s.done.store(false); s.return_requested.store(false);
-    { std::lock_guard<std::mutex> guard(s.m); s.cookie.clear(); s.uid.clear(); s.context.clear(); s.portal_url.clear(); s.note = "正在打开系统默认浏览器官网…"; }
+    { std::lock_guard<std::mutex> guard(s.m); s.cookie.clear(); s.uid.clear(); s.portal_url.clear(); s.note = "正在打开系统默认浏览器官网…"; }
     workers[int(site)] = std::thread([site, action = std::move(action)] {
         try { action(); } catch (...) { note(site, "官网登录连接失败，请重试"); }
         auto& s = state(site); s.running.store(false); s.done.store(true);
@@ -877,7 +721,7 @@ void forget(Site site) {
     cancelled[int(site)].store(true);
     auto& s = state(site);
     std::lock_guard<std::mutex> lock(s.m);
-    s.cookie.clear(); s.uid.clear(); s.context.clear(); s.portal_url.clear(); s.note = "已清除登录信息";
+    s.cookie.clear(); s.uid.clear(); s.portal_url.clear(); s.note = "已清除登录信息";
     s.return_requested.store(false);
 }
 void shutdown() {

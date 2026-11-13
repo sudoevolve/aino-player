@@ -878,6 +878,8 @@ public:
     // 度量
     float text_width(const std::string& text, float font_size, int weight = -1) const;
     float line_height(float font_size) const;
+    /** @brief 通过所属窗口的系统剪贴板回调复制 UTF-8 文本。 */
+    void set_clipboard(const std::string& text);
 
     // ---------------- 等宽文本（终端 / 日志 / 表格） ----------------
     // draw_text 走比例字体：一行里每个字符的步进都不同，画不出"列对得齐"的东西。
@@ -4514,6 +4516,10 @@ inline float Ui::line_height(float font_size) const {
     return impl->text->line_height(impl->px(fs), 400) / impl->scale;
 }
 
+inline void Ui::set_clipboard(const std::string& text) {
+    if (impl->set_clipboard) impl->set_clipboard(text);
+}
+
 // -----------------------------------------------------------------------------
 //  等宽文本：度量与绘制
 //
@@ -7903,26 +7909,30 @@ inline void Ui::tooltip(const Rect& anchor, const std::string& text, const Style
     // Tooltip 默认 11pt Medium，水平与垂直内边距分别为 6px 和 3px。
     const float fs = st.font_size > 0.0f ? st.font_size : 11.0f;
     const float padx = 6.0f, pady = 3.0f;
-    const float w = text_width(text, fs, 500) + padx * 2.0f;
-    const float h = std::max(line_height(fs), fs * 1.2f) + pady * 2.0f;
+    const float max_w = std::max(1.0f, std::min(560.0f, width() - 16.0f));
+    const float w = std::min(max_w, text_width(text, fs, 500) + padx * 2.0f);
+    Style ts;
+    ts.font_size = fs;
+    ts.font_weight = 500;
+    ts.wrap = true;
+    ts.valign = VAlign::Top;
+    const float text_h = std::max(line_height(fs), text_height(text, std::max(1.0f, w - padx * 2.0f), ts));
+    ts.align = text_h > line_height(fs) + 0.5f ? Align::Left : Align::Center;
+    const float h = std::min(std::max(1.0f, height() - 8.0f), text_h + pady * 2.0f);
     float x = anchor.cx() - w * 0.5f;
     float y = anchor.y - h - 7.0f;
     if (y < 4.0f) y = anchor.bottom() + 7.0f;          // 上方放不下就翻到下方
     x = detail::clampf(x, 4.0f, std::max(4.0f, width() - w - 4.0f));
+    y = detail::clampf(y, 4.0f, std::max(4.0f, height() - h - 4.0f));
 
     const Style st_copy = st;
-    deferred([this, x, y, w, h, text, fs, th, st_copy]() mutable {
+    deferred([this, x, y, w, h, text, padx, pady, ts, th, st_copy]() mutable {
         const Rect box(x, y, w, h);
         detail::pop_shadow(*this, box, 5.0f, th, 0);
         fill_rect(box, !st_copy.bg.is_none() ? st_copy.bg : th.tooltip_bg, 5.0f);
         if (!th.tooltip_stroke.is_none() && th.tooltip_stroke.a > 0)
             stroke_rect(box, th.tooltip_stroke, 5.0f, 0.6f);
-        Style ts;
-        ts.font_size = fs;
-        ts.font_weight = 500;
-        ts.align = Align::Center;
-        ts.valign = VAlign::Middle;
-        draw_text(text, box, !st_copy.fg.is_none() ? st_copy.fg : th.popover_foreground, ts);
+        draw_text(text, box.inset(padx, pady), !st_copy.fg.is_none() ? st_copy.fg : th.popover_foreground, ts);
     });
 }
 
@@ -12237,6 +12247,7 @@ struct X11State {
     ::Window settings_owner = 0;
     Atom settings_selection = 0, settings_property = 0, resource_manager = 0, manager = 0;
     WindowConfig config;
+    std::string clipboard_text;
 
     float mx = -1e6f, my = -1e6f;
     bool  btn_down[3] = {false, false, false};
@@ -12522,6 +12533,48 @@ inline bool x11_handle(X11State* s, XEvent& e) {
         o->need_frame = true;
         break;
     }
+    case SelectionRequest: {
+        const auto& request = e.xselectionrequest;
+        const Atom clipboard = XInternAtom(s->dpy, "CLIPBOARD", False);
+        const Atom targets = XInternAtom(s->dpy, "TARGETS", False);
+        const Atom utf8 = XInternAtom(s->dpy, "UTF8_STRING", False);
+        const Atom plain = XInternAtom(s->dpy, "text/plain;charset=utf-8", False);
+        const Atom property = request.property ? request.property : request.target;
+        XEvent response{};
+        response.xselection.type = SelectionNotify;
+        response.xselection.display = request.display;
+        response.xselection.requestor = request.requestor;
+        response.xselection.selection = request.selection;
+        response.xselection.target = request.target;
+        response.xselection.time = request.time;
+        if (request.selection == clipboard && request.owner == s->win) {
+            if (request.target == targets) {
+                const Atom supported[] = {targets, utf8, plain};
+                XChangeProperty(s->dpy, request.requestor, property, XA_ATOM, 32, PropModeReplace,
+                    reinterpret_cast<const unsigned char*>(supported), 3);
+                response.xselection.property = property;
+            } else if (request.target == utf8 || request.target == plain) {
+                // 分段写入同一个属性，完整复制长诊断，避免超过单次 X11 请求的大小限制。
+                const size_t chunk = size_t(std::max(1L, std::min(65536L, (XMaxRequestSize(s->dpy) - 32L) * 4L)));
+                size_t offset = 0;
+                do {
+                    const auto count = std::min(chunk, s->clipboard_text.size() - offset);
+                    XChangeProperty(s->dpy, request.requestor, property, request.target, 8,
+                        offset ? PropModeAppend : PropModeReplace,
+                        reinterpret_cast<const unsigned char*>(s->clipboard_text.data() + offset), int(count));
+                    offset += count;
+                } while (offset < s->clipboard_text.size());
+                response.xselection.property = property;
+            }
+        }
+        XSendEvent(s->dpy, request.requestor, False, 0, &response);
+        XFlush(s->dpy);
+        break;
+    }
+    case SelectionClear:
+        if (e.xselectionclear.selection == XInternAtom(s->dpy, "CLIPBOARD", False) &&
+            XGetSelectionOwner(s->dpy, e.xselectionclear.selection) != s->win) s->clipboard_text.clear();
+        break;
     case ClientMessage:
         if (e.xclient.message_type == s->manager && e.xclient.format == 32 && Atom(e.xclient.data.l[1]) == s->settings_selection) {
             x11_refresh_scale(s); break;
@@ -12708,6 +12761,7 @@ inline void x11_create(Window* self, const WindowConfig& cfg) {
     o->ui.impl->text = tr;
 
     x11_create_backbuffer(s, w, h);
+    o->ui.impl->set_clipboard = [self](const std::string& text) { self->set_clipboard(text); };
     o->ui.impl->canvas = &o->canvas;
     o->need_frame = true;
 }
@@ -12849,8 +12903,9 @@ inline void Window::set_clipboard(const std::string& text) {
     detail::X11State* s = reinterpret_cast<detail::X11State*>(impl->native);
     if (!s || !s->dpy) return;
     Atom sel = XInternAtom(s->dpy, "CLIPBOARD", False);
+    s->clipboard_text = text;
     XSetSelectionOwner(s->dpy, sel, s->win, CurrentTime);
-    (void)text;   // 完整实现需要响应 SelectionRequest，这里只做形式上的所有权声明
+    XFlush(s->dpy);
 }
 inline std::string Window::clipboard() const { return std::string(); }
 

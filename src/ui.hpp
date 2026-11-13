@@ -166,6 +166,24 @@ struct Ctx {
     const Snapshot& s;
     ViewModel& model;
 };
+
+struct ErrorDetails { bool open = false; std::string title, text; };
+static ErrorDetails error_details;
+static std::string error_summary(const std::string& error) {
+    const auto end = error.find_first_of("\r\n");
+    auto line = error.substr(0, end);
+    if (line.rfind("Error: ", 0) == 0) line.erase(0, 7);
+    return line.empty() ? "请求失败，请查看详情" : line;
+}
+static void error_notice(Ctx& c, const std::string& title, const std::string& error, const Rect& box) {
+    const auto summary = error_summary(error);
+    const Rect message{box.x, box.y, std::max(1.0f, box.w - 68), box.h};
+    c.ui.draw_text(ellipsize(c.ui, summary, message.w, 10.5f), message, c.th.label2, Style().font(10.5f));
+    c.ui.tooltip(message, summary);
+    if (c.ui.button("详情", {box.right() - 58, box.y, 58, box.h}, Style().ghost().font(10.5f)))
+        error_details = {true, title, error};
+}
+
 static float right_panel_width(const Ctx& c) {
     return c.model.ui.lyrics_open || c.model.ui.queue_open ? kPanelWidth : 0;
 }
@@ -649,11 +667,18 @@ static void discover_chips(Ctx& c, const Rect& box, const disc::Heats& h, float*
     cs.font_size = 11.0f;
     cs.valign = VAlign::Middle;
     cs.align = Align::Center;
+    const auto source = music::kDiscoveryPlatforms[std::clamp(c.model.ui.disc_site, 0, music::kDiscoveryCount - 1)];
+    const auto title = std::string(music::source_name(source)) + " · 热搜";
 
     if (h.words.empty()) {
-        c.ui.muted_text(h.err.empty() ? "热搜为空" : h.err, {box.x, box.y, box.w, 20}, Style().font(10.5f));
+        if (h.err.empty()) c.ui.muted_text("热搜为空", {box.x, box.y, box.w, 24}, Style().font(10.5f));
+        else error_notice(c, title, h.err, {box.x, box.y, box.w, 24});
         *used_h = 30.0f;
         return;
+    }
+    if (!h.err.empty()) {
+        error_notice(c, title, "刷新失败，仍显示上次热搜：" + h.err, {box.x, y, box.w, 24});
+        y += row_h;
     }
     for (size_t i = 0; i < h.words.size(); ++i) {
         const std::string& w = h.words[i].text;
@@ -675,6 +700,8 @@ static void discover_chips(Ctx& c, const Rect& box, const disc::Heats& h, float*
         const bool hot = c.ui.item("", "", "", chip, Style().corner(12));
         if (hot) {
             c.model.ui.query = w;
+            c.model.ui.src_mask = 1u << int(music::kDiscoveryPlatforms[std::clamp(c.model.ui.disc_site, 0, music::kDiscoveryCount - 1)]);
+            c.model.ui.config_dirty = true;
             c.model.ui.tab = 0;
             start_search();
         }
@@ -733,7 +760,7 @@ static void tab_discover(Ctx& c) {
 
     c.ui.heading("发现", {mx, 20, mw, 30});
     int site = c.model.ui.disc_site;
-    if (c.ui.segmented({"网易云", "QQ"}, &site, {mx, 58, std::min(mw - 104.0f, 168.0f), 28}, Style().font(11.5f))) {
+    if (c.ui.segmented({"网易云", "QQ", "酷我", "酷狗", "咪咕"}, &site, {mx, 58, std::min(mw - 104.0f, 400.0f), 28}, Style().font(11.5f))) {
         c.model.ui.disc_site = site;
         disc_refresh(site);
     }
@@ -755,14 +782,11 @@ static void tab_discover(Ctx& c) {
 
     // ---- 热门歌单 ----
     float y = 126.0f + used + 18.0f;
-    c.ui.subheading("热门歌单", {mx, y, 200, 22});
+    c.ui.subheading(site >= 2 ? "歌单与榜单" : "热门歌单", {mx, y, 200, 22});
     y += 28.0f;
 
     if (!d.err.empty() && d.cards.empty()) {
-        Style es;
-        es.font_size = 11.0f;
-        es.wrap_text();
-        c.ui.draw_text(d.err, {mx, y, mw, 44}, c.th.destructive, es);
+        error_notice(c, "发现 · 歌单加载失败", d.err, {mx, y, mw, 28});
         return;
     }
     if (d.cards.empty()) {
@@ -772,7 +796,7 @@ static void tab_discover(Ctx& c) {
     }
 
     if (!d.err.empty()) {
-        c.ui.muted_text("刷新失败，仍显示上次结果：" + d.err, {mx, y, mw, 28}, Style().font(10.5f).wrap_text().top());
+        error_notice(c, "发现 · 歌单刷新失败", "刷新失败，仍显示上次结果：" + d.err, {mx, y, mw, 28});
         y += 30;
     } else if (d.loading) {
         c.ui.muted_text("正在更新，暂时保留上次结果", {mx, y, mw, 22}, Style().font(10.5f));
@@ -1172,8 +1196,8 @@ static void tab_search(Ctx& c) {
     for (int k = 0; k < music::kPlatformCount; ++k)
         if ((c.model.ui.src_mask >> int(music::kPlatforms[k])) & 1u) mask |= 1u << k;
     const float filter_y = field_y + 42.0f;
-    const Rect chips{mx, filter_y, std::min(mw, 300.0f), 24};
-    if (c.ui.toggle_group_multi({"网易云", "QQ", "B 站"}, &mask, chips, Style().font(11.0f))) {
+    const Rect chips{mx, filter_y, std::min(mw, 480.0f), 24};
+    if (c.ui.toggle_group_multi({"网易云", "QQ", "酷我", "酷狗", "咪咕", "B 站"}, &mask, chips, Style().font(11.0f))) {
         std::uint32_t next = 0;
         for (int k = 0; k < music::kPlatformCount; ++k)
             if ((mask >> k) & 1u) next |= 1u << int(music::kPlatforms[k]);
@@ -1253,7 +1277,7 @@ static void tab_search(Ctx& c) {
 //      不参与搜索、不参与榜单。能到 320k / 无损，但随时可能失效。
 //    · 自带接口（providers/*.js + 内置）：负责搜索、榜单、歌单。
 //      登录后音质上限更高（无损、会员独家曲）。
-//  混排的结果是"酷我卡片让你填 Cookie，但实际取流走的是免登录脚本"这种荒唐事。
+//  平台的登录状态与第三方音源可用性分开显示。
 //  所以这里拆成两个页签，各自只说自己的范围。
 // ============================================================================
 
@@ -1314,9 +1338,11 @@ static void source_tab_scripts(Ctx& c, const Rect& area) {
 
     // 初始化只执行本地脚本；是否请求它自己的接口由脚本决定。
     const auto source_task = g_lx_task.load();
-    const std::string note = lx_sources_loading()
+    const std::string note = source_task == LxTask::Fetch && !g_lx_fetch_progress.empty()
+        ? g_lx_fetch_progress
+        : lx_sources_loading()
         ? std::string("正在初始化音源脚本…（部分脚本会访问自身接口）")
-        : source_task == LxTask::Fetch ? std::string("正在下载音源脚本，完成后初始化；已移除的源不会重新加入")
+        : source_task == LxTask::Fetch ? std::string("正在下载并加载音源脚本；本次获取的脚本会恢复到应用中")
         : source_task == LxTask::Import ? std::string("正在导入所选脚本，移除的源可通过重新导入恢复")
         : (g_lx_fetch_summary.empty()
             ? std::string("免登录 · 只负责把歌曲换成可播放的直链，不参与搜索与榜单。")
@@ -1324,9 +1350,11 @@ static void source_tab_scripts(Ctx& c, const Rect& area) {
     c.ui.muted_text(ellipsize(c.ui, note, head.w - 240, 10.5f),
                     {head.x + 20, head.y + 46, head.w - 240, 18}, Style().font(10.5f));
 
+    auto check_style = Style().ghost().font(10.5f); check_style.disabled = lx_sources_loading();
+    if (c.ui.button("重新检测", {head.right() - 160, head.y + 74, 76, 26}, check_style)) lx_check_sources(true);
     const bool on = lane_toggle(c, music::Lane::JsSource, {head.right() - 62, head.y + 76, 40, 22});
     c.ui.draw_text(on ? "取流时优先问音源" : "已停用：取流只走自带接口",
-                   {head.x + 20, head.y + 78, head.w - 120, 18},
+                   {head.x + 20, head.y + 78, head.w - 200, 18},
                    on ? c.th.label2 : c.th.destructive, Style().font(11.0f));
 
     const float footer_h = bad.empty() ? 0.0f : 32.0f;
@@ -1338,30 +1366,37 @@ static void source_tab_scripts(Ctx& c, const Rect& area) {
     if (rows == 0) {
         c.ui.empty_state(good.empty() && bad.empty() ? "还没有音源脚本" : "没有可用的音源脚本",
                          good.empty() && bad.empty() ? "点「导入音源」选一个 .js，或用「打开目录」把脚本放进去"
-                                                     : ("下面 " + std::to_string(bad.size()) + " 个都失败了，点「查看原因」看详情"),
+                                                     : ("有 " + std::to_string(bad.size()) + " 个未加载或已移除，点「查看原因」可恢复或查看详情"),
                          {body.x, body.y + 16, body.w, 100});
     } else {
         c.ui.scroll(body, rows, 52.0f, [&](int i, const Rect& row) {
             const bool is_good = i < int(good.size());
             const auto& item = is_good ? good[size_t(i)] : bad[size_t(i - int(good.size()))];
-            const float act_w = 62.0f;
+            const float act_w = 124.0f;
             const float text_w = std::max(80.0f, row.w - 44.0f - act_w);
-            c.ui.fill_circle(row.x + 10, row.y + row.h * 0.5f, 3.5f, is_good ? c.th.tint : c.th.destructive);
+            // 圆点表示加载及样本状态；单曲取流错误只作详情，不能覆盖另一个平台的成功结果。
+            c.ui.fill_circle(row.x + 10, row.y + row.h * 0.5f, 3.5f, item.removed ? c.th.label3 : !is_good ? c.th.destructive : item.health_rank < 0 ? c.th.tint : c.th.label3);
             c.ui.draw_text(ellipsize(c.ui, item.name, text_w, 12.5f, 600),
                            {row.x + 24, row.y + 7, text_w, 18}, is_good ? c.th.label : c.th.label2,
                            Style().font(12.5f).weight(600));
-            const std::string sub = !item.error.empty() ? item.error : is_good ? "已初始化 · 移除保留源文件" : "初始化失败";
+            const std::string sub = is_good ? item.health : error_summary(item.error);
             c.ui.muted_text(ellipsize(c.ui, sub, text_w, 10.5f), {row.x + 24, row.y + 26, text_w, 16},
                             Style().font(10.5f));
-            if (c.ui.button("移除", {row.right() - act_w + 8, row.y + 14, act_w - 14, 24},
+            if (c.ui.button("详情", {row.right() - 116, row.y + 14, 52, 24}, Style().ghost().font(10.5f))) {
+                std::string detail = item.health;
+                if (!item.error.empty()) detail += (detail.empty() ? "" : "\n\n") + item.error;
+                if (detail.empty()) detail = "脚本已加载，样本尚未检测。";
+                error_details = {true, item.name, detail + "\n\n文件：" + item.file};
+            }
+            if (c.ui.button(item.removed ? "恢复" : "移除", {row.right() - 56, row.y + 14, 50, 24},
                             Style().ghost().font(10.5f))) {
-                lx_remove_source(item.file);
+                if (item.removed) lx_restore_source(item.file); else lx_remove_source(item.file);
             }
         });
     }
 
     if (!bad.empty()) {
-        c.ui.muted_text(std::to_string(bad.size()) + " 个脚本没能加载（未声明任何平台，或自身接口报错）",
+        c.ui.muted_text(std::to_string(bad.size()) + " 个未加载或已移除的脚本（可查看原因或恢复）",
                         {foot.x + 4, foot.y + 2, foot.w - 90, 20}, Style().font(10.5f));
         if (c.ui.button(show_bad ? "收起" : "查看原因", {foot.right() - 84, foot.y - 2, 80, 24},
                         Style().ghost().font(10.5f)))
@@ -1374,9 +1409,9 @@ static void source_tab_builtin(Ctx& c, const Rect& area) {
     const Rect head{area.x, area.y, area.w, 96.0f};
     c.ui.panel(head, Style().corner(12));
     c.ui.draw_text("自带接口", {head.x + 20, head.y + 14, 160, 20}, c.th.label, Style().font(14).weight(600));
-    c.ui.muted_text("搜索 / 歌单 / 歌手专辑都走这里",
+    c.ui.muted_text("搜索 / 榜单 / 平台目录",
                     {head.x + 96, head.y + 17, 220, 18}, Style().font(10.5f));
-    c.ui.muted_text("不登录只有免费档；登录后能拿到无损与会员独家曲。",
+    c.ui.muted_text("网易云、QQ 使用账号权限取流；酷我、酷狗、咪咕需要第三方音源。",
                     {head.x + 20, head.y + 42, head.w - 120, 34}, Style().font(10.5f).wrap_text());
     const bool on = lane_toggle(c, music::Lane::Builtin, {head.right() - 62, head.y + 20, 40, 22});
 
@@ -1441,7 +1476,7 @@ static void source_tab_builtin(Ctx& c, const Rect& area) {
         } else {
             const char* note = src == music::Source::Bilibili
                 ? "公开视频音轨 · 分 P 可单独播放、收藏与下载（无需登录）"
-                : "匿名只能拿免费档";
+                : "目录可直接浏览 · 播放需要声明支持该平台的第三方音源";
             c.ui.muted_text(note, {card.x + 20, card.y + 76, card.w - 40, 24}, Style().font(10.5f));
         }
         if (!enabled) {
@@ -2240,6 +2275,22 @@ static void close_window_dialog(Ctx& c) {
     if (c.ui.button("取消", {box.x + 280, y, 120, 30}, Style().ghost().font(11))) c.model.ui.close_dialog = false;
 }
 
+static void error_details_dialog(Ctx& c) {
+    const Rect box = Rect::centered(c.W * 0.5f, c.H * 0.5f,
+        std::min(680.0f, c.W - 40), std::min(460.0f, c.H - 48));
+    c.ui.dialog("详细信息", error_details.title, &error_details.open, box);
+    if (!error_details.open) return;
+    const Rect content{box.x + 20, box.y + 88, box.w - 40, std::max(24.0f, box.h - 152)};
+    auto style = Style().font(11.5f).wrap_text().top().left();
+    const float height = std::max(content.h, c.ui.text_height(error_details.text, content.w - 16, style) + 8);
+    c.ui.scroll(content, 1, height, [&](int, const Rect& row) {
+        c.ui.draw_text(error_details.text, {row.x, row.y, row.w - 16, row.h}, c.th.label, style);
+    });
+    const float y = box.bottom() - 48;
+    if (c.ui.button("复制全部", {box.x + 20, y, 92, 28}, Style().font(11))) c.ui.set_clipboard(error_details.text);
+    if (c.ui.button("关闭", {box.right() - 100, y, 80, 28}, Style().primary().font(11))) error_details.open = false;
+}
+
 static void compose(aino::Ui& ui, Ctx& c) {
     if (c.model.ui.tab == 2) { c.model.ui.tab = 1; c.model.ui.queue_open = true; c.model.ui.lyrics_open = false; }
     ui.fill_rect({0, 0, c.W, c.H}, c.th.window_bg);
@@ -2263,6 +2314,7 @@ static void compose(aino::Ui& ui, Ctx& c) {
     if (c.model.ui.close_dialog) close_window_dialog(c);
     else if (artist_chooser.open) artist_chooser_dialog(c);
     else if (!c.model.ui.remove_playlist_key.empty()) remove_playlist_dialog(c);
+    else if (error_details.open) error_details_dialog(c);
     else clear_data_dialog(c);
 }
 

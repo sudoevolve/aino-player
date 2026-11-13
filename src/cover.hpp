@@ -177,8 +177,28 @@ private:
             const std::vector<uint8_t> bytes(metadata.cover.begin(), metadata.cover.end());
             ok = !bytes.empty() && detail::decode(bytes, 192, *img);
         } else {
-        const net::Response r = net::get(url, {"User-Agent: Mozilla/5.0", "Referer: https://music.163.com/"},
-                                         12000);
+        std::string address = url;
+        if (address.rfind("platform-cover:kuwo:", 0) == 0) {
+            const auto id = address.substr(20);
+            address.clear();
+            if (!id.empty() && id.find_first_not_of("0123456789") == std::string::npos) {
+                const auto resolved = net::get("https://artistpicserver.kuwo.cn/pic.web?corp=kuwo&type=rid_pic&pictype=500&size=500&rid=" + id,
+                    {"User-Agent: Mozilla/5.0"}, 6000);
+                if (resolved.ok() && resolved.body.size() < 4096) {
+                    address = resolved.body;
+                    while (!address.empty() && (address.back() == '\r' || address.back() == '\n' || address.back() == ' ')) address.pop_back();
+                    if (address.rfind("http://", 0) != 0 && address.rfind("https://", 0) != 0) address.clear();
+                }
+            }
+        }
+        std::string referer = "https://music.163.com/";
+        if (address.find(".kuwo.cn/") != std::string::npos || address.find(".kwcdn.kuwo.cn/") != std::string::npos) referer = "https://www.kuwo.cn/";
+        else if (address.find(".kugou.com/") != std::string::npos) referer = "https://www.kugou.com/";
+        else if (address.find(".migu.cn/") != std::string::npos) referer = "https://music.migu.cn/";
+        else if (address.find(".qq.com/") != std::string::npos) referer = "https://y.qq.com/";
+        else if (address.find(".hdslb.com/") != std::string::npos) referer = "https://www.bilibili.com/";
+        const net::Response r = address.empty() ? net::Response{} : net::get(address,
+            {"User-Agent: Mozilla/5.0", "Referer: " + referer}, 12000);
         if (r.status == 200 && r.body.size() > 256) {
             std::vector<uint8_t> bytes(r.body.begin(), r.body.end());
             ok = detail::decode(bytes, 192, *img);

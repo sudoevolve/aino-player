@@ -1,11 +1,6 @@
 // lyrics.hpp —— 歌词抓取与 LRC 解析
 //
-// 为什么只走网易云：实测三个源里只有它匿名给歌词。
-//   * 网易云  /api/song/lyric?id=…           → 完整 LRC（可用）
-//   * 酷我    m.kuwo.cn/…/songinfoandlrc      → status 301「音乐查询失败」（已下线）
-//   * QQ      c.y.qq.com/…/fcg_query_lyric    → retcode 1101（要 g_tk / 登录）
-// 所以酷我和 QQ 的曲目会用「歌名 + 歌手」反查网易云取歌词 —— 同一首歌的歌词
-// 在各平台基本一致，这样三个源的曲目都能显示歌词。
+// 优先使用曲目所属平台的歌词；失败后按标题、歌手和时长反查网易云。
 #pragma once
 
 #include <algorithm>
@@ -139,7 +134,7 @@ inline std::string find_netease_id(const music::Track& t, const music::Settings&
     for (const auto& v : t.variants)
         if (v.source == music::Source::Netease && !v.id.empty()) return v.id;
 
-    // 曲目不在网易云上（酷我独有 / QQ 独有）→ 按「歌名 + 歌手」反查。
+    // 曲目不在网易云上 → 按「歌名 + 歌手」反查。
     // 反查结果往往混着一堆翻唱（搜「花海 周杰伦」前两条都是 70 秒的改编版），
     // 所以判据要严格：**原始标题**完全相等才算强命中，时长差是主要过滤器。
     // 只用 normalize_title 不行 —— 它会把「（治愈版）」这类后缀抹掉，翻唱和原曲同分。
@@ -177,11 +172,9 @@ inline std::string find_netease_id(const music::Track& t, const music::Settings&
 
 // ---------------------------------------------------------------- 各源直取
 //
-// 三家都有能匿名拿到明文 LRC 的接口，没必要只认一家：
+// 网易云与 QQ 的歌词接口：
 //   网易云  /api/song/lyric?id=…                            → lrc.lyric
 //   QQ      fcg_query_lyric_new.fcg?songmid=…&nobase64=1    → lyric（nobase64=1 才是明文）
-//   酷我    m.kuwo.cn/newh5/singles/songinfoandlrc?musicId=… → data.lrclist[{time,lineLyric}]
-// 酷我这条**必须走 https 且带 httpsStatus=1**：走 http 会回 status 301「音乐查询失败」。
 
 inline Doc from_lrc(const std::string& raw, const char* origin) {
     Doc d;
@@ -260,44 +253,9 @@ inline Doc fetch_qq_lyric(const std::string& mid, const std::string& cookie, int
     return from_lrc(raw, "QQ");
 }
 
-inline Doc fetch_kuwo_lyric(const std::string& rid, int timeout_ms) {
-    Doc d;
-    d.origin = "酷我";
-    if (rid.empty()) {
-        d.error = "没有酷我 rid";
-        return d;
-    }
-    const std::string url = "https://m.kuwo.cn/newh5/singles/songinfoandlrc?musicId=" + rid + "&httpsStatus=1";
-    const net::Response r = net::get(url,
-                                    {"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                                     "Referer: https://www.kuwo.cn/"}, timeout_ms);
-    if (!r.ok()) {
-        d.error = "歌词请求失败（HTTP " + std::to_string(r.status) + "）";
-        return d;
-    }
-    js::Value root;
-    if (!js::parse(r.body, root, true)) {
-        d.error = "歌词返回格式异常";
-        return d;
-    }
-    const js::Value& list = root["data"]["lrclist"];
-    if (!list.is_array() || list.size() == 0) {
-        d.error = "这首歌没有歌词";
-        return d;
-    }
-    for (size_t i = 0; i < list.size(); ++i) {
-        Line l;
-        l.ms = (long long)(std::atof(list[i]["time"].str().c_str()) * 1000.0 + 0.5);  // 秒（小数）→ 毫秒
-        l.text = music::text::decode_entities(list[i]["lineLyric"].str());
-        d.lines.push_back(std::move(l));
-    }
-    d.synced = true;
-    return d;
-}
-
 // ---------------------------------------------------------------- 按名反查
 //
-// 三家都没有这首歌的歌词时（多见于酷我独有 / QQ 独有曲目），去网易云按
+// 平台没有返回这首歌的歌词时，去网易云按
 // 「歌名 + 歌手」反查一条 —— 同一首歌的歌词在各平台基本一致。
 // 反查结果常混着翻唱（搜「花海 周杰伦」前两条是 70 秒改编版），所以判据要严格：
 // **原始标题**完全相等才算强命中，时长差是主要过滤器。

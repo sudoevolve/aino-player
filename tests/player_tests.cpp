@@ -90,7 +90,8 @@ int main(int argc, char** argv) {
             int(music::Source::Bilibili) == 4 && int(music::Source::Local) == 5,
             "source ids keep their historical values so old playlists do not switch platforms");
         static_assert(int(music::Source::Local) < music::kSourceCount, "Local must stay a valid array index");
-        static_assert(music::kPlatformCount == 3, "only NetEase / QQ / Bilibili are searchable online platforms");
+        static_assert(music::kPlatformCount == 6 && int(music::Source::Kuwo) == 2 && int(music::Source::Kugou) == 6 &&
+            int(music::Source::Migu) == 7, "platform IDs remain stable when restoring and extending catalogs");
         check(Md5Hex("") == "d41d8cd98f00b204e9800998ecf8427e" && Md5Hex("abc") == "900150983cd24fb0d6963f7d28e17f72", "MD5 protocol vectors");
         const auto signed_query = wbi_query({{"foo", "a!b(c)*'"}, {"bar", "空 格"}}, "key", 123);
         check(signed_query.rfind("bar=%E7%A9%BA%20%E6%A0%BC&foo=abc&wts=123&w_rid=", 0) == 0, "WBI sorting encoding and character filtering");
@@ -114,6 +115,21 @@ int main(int argc, char** argv) {
         check(js::parse(library::encode_track(catalog_song), catalog_saved) && library::decode_track(catalog_saved, catalog_restored) &&
             catalog_restored.current().artists[0].id == "1" && catalog_restored.current().album_id == "22", "catalog metadata survives library and queue persistence");
         check(music::track_artists(catalog_restored)[0].name == "AC/DC", "structured artist names are not split on punctuation");
+        {
+            music::Track track; music::Variant v; v.source = music::Source::Kugou;
+            v.id = "audio-id"; v.native_id = "mp3-hash"; v.album_audio_id = "mix-song-id";
+            v.title = "Hash fixture"; v.quality_hashes = {{"128k", "mp3-hash"}, {"flac", "flac-hash"}};
+            track.variants.push_back(v);
+            js::Value saved; music::Track restored;
+            check(js::parse(library::encode_track(track), saved) && library::decode_track(saved, restored) &&
+                restored.current().album_audio_id == "mix-song-id" && restored.current().quality_hashes.at("flac") == "flac-hash",
+                "Kugou quality identity survives library and queue serialization");
+            js::Value payload;
+            check(js::parse(music::lx_music_info(restored.current(), "kg"), payload) &&
+                payload["songmid"].str() == "audio-id" && payload["hash"].str() == "mp3-hash" &&
+                payload["albumAudioId"].str() == "mix-song-id" && payload["_types"]["flac"]["hash"].str() == "flac-hash",
+                "LX receives distinct Audioid, MixSongID and quality hash");
+        }
         check(js::parse(R"({"mid":"songMid","name":"QQ Song","singer":[{"mid":"artistMid","name":"Singer"}],"album":{"mid":"albumMid","name":"Album"},"interval":90})", fixture), "QQ catalog fixture");
         const auto qq_catalog_song = music::catalog_track(music::Source::QQ, fixture);
         check(qq_catalog_song.current().artists[0].id == "artistMid" && qq_catalog_song.current().album_id == "albumMid" &&
@@ -419,9 +435,14 @@ int main(int argc, char** argv) {
                     }) && candidates == 2 && url == "https://example.invalid/good", "rejected media advances to next script");
                 check(engine.remove_source(bad, error) && platform::exists(bad), "app removal preserves source file");
                 check(engine.entries().size() == 1 && engine.load_dir(scripts) == 1, "reload does not restore removed script");
+                check(engine.refresh_files(scripts, {"01-bad.js", "02-good.js"}) == 1 && engine.entries().size() == 1,
+                      "ordinary refresh preserves removed script and refreshes active script");
+                const auto revision = engine.revision();
+                check(engine.refresh_files(scripts, {}) == 0 && engine.revision() == revision,
+                      "empty online refresh preserves loaded runtimes");
                 lx::Engine restarted(preferences);
                 check(restarted.load_dir(scripts) == 1, "removed script survives application restart");
-                check(engine.load_files(scripts, {"01-bad.js"}) == 1 && engine.entries().size() == 2, "explicit import restores only selected script");
+                check(engine.load_files(scripts, {"01-bad.js"}) == 1 && engine.entries().size() == 2, "explicit import or online fetch restores selected script");
                 lx::Script script;
                 check(script.load(good, code("good"), error) && script.init(error), "standalone script fixture");
                 {
@@ -429,6 +450,30 @@ int main(int argc, char** argv) {
                     check(!script.music_url("wy", "128k", "{}", url, error), "cancelled script request returns promptly");
                 }
                 check(script.music_url("wy", "128k", "{}", url, error), "cancelled request does not poison later calls");
+                {
+                    lx::Script deferred;
+                    const std::string startup = "const lx = globalThis.lx;"
+                        "const token = new Promise(resolve=>setTimeout(()=>resolve('https://example.invalid/startup'),10));"
+                        "lx.send('inited',{sources:{wy:{actions:['musicUrl'],qualitys:['128k']}}})"
+                        ".then(()=>lx.on('request',()=>token));";
+                    check(deferred.load("startup-fixture.js", startup, error) && deferred.init(error),
+                        "Promise-based send and on finish registering before initialization completes");
+                    check(deferred.music_url("wy", "128k", "{}", url, error) && url == "https://example.invalid/startup",
+                        "playback preserves initialization tasks needed by its handler");
+                    check(deferred.debug_eval("lx.version") == "2.0.0", "LX API version is independent of application version");
+                    check(deferred.debug_eval("lx.utils.buffer.bufToString(new Uint8Array([255,128,0]),'base64')") == "/4AA",
+                        "binary base64 preserves high bytes without UTF-8 conversion");
+                }
+                {
+                    lx::Script timed;
+                    const std::string delayed = "const lx = globalThis.lx; lx.send('inited',{sources:{wy:{actions:['musicUrl'],qualitys:['128k']}}});"
+                        "lx.on('request',()=>new Promise((resolve,reject)=>{"
+                        "const fail=setTimeout(()=>reject(new Error('timer ran early')),80);"
+                        "setTimeout(()=>{clearTimeout(fail);resolve('https://example.invalid/timer');},5); }));";
+                    check(timed.load("timer-fixture.js", delayed, error) && timed.init(error) &&
+                        timed.music_url("wy", "128k", "{}", url, error) && url == "https://example.invalid/timer",
+                        "timers run in due order and cancellation prevents premature script failure");
+                }
                 std::atomic<bool> concurrent_ok{true};
                 auto request = [&] {
                     std::string result, why;

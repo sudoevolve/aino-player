@@ -6,6 +6,7 @@
 | --- | --- | --- | --- | --- |
 | `miniaudio/miniaudio.h` | 0.11.21 | https://github.com/mackron/miniaudio | Public Domain / MIT-0 二选一，完整条款位于头文件末尾 | Windows / Linux 播放、MP3 / FLAC / WAV 解码 |
 | `stb/stb_image.h` | 2.30 | https://github.com/nothings/stb | Public Domain / MIT 二选一，完整条款位于头文件末尾 | Linux 专辑封面 JPEG / PNG 解码 |
+| `quickjs/` | QuickJS-NG 0.18.0（头文件版本） | https://github.com/quickjs-ng/quickjs | MIT，完整条款保留在各源码文件头部 | 自带搜索与第三方音源脚本运行时 |
 | 嵌入的 FFmpeg 可执行文件 | 8.1.3 | https://ffmpeg.org/releases/ffmpeg-8.1.3.tar.xz | LGPL-2.1-or-later，见 `LICENSE.FFmpeg.txt` | AAC/ALAC、Ogg/Opus、WebM 解码至 PCM WAV |
 
 miniaudio 和 stb 头文件从本机已有上游副本引入。登录直接使用外部浏览器中的官网，不再嵌入二维码脚本或自行生成扫码页面。

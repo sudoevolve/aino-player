@@ -175,7 +175,7 @@ struct Snapshot {
 struct UiState {
     std::string query = "周杰伦";
     music::Settings settings;
-    uint32_t src_mask = 0x3;   // 默认只开网易云 + QQ（酷我受限曲目只给 11 秒试听）
+    uint32_t src_mask = 0x3;   // 默认只开网易云 + QQ
     int tab = 1;
     float volume = 70.0f;
     float pos_ms = 0.0f;
@@ -222,8 +222,8 @@ struct UiState {
     int settings_tab = 0;
     bool update_settings = false;
     ClearAction clear_action = ClearAction::None;
-    // 发现页当前看的是哪个平台（0=网易云 1=QQ 2=酷我）
-    int disc_site = 0;   // 0 = 网易云，1 = QQ（酷我已移除）
+    // 发现页平台（0=网易云，1=QQ）
+    int disc_site = 0;   // kDiscoveryPlatforms 的界面索引
     PlayMode play_mode = PlayMode::RepeatAll;
     unsigned long long sleep_deadline = 0;
     unsigned sleep_remaining_seconds = 0;
@@ -438,12 +438,13 @@ void load(UiState& state) {
         if (!v.empty()) state.volume = float(std::atof(v.c_str()));
         v = read_line_value(line, "sources");
         if (!v.empty()) {
-            uint32_t m = uint32_t(std::strtoul(v.c_str(), nullptr, 10)) & ((1u << music::kSourceCount) - 1);
+            const uint32_t m = uint32_t(std::strtoul(v.c_str(), nullptr, 10));
             // 老配置里可能还开着已删除的平台，这里直接清掉
             uint32_t allowed = 0;
             for (music::Source src : music::kPlatforms) allowed |= 1u << int(src);
             state.src_mask = m & allowed;
-            state.src_mask = m ? m : 0x3u;   // 全关等于搜不出东西，退回默认的网易云 + QQ
+            if (!state.src_mask && m) state.src_mask = 0x3u; // 旧配置只启用历史平台时，恢复默认平台。
+            if (m != state.src_mask) state.config_dirty = true;
         }
         v = read_line_value(line, "netease_cookie");
         if (!v.empty()) state.settings.netease_cookie = v;
@@ -484,15 +485,8 @@ void load(UiState& state) {
     }
     std::fclose(f);
 
-    // 老配置里三个源都是开的。这一版把酷我改成默认关（受限曲目只给 11 秒试听，
-    // 留着它会让人以为"歌手没唱完"），所以迁移一次：只做一次，之后用户自己开就保留。
-    if (!has_version) {
-        if (state.src_mask & (1u << 2)) {
-            state.src_mask &= ~(1u << 2);
-            state.config_dirty = true;
-        }
-        state.config_dirty = true;   // 让新版本号落盘
-    }
+    // 保留旧配置版本迁移；平台位始终按当前支持列表过滤。
+    if (!has_version) state.config_dirty = true;
 }
 
 bool save(UiState& state) {
@@ -842,7 +836,7 @@ void retry_search_source(int source) {
     dispatch_search(std::move(request));
 }
 
-// 按文件头判容器：QQ 给的是 m4a（ftypmp42），酷我/网易云是 mp3。
+// 按文件头判容器：兼容 MP3、M4A 等响应，不依赖下载地址的扩展名。
 // 扩展名与内容一致，供缓存、下载和 AAC 转码选择正确的容器。
 static std::string sniff_ext(const std::string& path) {
     std::FILE* f = platform::fopen(path, "rb");
@@ -1110,7 +1104,7 @@ static void do_play(HostCallbacks* win, music::Track track, music::Settings st, 
         ++g_as.tracks_version;
     };
 
-    // 一个候选的完整尝试：取流 → 探体积（识别酷我 11 秒片段）→ 下载 → 交给播放器。
+    // 一个候选的完整尝试：取流 → 探测完整性 → 缓冲或下载 → 交给播放器。
     // 返回 true = 不必再试别的候选（成功了，或者用户已经切歌）。
     auto attempt = [&](const music::Variant& v) -> bool {
         if (g_shutdown.load()) return true;
@@ -1550,8 +1544,7 @@ void start_download(music::Track track, music::Settings st) {
                 break;
             }
         }
-        // 兜底 2：这条目在网易云上没有对应（常见于 QQ/酷我独有），而酷我对受限曲目
-        // 只给 11 秒片段、QQ 匿名直接拒。按「歌名 + 歌手」去网易云翻一遍，命中就下完整曲。
+        // 没有网易云变体时，按标题和歌手寻找时长匹配的同曲候选。
         if (!saved) {
             const bool has_netease =
                 std::any_of(track.variants.begin(), track.variants.end(), [](const music::Variant& v) {
@@ -1948,8 +1941,7 @@ void queue_play_next(const music::Track& track) {
 // =============================================================================
 //  发现页（热搜 + 热门歌单）
 // =============================================================================
-// 三家接口的可用性不一样，这里如实呈现：网易云 / QQ 有热搜也有热门歌单，
-// 酷我只有热搜（web 端歌单接口要 kw_token + csrf 双校验，匿名一律拒绝）。
+// 发现页使用网易云 / QQ 的热搜与热门歌单。
 struct DiscState {
     std::mutex m;
     bool loading = false;
@@ -1967,7 +1959,7 @@ static DiscState g_disc;
 static DiscSnap g_disc_snap;
 
 void disc_refresh(int site) {
-    if (site < 0 || site >= 2) return;
+    if (site < 0 || site >= music::kDiscoveryCount) return;
     int request;
     {
         std::lock_guard<std::mutex> lk(g_disc.m);
@@ -1983,14 +1975,27 @@ void disc_refresh(int site) {
         ++g_disc.version;
     }
     background::start([site, request] {
-        disc::Heats h = disc::heats(music::Source(site));
+        net::CancelScope cancellation([request] {
+            if (g_shutdown.load()) return true;
+            std::lock_guard<std::mutex> lock(g_disc.m);
+            return g_disc.request != request;
+        });
+        const auto platform = music::kDiscoveryPlatforms[site];
+        disc::Heats h = disc::heats(platform);
+        {
+            std::lock_guard<std::mutex> lk(g_disc.m);
+            if (g_disc.request != request || g_shutdown.load()) return;
+            if (h.err.empty() || g_disc.heats.words.empty()) g_disc.heats = std::move(h);
+            else g_disc.heats.err = std::move(h.err);
+            ++g_disc.version;
+        }
+        if (g_win) g_win->wake();
         std::string err;
-        auto cards = disc::playlists(music::Source(site), 30, err);
+        auto cards = disc::playlists(platform, 30, err);
         if (g_shutdown.load()) return;
         {
             std::lock_guard<std::mutex> lk(g_disc.m);
             if (g_disc.request != request) return; // A → B → A 也拒绝旧请求。
-            if (h.err.empty() || g_disc.heats.words.empty()) g_disc.heats = std::move(h);
             if (err.empty() || g_disc.cards.empty()) g_disc.cards = std::move(cards);
             g_disc.err = err;
             g_disc.loading = false;
@@ -2029,6 +2034,22 @@ void disc_open(int idx) {
 // ---- 落雪音源（界面用） ----
 enum class LxTask { None, Import, Fetch, Reload };
 static std::atomic<LxTask> g_lx_task{LxTask::None};
+static void lx_check_sources(bool force = false) {
+    background::start([force] {
+        std::vector<lx::Engine::Check> cases;
+        for (const auto source : {music::Source::Netease, music::Source::QQ}) {
+            music::Variant v; v.source = source;
+            if (source == music::Source::Netease) {
+                v.id = "347230"; v.title = "海阔天空"; v.artist = "Beyond"; v.duration_ms = 326000;
+            } else {
+                v.id = "0039MnYb0qxYhV"; v.title = "晴天"; v.artist = "周杰伦"; v.duration_ms = 269000;
+            }
+            const auto* key = music::lx_platform_key(source);
+            cases.push_back({key, music::lx_music_info(v, key)});
+        }
+        lx::Engine::instance().check_sources(cases, force, [] { return g_shutdown.load(); }, [] { if (g_win) g_win->wake(); });
+    });
+}
 static void lx_source_task(LxTask kind, std::function<void()> action) {
     if (g_shutdown.load()) return;
     LxTask expected = LxTask::None;
@@ -2037,14 +2058,17 @@ static void lx_source_task(LxTask kind, std::function<void()> action) {
         struct Done {
             ~Done() { g_lx_task.store(LxTask::None); if (g_win) g_win->wake(); }
         } done;
-        try { action(); }
-        catch (const std::exception& error) { toast(std::string("音源操作失败：") + error.what(), 6000); }
-        catch (...) { toast("音源操作失败，请重试", 6000); }
+        try { action(); lx_check_sources(); }
+        catch (const std::exception& error) { const auto message = std::string("音源操作失败：") + error.what(); post_ui([message] { toast(message, 6000); }); }
+        catch (...) { post_ui([] { toast("音源操作失败，请重试", 6000); }); }
     });
 }
 struct LxSourceView {
     std::string name, version, error, file;   // file 是磁盘上的完整路径，删除时用它
     bool ok = false;
+    bool removed = false;
+    int health_rank = 1;
+    std::string health;
 };
 
 // 音源引擎是否正在后台加载（界面上显示"加载中"，而不是等锁卡住）
@@ -2053,6 +2077,7 @@ bool lx_sources_loading() { return lx::Engine::instance().loading(); }
 std::vector<LxSourceView> lx_source_status() {
     std::vector<LxSourceView> out;
     const auto errors = lx::Engine::instance().runtime_errors();
+    const auto checks = lx::Engine::instance().health();
     for (const auto& e : lx::Engine::instance().entries()) {
         LxSourceView v;
         v.name = e.first; v.file = e.second; v.ok = true;
@@ -2061,9 +2086,36 @@ std::vector<LxSourceView> lx_source_status() {
         key = music::text::lower_ascii(key);
 #endif
         const auto error = errors.find(key);
-        if (error != errors.end()) v.error = error->second;
+        if (error != errors.end()) {
+            for (const auto& item : error->second) {
+                if (!v.error.empty()) v.error += "\n";
+                std::string name = item.first;
+                for (const auto& p : music::kPlatformInfo) if (p.lx_key && item.first == p.lx_key) { name = p.name; break; }
+                v.error += name + " 最近一次取流失败（不代表整个音源失效）：" + item.second;
+            }
+        }
+        const auto health = checks.find(key);
+        int passed = 0, failed = 0;
+        for (const auto& platform : {std::string("tx"), std::string("wy")}) {
+            const lx::Engine::Health* h = nullptr;
+            if (health != checks.end()) {
+                const auto found = health->second.find(platform);
+                if (found != health->second.end()) h = &found->second;
+            }
+            if (!v.health.empty()) v.health += " · ";
+            v.health += platform == "tx" ? "QQ " : "网易云 ";
+            v.health += !h || h->state == 0 ? "待检测" : h->state == 1 ? "检测中" : h->state == 2 ? "样本通过" : h->state == 4 ? "不支持" : h->state == 5 ? "检测未完成" : "样本失败";
+            if (h && h->state == 2) ++passed;
+            if (h && !h->reason.empty()) {
+                if (!v.error.empty()) v.error += "\n";
+                v.error += (platform == "tx" ? "QQ 样本：" : "网易云样本：") + h->reason;
+            }
+            if (h && h->state == 3) ++failed;
+        }
+        v.health_rank = passed ? -passed : failed ? 2 : 1;
         out.push_back(std::move(v));
     }
+    std::stable_sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.health_rank < b.health_rank; });
     const auto dir = lx::default_dir();
     for (const auto& f : lx::Engine::instance().failures()) {
         LxSourceView v;
@@ -2074,6 +2126,10 @@ std::vector<LxSourceView> lx_source_status() {
         v.error = f.second;
         v.ok = false;
         out.push_back(std::move(v));
+    }
+    for (const auto& file : lx::Engine::instance().removed_files()) {
+        LxSourceView v; v.name = file; v.file = platform::join(dir, file); v.removed = true;
+        v.error = "已从应用移除 · 源文件保留"; out.push_back(std::move(v));
     }
     return out;
 }
@@ -2096,22 +2152,25 @@ void lx_remove_source(const std::string& file) {
         post_ui([removed, error, name] { toast(removed ? "已从应用移除 " + name + "，源文件保留，可重新导入" : error, 5000); });
     });
 }
+void lx_restore_source(const std::string& file) {
+    lx_source_task(LxTask::Import, [file] {
+        const auto name = platform::fs::u8path(file).filename().u8string();
+        const int n = lx::Engine::instance().load_files(lx::default_dir(), {name});
+        post_ui([n] { toast(n > 0 ? "音源已恢复，正在后台静默检测" : "恢复失败，请查看初始化原因"); });
+    });
+}
 
-// 从 pdone/lx-music-source 拉全部音源脚本。
-// 每个音源目录下都有一个 latest.js；本机直连 raw.githubusercontent.com 不通，
-// 所以按「直连 → 加速镜像」的顺序试，镜像返回 HTML 错误页时按内容拒掉。
-// 6 线程并发：串行 20 个要几十秒，并发后一次构建期间就拉完了。
-std::string g_lx_fetch_summary;   // 上一次在线获取的结果，音源页显示
-// 从 pdone/lx-music-source 拉全部音源脚本（20 个，6 线程并发，失败的再串行补拉一轮）。
-// 本机直连 raw.githubusercontent.com 不通：先用一个文件探测一次，不通就整轮直接走镜像，
-// 不再每个任务都白等 8 秒超时。镜像返回 HTML 错误页时按内容拒掉。
+// 下载与脚本初始化分阶段显示；失败不覆盖本地文件，主动获取恢复成功下载的音源。
+std::string g_lx_fetch_summary;
+std::string g_lx_fetch_progress; // 仅在 UI 线程读写。
 void lx_fetch_online_sources() {
     lx_source_task(LxTask::Fetch, [] {
-        toast("正在从 GitHub 获取音源…", 4000);
+        post_ui([] { g_lx_fetch_progress = "正在选择下载通路…"; });
         static const char* kSlugs[] = {"changqing", "feichangdao", "fish", "flower", "grass",
             "helloworld", "huanyin", "huibq", "hyw", "ikun", "jiexiang", "juhe", "lx", "qdy",
             "qingliang", "sixyin", "suyin", "xinghai", "xinglan", "yuningxi"};
         constexpr int kCount = int(sizeof(kSlugs) / sizeof(kSlugs[0]));
+        constexpr int kProbeIndex = 7;
         static const char* kBases[] = {
             "https://raw.githubusercontent.com/",
             "https://gh-proxy.org/raw.githubusercontent.com/",
@@ -2119,76 +2178,134 @@ void lx_fetch_online_sources() {
         };
         constexpr int kBaseCount = int(sizeof(kBases) / sizeof(kBases[0]));
         const auto dir = lx::default_dir();
-        if (!platform::fs::exists(dir)) platform::fs::create_directories(dir);
-
-        // 内容校验：现成脚本都是 globalThis.lx 解构风格；juhe 这种 1KB 精简脚本
-        // 只有 globalThis.lx 一个标志，不能按 musicUrl / lx.request 判死。
-        auto looks_like_script = [](const std::string& body) {
+        platform::fs::create_directories(platform::fs::u8path(dir));
+        const auto started = std::chrono::steady_clock::now();
+        const auto deadline = started + std::chrono::seconds(35);
+        const auto valid = [](const net::Response& r) {
+            const auto& body = r.body;
+            const auto begin = body.find_first_not_of(" \t\r\n");
+            if (!r.ok() || r.status != 200 || body.size() < 200 || begin == std::string::npos || body[begin] == '<') return false;
             return body.find("globalThis.lx") != std::string::npos ||
-                body.find("lx.request") != std::string::npos ||
-                body.find("lx.on") != std::string::npos ||
-                body.find("EVENT_NAMES") != std::string::npos ||
-                body.find("musicUrl") != std::string::npos;
+                body.find("lx.request") != std::string::npos || body.find("lx.on") != std::string::npos ||
+                body.find("EVENT_NAMES") != std::string::npos || body.find("musicUrl") != std::string::npos;
         };
-        // base_start 指定起始镜像，两轮错开分摊压力。
-        auto fetch_one = [&](const std::string& slug, int base_start) {
-            const std::string path = "pdone/lx-music-source/main/" + slug + "/latest.js";
-            const std::string dest = platform::join(dir, "lx_" + slug + ".js");
-            for (int b = 0; b < kBaseCount; ++b) {
-                const int idx = ((base_start + b) % kBaseCount + kBaseCount) % kBaseCount;
-                const auto r = net::get(std::string(kBases[idx]) + path, {"User-Agent: Mozilla/5.0"}, 12000);
-                if (r.status != 200 || r.body.size() < 200 || !looks_like_script(r.body)) continue;
-                if (auto* fp = platform::fopen(dest, "wb")) {
-                    std::fwrite(r.body.data(), 1, r.body.size(), fp);
-                    std::fclose(fp);
-                    return true;
+        const auto url = [&](int base, int file) {
+            return std::string(kBases[base]) + "pdone/lx-music-source/main/" + kSlugs[file] + "/latest.js";
+        };
+        const auto parallel = [](int count, const auto& work) {
+            std::vector<std::thread> threads;
+            struct Join {
+                std::vector<std::thread>& threads;
+                ~Join() { for (auto& thread : threads) if (thread.joinable()) thread.join(); }
+            } join{threads};
+            for (int i = 0; i < count; ++i) threads.emplace_back(work, i);
+        };
+
+        // 三条通路同时获取同一个小脚本，首个有效响应获胜，其余请求取消；复用探测内容。
+        std::atomic<int> winner{-1};
+        std::vector<net::Response> probes(size_t(kBaseCount), net::Response{});
+        parallel(kBaseCount, [&](int base) {
+            try {
+                net::CancelScope network([&] { return winner.load() >= 0 || g_shutdown.load(); });
+                auto response = net::get(url(base, kProbeIndex), {"User-Agent: Aino-Player"}, 5000);
+                if (!valid(response)) return;
+                probes[size_t(base)] = std::move(response);
+                int expected = -1;
+                winner.compare_exchange_strong(expected, base);
+            } catch (...) { /* 单条通路失败不影响其余通路。 */ }
+        });
+        if (g_shutdown.load()) return;
+        if (winner.load() < 0) {
+            post_ui([] {
+                g_lx_fetch_progress.clear();
+                g_lx_fetch_summary = "无法连接音源仓库，已有脚本已保留，请检查网络后重试";
+                toast(g_lx_fetch_summary, 6000);
+            });
+            return;
+        }
+        std::atomic<int> preferred{winner.load()};
+        std::set<std::string> loaded;
+        for (const auto& entry : lx::Engine::instance().entries())
+            loaded.insert(platform::fs::u8path(entry.second).filename().u8string());
+        std::atomic<int> next{0};
+        int completed = 0, changed = 0, unchanged = 0, failed = 0;
+        std::vector<std::string> refresh;
+        std::string failed_names;
+        std::mutex result_mutex;
+        const auto fetch_one = [&](int file, bool& modified) {
+            net::CancelScope network([&] {
+                return g_shutdown.load() || std::chrono::steady_clock::now() >= deadline;
+            });
+            std::string body;
+            if (file == kProbeIndex) body = std::move(probes[size_t(winner.load())].body);
+            else {
+                const int first = preferred.load();
+                for (int attempt = 0; attempt < kBaseCount && !net::cancelled(); ++attempt) {
+                    const int base = (first + attempt) % kBaseCount;
+                    auto response = net::get(url(base, file), {"User-Agent: Aino-Player"}, 6000);
+                    if (!valid(response)) continue;
+                    body = std::move(response.body);
+                    preferred.store(base);
+                    break;
                 }
             }
-            return false;
+            if (body.empty() || net::cancelled()) return false;
+            const auto dest = platform::join(dir, std::string("lx_") + kSlugs[file] + ".js");
+            if (platform::file_size(dest) == static_cast<long long>(body.size())) {
+                std::ifstream input(platform::fs::u8path(dest), std::ios::binary);
+                const std::string old((std::istreambuf_iterator<char>(input)), {});
+                if (input.is_open() && !input.bad() && old == body) return true;
+            }
+            const auto temporary = dest + ".download";
+            auto* output = platform::fopen(temporary, "wb");
+            if (!output) return false;
+            const bool written = std::fwrite(body.data(), 1, body.size(), output) == body.size() && !std::ferror(output);
+            const bool closed = std::fclose(output) == 0;
+            const bool saved = written && closed && platform::replace_file(temporary, dest);
+            if (!saved) { platform::remove(temporary); return false; }
+            modified = true;
+            return true;
         };
-
-        // 探测一次直连：通 → 直连优先；不通 → 整轮跳过直连（一次 8s，而不是每个任务 8s）
-        bool raw_ok = false;
-        {
-            const auto r = net::get(std::string(kBases[0]) + "pdone/lx-music-source/main/huibq/latest.js",
-                {"User-Agent: Mozilla/5.0"}, 8000);
-            raw_ok = r.status == 200;
-        }
-        const int first_base = raw_ok ? 0 : 1;
-
-        std::atomic<int> next{0}, ok{0};
-        std::vector<std::string> pending;   // 第一轮失败的，稍后串行补拉
-        std::mutex out_mu;
-        auto worker = [&] {
+        const auto worker = [&](int) {
             for (;;) {
-                const int i = next.fetch_add(1);
-                if (i >= kCount) return;
-                const std::string slug = kSlugs[i];
-                if (fetch_one(slug, first_base)) { ok.fetch_add(1); continue; }
-                std::lock_guard<std::mutex> lk(out_mu);
-                pending.push_back(slug);
+                const int file = next.fetch_add(1);
+                if (file >= kCount || g_shutdown.load()) return;
+                bool modified = false, ok = false;
+                try { ok = fetch_one(file, modified); } catch (...) { /* 保留原文件，纳入失败汇总。 */ }
+                const std::string name = std::string("lx_") + kSlugs[file] + ".js";
+                std::lock_guard<std::mutex> lock(result_mutex);
+                if (ok) {
+                    if (modified) ++changed; else ++unchanged;
+                    if (modified || !loaded.count(name)) refresh.push_back(name);
+                } else {
+                    ++failed;
+                    if (failed_names.size() < 120) failed_names += (failed_names.empty() ? "" : " ") + std::string(kSlugs[file]);
+                }
+                const auto progress = "正在下载音源 " + std::to_string(++completed) + "/" + std::to_string(kCount) +
+                    " · 更新 " + std::to_string(changed) + " · 未变 " + std::to_string(unchanged) + " · 失败 " + std::to_string(failed);
+                post_ui([progress] { g_lx_fetch_progress = progress; });
             }
         };
-        std::vector<std::thread> pool;
-        for (int t = 0; t < 6; ++t) pool.emplace_back(worker);
-        for (auto& th : pool) th.join();
-
-        // 第二轮：并发可能触发镜像瞬时限流，失败的串行慢速补一遍（换一个镜像起点）
-        int failed = 0;
-        std::string failed_names;
-        for (const auto& slug : pending) {
-            if (fetch_one(slug, first_base + 1)) { ok.fetch_add(1); continue; }
-            ++failed;
-            if (failed_names.size() < 120) failed_names += (failed_names.empty() ? "" : " ") + slug;
-        }
-
-        // 拉完立即加载，列表自动刷新，不需要用户再点「重新加载」
-        const int n = lx::Engine::instance().load_dir(dir);
-        const int o = ok.load();
-        post_ui([o, failed, failed_names, n] {
-            g_lx_fetch_summary = "上次在线获取：写入 " + std::to_string(o) + " 个";
-            if (failed > 0) g_lx_fetch_summary += "，下载失败 " + std::to_string(failed) + " 个（" + failed_names + "）";
-            g_lx_fetch_summary += "；当前可加载 " + std::to_string(n) + " 个";
+        parallel(6, worker);
+        if (g_shutdown.load()) return;
+        const auto count = refresh.size();
+        post_ui([count] { g_lx_fetch_progress = "下载完成，正在加载脚本（" + std::to_string(count) + " 个）…"; });
+        // 主动在线获取与导入含义一致：恢复这次成功下载的文件。普通重载仍尊重移除记录。
+        const int refreshed = refresh.empty() ? 0 : lx::Engine::instance().load_files(dir, refresh);
+        const int available = int(lx::Engine::instance().entries().size());
+        const auto failures = lx::Engine::instance().failures();
+        int init_failed = 0;
+        for (const auto& failure : failures)
+            if (std::find(refresh.begin(), refresh.end(), failure.first) != refresh.end()) ++init_failed;
+        const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started).count();
+        post_ui([changed, unchanged, failed, failed_names, refreshed, available, init_failed, seconds] {
+            g_lx_fetch_progress.clear();
+            g_lx_fetch_summary = "在线获取：更新 " + std::to_string(changed) + " · 未变 " + std::to_string(unchanged);
+            if (failed) g_lx_fetch_summary += " · 失败 " + std::to_string(failed) + "（" + failed_names + "），原文件保留";
+            if (refreshed < 0) g_lx_fetch_summary += " · " + lx::Engine::instance().preferences_error();
+            g_lx_fetch_summary += "；已加载 " + std::to_string(available) + " 个";
+            if (init_failed) g_lx_fetch_summary += " · 初始化失败 " + std::to_string(init_failed) + "（查看原因）";
+            g_lx_fetch_summary += " · " + std::to_string(seconds) + " 秒";
             toast(g_lx_fetch_summary, 9000);
         });
     });
@@ -3015,6 +3132,8 @@ void playlist_open_remote(library::Playlist playlist) {
             playlist.tracks = std::move(parts.tracks);
             if (!parts.title.empty()) playlist.name = parts.title;
             if (!parts.cover.empty()) playlist.cover = parts.cover;
+        } else if (music::script_platform(playlist.source)) {
+            playlist.tracks = music::board_tracks(playlist.source, playlist.remote_id, 200, error);
         } else playlist.tracks = playlist.source == music::Source::Netease ?
             ne::fetch_playlist(settings.netease_cookie, playlist.remote_id, error) :
             qq::fetch_playlist(settings.qq_cookie, playlist.remote_id, uin, error, 15000, playlist.remote_owner.empty());
@@ -3311,6 +3430,8 @@ void library_fetch(library::Playlist playlist) {
             tracks = std::move(parts.tracks);
             if (!parts.title.empty()) playlist.name = parts.title;
             if (!parts.cover.empty()) playlist.cover = parts.cover;
+        } else if (music::script_platform(playlist.source)) {
+            tracks = music::board_tracks(playlist.source, playlist.remote_id, 200, error);
         } else tracks = playlist.source == music::Source::Netease ?
             ne::fetch_playlist(settings.netease_cookie, playlist.remote_id, error, 15000, &ne_metadata) :
             qq::fetch_playlist(settings.qq_cookie, playlist.remote_id, uin, error, 15000, playlist.remote_owner.empty(), &qq_metadata);
@@ -3655,13 +3776,12 @@ void tick() {
             auto& st = login::state(ls);
             if (st.done.load()) {
                 g_wait_login_site.store(-1);
-                std::string cookie, uid, note, context;
+                std::string cookie, uid, note;
                 {
                     std::lock_guard<std::mutex> lk(st.m);
                     cookie = st.cookie;
                     uid = st.uid;
                     note = st.note;
-                    context = st.context;
                 }
                 if (!cookie.empty()) {
                     if (site == 1) {

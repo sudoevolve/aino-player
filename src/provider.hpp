@@ -7,17 +7,16 @@
 // 契约（每平台一个文件，providers/<key>.js）：
 //
 //   globalThis.provider = {
-//     key: 'kugou', name: '酷狗',
+//     key: 'netease', name: '网易云',
 //     search(keyword, page, limit) -> [song...],
 //     board(boardId, page, limit)  -> [song...],
-//     resolve(song, quality)       -> 'http://...',   // 可选：不给就走落雪音源
+//     resolve(song, quality)       -> 'http://...',   // 可选：不给就走 C++ 内置接口
 //   }
 //
 //   song = { id, title, artist, album, duration_ms, bitrate, native_id, cover }
 //
 // 宿主注入 ctx：
 //   ctx.http(url, opts)            同步 HTTP，返回 {statusCode, body(已解析), headers}
-//   ctx.lxUrl(key, song, quality)  让落雪音源去取直链
 //   ctx.md5 / ctx.b64encode / ctx.b64decode / ctx.log
 #pragma once
 
@@ -30,8 +29,13 @@
 #include "json.hpp"
 #include "lxsource.hpp"
 #include "net.hpp"
+#if __has_include("aino_platforms.hpp")
+#include "aino_platforms.hpp"
+#define AINO_HAS_BUNDLED_PLATFORMS 1
+#endif
 
 namespace prov {
+inline std::string default_dir();
 
 // provider 与音源共享 HTTP 桥，但每次执行必须有独立的实际时间截止点。
 struct ExecutionTime {
@@ -47,6 +51,7 @@ struct Song {  // 和 music::Variant 一一对应，隔离掉上层类型
     std::string id, title, artist, album, native_id, cover;
     int duration_ms = 0;
     int bitrate = 0;
+    js::Value metadata; // 保留平台返回的目录 ID、付费标记与音质 hash。
 };
 
 // ---------------------------------------------------------------- JS 侧桥
@@ -68,9 +73,12 @@ inline JSValue to_js_song(JSContext* ctx, const Song& s) {
 
 inline Song song_from_js(JSContext* ctx, JSValueConst v) {
     Song s;
+    JSValue json = JS_JSONStringify(ctx, v, JS_UNDEFINED, JS_UNDEFINED);
+    if (!JS_IsException(json)) js::parse(lx::detail::from_js(ctx, json), s.metadata);
+    JS_FreeValue(ctx, json);
     auto str = [&](const char* k) {
         JSValue x = JS_GetPropertyStr(ctx, v, k);
-        std::string r = lx::detail::from_js(ctx, x);
+        std::string r = JS_IsString(x) || JS_IsNumber(x) ? lx::detail::from_js(ctx, x) : std::string();
         JS_FreeValue(ctx, x);
         return r;
     };
@@ -90,34 +98,6 @@ inline Song song_from_js(JSContext* ctx, JSValueConst v) {
     s.duration_ms = num("duration_ms");
     s.bitrate = num("bitrate");
     return s;
-}
-
-// ctx.lxUrl(key, song, quality)：转手问落雪音源要直链
-inline JSValue cb_lx_url(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
-    JSValue out = JS_NewObject(ctx);
-    if (argc < 3) {
-        JS_DefinePropertyValueStr(ctx, out, "error", lx::detail::to_js(ctx, "lxUrl: 参数不足"), JS_PROP_C_W_E);
-        return out;
-    }
-    const std::string key = lx::detail::from_js(ctx, argv[0]);
-    const Song song = song_from_js(ctx, argv[1]);
-    const std::string quality = lx::detail::from_js(ctx, argv[2]);
-
-    // 音源要的是 lx 的 musicInfo 形状；这里把 Song 摊平成最常见的那几个字段
-    std::string info = "{\"songmid\":" + lx::detail::js_quote(song.id);
-    info += ",\"hash\":" + lx::detail::js_quote(song.native_id.empty() ? song.id : song.native_id);
-    info += ",\"name\":" + lx::detail::js_quote(song.title);
-    info += ",\"singer\":" + lx::detail::js_quote(song.artist);
-    info += ",\"albumName\":" + lx::detail::js_quote(song.album);
-    info += ",\"source\":" + lx::detail::js_quote(key) + "}";
-
-    std::string url, err;
-    if (!lx::Engine::instance().resolve(key, quality, info, url, err)) {
-        JS_DefinePropertyValueStr(ctx, out, "error", lx::detail::to_js(ctx, err), JS_PROP_C_W_E);
-        return out;
-    }
-    JS_DefinePropertyValueStr(ctx, out, "url", lx::detail::to_js(ctx, url), JS_PROP_C_W_E);
-    return out;
 }
 
 }  // namespace detail
@@ -141,13 +121,23 @@ public:
     bool search(const std::string& keyword, int page, int limit, std::vector<Song>& out, std::string& err);
     bool board(const std::string& board_id, int page, int limit, std::vector<Song>& out, std::string& err);
     bool resolve(const Song& song, const std::string& quality, std::string& url, std::string& err);
+    bool request(const char* method, const std::string& args, js::Value& out, std::string& err);
 
     void close();
 
 private:
+    struct Operation {
+        ExecutionTime time;
+        std::unique_lock<std::timed_mutex> lock;
+        explicit Operation(Provider& p) : lock(p.execution_, std::defer_lock) {
+            while (!net::cancelled() && !lock.try_lock_for(std::chrono::milliseconds(20))) {}
+            if (lock.owns_lock() && p.rt_) JS_UpdateStackTop(p.rt_);
+        }
+        explicit operator bool() const { return lock.owns_lock() && !net::cancelled(); }
+    };
+    std::timed_mutex execution_;
     bool eval(const std::string& code, const char* name, std::string& err);
     bool call(const char* fn, int argc, JSValue* argv, std::vector<Song>& out, std::string& err);
-    bool call_url(const char* fn, int argc, JSValue* argv, std::string& url, std::string& err);
 
     JSRuntime* rt_ = nullptr;
     JSContext* ctx_ = nullptr;
@@ -172,7 +162,6 @@ inline const char* provider_bootstrap() {
 (function () {
   const ctx = {
     http: function (url, opts) { return __lxhost.http(String(url), JSON.stringify(opts || {})); },
-    lxUrl: function (key, song, quality) { return __lxhost.lxUrl(String(key), song, String(quality || '320k')); },
     cookie: function (name) { return __lxhost.cookie(String(name)); },
     md5: function (s) { return __lx.md5(String(s)); },
     b64encode: function (s) { return __lx.b64encode(String(s)); },
@@ -186,15 +175,13 @@ inline const char* provider_bootstrap() {
 )JS";
 }
 
-// provider 拿不到应用设置，凭据由 Host 在检索前写进来
-inline std::mutex g_cred_mutex;
-inline std::string g_cred_netease, g_cred_qq;
+// 每次调用线程持有自己的凭据快照，跨平台并发和旧搜索不会互相覆盖。
+inline thread_local std::string g_cred_netease, g_cred_qq;
 
 // ctx.cookie('netease'|'qq') —— 从宿主拿登录 Cookie
 inline JSValue host_cookie(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
     const std::string key = argc > 0 ? lx::detail::from_js(ctx, argv[0]) : std::string();
-    // 由 Host::set_credentials 在每次检索前写入
-    std::lock_guard<std::mutex> lock(g_cred_mutex);
+    // 调用者在本线程创建请求前写入
     std::string v;
     if (key == "netease") v = g_cred_netease;
     else if (key == "qq") v = g_cred_qq;
@@ -222,7 +209,6 @@ inline bool Provider::load(const std::string& path, const std::string& code, std
     JSValue api = JS_NewObject(ctx_);
     JS_SetPropertyStr(ctx_, api, "http", JS_NewCFunction(ctx_, host_http, "http", 2));
     JS_SetPropertyStr(ctx_, api, "cookie", JS_NewCFunction(ctx_, host_cookie, "cookie", 1));
-    JS_SetPropertyStr(ctx_, api, "lxUrl", JS_NewCFunction(ctx_, detail::cb_lx_url, "lxUrl", 3));
     JS_SetPropertyStr(ctx_, api, "md5", JS_NewCFunction(ctx_, lx::detail::cb_md5, "md5", 1));
     JS_SetPropertyStr(ctx_, api, "b64encode", JS_NewCFunction(ctx_, lx::detail::cb_b64e, "b64encode", 1));
     JS_SetPropertyStr(ctx_, api, "b64decode", JS_NewCFunction(ctx_, lx::detail::cb_b64d, "b64decode", 1));
@@ -235,7 +221,9 @@ inline bool Provider::load(const std::string& path, const std::string& code, std
     if (!eval(provider_bootstrap(), "<provider-bootstrap>", err)) return false;
     if (!eval(code, path.c_str(), err)) return false;
 
-    JSValue p = JS_GetPropertyStr(ctx_, JS_GetGlobalObject(ctx_), "provider");
+    gl = JS_GetGlobalObject(ctx_);
+    JSValue p = JS_GetPropertyStr(ctx_, gl, "provider");
+    JS_FreeValue(ctx_, gl);
     if (!JS_IsObject(p)) {
         JS_FreeValue(ctx_, p);
         err = "脚本没有定义 globalThis.provider";
@@ -331,6 +319,7 @@ inline bool Provider::call(const char* fn, int argc, JSValue* argv, std::vector<
     int32_t n = 0;
     JS_ToInt32(ctx_, &n, lenv);
     JS_FreeValue(ctx_, lenv);
+    if (n < 0 || n > 10000) { err = "平台返回曲目数量超限"; JS_FreeValue(ctx_, r); return false; }
     out.clear();
     out.reserve(size_t(n > 0 ? n : 0));
     for (int i = 0; i < n; ++i) {
@@ -346,6 +335,8 @@ inline JSValue mk_str(JSContext* ctx, const std::string& s) { return lx::detail:
 
 inline bool Provider::search(const std::string& keyword, int page, int limit, std::vector<Song>& out,
                              std::string& err) {
+    Operation operation(*this);
+    if (!operation) { err = "平台请求已取消或等待超时"; return false; }
     if (!ctx_) { err = "provider 未加载"; return false; }
     JS_UpdateStackTop(rt_);
     JSValue args[3] = {mk_str(ctx_, keyword), JS_NewInt32(ctx_, page), JS_NewInt32(ctx_, limit)};
@@ -356,6 +347,8 @@ inline bool Provider::search(const std::string& keyword, int page, int limit, st
 
 inline bool Provider::board(const std::string& board_id, int page, int limit, std::vector<Song>& out,
                             std::string& err) {
+    Operation operation(*this);
+    if (!operation) { err = "平台请求已取消或等待超时"; return false; }
     if (!ctx_) { err = "provider 未加载"; return false; }
     JS_UpdateStackTop(rt_);
     JSValue args[3] = {mk_str(ctx_, board_id), JS_NewInt32(ctx_, page), JS_NewInt32(ctx_, limit)};
@@ -365,6 +358,8 @@ inline bool Provider::board(const std::string& board_id, int page, int limit, st
 }
 
 inline bool Provider::resolve(const Song& song, const std::string& quality, std::string& url, std::string& err) {
+    Operation operation(*this);
+    if (!operation) { err = "平台请求已取消或等待超时"; return false; }
     ExecutionTime time_limit;
     if (net::cancelled()) { err = "provider 请求已取消"; return false; }
     if (!ctx_ || !has_resolve_) { err = "该 provider 不提供取流"; return false; }
@@ -402,6 +397,28 @@ inline bool Provider::resolve(const Song& song, const std::string& quality, std:
 
 // ---------------------------------------------------------------- 集合
 
+// 平台目录接口统一返回 JSON；平台字段解释只保留在相应 JS 中。
+inline bool Provider::request(const char* method, const std::string& args, js::Value& out, std::string& err) {
+    Operation operation(*this);
+    if (!operation || !ctx_) { err = "平台未加载、请求已取消或等待超时"; return false; }
+    JSValue f = JS_GetPropertyStr(ctx_, provider_, method);
+    JSValue arg = JS_ParseJSON(ctx_, args.c_str(), args.size(), "<platform-args>");
+    if (!JS_IsFunction(ctx_, f) || JS_IsException(arg)) {
+        if (JS_IsException(arg)) err = lx::detail::take_exception(ctx_);
+        else err = std::string("平台没有实现 ") + method;
+        JS_FreeValue(ctx_, f); JS_FreeValue(ctx_, arg); return false;
+    }
+    JSValue r = JS_Call(ctx_, f, provider_, 1, &arg);
+    JS_FreeValue(ctx_, f); JS_FreeValue(ctx_, arg);
+    if (JS_IsException(r)) { err = lx::detail::take_exception(ctx_); JS_FreeValue(ctx_, r); return false; }
+    JSValue json = JS_JSONStringify(ctx_, r, JS_UNDEFINED, JS_UNDEFINED);
+    JS_FreeValue(ctx_, r);
+    const bool ok = !JS_IsException(json) && js::parse(lx::detail::from_js(ctx_, json), out);
+    if (!ok) err = JS_IsException(json) ? lx::detail::take_exception(ctx_) : "平台没有返回 JSON 数据";
+    JS_FreeValue(ctx_, json);
+    return ok;
+}
+
 class Host {
 public:
     static Host& instance() {
@@ -409,44 +426,55 @@ public:
         return h;
     }
 
-    int load_dir(const std::string& dir) {
-        std::lock_guard<std::mutex> lock(mu_);
-        list_.clear();
-        fail_.clear();
-        std::vector<std::string> files;
+    int load_dir(const std::string& dir, bool only_if_missing = false) {
+        std::lock_guard<std::mutex> loading(load_mu_);
+        if (only_if_missing && loaded_.load()) return 0;
+        // 首次搜索可能被用户的新搜索取消；不能因此把共享默认平台全部加载成失败。
+        net::CancelScope initialization([] { return false; }); // 应用退出信号仍由 net::cancelled 检查。
+        std::vector<std::shared_ptr<Provider>> next;
+        std::vector<std::pair<std::string, std::string>> failures;
+        std::map<std::string, std::string> scripts;
+#ifdef AINO_HAS_BUNDLED_PLATFORMS
+        for (const auto& script : bundled_scripts) scripts[script.first] = script.second;
+#endif
         std::error_code ec;
         for (std::filesystem::directory_iterator it(std::filesystem::u8path(dir), ec), end;
              !ec && it != end; it.increment(ec)) {
-            if (it->is_regular_file(ec) && lx::script_file(it->path()))
-                files.push_back(it->path().filename().u8string());
+            if (it->is_regular_file(ec) && lx::script_file(it->path())) {
+                std::ifstream in(it->path(), std::ios::binary);
+                if (!in) { failures.push_back({it->path().filename().u8string(), "无法读取平台脚本"}); continue; }
+                std::stringstream code; code << in.rdbuf();
+                scripts[it->path().filename().u8string()] = code.str();
+            }
         }
-        std::sort(files.begin(), files.end());
         int ok = 0;
-        for (const auto& name : files) {
+        for (const auto& script : scripts) {
+            const auto& name = script.first;
             const auto file = std::filesystem::u8path(dir) / std::filesystem::u8path(name);
             const auto path = file.u8string();
-            std::ifstream in(file, std::ios::binary);
-            if (!in) continue;
-            std::stringstream ss;
-            ss << in.rdbuf();
-            auto p = std::make_unique<Provider>();
+            auto p = std::make_shared<Provider>();
             std::string err;
-            if (!p->load(path, ss.str(), err)) {
-                fail_.push_back({name, err});
+            if (!p->load(path, script.second, err)) {
+                failures.push_back({name, err});
                 continue;
             }
-            list_.push_back(std::move(p));
+            next.push_back(std::move(p));
             ++ok;
         }
+        { std::lock_guard<std::mutex> lock(mu_); list_.swap(next); fail_.swap(failures); }
+        loaded_.store(true);
         return ok;
     }
 
-    Provider* get(const std::string& key) {
+    std::shared_ptr<Provider> get(const std::string& key) {
+        ensure_loaded();
         std::lock_guard<std::mutex> lock(mu_);
         for (auto& p : list_)
-            if (p->key() == key) return p.get();
+            if (p->key() == key) return p;
         return nullptr;
     }
+
+    void ensure_loaded() { if (!loaded_.load()) load_dir(default_dir(), true); }
 
     std::vector<std::string> keys() const {
         std::lock_guard<std::mutex> lock(mu_);
@@ -465,50 +493,47 @@ public:
         return list_.empty();
     }
 
-    // 对外三个动作：内部加锁，QuickJS 上下文不能并发调用
+    // 集合只提供 shared_ptr 快照。Provider 锁包含参数构造、JS 调用及释放。
     bool search(const std::string& key, const std::string& kw, int page, int limit, std::vector<Song>& out,
                 std::string& err) {
-        std::lock_guard<std::mutex> lock(mu_);
-        for (auto& p : list_)
-            if (p->key() == key) return p->search(kw, page, limit, out, err);
+        if (auto p = get(key)) return p->search(kw, page, limit, out, err);
         err = "没有 " + key + " 的 provider";
         return false;
     }
 
     bool board(const std::string& key, const std::string& board_id, int page, int limit, std::vector<Song>& out,
                std::string& err) {
-        std::lock_guard<std::mutex> lock(mu_);
-        for (auto& p : list_)
-            if (p->key() == key) return p->board(board_id, page, limit, out, err);
+        if (auto p = get(key)) return p->board(board_id, page, limit, out, err);
         err = "没有 " + key + " 的 provider";
         return false;
     }
 
     bool resolve(const std::string& key, const Song& song, const std::string& quality, std::string& url,
                  std::string& err) {
-        std::lock_guard<std::mutex> lock(mu_);
-        for (auto& p : list_)
-            if (p->key() == key) return p->resolve(song, quality, url, err);
+        if (auto p = get(key)) return p->resolve(song, quality, url, err);
         err = "没有 " + key + " 的 provider";
         return false;
     }
 
     void set_credentials(const std::string& netease, const std::string& qq) {
-        std::lock_guard<std::mutex> lock(g_cred_mutex);
         g_cred_netease = netease;
         g_cred_qq = qq;
     }
 
+    bool request(const std::string& key, const char* method, const std::string& args, js::Value& out, std::string& err) {
+        if (auto p = get(key)) return p->request(method, args, out, err);
+        err = "没有 " + key + " 的平台适配器"; return false;
+    }
+
     bool has(const std::string& key) {
-        std::lock_guard<std::mutex> lock(mu_);
-        for (auto& p : list_)
-            if (p->key() == key) return true;
-        return false;
+        return bool(get(key));
     }
 
 private:
     mutable std::mutex mu_;
-    std::vector<std::unique_ptr<Provider>> list_;
+    std::mutex load_mu_;
+    std::atomic<bool> loaded_{false};
+    std::vector<std::shared_ptr<Provider>> list_;
     std::vector<std::pair<std::string, std::string>> fail_;
 };
 
@@ -517,12 +542,19 @@ inline std::string default_dir() {
         if (*e) return e;
     }
 #ifdef _WIN32
-    char buf[MAX_PATH]{};
-    if (GetModuleFileNameA(nullptr, buf, MAX_PATH)) {
-        std::string p(buf);
-        const size_t cut = p.find_last_of("\\/");
-        if (cut != std::string::npos) return p.substr(0, cut) + "\\providers";
+    wchar_t buf[32768]{};
+    if (GetModuleFileNameW(nullptr, buf, 32768)) {
+        return (std::filesystem::path(buf).parent_path() / "providers").u8string();
     }
+#else
+    char buf[4096]{};
+    const auto n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) {
+        const auto dir = std::filesystem::path(std::string(buf, size_t(n))).parent_path() / "providers";
+        std::error_code ec;
+        if (std::filesystem::is_directory(dir, ec)) return dir.u8string();
+    }
+    return "/usr/share/aino-player/providers";
 #endif
     return "providers";
 }

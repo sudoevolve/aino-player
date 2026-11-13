@@ -107,6 +107,19 @@ if(MSVC)
 endif()
 
 add_executable(aino_player WIN32 src/main.cpp src/cover_decode.cpp)
+# JS 是目录接口的唯一实现。内嵌默认脚本，仍允许 providers/ 同名文件覆盖；
+# 单 EXE 和 Linux 安装均不依赖启动工作目录。
+file(GLOB platform_scripts CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/providers/*.js")
+set(platform_header "#pragma once\nnamespace prov { inline const std::pair<const char*, const char*> bundled_scripts[] = {\n")
+foreach(script IN LISTS platform_scripts)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${script}")
+  get_filename_component(script_name "${script}" NAME)
+  file(READ "${script}" script_code)
+  string(APPEND platform_header "{\"${script_name}\", R\"AINOPLATFORM(${script_code})AINOPLATFORM\"},\n")
+endforeach()
+string(APPEND platform_header "}; }\n")
+file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/generated/aino_platforms.hpp" CONTENT "${platform_header}")
+target_include_directories(aino_player PRIVATE "${CMAKE_BINARY_DIR}/generated")
 aino_attach_codec(aino_player)
 target_link_libraries(aino_player PRIVATE player_audio player_login player_desktop quickjs)
 if(WIN32)
@@ -137,7 +150,7 @@ endforeach()
 # 测试程序也会 include 到 business.hpp / sources.hpp 这条链（→ quickjs.h），
 # 所以必须给它们同样的头文件路径，并链接 quickjs（否则链接期 Engine 符号缺失）。
 function(aino_link_quickjs target)
-  target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vendor/quickjs)
+  target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vendor/quickjs "${CMAKE_BINARY_DIR}/generated")
   target_link_libraries(${target} PRIVATE quickjs)
 endfunction()
 

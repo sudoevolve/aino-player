@@ -23,6 +23,7 @@
 #include <functional>
 #include <atomic>
 #include <algorithm>
+#include <utility>
 namespace net {
 inline const std::atomic<bool>* shutdown_signal = nullptr;
 inline thread_local std::function<bool()> cancel_current;
@@ -34,7 +35,7 @@ struct CancelScope {
     CancelScope& operator=(const CancelScope&) = delete;
     ~CancelScope() { cancel_current = std::move(previous); }
 };
-// YouTube 请求签名和本机 WebSocket 握手共用 SHA-1；不用于密码存储。
+// 本机浏览器 WebSocket 握手使用 SHA-1；不用于密码存储。
 inline std::array<unsigned char, 20> sha1(std::string input) {
     const uint64_t bits = uint64_t(input.size()) * 8;
     input += char(0x80);
@@ -66,7 +67,7 @@ inline std::string sha1_hex(const std::string& input) {
     for (auto byte : digest) { out += hex[byte >> 4]; out += hex[byte & 15]; }
     return out;
 }
-// 判断容器头而非只认 MP3；DASH 音轨通常是 M4A，YouTube 也可能返回 WebM。
+// 判断容器头而非只认 MP3；支持 M4A、WebM 等音频容器。
 inline bool audio_prefix(const char* bytes, size_t size) {
     if (size >= 3 && !std::memcmp(bytes, "ID3", 3)) return true;
     if (size >= 2 && static_cast<unsigned char>(bytes[0]) == 0xff &&
@@ -135,6 +136,7 @@ struct Response {
     std::string final_url;
     std::string error;   // 非空 = 传输层失败
     std::vector<std::string> set_cookies;
+    std::vector<std::pair<std::string, std::string>> headers;
     std::string location;
     std::string content_range;
     bool ok() const { return error.empty() && status >= 200 && status < 300; }
@@ -366,6 +368,20 @@ inline Response execute(const Request& req) {
     out.content_type = detail::query_header(hreq, WINHTTP_QUERY_CONTENT_TYPE);
     out.final_url = detail::final_url_of(hreq);
     out.location = detail::query_header(hreq, WINHTTP_QUERY_LOCATION);
+    const auto raw_headers = detail::query_header(hreq, WINHTTP_QUERY_RAW_HEADERS_CRLF);
+    for (size_t pos = 0; pos < raw_headers.size();) {
+        const auto end = raw_headers.find("\r\n", pos);
+        const auto line = raw_headers.substr(pos, end == std::string::npos ? end : end - pos);
+        const auto colon = line.find(':');
+        if (colon != std::string::npos) {
+            auto key = line.substr(0, colon);
+            for (char& c : key) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+            const auto first = line.find_first_not_of(" \t", colon + 1);
+            out.headers.emplace_back(std::move(key), first == std::string::npos ? "" : line.substr(first));
+        }
+        if (end == std::string::npos) break;
+        pos = end + 2;
+    }
     DWORD cookie_index = 0;
     for (int i = 0; i < 64; ++i) {
         std::wstring buffer(16384, L'\0');
