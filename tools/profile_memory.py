@@ -39,6 +39,21 @@ if os.name == 'nt':
     kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
     kernel.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
     kernel.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME)]
+
+
+def windows_created(pid):
+    handle = kernel.OpenProcess(0x1000, False, pid)
+    if not handle:
+        return None
+    try:
+        values = [wintypes.FILETIME() for _ in range(4)]
+        if not kernel.GetProcessTimes(handle, *(ctypes.byref(value) for value in values)):
+            return None
+        return (values[0].dwHighDateTime << 32) | values[0].dwLowDateTime
+    finally:
+        kernel.CloseHandle(handle)
 
 
 def windows_memory(pid):
@@ -78,9 +93,10 @@ def windows_children(pid):
             exists = kernel.Process32NextW(snapshot, ctypes.byref(entry))
     finally:
         kernel.CloseHandle(snapshot)
-    found = {pid}
+    found = {pid}; created = windows_created(pid)
     while True:
-        more = {child for child, parent in parents.items() if parent in found}
+        more = {child for child, parent in parents.items() if parent in found and
+                (born := windows_created(child)) is not None and created is not None and born >= created}
         if more <= found:
             return sorted(found - {pid})
         found |= more
@@ -247,7 +263,20 @@ def run(binary, output, scale, fixture_directory=None, no_icons=False):
                     trace = dict(traces[-1]); mem = read_memory(process.pid)
                     if mem:
                         row = dict(trace, **mem)
-                        child_memory = [value for pid in descendants(process.pid) if (value := read_memory(pid))]
+                        child_memory = []
+                        details = []
+                        for pid in descendants(process.pid):
+                            value = read_memory(pid)
+                            if value:
+                                child_memory.append(value)
+                                if os.name == 'nt':
+                                    modules = windows_modules(pid)
+                                    name = modules[0] if modules else str(pid)
+                                else:
+                                    try: name = os.readlink(f'/proc/{pid}/exe')
+                                    except (FileNotFoundError, ProcessLookupError): name = str(pid)
+                                details.append(dict(pid=pid, name=name, **value))
+                        row['child_processes'] = details
                         for key in ('VmRSS', 'Pss', 'Private', 'PrivateCommit'):
                             row['children_' + key] = sum(value.get(key, 0) for value in child_memory)
                             row['tree_' + key] = row.get(key, 0) + row['children_' + key]

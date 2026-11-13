@@ -20,6 +20,7 @@ inline void initialize(aino::Window& win) {
     // 诊断构建强制同样的客户区像素，避免 runner 桌面工作区自动缩小窗口。
     const float scale = std::stof(platform::env("AINO_SCALE"));
     win.impl->scale = scale;
+    win.impl->max_pw = 4000; win.impl->max_ph = 3000;
     auto* native = static_cast<aino::detail::Win32State*>(win.impl->native);
     RECT outer{0, 0, LONG(1180 * scale), LONG(760 * scale)};
     AdjustWindowRectEx(&outer, DWORD(GetWindowLongPtrW(native->hwnd, GWL_STYLE)), FALSE,

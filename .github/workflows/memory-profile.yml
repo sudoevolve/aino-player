@@ -18,6 +18,7 @@ jobs:
           name: memory-fixtures
           path: build/fixtures/
   linux:
+    if: "!contains(github.event.head_commit.message, '[windows-only]')"
     needs: fixtures
     runs-on: ubuntu-22.04
     timeout-minutes: 20
