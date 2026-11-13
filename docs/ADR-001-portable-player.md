@@ -347,3 +347,10 @@ Windows 定向 controller_test.py 复核通过。同步修正另两处旧场景�
 最终 v0.2.6 发布完成：Actions 43378694688 的 Windows 6/6、Linux 8/8 回归通过；Linux AppStream 校验、v0.2.3 → v0.2.6 apt --no-remove 覆盖升级、安装后 Xvfb 启动均通过。该工作流的 Windows 安装器步骤因 Python 默认 cp1252 读取含中文 CMake 注释失败，自动 publish 因此跳过。工具已在 master 显式使用 UTF-8 修正；未移动版本标签。为避免再重复两端构建，使用已通过 Linux 任务的原始附件及同一应用源码的本机 MSVC Release 构建完成 Windows 打包；本机构建内置 helper 的工具链与 runner 不同，最终 helper 另以 player_regressions / embedded_audio_decode 2/2 验证，版本、内置标识及 LGPL 通知均校验。Windows 构建信息随实际附件发布。
 
 GitHub Release v0.2.6 已设为 latest；Windows 安装器 3,798,969 字节、便携 EXE 6,457,856 字节、deb 2,405,090 字节。发布后通过 API 核对正文（归一化换行）、八个附件的大小及 GitHub SHA-256 digest，全部与本地发布文件一致。源代码与构建记录保留明确边界，未运行真实 YouTube/账号探测，未修改 IME。
+
+
+### 2026-11-13：项目签名 APT 软件源
+
+用户优先要求完成可添加的软件源，Ubuntu 官方仓库与 NextKde 工作暂缓。沿用已发布、已验证的 deb，不改播放器源码、版本或 Release 附件。独立工具仅负责从正式 GitHub Releases 收集包、核对服务器 digest / SHA256SUMS / dpkg 包身份、生成索引和签名；独立工作流将静态站点部署到 GitHub Pages。客户端使用 deb822 源及 Signed-By 专用 keyring，不全局信任公钥。依赖只有 runner 的标准 APT/GnuPG 工具，播放器运行时不增加依赖。
+
+专用 Ed25519 签名密钥指纹 6BC11916DDE36B879AD6AC8A18681C67CA6020FE；私钥在本机受限目录备份，并配置为 APT_SIGNING_PRIVATE_KEY secret，不在仓库或日志中输出。索引有效期 30 天，每周和正式版成功发布后刷新；保留最高三个兼容正式版及上一代按摘要寻址的索引。先做脚本语法、差异与发布边界审查，部署时以 gpgv 与隔离 APT 配置核对签名和候选版本；不安装/启动播放器、不跑 CTest、音频、浏览器或界面回归。README 只增加安装入口，详细维护说明放在 APT.md。
