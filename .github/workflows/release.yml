@@ -65,7 +65,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           ref: refs/tags/${{ inputs.tag || github.ref_name }}
-      - run: sudo apt-get update && sudo apt-get install -y build-essential python3 libx11-dev libgdk-pixbuf-2.0-0 librsvg2-common adwaita-icon-theme libcurl4-openssl-dev libfreetype6 libfontconfig1 fonts-noto-cjk libasound2 xvfb xdg-utils dpkg-dev
+      - run: sudo apt-get update && sudo apt-get install -y build-essential python3 libx11-dev libgdk-pixbuf-2.0-0 librsvg2-common adwaita-icon-theme libcurl4-openssl-dev libfreetype6 libfontconfig1 fonts-noto-cjk libasound2 xvfb xdg-utils dpkg-dev appstream
       - run: python3 tools/build_ffmpeg.py --jobs 2
       # 只调整临时 CI 虚拟机的 userns 策略，不给浏览器添加 --no-sandbox。
       - run: if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; fi
@@ -75,13 +75,29 @@ jobs:
       - name: Report Linux DPI and resident memory
         run: xvfb-run -a build/aino_player --diagnostics
       - name: Build and verify Debian package
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           test "$(build/aino_player --version)" = "aino player ${RELEASE_TAG#v}"
           build/aino_player --codec-info | grep -F embedded
           cpack --config build/CPackConfig.cmake -G DEB -B dist
           dpkg-deb --info dist/*.deb
-          sudo apt-get install -y ./dist/*.deb
+          test "$(dpkg-deb --field dist/*.deb Maintainer)" = "sudoevolve <sudoevolve@gmail.com>"
+          appstreamcli validate --no-net build/generated/io.github.sudoevolve.AinoPlayer.metainfo.xml
+          # 先装上一正式版，再覆盖升级；不以卸载旧版绕过升级问题。
+          previous_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+          if [ "$previous_tag" != "$RELEASE_TAG" ]; then
+            gh release download "$previous_tag" --repo "$GITHUB_REPOSITORY" --dir build/previous-release --pattern '*.deb' --pattern SHA256SUMS.txt
+            (cd build/previous-release && sha256sum --check --ignore-missing SHA256SUMS.txt)
+            test "$(dpkg-deb --field build/previous-release/*.deb Package)" = aino-player
+            sudo apt-get install -y --no-remove ./build/previous-release/*.deb
+            previous_version="$(dpkg-query -W -f='${Version}' aino-player)"
+            dpkg --compare-versions "$previous_version" lt "${RELEASE_TAG#v}"
+          fi
+          sudo apt-get install -y --no-remove ./dist/*.deb
+          test "$(dpkg-query -W -f='${Version}' aino-player)" = "${RELEASE_TAG#v}"
+          test -f /usr/share/metainfo/io.github.sudoevolve.AinoPlayer.metainfo.xml
           test "$(/usr/bin/aino_player --version)" = "aino player ${RELEASE_TAG#v}"
           xvfb-run -a /usr/bin/aino_player --smoke-test
           cp build/codec-build/ffmpeg-*.tar.xz dist/

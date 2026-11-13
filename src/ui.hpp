@@ -1257,12 +1257,13 @@ static void update_settings(Ctx& c, float x, float w, float y) {
     c.ui.draw_text(update.message.empty() ? "启动时自动检查 GitHub 正式版" : update.message,
         {x + 20, card.y + 87, w - 40, 48}, update.status == UpdateStatus::Failed ? c.th.destructive : c.th.label2, Style().font(11.5f).wrap_text());
     Style check = Style().font(11);
-    check.disabled = update.status == UpdateStatus::Checking || update.status == UpdateStatus::Downloading || update.status == UpdateStatus::Installing;
+    check.disabled = update.status == UpdateStatus::Checking || update.status == UpdateStatus::Downloading ||
+        update.status == UpdateStatus::Installing || update.status == UpdateStatus::Installed;
     if (c.ui.button(update.status == UpdateStatus::Checking ? "正在检查…" : "检查更新", {x + 20, card.y + 154, 88, 28}, check)) check_updates();
     if (c.ui.button("发布页", {x + 118, card.y + 154, 72, 28}, Style().ghost().font(11))) open_update(false);
     if (update.status == UpdateStatus::Available && c.ui.button(update.installer ? "下载并安装" : "下载新版", {x + w - 116, card.y + 154, 96, 28}, Style().primary().font(11))) open_update(true);
     if (update.status == UpdateStatus::Downloading) c.ui.muted_text("下载 " + std::to_string(update.progress) + "%", {x + 20, card.bottom() + 14, w - 40, 20}, Style().font(11));
-    c.ui.muted_text("Windows 使用安装器覆盖升级；Linux 下载 deb 安装。更新保留配置、收藏和歌单。", {x + 2, card.bottom() + 48, w - 4, 64}, Style().font(11).wrap_text());
+    c.ui.muted_text("Windows 使用安装器覆盖升级；Linux 完成系统授权后覆盖安装 deb，无需卸载旧版。更新保留配置、收藏和歌单。", {x + 2, card.bottom() + 48, w - 4, 64}, Style().font(11).wrap_text());
 }
 static void about_settings(Ctx& c, float x, float w, float y) {
     draw_brand(c, {x + w / 2 - 32, y + 6, 64, 64});

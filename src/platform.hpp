@@ -551,6 +551,48 @@ inline bool launch_installer(const std::string& path) {
     if (info.hProcess) CloseHandle(info.hProcess);
     return launched;
 }
+#elif defined(__linux__)
+// coreutils 是 Debian/Ubuntu 基础组件；只读取固定系统程序的 SHA-256 输出，不新增密码库依赖。
+inline std::string sha256_file(const std::string& path) {
+    PipeProcess process;
+    if (!process.start({"/usr/bin/sha256sum", "--zero", "--", path})) return {};
+    process.finish_input();
+    std::string output;
+    std::array<char, 512> buffer{};
+    while (const auto n = process.read(buffer.data(), buffer.size())) {
+        if (output.size() + n > 8192) return {};
+        output.append(buffer.data(), n);
+    }
+    if (process.wait() != 0 || output.size() < 66 || output[64] != ' ') return {};
+    const auto digest = output.substr(0, 64);
+    return digest.find_first_not_of("0123456789abcdef") == std::string::npos ? digest : std::string();
+}
+inline bool deb_installer_available() {
+    return ::access("/usr/bin/pkexec", X_OK) == 0 && ::access("/usr/bin/apt-get", X_OK) == 0;
+}
+// 系统授权窗口负责提权；按 argv 覆盖安装，禁止移除其他包。开始安装后不强杀 dpkg。
+inline int install_deb(const std::string& path, const std::string& log_path) {
+    if (!deb_installer_available()) return -1;
+    std::error_code ec;
+    const auto package = fs::canonical(fs::u8path(path), ec);
+    if (ec || !fs::is_regular_file(package, ec) || ec) return -1;
+    std::vector<std::string> args{"/usr/bin/pkexec", "--disable-internal-agent", "/usr/bin/apt-get",
+        "-o", "Dpkg::Use-Pty=0", "install", "--yes", "--no-remove", "--", package.u8string()};
+    std::vector<char*> argv;
+    for (auto& arg : args) argv.push_back(arg.data());
+    argv.push_back(nullptr);
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) return -1;
+    int error = posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (!error) error = posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
+    pid_t pid = 0;
+    if (!error) error = posix_spawn(&pid, args[0].c_str(), &actions, nullptr, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if (error) return -1;
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) if (errno != EINTR) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
 #endif
 inline bool open_folder(const std::string& path) {
     std::error_code ec;

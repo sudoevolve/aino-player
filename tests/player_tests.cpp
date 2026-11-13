@@ -308,7 +308,8 @@ int main(int argc, char** argv) {
         for (const auto& relative : {"7/ffmpeg-0123456789abcdef.exe", "9/ffmpeg-0123456789abcdef.exe"})
             check(platform::exists(platform::join(cache_root, relative)), "cache cleanup preserves live decoder executables");
         check(!cache::codec_file("ffmpeg-unrelated.exe") && !cache::codec_file("ffmpeg-0123456789abcdef.txt"), "codec cleanup recognizes only owned names");
-        check(cache::update_file("aino-update-v2.0.0.exe") && !cache::update_file("aino-update-v2..0.exe") &&
+        check(cache::update_file("aino-update-v2.0.0.exe") && cache::update_file("aino-update-v2.0.0.deb") &&
+              !cache::update_file("aino-update-v2.0.0.deb.extra") && !cache::update_file("aino-update-v2..0.exe") &&
               !cache::update_file("aino-update-v2.0.0.exe.extra"), "installer cleanup recognizes only owned names");
         for (const auto& relative : {"7/aino-update-v2.0.0.exe", "9/aino-update-v2.0.0.exe", "8/unrelated.exe"})
             check(platform::exists(platform::join(cache_root, relative)), "installer cleanup preserves live instances and unknown files");

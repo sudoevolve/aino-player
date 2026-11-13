@@ -28,7 +28,8 @@ inline bool codec_file(const std::string& name) {
     return suffix.empty() || suffix == ".exe" || suffix == ".part" || suffix == ".exe.part";
 }
 inline bool update_file(const std::string& name) {
-    const std::string prefix = "aino-update-v", suffix = ".exe";
+    const std::string prefix = "aino-update-v";
+    const std::string suffix = name.size() >= 4 && name.compare(name.size() - 4, 4, ".deb") == 0 ? ".deb" : ".exe";
     if (name.rfind(prefix, 0) != 0 || name.size() <= prefix.size() + suffix.size() ||
         name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) return false;
     const auto version = name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());

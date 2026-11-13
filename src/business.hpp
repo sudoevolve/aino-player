@@ -60,7 +60,7 @@ inline constexpr const char* github = "https://github.com/sudoevolve/aino-player
 inline constexpr const char* license = "Apache-2.0";
 }
 enum class ProjectLink { Repository, Issues, License, Dependencies };
-enum class UpdateStatus { Idle, Checking, Current, Available, Downloading, Installing, Failed, NoRelease };
+enum class UpdateStatus { Idle, Checking, Current, Available, Downloading, Installing, Installed, Failed, NoRelease };
 struct UpdateView {
     UpdateStatus status = UpdateStatus::Idle;
     std::string version, release_url, asset_url, message, digest;
@@ -116,7 +116,9 @@ inline UpdateView parse_release(const net::Response& response, const std::string
         if (!suffix.empty() && name.size() > suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0 &&
             name.rfind("aino-player", 0) == 0 && name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") == std::string::npos &&
             url == prefix + name) {
-            const bool installer = name == "aino-player-" + tag + "-setup-windows-x64.exe";
+            const auto version = tag.front() == 'v' ? tag.substr(1) : tag;
+            const bool installer = name == "aino-player-" + tag + "-setup-windows-x64.exe" ||
+                                   name == "aino-player_" + version + "_amd64.deb";
             if (!view.asset_url.empty() && (!installer || view.installer)) continue;
             view.asset_url = url; view.installer = installer;
             view.digest = asset["digest"].str();
@@ -2780,6 +2782,7 @@ void clear_data(ClearAction action) {
 }
 
 void check_updates(bool notify) {
+    if (g_update_view.status == UpdateStatus::Installed) { if (notify) toast("新版已安装，请重新启动播放器", 6000); return; }
     if (g_update_view.status == UpdateStatus::Checking || g_update_view.status == UpdateStatus::Downloading ||
         g_update_view.status == UpdateStatus::Installing) return;
     g_update_view.status = UpdateStatus::Checking;
@@ -2801,9 +2804,14 @@ void check_updates(bool notify) {
     });
 }
 void open_update(bool download) {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__linux__)
     if (download && g_update_view.installer) {
         if (g_update_view.status != UpdateStatus::Available) return;
+#ifdef __linux__
+        if (!platform::deb_installer_available()) {
+            toast("系统缺少 pkexec 或 apt-get，请安装 pkexec 后重试；无需卸载旧版", 7000); return;
+        }
+#endif
         const auto release = g_update_view;
         if (!release.asset_size || release.digest.size() != 71 || release.digest.rfind("sha256:", 0) != 0 ||
             release.digest.substr(7).find_first_not_of("0123456789abcdef") != std::string::npos) {
@@ -2811,10 +2819,14 @@ void open_update(bool download) {
         }
         g_update_cancel.store(false);
         g_update_view.status = UpdateStatus::Downloading; g_update_view.progress = 0;
-        g_update_view.message = "正在下载安装包，完成校验后将关闭播放器并升级…";
+        g_update_view.message = "正在下载安装包并校验 SHA-256…";
         background::start([release] {
             const auto tag = release.version.front() == 'v' ? release.version : "v" + release.version;
+#ifdef _WIN32
             const auto path = platform::join(g_temp_dir, "aino-update-" + tag + ".exe");
+#else
+            const auto path = platform::join(g_temp_dir, "aino-update-" + tag + ".deb");
+#endif
             std::string error;
             bool ok = false;
             try {
@@ -2836,6 +2848,7 @@ void open_update(bool download) {
                 post_ui([error] { g_update_view.status = UpdateStatus::Available; g_update_view.message = error; toast(error, 7000); });
                 return;
             }
+#ifdef _WIN32
             post_ui([path] {
                 if (!g_host.close || !platform::launch_installer(path)) {
                     g_update_view.status = UpdateStatus::Available; g_update_view.message = "无法启动安装器，请重试或从发布页下载";
@@ -2845,6 +2858,24 @@ void open_update(bool download) {
                 g_update_view.message = "安装器已启动，正在保存配置并退出…";
                 g_host.close();
             });
+#else
+            post_ui([] {
+                g_update_view.status = UpdateStatus::Installing;
+                g_update_view.message = "请完成系统授权窗口，正在覆盖升级。安装期间退出会等待安装结束…";
+            });
+            if (g_update_cancel.load() || g_shutdown.load()) { platform::remove(path); return; }
+            const auto data_dir = platform::config_dir();
+            const auto log = platform::join(data_dir.empty() ? g_temp_dir : data_dir, "update-install.log");
+            const int code = platform::install_deb(path, log);
+            platform::remove(path);
+            post_ui([code, log] {
+                g_update_view.status = code == 0 ? UpdateStatus::Installed : UpdateStatus::Available;
+                g_update_view.message = code == 0 ? "新版已覆盖安装，请重新启动播放器；配置和歌单已保留" :
+                    code == 126 ? "已取消系统授权，旧版仍可使用" :
+                    "覆盖安装未完成（退出码 " + std::to_string(code) + "），无需卸载旧版。详情见 " + log;
+                toast(g_update_view.message, 8000);
+            });
+#endif
         });
         return;
     }

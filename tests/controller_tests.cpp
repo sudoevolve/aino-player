@@ -29,6 +29,18 @@ int main(int argc, char** argv) {
             }
         };
         check(model.ui.tab == 1 && model.playback.tracks.empty(), "default Discover and empty list");
+#if defined(_WIN32) || defined(__linux__)
+        const auto hash_path = platform::join(g_temp_dir, "update hash fixture.bin");
+        auto* hash_file = platform::fopen(hash_path, "wb"); check(hash_file != nullptr, "hash fixture file");
+        std::fwrite("abc", 1, 3, hash_file); std::fclose(hash_file);
+        check(platform::sha256_file(hash_path) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "update integrity uses the known SHA-256 of abc");
+        hash_file = platform::fopen(hash_path, "wb"); check(hash_file != nullptr, "empty hash fixture"); std::fclose(hash_file);
+        check(platform::sha256_file(hash_path) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "update integrity accepts an empty file digest");
+        platform::remove(hash_path);
+        check(platform::sha256_file(hash_path).empty(), "missing update file never yields a valid digest");
+#endif
         static std::atomic<int> wakes{0}, activations{0};
         start({[&] { ++wakes; }, [&] { ++activations; }});
         if (argc > 2 && std::string(argv[1]) == "--cover-stress") {
@@ -71,7 +83,9 @@ int main(int argc, char** argv) {
             check(!updates::version_parts(bad, version), "invalid and prerelease versions rejected");
         auto response = [](const char* tag, const char* suffix) {
             net::Response value; value.status = 200;
-            const std::string name = std::string("aino-player-") + tag + suffix;
+            const std::string version = tag[0] == 'v' ? tag + 1 : tag;
+            const std::string name = std::string(suffix) == "_amd64.deb" ? "aino-player_" + version + suffix :
+                std::string("aino-player-") + tag + suffix;
             value.body = "{\"tag_name\":" + library::quote(tag) + ",\"draft\":false,\"prerelease\":false,\"html_url\":" +
                 library::quote(std::string(updates::kReleases) + "/tag/" + tag) + ",\"assets\":[{\"name\":" + library::quote(name) +
                 ",\"browser_download_url\":" + library::quote(std::string(updates::kReleases) + "/download/" + tag + "/" + name) + "}]}";
@@ -83,6 +97,11 @@ int main(int argc, char** argv) {
             check(updates::parse_release(response("v1.10.0", suffix), "1.10.0", suffix).status == UpdateStatus::Current, "same version is current");
             check(updates::parse_release(response("v1.9.0", suffix), "1.10.0", suffix).status == UpdateStatus::Current, "no downgrade prompt");
         }
+        auto deb = response("v2.0.0", "_amd64.deb");
+        deb.body.insert(deb.body.rfind("}]"), ",\"size\":123456,\"digest\":\"sha256:" + std::string(64, 'a') + "\"");
+        const auto deb_update = updates::parse_release(deb, "1.0.0", "_amd64.deb");
+        check(deb_update.installer && deb_update.asset_url.find("aino-player_2.0.0_amd64.deb") != std::string::npos &&
+            deb_update.asset_size == 123456 && deb_update.digest.size() == 71, "Debian update uses exact package name and integrity metadata");
         auto malformed = response("v2.0.0", "_amd64.deb");
         malformed.body.replace(malformed.body.find("github.com"), 10, "evil.test");
         check(updates::parse_release(malformed, "1.0.0", "_amd64.deb").status == UpdateStatus::Failed, "foreign release host rejected");
