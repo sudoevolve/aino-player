@@ -228,7 +228,7 @@ class RangeBridge {
         if (!send_bytes(socket, response.data(), response.size()) || head) return;
         net::CancelScope signal([this] { return stopped(); });
         for (auto offset = begin; offset <= end && !stopped();) {
-            const auto last = std::min(end, offset + 256 * 1024 - 1);
+            const auto last = offset + std::min(end - offset, 256LL * 1024 - 1);
             auto headers = spec.headers;
             headers.erase(std::remove_if(headers.begin(), headers.end(), [](std::string h) { std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c) { return char(std::tolower(c)); }); return h.rfind("range:", 0) == 0 || h.rfind("accept-encoding:", 0) == 0; }), headers.end());
             headers.push_back("Range: bytes=" + std::to_string(offset) + "-" + std::to_string(last));
@@ -370,7 +370,7 @@ struct Stream::Impl {
             if (server->start(spec, [this] { return stopped(); })) bridge = std::move(server);
         }
         std::vector<std::string> args{helper, "-nostdin", "-v", "error"};
-        if (bridge) args.insert(args.end(), {"-protocol_whitelist", "http,tcp", "-rw_timeout", "10000000"});
+        if (bridge) args.insert(args.end(), {"-protocol_whitelist", "http,tcp", "-http_proxy", "", "-rw_timeout", "10000000"});
         const auto seconds = std::to_string(double(std::max(0LL,spec.start_ms)) / 1000.0);
         if ((!spec.local_path.empty() || bridge) && spec.start_ms > 0) { args.push_back("-ss"); args.push_back(seconds); }
         args.insert(args.end(), {"-i", bridge ? bridge->url() : spec.local_path.empty() ? "pipe:0" : spec.local_path});

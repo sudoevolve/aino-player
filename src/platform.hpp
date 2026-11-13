@@ -541,7 +541,7 @@ inline std::string choose_music_folder(void* owner, const std::atomic<bool>& can
     if (timer_window) DestroyWindow(timer_window);
     dialog->Release();
     CoUninitialize();
-    if (FAILED(result) && result != HRESULT_FROM_WIN32(ERROR_CANCELLED) && !cancelled.load()) error = "无法打开或读取音乐文件夹，请直接粘贴路径";
+    if (FAILED(result) && result != HRESULT_FROM_WIN32(ERROR_CANCELLED) && !cancelled.load()) error = "无法打开或读取文件选择结果，请直接粘贴路径";
     return selected;
 #else
     (void)owner;

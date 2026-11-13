@@ -2478,7 +2478,15 @@ void choose_local_lyrics() {
     });
 }
 void media_action(const platform::MediaEvent& event) {
-    const auto state = g_snapshot.ps;
+    PlayState state;
+    {
+        std::lock_guard<std::mutex> lock(g_mu); state = g_as.ps;
+        if (state == PlayState::Buffering || state == PlayState::Resolving || state == PlayState::Ready) {
+            if (event.action == platform::MediaAction::Pause) { g_play_ready_paused = true; return; }
+            if (event.action == platform::MediaAction::Play) { g_play_ready_paused = false; return; }
+            if (event.action == platform::MediaAction::Toggle) { g_play_ready_paused = !g_play_ready_paused; return; }
+        }
+    }
     switch (event.action) {
         case platform::MediaAction::Toggle: toggle_pause(); break;
         case platform::MediaAction::Play:
@@ -2510,12 +2518,17 @@ void refresh_output_devices() {
     });
 }
 void select_output_device(const std::string& id) {
-    const auto position = g_player.position_ms();
-    const bool paused = g_snapshot.ps == PlayState::Paused;
-    const int index = g_snapshot.playing;
+    bool paused, active; int index; long long position;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        const auto state = g_as.ps; index = g_as.playing;
+        active = state == PlayState::Playing || state == PlayState::Paused || state == PlayState::Buffering || state == PlayState::Resolving || state == PlayState::Ready;
+        paused = state == PlayState::Paused || ((state == PlayState::Buffering || state == PlayState::Resolving || state == PlayState::Ready) && g_play_ready_paused);
+        position = (state == PlayState::Playing || state == PlayState::Paused) ? g_player.position_ms() : g_as.position_ms;
+    }
     g_ui.device_error.clear();
     g_player.set_device(id); g_ui.output_device = id; g_ui.config_dirty = true;
-    if (index >= 0 && !g_snapshot.now_uid.empty() && (paused || g_snapshot.ps == PlayState::Playing || g_snapshot.ps == PlayState::Buffering || g_snapshot.ps == PlayState::Resolving)) {
+    if (index >= 0 && active) {
         { std::lock_guard<std::mutex> lock(g_mu); g_resume_on_start = position; }
         start_play(index);
         { std::lock_guard<std::mutex> lock(g_mu); g_play_ready_paused = paused; }
@@ -3177,7 +3190,7 @@ void tick() {
         refresh_snapshot(g_snapshot);
         auto& snap = g_snapshot;
         {
-            // 下载表：几十条小结构，直接整份拷给界面读，省得绘制时持锁
+            // 下载状态变化后才复制，绘制读取只读快照。
             std::lock_guard<std::mutex> lk(g_dlm);
             if (g_download_snapshot_revision != g_download_revision) {
                 g_dls_snap = g_dls; g_download_snapshot_revision = g_download_revision;

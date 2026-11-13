@@ -920,11 +920,9 @@ static void tab_playlists(Ctx& c) {
         c.ui.input(&c.model.ui.local_name, {mx, 144, mw - 106, 30}, Style().font(11.5f).hint("输入名称，将播放队列保存为本地歌单"));
         if (c.ui.button("保存播放队列", {mx + mw - 100, 144, 100, 30}, Style().font(10.5f))) library_save_current();
         c.ui.input(&c.model.ui.local_folder, {mx, 186, mw - 190, 30}, Style().font(11.5f).hint("粘贴本地音乐文件夹路径"));
-#ifdef _WIN32
         if (c.ui.button("选择文件夹", {mx + mw - 184, 186, 84, 30}, Style().font(10.5f))) {
             library_choose_folder();
         }
-#endif
         if (c.ui.button(c.model.ui.importing_playlist ? "导入中…" : "导入文件夹", {mx + mw - 94, 186, 94, 30}, Style().font(10.5f)))
             library_import_folder(c.model.ui.local_folder, c.model.ui.scan_recursive);
         c.ui.toggle(&c.model.ui.scan_recursive, {mx, 226, 36, 20});
