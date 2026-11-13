@@ -15,7 +15,12 @@
 - **歌曲右键菜单**：搜索、歌单详情和队列里的歌曲均可右键，选择下一首播放、添加到播放列表、收藏或下载；下一首播放保留当前曲目，优先于随机和单曲循环
 - **睡眠定时器**：底栏选择 15 / 30 / 60 / 90 分钟后停止，或播完当前歌曲；紧凑菜单显示状态和剩余时间，禁用不可用的取消项。计时不因暂停而暂停，重新启动不恢复定时器
 - **歌单**：本地、账号与发现页歌单均打开独立详情页，含返回、曲目列表和播放全部；点击歌曲后才建立播放队列，不改在线搜索词；「同步到此」写回账号
-- **歌词**：三源歌词，居中跟随、hover 高亮、点行跳转
+- **系统媒体控制**：Windows SMTC、Linux MPRIS，支持桌面媒体面板、媒体键、播放/暂停、切歌和定位
+- **后台播放**：「设置 → 通用」可开启托盘与关闭到托盘；隐藏时停止绘制业务界面，继续播放和计时。Linux 使用 StatusNotifierItem / DBusMenu，无托盘宿主时关闭仍会退出
+- **下载管理**：左侧「下载管理」查看本次运行的等待、下载、失败和完成记录；支持单项/全部取消、失败重试、清理记录和打开文件位置，清理记录不会删除音乐
+- **最近播放**：左侧「最近播放」保存最近 200 首，播放至 5 秒后去重记录，可直接重播、右键操作或清空；与本地资料库一起保存及备份
+- **输出设备**：「设置 → 播放」刷新并选择音频输出，保存选择；切换时保留位置及暂停状态，设备失效时恢复系统默认输出
+- **歌词**：三源歌词，居中跟随、hover 高亮、点行跳转；「校准」按歌曲保存提前/延后偏移，也可选择 UTF-8 本地 LRC 或恢复默认
 - **音质**：标准 / 高 / 无损；下载可内嵌封面与歌词（ID3v2.3 / MP4 ilst）
 - **本地收藏**：单个后台写入任务合并连续操作，保存成功后发布新资料库，写失败保留原文件并提示；歌曲行、队列和播放条都能收藏；播放条的收藏按钮位于歌词按钮左侧，已收藏时高亮
 - **本地歌单**：「歌单 → 本地」可导入音乐文件夹、把播放队列保存为命名歌单，也能保存发现页和账号中的歌单
@@ -36,9 +41,9 @@ https://y.qq.com/n/ryqq/playlist/123
 
 ## 导入本地音乐
 
-打开「歌单 → 本地」，在第三行选择音乐文件夹（Windows）或粘贴路径（Windows / Linux），点击「导入文件夹」。默认包含子文件夹，可以关闭。支持 MP3、FLAC、WAV、M4A、AAC、Ogg、Opus、WebM；AAC/M4A（含 ALAC）、Ogg/Opus 和 WebM 由内置精简 FFmpeg 解码，无需用户安装系统 FFmpeg。
+打开「歌单 → 本地」，在第三行选择音乐文件夹或粘贴路径（Windows / Linux），点击「导入文件夹」。默认包含子文件夹，可以关闭。支持 MP3、FLAC、WAV、M4A、AAC、Ogg、Opus、WebM；AAC/M4A（含 ALAC）、Ogg/Opus 和 WebM 由内置精简 FFmpeg 解码，无需用户安装系统 FFmpeg。
 
-Windows 文件夹选择器在独立 STA 任务打开，关闭应用会取消选择器，重复点击不会叠加窗口。导入后点击歌单进入独立详情，点击一首或「播放全部」开始播放。「管理」默认折叠，展开后可歌单内搜索、按歌名/歌手/专辑/时长排序、重命名、多选移除以及导出；播放按当前筛选与排序建立队列。扫描优先读取 ID3v2、FLAC/Vorbis、Ogg/Opus、MP4 ilst、WAV INFO 中的标题、歌手和专辑，并提取支持的内嵌封面；无标签时回退文件名 `歌手 - 标题` 和父目录。读取有容量上限，损坏或不支持的字段会忽略；并非支持所有标签变体。原生解码格式会在后台扫描时读取时长。与音频同名的 UTF-8 `.lrc` 自动作为本地歌词（支持 BOM），不会向在线歌词接口提交本地路径。
+Windows 文件夹选择器在独立 STA 任务打开，Linux 通过桌面文件门户打开；门户不可用时可粘贴路径。关闭应用会取消选择器，重复点击不会叠加窗口。导入后点击歌单进入独立详情，点击一首或「播放全部」开始播放。「管理」默认折叠，展开后可歌单内搜索、按歌名/歌手/专辑/时长排序、重命名、多选移除以及导出；播放按当前筛选与排序建立队列。扫描优先读取 ID3v2、FLAC/Vorbis、Ogg/Opus、MP4 ilst、WAV INFO 中的标题、歌手和专辑，并提取支持的内嵌封面；无标签时回退文件名 `歌手 - 标题` 和父目录。读取有容量上限，损坏或不支持的字段会忽略；并非支持所有标签变体。原生解码格式会在后台扫描时读取时长。与音频同名的 UTF-8 `.lrc` 自动作为本地歌词（支持 BOM），不会向在线歌词接口提交本地路径。
 
 文件夹歌单的「更新」按钮重新扫描；重复导入同一个规范路径会更新原歌单，扫描失败保留旧列表。移动或删除文件后需重新扫描；失效文件会明确提示，不会自动换成同名在线音乐。删除歌单、清除资料库和清理缓存只移除播放器记录或生成的缓存，均不删除原音乐；转码产物保存在播放器临时缓存目录。
 
@@ -84,16 +89,12 @@ Windows exe 内含精简 FFmpeg，体积主要来自音频解码器和静态运�
 # 首次构建解码器；生成 build/codec/ffmpeg.exe（Windows）或 ffmpeg（Linux）
 python tools/build_ffmpeg.py
 
-# MinGW-w64（GCC 12+，UCRT；需要 CMake 和 Ninja）
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-
-# MSVC：使用本机已安装的 Visual Studio 生成器
+# Windows 播放器：MSVC + Windows SDK（含 C++/WinRT）；解码器仍用 GCC 构建
 cmake -S . -B build -A x64
 cmake --build build --config Release
 
 # Ubuntu / Debian（Linux 使用 X11，Wayland 桌面需 XWayland）
-sudo apt-get install build-essential python3 cmake libx11-dev libcurl4-openssl-dev libfreetype6 libfontconfig1 libgdk-pixbuf-2.0-0 librsvg2-common adwaita-icon-theme fonts-noto-cjk xdg-utils
+sudo apt-get install build-essential python3 cmake pkg-config libdbus-1-dev libx11-dev libcurl4-openssl-dev libfreetype6 libfontconfig1 libgdk-pixbuf-2.0-0 librsvg2-common adwaita-icon-theme fonts-noto-cjk xdg-utils xdg-desktop-portal
 python3 tools/build_ffmpeg.py
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
@@ -105,7 +106,7 @@ cmake --build build --config Release --parallel 2
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-Windows 需要 Windows SDK 或 mingw-w64 头文件。产物为 `build/aino_player.exe`（MSVC 为 `build/Release/aino_player.exe`），Linux 为 `build/aino_player`。Windows 静态链接 C/C++ 运行库；Linux 使用系统 libcurl、X11 和动态加载的字体/音频库。
+Windows 桌面媒体接入使用 Windows SDK 自带 C++/WinRT，需要 MSVC；仅桌面接入编译单元启用 C++20，其余为 C++17。产物为 `build/aino_player.exe`（MSVC 为 `build/Release/aino_player.exe`），Linux 为 `build/aino_player`。Windows 静态链接 C/C++ 运行库；Linux 使用系统 libcurl、X11、libdbus-1 和动态加载的字体/音频库；系统媒体与托盘不加载 GTK/Qt。文件选择器使用系统 xdg-desktop-portal，未安装时仍可输入路径。
 
 Windows 安装器使用构建时的 Inno Setup 6，不作为播放器运行依赖：
 
@@ -234,3 +235,9 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 cpack --config build/CPackConfig.cmake -G DEB -B dist
 ```
+
+## 流式播放与定位
+
+在线音频优先通过有界 PCM 缓冲边解码边播放。远端正确支持 HTTP Range 时，播放器以随机路径的本机 HTTP 地址提供经过范围校验的数据，FFmpeg 按容器索引读取和定位；远端 HTTPS、Cookie 和请求头仍由播放器处理，不交给 FFmpeg。每连接数据块上限 256 KiB，最多四个连接；PCM 缓冲仍为三秒。定位速度取决于容器索引和远端响应，不支持 Range 或解码失败时保留顺序管道/完整文件回退。
+
+Linux 使用 X11 或 Wayland 下的 XWayland。桌面媒体控制需要会话 D-Bus；托盘需要 StatusNotifier 宿主，纯 GNOME 未启用托盘支持时不会隐藏窗口。源码编译通过不等于真实耳机、热插拔、桌面托盘和网络定位均已实机验证；发布时再统一回归。

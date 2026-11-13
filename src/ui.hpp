@@ -1422,7 +1422,7 @@ static void tab_settings(Ctx& c) {
         settings_rule(c, desktop, desktop.y + 62);
         settings_label(c, "关闭窗口后继续播放", {x, desktop.y + 62, w, 62});
         if (c.ui.toggle(&c.model.ui.close_to_tray, {x + w - 54, desktop.y + 82, 38, 22})) c.model.ui.config_dirty = true;
-        c.ui.muted_text("无可用托盘时关闭窗口仍会退出，可从系统媒体面板控制播放。", {x + 2, desktop.bottom() + 14, w - 4, 42}, Style().font(10.5f).wrap_text());
+        c.ui.muted_text(std::string(c.model.ui.media_available ? "系统媒体控制已连接。" : "系统媒体控制暂不可用。") + (c.model.ui.tray_available ? "托盘已就绪。" : "无可用托盘时关闭窗口仍会退出。"), {x + 2, desktop.bottom() + 14, w - 4, 42}, Style().font(10.5f).wrap_text());
     });
 }
 

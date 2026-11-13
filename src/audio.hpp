@@ -73,6 +73,7 @@ public:
     void set_device(const std::string& id);
     /** @brief 读取设备通知，UI 线程据此恢复播放，音频回调不接触业务状态。 */
     bool take_device_change();
+    bool take_device_fallback();
     const std::string& error() const;
 private:
     struct Impl;

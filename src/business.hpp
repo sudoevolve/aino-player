@@ -621,6 +621,7 @@ static cover::Store g_covers;
 
 // 歌词：后台线程取，主线程只拿 shared_ptr 读，不加锁看内容
 struct LyricState {
+    unsigned long long generation = 0;
     std::mutex m;
     std::string for_uid;
     std::shared_ptr<const lyr::Doc> doc;
@@ -628,7 +629,7 @@ struct LyricState {
 };
 static LyricState g_lyr;
 
-// 下载表：uid → 状态。主线程每帧拷一份快照（几十条小结构，开销可忽略）
+// 下载表：uid → 状态。仅修订号变化时发布 UI 快照。
 
 static std::mutex g_dlm;
 static std::map<std::string, DlItem> g_dls;
@@ -1227,11 +1228,13 @@ void toast(const std::string& text, int ms) {
 // ---------------- 歌词 ----------------
 // 取一次就缓存住：同一个 uid 不重复请求。切歌后旧结果会被丢弃（比对 for_uid）。
 static void request_lyrics(const music::Track& track) {
+    unsigned long long generation = 0;
     const std::string uid = track_uid(track);
     if (uid.empty()) return;
     {
         std::lock_guard<std::mutex> lk(g_lyr.m);
         if (g_lyr.for_uid == uid && (g_lyr.doc || g_lyr.loading)) return;
+        generation = ++g_lyr.generation;
         g_lyr.for_uid = uid;
         g_lyr.doc.reset();
         g_lyr.loading = true;
@@ -1240,7 +1243,7 @@ static void request_lyrics(const music::Track& track) {
     const auto found = g_library->lyric_preferences.find(uid);
     const std::string local = found == g_library->lyric_preferences.end() ? "" : found->second.path;
     music::Settings st = g_ui.settings;
-    background::start([t, st, uid, local] {
+    background::start([t, st, uid, local, generation] {
         lyr::Doc d;
         if (local.empty()) d = lyr::fetch(t, st);
         else {
@@ -1249,7 +1252,9 @@ static void request_lyrics(const music::Track& track) {
             if (size <= 0 || size > 4 * 1024 * 1024) d.error = "本地歌词不存在、为空或超过 4 MiB，可重新选择或恢复默认";
             else {
                 std::ifstream file(platform::fs::u8path(local), std::ios::binary);
-                std::string text((std::istreambuf_iterator<char>(file)), {});
+                std::string text(4 * 1024 * 1024 + 1, '\0');
+                file.read(text.data(), std::streamsize(text.size())); text.resize(size_t(file.gcount()));
+                if (text.size() > 4 * 1024 * 1024) { d.error = "本地歌词超过 4 MiB"; text.clear(); }
                 if (text.rfind("\xef\xbb\xbf", 0) == 0) text.erase(0, 3);
                 d.lines = lyr::parse(text, &d.synced);
                 if (d.lines.empty()) d.error = "本地歌词没有可显示内容";
@@ -1259,7 +1264,7 @@ static void request_lyrics(const music::Track& track) {
         auto shared = std::make_shared<const lyr::Doc>(std::move(d));
         {
             std::lock_guard<std::mutex> lk(g_lyr.m);
-            if (g_lyr.for_uid != uid) return;  // 已经切到别的歌了，这份丢掉
+            if (g_lyr.for_uid != uid || g_lyr.generation != generation) return; // 切歌或重选歌词后丢弃旧请求。
             g_lyr.doc = shared;
             g_lyr.loading = false;
         }
@@ -2448,12 +2453,12 @@ void change_lyric_offset(int delta, bool reset) {
 void use_local_lyrics(bool reset) {
     const auto uid = g_snapshot.now_uid; if (uid.empty()) { toast("请先播放一首歌"); return; }
     const auto path = reset ? std::string() : music::text::trim(g_ui.lyric_file_path);
-    if (!reset && (path.empty() || !platform::exists(path))) { toast("请输入有效的 UTF-8 LRC 文件完整路径"); return; }
+    if (!reset && (path.empty() || path.size() > 8192 || !platform::exists(path))) { toast("请输入有效的 UTF-8 LRC 文件完整路径"); return; }
     library_edit([uid, path](auto& next) {
         if (!next.lyric_preferences.count(uid) && next.lyric_preferences.size() >= 4096) return;
         next.lyric_preferences[uid].path = path;
     }, [uid] {
-        { std::lock_guard<std::mutex> lock(g_lyr.m); if (g_lyr.for_uid == uid) { g_lyr.doc.reset(); g_lyr.loading = false; } }
+        { std::lock_guard<std::mutex> lock(g_lyr.m); if (g_lyr.for_uid == uid) { ++g_lyr.generation; g_lyr.doc.reset(); g_lyr.loading = false; } }
         if (g_snapshot.now_uid == uid) request_current_lyrics();
     });
 }
@@ -2508,6 +2513,7 @@ void select_output_device(const std::string& id) {
     const auto position = g_player.position_ms();
     const bool paused = g_snapshot.ps == PlayState::Paused;
     const int index = g_snapshot.playing;
+    g_ui.device_error.clear();
     g_player.set_device(id); g_ui.output_device = id; g_ui.config_dirty = true;
     if (index >= 0 && !g_snapshot.now_uid.empty() && (paused || g_snapshot.ps == PlayState::Playing || g_snapshot.ps == PlayState::Buffering || g_snapshot.ps == PlayState::Resolving)) {
         { std::lock_guard<std::mutex> lock(g_mu); g_resume_on_start = position; }
@@ -3337,14 +3343,15 @@ void tick() {
             std::lock_guard<std::mutex> lock(g_lyr.m);
             g_lyric_view = {g_lyr.doc, g_lyr.for_uid, g_lyr.loading};
         }
-        static std::string recorded;
-        if (snap.ps == PlayState::Playing && g_ui.pos_ms >= 5000 && !snap.now_uid.empty() && recorded != snap.now_uid) {
-            recorded = snap.now_uid;
+        static int recorded_generation = -1;
+        if (snap.ps == PlayState::Playing && g_ui.pos_ms >= 5000 && !snap.now_uid.empty() && recorded_generation != snap.gen) {
+            recorded_generation = snap.gen;
             const auto track = snap.now_track;
             library_edit([track](auto& next) { next.remember(track); });
         }
+        if (g_player.take_device_fallback()) { g_ui.device_error = "所选设备不可用，当前使用系统默认输出"; toast(g_ui.device_error); }
         static unsigned long long last_device_recovery = 0;
-        if (snap.ps == PlayState::Playing && g_player.take_device_change() && platform::ticks() > last_device_recovery + 3000) {
+        if ((snap.ps == PlayState::Playing || snap.ps == PlayState::Paused) && g_player.take_device_change() && platform::ticks() > last_device_recovery + 3000) {
             last_device_recovery = platform::ticks();
             select_output_device(""); toast("音频设备已断开，正在恢复系统默认输出"); refresh_output_devices();
         }

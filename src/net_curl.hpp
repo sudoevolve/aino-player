@@ -109,7 +109,7 @@ inline Response execute(const Request& req) {
     curl_easy_setopt(transfer.handle, CURLOPT_WRITEFUNCTION, +[](char* p, size_t a, size_t b, void* data) -> size_t {
         auto& body = *static_cast<Body*>(data);
         const auto n = a * b;
-        if (body.text.size() + n > body.limit) return 0;
+        if (body.text.size() > body.limit || n > body.limit - body.text.size()) return 0;
         body.text.append(p, n); return n;
     });
     curl_easy_setopt(transfer.handle, CURLOPT_WRITEDATA, &body);

@@ -129,7 +129,6 @@ inline std::string url_encode(const std::string& s) {
 }
 
 struct Response {
-    std::string content_range;
     int status = 0;
     std::string body;
     std::string content_type;
@@ -137,6 +136,7 @@ struct Response {
     std::string error;   // 非空 = 传输层失败
     std::vector<std::string> set_cookies;
     std::string location;
+    std::string content_range;
     bool ok() const { return error.empty() && status >= 200 && status < 300; }
 };
 
@@ -384,8 +384,8 @@ inline Response execute(const Request& req) {
         DWORD read = 0;
         if (!detail::read(hreq, buf.data(), avail, &read)) { out.error = detail::last_error_text("读取响应"); break; }
         if (!read) break;
+        if (out.body.size() > req.max_body || read > req.max_body - out.body.size()) { out.error = "接口响应过大"; break; }
         out.body.append(buf.data(), read);
-        if (out.body.size() > req.max_body) { out.error = "接口响应过大"; break; }  // 接口响应不可能这么大
     }
     detail::close_request(hreq);
     WinHttpCloseHandle(conn);

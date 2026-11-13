@@ -9,6 +9,7 @@
 #include <functional>
 #include <cctype>
 #include <map>
+#include <cmath>
 
 namespace library {
 inline std::string quote(const std::string& text) {
@@ -249,7 +250,7 @@ public:
         }
         for (const auto& row : root["lyrics"].array) {
             const auto uid = row["uid"].str(), path = row["path"].str();
-            if (uid.empty() || uid.size() > 8192 || path.size() > 8192) { err = "歌词配置损坏"; return false; }
+            if (uid.empty() || uid.size() > 8192 || path.size() > 8192 || !std::isfinite(row["offset"].num())) { err = "歌词配置损坏"; return false; }
             loaded.lyric_preferences[uid] = {int(std::clamp(row["offset"].num(), -60000.0, 60000.0)), path};
         }
         *this = std::move(loaded); return true;

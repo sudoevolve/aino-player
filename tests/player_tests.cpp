@@ -261,11 +261,16 @@ int main(int argc, char** argv) {
         check(platform::make_dirs(dir), "test directory");
         const auto file = platform::join(dir, "资料库.json");
         std::string err;
+        lib.remember(track); lib.remember(track);
+        lib.lyric_preferences["test-song"] = {1250, "中文歌词.lrc"};
         check(lib.save(file, err), "library save");
         library::Library loaded;
         check(loaded.load(file, err), "library load");
         const auto& saved = loaded.playlists.front().tracks.front();
         check(saved.title == track.title && saved.chosen == 1 && saved.variants.size() == 2, "roundtrip metadata");
+        check(loaded.recent.size() == 1 && loaded.recent.front().chosen == 1, "recent history deduplicates and preserves variants");
+        check(loaded.lyric_preferences.at("test-song").offset_ms == 1250 &&
+            loaded.lyric_preferences.at("test-song").path == "中文歌词.lrc", "lyric preferences persist with history");
         check(!loaded.toggle(track) && loaded.playlists.front().tracks.empty(), "favorite remove");
         library::Playlist playlist;
         playlist.key = "netease#99"; playlist.name = "在线歌单"; playlist.remote_id = "99"; playlist.tracks.push_back(track);
@@ -275,6 +280,13 @@ int main(int argc, char** argv) {
         check(loaded.playlists[1].remote_id == "99", "remote id persistence");
         auto* broken = platform::fopen(file, "wb"); std::fputs("{broken", broken); std::fclose(broken);
         check(!loaded.load(file, err) && loaded.playlists.size() == 2, "corrupt file preserves state");
+        auto write_library = [&](const char* text) { auto* output = platform::fopen(file, "wb"); check(output != nullptr, "open library fixture"); std::fputs(text, output); std::fclose(output); };
+        write_library("{\"version\":1,\"playlists\":[],\"recent\":{}}");
+        check(!loaded.load(file, err) && loaded.recent.size() == 1, "invalid optional records preserve prior library");
+        write_library("{\"version\":1,\"playlists\":[],\"lyrics\":[{\"uid\":\"large-offset\",\"offset\":1e100,\"path\":\"\"}]}");
+        check(loaded.load(file, err) && loaded.lyric_preferences.at("large-offset").offset_ms == 60000, "lyric offset clamps before integer conversion");
+        write_library("{\"version\":1,\"playlists\":[]}");
+        check(loaded.load(file, err) && loaded.recent.empty() && loaded.lyric_preferences.empty(), "legacy library without optional records remains readable");
         music::Source source; std::string id;
         check(library::parse_link("https://music.163.com/#/playlist?id=123&userid=456", source, id) && id == "123" && source == music::Source::Netease, "netease url");
         check(library::parse_link("https://y.qq.com/n/ryqq/playlist/123", source, id) && source == music::Source::QQ, "qq url");

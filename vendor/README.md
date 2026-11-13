@@ -19,7 +19,7 @@ stb_image.h 1F8C1B6B408F26E3B20CBFBBD4758AFB3DC9B837FF1E17C258928F406148A87C
 
 FFmpeg 原始源码包 SHA-256：`7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3`。
 
-`tools/build_ffmpeg.py` 保留完整的精简构建参数，不修改上游源码，不启用 GPL、nonfree 或外部库。只保留本地文件协议、所需音频解码器/容器、PCM WAV 输出；关闭网络、设备及视频处理。Windows 产物约 2.97 MiB，嵌入播放器，独立进程运行；`AINO_FFMPEG` 允许替换。完整许可、版本和参数也嵌入 exe，可通过 `--ffmpeg-license` 读取。发布工作流附带官方原始源码包和平台构建信息；Linux deb 安装许可与构建脚本。
+`tools/build_ffmpeg.py` 保留完整的精简构建参数，不修改上游源码，不启用 GPL、nonfree 或外部库。只保留 file/pipe/http/tcp 协议、所需音频解码器/容器、PCM 输出；关闭外部库、设备及视频解码。HTTP/TCP 供播放器本机 Range 代理使用，FFmpeg 不承担远端 HTTPS 或账号请求。Windows 产物约 3.33 MiB，嵌入播放器，独立进程运行；`AINO_FFMPEG` 允许替换。完整许可、版本和参数也嵌入 exe，可通过 `--ffmpeg-license` 读取。发布工作流附带官方原始源码包和平台构建信息；Linux deb 安装许可与构建脚本。
 
 `tests/fixtures/audio-formats.zip` 为本项目生成的一秒钟静音测试样本（CC0），仅供回归，不含音乐作品，也不打入播放器。样本生成命令和格式列表见 `tests/audio_formats_test.py` 的 `--ffmpeg` 参数。
 

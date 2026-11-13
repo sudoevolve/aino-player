@@ -461,10 +461,26 @@ bool Stream::failed() const { return impl_->broken.load(); }
 bool Stream::buffering() const { return impl_->waiting.load() && !impl_->decoded.load(); }
 std::string Stream::error() const { std::lock_guard<std::mutex> lock(impl_->mutex); return impl_->failure; }
 
-static std::string device_key(const ma_device_id& id) {
-    const auto* bytes = reinterpret_cast<const unsigned char*>(&id);
-    const char* hex = "0123456789abcdef"; std::string key;
-    for (size_t i = 0; i < sizeof id; ++i) { key += hex[bytes[i] >> 4]; key += hex[bytes[i] & 15]; }
+static std::string device_key(ma_backend backend, const ma_device_id& id) {
+    const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&id); size_t size = 0;
+    // 仅序列化后端的有效成员，避免 union 尾部未定义字节影响跨启动匹配。
+    const auto text_size = [](const char* text, size_t cap) { size_t n = 0; while (n < cap && text[n]) ++n; return n; };
+    switch (backend) {
+        case ma_backend_wasapi: while (size < 64 && id.wasapi[size]) ++size; size *= sizeof(id.wasapi[0]); break;
+        case ma_backend_dsound: size = sizeof id.dsound; break;
+        case ma_backend_winmm: size = sizeof id.winmm; break;
+        case ma_backend_alsa: size = text_size(id.alsa, sizeof id.alsa); break;
+        case ma_backend_pulseaudio: size = text_size(id.pulse, sizeof id.pulse); break;
+        case ma_backend_coreaudio: size = text_size(id.coreaudio, sizeof id.coreaudio); break;
+        case ma_backend_sndio: size = text_size(id.sndio, sizeof id.sndio); break;
+        case ma_backend_audio4: size = text_size(id.audio4, sizeof id.audio4); break;
+        case ma_backend_oss: size = text_size(id.oss, sizeof id.oss); break;
+        case ma_backend_jack: size = sizeof id.jack; break;
+        case ma_backend_null: size = sizeof id.nullbackend; break;
+        default: return {}; // 自定义/未知后端不持久化指针或未定义标识。
+    }
+    const char* hex = "0123456789abcdef"; std::string key = std::string(ma_get_backend_name(backend)) + ":";
+    for (size_t i = 0; i < size; ++i) { key += hex[bytes[i] >> 4]; key += hex[bytes[i] & 15]; }
     return key;
 }
 std::vector<OutputDevice> output_devices(std::string& error) {
@@ -473,11 +489,13 @@ std::vector<OutputDevice> output_devices(std::string& error) {
     if (rc != MA_SUCCESS) { error = ma_result_description(rc); return out; }
     ma_device_info* devices = nullptr; ma_uint32 count = 0;
     if (ma_context_get_devices(&context, &devices, &count, nullptr, nullptr) == MA_SUCCESS)
-        for (ma_uint32 i = 0; i < count; ++i) out.push_back({device_key(devices[i].id), devices[i].name, devices[i].isDefault != 0});
+        for (ma_uint32 i = 0; i < count; ++i) out.push_back({device_key(context.backend, devices[i].id), devices[i].name, devices[i].isDefault != 0});
     else error = "无法读取系统音频设备";
     ma_context_uninit(&context); return out;
 }
 struct Player::Impl {
+    ma_context context{};
+    bool context_ready = false, device_fallback = false;
     ma_engine engine{};
     ma_sound sound{};
     bool engine_ready = false;
@@ -490,24 +508,27 @@ struct Player::Impl {
         if (engine_ready) return true;
         auto& p = *this;
         auto config = ma_engine_config_init();
+        if (!context_ready) {
+            const auto rc = ma_context_init(nullptr, 0, nullptr, &context);
+            if (rc != MA_SUCCESS) { error = std::string("音频后端初始化失败：") + ma_result_description(rc); return false; }
+            context_ready = true;
+        }
+        config.pContext = &context;
         ma_device_id selected{};
-        if (p.selected_device.size() == sizeof selected * 2) {
-            bool valid = true;
-            for (size_t i = 0; i < sizeof selected; ++i) {
-                const auto a = std::string("0123456789abcdef").find(p.selected_device[i * 2]);
-                const auto b = std::string("0123456789abcdef").find(p.selected_device[i * 2 + 1]);
-                if (a > 15 || b > 15) { valid = false; break; }
-                reinterpret_cast<unsigned char*>(&selected)[i] = static_cast<unsigned char>(a * 16 + b);
-            }
-            if (valid) config.pPlaybackDeviceID = &selected;
+        if (!selected_device.empty()) {
+            ma_device_info* devices = nullptr; ma_uint32 count = 0;
+            if (ma_context_get_devices(&context, &devices, &count, nullptr, nullptr) == MA_SUCCESS)
+                for (ma_uint32 i = 0; i < count; ++i)
+                    if (device_key(context.backend, devices[i].id) == selected_device) { selected = devices[i].id; config.pPlaybackDeviceID = &selected; break; }
+            if (!config.pPlaybackDeviceID) device_fallback = true;
         }
         auto rc = ma_engine_init(&config, &p.engine);
-        if (rc != MA_SUCCESS && config.pPlaybackDeviceID) { config.pPlaybackDeviceID = nullptr; rc = ma_engine_init(&config, &p.engine); }
+        if (rc != MA_SUCCESS && config.pPlaybackDeviceID) { device_fallback = true; config.pPlaybackDeviceID = nullptr; rc = ma_engine_init(&config, &p.engine); }
         if (rc != MA_SUCCESS) { p.error = std::string("音频设备初始化失败：") + ma_result_description(rc); return false; }
         p.engine_ready = true;
         return true;
     }
-    ~Impl() { if (sound_ready) ma_sound_uninit(&sound); if (engine_ready) ma_engine_uninit(&engine); }
+    ~Impl() { if (sound_ready) ma_sound_uninit(&sound); if (engine_ready) ma_engine_uninit(&engine); if (context_ready) ma_context_uninit(&context); }
 };
 Player::Player() : impl_(std::make_unique<Impl>()) {}
 Player::~Player() = default;
@@ -542,6 +563,7 @@ void Player::close() {
 void Player::shutdown() {
     close();
     if (impl_->engine_ready) { ma_engine_uninit(&impl_->engine); impl_->engine_ready = false; }
+    if (impl_->context_ready) { ma_context_uninit(&impl_->context); impl_->context_ready = false; }
 }
 bool Player::play() {
     if (!impl_->sound_ready) return false;
@@ -580,12 +602,13 @@ void Player::set_volume(int volume) {
     if (impl_->sound_ready) ma_sound_set_volume(&impl_->sound, float(impl_->volume) / 100);
 }
 void Player::set_device(const std::string& id) {
-    shutdown(); impl_->selected_device = id;
+    shutdown(); impl_->selected_device = id; impl_->device_fallback = false;
 }
 bool Player::take_device_change() {
     // 默认设备切换由 miniaudio 后端处理；失效设备交给 UI 线程重建，回调不执行销毁。
-    return impl_->engine_ready && ma_device_get_state(ma_engine_get_device(&impl_->engine)) == ma_device_state_stopped && is_playing();
+    return impl_->engine_ready && ma_device_get_state(ma_engine_get_device(&impl_->engine)) == ma_device_state_stopped && impl_->sound_ready;
 }
+bool Player::take_device_fallback() { const bool value = impl_->device_fallback; impl_->device_fallback = false; return value; }
 const std::string& Player::error() const {
     if (impl_->stream && impl_->stream->failed()) impl_->error = impl_->stream->error();
     return impl_->error;
