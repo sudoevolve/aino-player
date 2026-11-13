@@ -354,3 +354,6 @@ GitHub Release v0.2.6 已设为 latest；Windows 安装器 3,798,969 字节、�
 用户优先要求完成可添加的软件源，Ubuntu 官方仓库与 NextKde 工作暂缓。沿用已发布、已验证的 deb，不改播放器源码、版本或 Release 附件。独立工具仅负责从正式 GitHub Releases 收集包、核对服务器 digest / SHA256SUMS / dpkg 包身份、生成索引和签名；独立工作流将静态站点部署到 GitHub Pages。客户端使用 deb822 源及 Signed-By 专用 keyring，不全局信任公钥。依赖只有 runner 的标准 APT/GnuPG 工具，播放器运行时不增加依赖。
 
 专用 Ed25519 签名密钥指纹 6BC11916DDE36B879AD6AC8A18681C67CA6020FE；私钥在本机受限目录备份，并配置为 APT_SIGNING_PRIVATE_KEY secret，不在仓库或日志中输出。索引有效期 30 天，每周和正式版成功发布后刷新；保留最高三个兼容正式版及上一代按摘要寻址的索引。先做脚本语法、差异与发布边界审查，部署时以 gpgv 与隔离 APT 配置核对签名和候选版本；不安装/启动播放器、不跑 CTest、音频、浏览器或界面回归。README 只增加安装入口，详细维护说明放在 APT.md。
+
+
+部署验收：Publish APT repository 工作流 43391708355 成功，隔离 APT 索引读取显示 Candidate: 0.2.6；保留 0.2.6、0.2.3、0.2.1 三个经过 GitHub digest 与 SHA256SUMS 双重核验的正式 deb。GitHub Pages 已以 Actions 模式启用，公网 https://sudoevolve.github.io/aino-player/apt/ 可访问。另从公网下载公钥、源配置、InRelease、Packages/Packages.gz 与最新 deb：公钥及配置与仓库一致，gpgv 验签成功，两个索引符合签名 Release 的摘要/大小，最新 deb 符合 Packages 摘要并逐字节等于原 v0.2.6 Release 附件。本轮未构建、安装、启动播放器或运行回归，没有创建新播放器版本。
