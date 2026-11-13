@@ -41,7 +41,7 @@ python tools/build_installer.py --exe build/Release/aino_player.exe --output bui
 
 ## 发布流程
 
-`CMakeLists.txt` 中的项目版本是版本号来源。仅在明确要求发布新版本时运行回归，普通提交不触发 CI。推送对应 `v*` 标签后，`release.yml` 分别在 Windows 和 Ubuntu 编译精简 FFmpeg、嵌入播放器并运行无系统解码器的回归；Linux 生成 deb 后验证安装与 Xvfb 启动。两端成功后发布 exe、deb、FFmpeg 官方原始源码包、构建信息、许可及 `SHA256SUMS.txt`。当前 `0.2.5` 对应标签 `v0.2.5`，标签与程序版本不符或缺少内置解码器会中止发布；不会覆盖旧版标签或安装包。
+`CMakeLists.txt` 中的项目版本是版本号来源。仅在明确要求发布新版本时运行回归，普通提交不触发 CI。推送对应 `v*` 标签后，`release.yml` 分别在 Windows 和 Ubuntu 编译精简 FFmpeg、嵌入播放器并运行无系统解码器的回归；Linux 生成 deb 后验证安装与 Xvfb 启动。两端成功后发布 exe、deb、FFmpeg 官方原始源码包、构建信息、许可及 `SHA256SUMS.txt`。当前 `0.2.6` 对应标签 `v0.2.6`，标签与程序版本不符或缺少内置解码器会中止发布；不会覆盖旧版标签或安装包。
 
 本地 Debian 打包：
 

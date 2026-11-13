@@ -34,7 +34,7 @@
 Linux 可直接覆盖升级，无需先卸载：
 
 ```bash
-sudo apt install ./aino-player_0.2.5_amd64.deb
+sudo apt install ./aino-player_0.2.6_amd64.deb
 ```
 
 设置 → 通用 → 版本更新可查看更新内容并升级。升级保留配置、收藏和歌单。
