@@ -24,7 +24,7 @@ inline std::string url_encode(const std::string& s) {
 }
 struct Response {
     int status = 0;
-    std::string body, content_type, final_url, error;
+    std::string body, content_type, final_url, error, content_range;
     std::vector<std::string> set_cookies;
     std::string location;
     bool ok() const { return error.empty() && status >= 200 && status < 300; }
@@ -34,6 +34,7 @@ struct Request {
     std::vector<std::string> headers;
     int timeout_ms = 8000;
     bool follow_redirects = true;
+    size_t max_body = 8u * 1024 * 1024;
 };
 namespace detail {
 struct Transfer {
@@ -93,7 +94,7 @@ struct Transfer {
         curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &status);
         curl_easy_getinfo(handle, CURLINFO_CONTENT_TYPE, &type);
         curl_easy_getinfo(handle, CURLINFO_EFFECTIVE_URL, &url);
-        out.status = int(status);
+        out.status = int(status); out.content_range = content_range;
         out.set_cookies = set_cookies; out.location = location;
         if (type) out.content_type = type;
         if (url) out.final_url = url;
@@ -104,13 +105,14 @@ inline Response execute(const Request& req) {
     Response out;
     detail::Transfer transfer;
     if (!transfer.setup(req)) { out.error = "网络初始化失败"; return out; }
+    struct Body { std::string& text; size_t limit; } body{out.body, req.max_body};
     curl_easy_setopt(transfer.handle, CURLOPT_WRITEFUNCTION, +[](char* p, size_t a, size_t b, void* data) -> size_t {
-        auto& body = *static_cast<std::string*>(data);
+        auto& body = *static_cast<Body*>(data);
         const auto n = a * b;
-        if (body.size() + n > 8 * 1024 * 1024) return 0;
-        body.append(p, n); return n;
+        if (body.text.size() + n > body.limit) return 0;
+        body.text.append(p, n); return n;
     });
-    curl_easy_setopt(transfer.handle, CURLOPT_WRITEDATA, &out.body);
+    curl_easy_setopt(transfer.handle, CURLOPT_WRITEDATA, &body);
     const auto rc = curl_easy_perform(transfer.handle);
     transfer.response(out);
     if (rc != CURLE_OK) out.error = curl_easy_strerror(rc);

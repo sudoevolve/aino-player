@@ -1,0 +1,35 @@
+name: Desktop compile only
+# 独立编译验证：不运行 CTest、音频、浏览器、窗口或发布流程。
+on:
+  push:
+    branches: ['build/desktop-linux-20261113']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y build-essential python3 libx11-dev libdbus-1-dev pkg-config libcurl4-openssl-dev
+      - uses: actions/cache@v5.0.5
+        with:
+          path: |
+            build/codec
+            build/codec-build
+          key: desktop-codec-${{ matrix.os }}-${{ hashFiles('tools/build_ffmpeg.py') }}
+      - name: Build minimal decoder
+        run: python3 tools/build_ffmpeg.py --jobs 2
+      - name: Configure without tests
+        run: cmake -S . -B build/desktop -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+      - name: Compile player only
+        run: cmake --build build/desktop --target aino_player --parallel 2
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: aino-player-${{ matrix.os }}-development
+          path: build/desktop/aino_player
