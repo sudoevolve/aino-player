@@ -8,6 +8,12 @@ on:
         description: Existing version tag to build and publish
         required: true
         type: string
+      platform:
+        description: Build both to publish; a single platform only uploads validated artifacts
+        required: true
+        default: both
+        type: choice
+        options: [both, windows, linux]
 permissions:
   contents: read
 env:
@@ -17,6 +23,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   windows:
+    if: github.event_name != 'workflow_dispatch' || inputs.platform != 'linux'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7.0.1
@@ -60,6 +67,7 @@ jobs:
             dist/FFmpeg-BUILD-windows.txt
           if-no-files-found: error
   linux:
+    if: github.event_name != 'workflow_dispatch' || inputs.platform != 'windows'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7.0.1
@@ -89,7 +97,8 @@ jobs:
           previous_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
           if [ "$previous_tag" != "$RELEASE_TAG" ]; then
             gh release download "$previous_tag" --repo "$GITHUB_REPOSITORY" --dir build/previous-release --pattern '*.deb' --pattern SHA256SUMS.txt
-            (cd build/previous-release && sha256sum --check --ignore-missing SHA256SUMS.txt)
+            # 早期版本的校验清单由 Windows 生成，兼容 CRLF，不改变摘要或文件内容。
+            (cd build/previous-release && tr -d '\r' < SHA256SUMS.txt | sha256sum --check --ignore-missing -)
             test "$(dpkg-deb --field build/previous-release/*.deb Package)" = aino-player
             sudo apt-get install -y --no-remove ./build/previous-release/*.deb
             previous_version="$(dpkg-query -W -f='${Version}' aino-player)"

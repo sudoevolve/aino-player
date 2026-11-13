@@ -45,6 +45,8 @@ python tools/build_installer.py --exe build/Release/aino_player.exe --output bui
 
 本地 Debian 打包：
 
+发布工作流手动执行时可选择单个平台，仅构建、验证并上传产物，不自动发布。可用于只恢复失败的平台；复用另一平台的产物前须确认同一标签、同一提交且其验证任务成功。
+
 ```bash
 python3 tools/build_ffmpeg.py
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DAINO_BUILD_TESTS=ON
