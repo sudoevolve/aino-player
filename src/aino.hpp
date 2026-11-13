@@ -1321,6 +1321,13 @@ namespace icons {
     extern const char* dot;
 }
 
+/**
+ * @brief 在创建窗口之前调用；处理短时系统图标解码子进程，并为普通启动启用隔离。
+ * @return -1 表示继续应用启动，非负值表示工作进程已处理，应立即作为退出码返回。
+ * @note Linux 复用当前可执行文件；其他平台返回 -1。未接入的应用保持进程内解码。
+ */
+int system_icon_worker_entry(int argc, char** argv);
+
 } // namespace aino
 
 #endif // AINO_HPP
@@ -1370,6 +1377,15 @@ namespace icons {
 // 装 libfreetype-dev 才看得见正常字，等于没修。见下方 FtApi / FcApi。
 #  include <dlfcn.h>
 #  include <time.h>
+#  if defined(__linux__)
+#    include <spawn.h>
+#    include <sys/stat.h>
+#    include <sys/wait.h>
+#    include <fcntl.h>
+#    include <signal.h>
+#    include <filesystem>
+extern char** environ;
+#  endif
 #elif defined(AINO_PLATFORM_MACOS)
 // MacTypes.h 会往**全局**塞 ::Rect 和 ::Style（QuickDraw 遗产），和 aino::Rect /
 // aino::Style 撞名 —— 用户代码里 `using aino::Rect;` 会变成二义性。包含系统头之前
@@ -11724,7 +11740,7 @@ private:
     };
     struct Font {
         double px = 0.0;
-        void* face = nullptr;             // 主字体的 FT_Face
+        bool ready = false;              // 度量已建立；不持有可被冷回收的裸 FT_Face。
         int asc = 0, desc = 0;
         std::vector<std::string> files;   // 兜底链：文件路径
         std::vector<long> indices;
@@ -11735,18 +11751,19 @@ private:
 
     Font* font(float size, int weight, bool mono) {
         if (!ft_ready_ || size <= 0.0f) return nullptr;
+        reap_faces();
         const int q  = int(size * 2.0f + 0.5f);       // 0.5px 量化，一次开一种字号
         const int wq = weight >= 650 ? 200 : (weight >= 550 ? 180 : (weight <= 350 ? 50 : 80));
         const int key = (mono ? 100000000 : 0) + q * 1000 + wq;
         auto it = fonts_.find(key);
-        if (it != fonts_.end()) return it->second.face ? &it->second : nullptr;
+        if (it != fonts_.end()) return it->second.ready ? &it->second : nullptr;
         Font f;
         if (build(f, mono ? mono_ : sans_, double(q) * 0.5, wq)) {
             Font& slot = fonts_[key];
             slot = std::move(f);
             return &slot;
         }
-        // 失败也记一笔（face 为空），避免每帧重试一遍 fontconfig
+        // 失败也记一笔，避免每帧重试一遍 fontconfig。
         fonts_[key] = Font();
         return nullptr;
     }
@@ -11785,9 +11802,14 @@ private:
                 void* cs = nullptr;
                 std::shared_ptr<void> charset;
                 if (fc.get_charset) fc.get_charset(set->fonts[i], "charset", 0, &cs);
-                if (cs && fc.charset_copy && fc.charset_destroy)
-                    charset = std::shared_ptr<void>(fc.charset_copy(cs), fc.charset_destroy);
                 const bool has_cjk = !cjk_found && cs && fc.charset_has && fc.charset_has(cs, 0x4E2Du);
+                if ((int(f.files.size()) < cap || has_cjk) && cs && fc.charset_copy && fc.charset_destroy) {
+                    const auto key = std::make_pair(std::string(reinterpret_cast<const char*>(file)), long(index));
+                    auto found = charsets_.find(key);
+                    if (found == charsets_.end())
+                        found = charsets_.emplace(key, std::shared_ptr<void>(fc.charset_copy(cs), fc.charset_destroy)).first;
+                    charset = found->second;
+                }
                 if (has_cjk) {
                     cjk_found = true;
                     cjk_file = reinterpret_cast<const char*>(file);
@@ -11826,7 +11848,7 @@ private:
             }
         }
         if (!face) return false;
-        f.face = face;
+        f.ready = true;
 
         // 升降部采用主字体 metrics，避免使用单个 CJK 字形的墨迹高度改变行高和垂直对齐。
         FtFaceLite* fr = static_cast<FtFaceLite*>(face);
@@ -11858,6 +11880,7 @@ private:
         const auto key = std::make_pair(f.files[i], f.indices[i]);
         auto inserted = faces_.emplace(key, SharedFace{});
         auto& shared = inserted.first->second;
+        shared.touched = face_time();
         FtApi& ft = ft_api();
         if (inserted.second) {
             if (ft.new_face(ft.ft_lib, f.files[i].c_str(), f.indices[i], &shared.face) != 0) shared.face = nullptr;
@@ -11870,6 +11893,24 @@ private:
             shared.size = size;
         }
         return shared.face;
+    }
+
+    static uint64_t face_time() {
+        timespec value{}; clock_gettime(CLOCK_MONOTONIC, &value);
+        return uint64_t(value.tv_sec) * 1000 + uint64_t(value.tv_nsec) / 1000000;
+    }
+    // 已复制的字形和行高不依赖 FT_Face；只关闭十秒未参与缺字光栅化的文件。
+    // 下一次缓存缺字时按相同文件、face index、字号重新打开，不改变选字与显示。
+    void reap_faces() {
+        const auto now = face_time();
+        if (now < face_reap_ + 1000) return;
+        face_reap_ = now;
+        for (auto it = faces_.begin(); it != faces_.end();) {
+            if (now >= it->second.touched + 10000) {
+                if (it->second.face) ft_api().done_face(it->second.face);
+                it = faces_.erase(it);
+            } else ++it;
+        }
     }
 
     bool covers(const Font& f, size_t index, unsigned long cp) const {
@@ -12025,7 +12066,7 @@ private:
         if (ft.lib) {
             for (auto& kv : faces_) if (kv.second.face) ft.done_face(kv.second.face);
         }
-        fonts_.clear(); faces_.clear(); glyph_bytes_ = 0; glyph_count_ = 0;
+        fonts_.clear(); faces_.clear(); charsets_.clear(); face_reap_ = 0; glyph_bytes_ = 0; glyph_count_ = 0;
         uncached_glyph_ = Glyph{};
     }
 
@@ -12166,8 +12207,10 @@ private:
     std::string mono_;
     std::unordered_map<int, XFontSet> sets_;
     std::unordered_map<int, Font> fonts_;
-    struct SharedFace { void* face = nullptr; long size = 0; };
+    struct SharedFace { void* face = nullptr; long size = 0; uint64_t touched = 0; };
     std::map<std::pair<std::string, long>, SharedFace> faces_;
+    std::map<std::pair<std::string, long>, std::shared_ptr<void>> charsets_;
+    uint64_t face_reap_ = 0;
     size_t glyph_bytes_ = 0;
     size_t glyph_count_ = 0;
     Glyph uncached_glyph_;
@@ -13454,7 +13497,7 @@ struct X11IconLookup {
         return file;
     }
 };
-inline SystemIconMask x11_load_system_icon(SystemIcon icon, int size) {
+inline std::string x11_system_icon_file(SystemIcon icon, int size) {
     static const char* names[] = {
         "input-mouse", "insert-text", "object-select", "preferences-system", "view-list", "open-menu",
         "x-office-calendar", "applications-graphics", "preferences-system-notifications", "view-grid",
@@ -13467,16 +13510,19 @@ inline SystemIconMask x11_load_system_icon(SystemIcon icon, int size) {
         "media-playlist-shuffle", "media-playlist-repeat-song", "media-playlist-repeat", "alarm"
     };
     static_assert(sizeof(names) / sizeof(names[0]) == size_t(SystemIcon::Count));
-    SystemIconMask mask;
-    if (size <= 0 || size > 512 || size_t(icon) >= size_t(SystemIcon::Count)) return mask;
-    static X11IconPixels api;
+    if (size <= 0 || size > 512 || size_t(icon) >= size_t(SystemIcon::Count)) return {};
     static thread_local X11IconLookup lookup;
-    if (!api.lib) return mask;
     std::string file = lookup.find(std::string(names[size_t(icon)]) + "-symbolic");
     if (file.empty()) file = lookup.find(names[size_t(icon)]);
     if (file.empty() && icon == SystemIcon::RepeatOne) file = lookup.find("media-playlist-repeat-symbolic");
     if (file.empty() && icon == SystemIcon::Timer) file = lookup.find("preferences-system-time-symbolic");
-    if (file.empty()) { x11_trace("system icon unavailable: %s", names[size_t(icon)]); return mask; }
+    if (file.empty()) x11_trace("system icon unavailable: %s", names[size_t(icon)]);
+    return file;
+}
+inline SystemIconMask x11_decode_system_icon(const std::string& file, int size) {
+    SystemIconMask mask;
+    static X11IconPixels api;
+    if (!api.lib || file.empty()) return mask;
     void* image = api.load(file.c_str(), size, size, 1, nullptr);
     if (!image) return mask;
     const int w = api.width(image), h = api.height(image), stride = api.stride(image), channels = api.channels(image);
@@ -13493,6 +13539,130 @@ inline SystemIconMask x11_load_system_icon(SystemIcon icon, int size) {
     }
     api.unref(image);
     return mask;
+}
+#if defined(__linux__)
+inline bool& x11_icon_worker_enabled() { static bool enabled = false; return enabled; }
+// 缓存只存最终 alpha；主题源文件、时间戳、尺寸和协议版本共同参与键。
+inline std::string x11_icon_cache_dir() {
+    const char* cache = std::getenv("XDG_CACHE_HOME");
+    const char* home = std::getenv("HOME");
+    const std::string base = cache && *cache ? cache : home && *home ? std::string(home) + "/.cache" : "";
+    if (base.empty() || base.front() != '/') return {};
+    std::error_code ec;
+    const auto dir = std::filesystem::path(base) / "aino-system-icons-v1";
+    std::filesystem::create_directories(dir, ec);
+    if (ec) return {};
+    struct stat status{};
+    if (lstat(dir.c_str(), &status) != 0 || !S_ISDIR(status.st_mode) || status.st_uid != getuid() ||
+        (status.st_mode & 0077) != 0) {
+        // 只收紧本用户创建的真实目录，不跟随符号链接。
+        if (!S_ISDIR(status.st_mode) || status.st_uid != getuid() || chmod(dir.c_str(), 0700) != 0) return {};
+    }
+    return dir.string();
+}
+inline std::string x11_icon_cache_file(const std::string& dir, const std::string& source, int size) {
+    struct stat status{};
+    if (dir.empty() || source.empty() || stat(source.c_str(), &status) != 0 || !S_ISREG(status.st_mode)) return {};
+    const auto key = std::string("alpha-v1|") + source + "|" + std::to_string(size) + "|" +
+        std::to_string(status.st_size) + "|" + std::to_string(status.st_mtim.tv_sec) + "|" + std::to_string(status.st_mtim.tv_nsec);
+    uint64_t hash = 1469598103934665603ull;
+    for (unsigned char byte : key) { hash ^= byte; hash *= 1099511628211ull; }
+    char name[40]; std::snprintf(name, sizeof name, "/%016llx.mask", static_cast<unsigned long long>(hash));
+    return dir + name;
+}
+inline bool x11_read_icon_cache(const std::string& path, int size, SystemIconMask& mask) {
+    if (path.empty()) return false;
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return false;
+    FILE* input = fdopen(fd, "rb");
+    if (!input) { close(fd); return false; }
+    struct stat info{}; uint32_t header[3]{};
+    bool ok = fstat(fd, &info) == 0 && S_ISREG(info.st_mode) && info.st_uid == getuid() &&
+        std::fread(header, sizeof header, 1, input) == 1 && header[0] == 0x41494e31 &&
+        header[1] > 0 && header[2] > 0 && header[1] <= uint32_t(size) && header[2] <= uint32_t(size) &&
+        info.st_size == static_cast<off_t>(sizeof header + size_t(header[1]) * header[2]);
+    if (ok) {
+        mask.width = int(header[1]); mask.height = int(header[2]);
+        mask.alpha.resize(size_t(mask.width) * mask.height);
+        ok = std::fread(mask.alpha.data(), 1, mask.alpha.size(), input) == mask.alpha.size();
+    }
+    std::fclose(input);
+    if (!ok) mask = {};
+    return ok;
+}
+inline bool x11_write_icon_cache(const std::string& path, const SystemIconMask& mask) {
+    if (path.empty() || mask.alpha.empty()) return false;
+    std::string temporary = path + ".XXXXXX";
+    const int fd = mkstemp(&temporary[0]);
+    if (fd < 0) return false;
+    FILE* output = fdopen(fd, "wb");
+    if (!output) { close(fd); unlink(temporary.c_str()); return false; }
+    const uint32_t header[]{0x41494e31, uint32_t(mask.width), uint32_t(mask.height)};
+    bool ok = std::fwrite(header, sizeof header, 1, output) == 1 &&
+        std::fwrite(mask.alpha.data(), 1, mask.alpha.size(), output) == mask.alpha.size();
+    ok = std::fclose(output) == 0 && ok;
+    if (ok) ok = rename(temporary.c_str(), path.c_str()) == 0;
+    if (!ok) unlink(temporary.c_str());
+    return ok;
+}
+inline void x11_trim_icon_cache(const std::string& dir) {
+    namespace fs = std::filesystem;
+    std::error_code ec; uintmax_t bytes = 0;
+    std::vector<std::pair<fs::file_time_type, fs::path>> files;
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        const auto status = it->symlink_status(ec);
+        if (ec || !fs::is_regular_file(status) || it->path().extension() != ".mask") continue;
+        const auto count = it->file_size(ec); if (ec) break;
+        const auto time = it->last_write_time(ec); if (ec) break;
+        bytes += count; files.push_back({time, it->path()});
+    }
+    std::sort(files.begin(), files.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (const auto& file : files) {
+        if (bytes <= 8u * 1024u * 1024u) break;
+        const auto count = fs::file_size(file.second, ec); if (ec) continue;
+        if (fs::remove(file.second, ec)) bytes -= count;
+    }
+}
+inline bool x11_run_icon_worker(int size) {
+    std::string scale = std::to_string(size), theme = x11_effective_icon_theme();
+    char executable[] = "/proc/self/exe", mode[] = "--aino-system-icons-v1";
+    char* args[]{executable, mode, &scale[0], &theme[0], nullptr};
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) return false;
+    int error = posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    if (!error) error = posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+    if (!error) error = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    pid_t pid = 0;
+    if (!error) error = posix_spawn(&pid, executable, &actions, nullptr, args, ::environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if (error) return false;
+    timespec start{}; clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;) {
+        int status = 0; const auto result = waitpid(pid, &status, WNOHANG);
+        if (result == pid) return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        if (result < 0 && errno != EINTR) return false;
+        timespec now{}; clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - start.tv_sec >= 5) {
+            kill(pid, SIGKILL); while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+            return false;
+        }
+        timespec delay{0, 2000000}; nanosleep(&delay, nullptr);
+    }
+}
+#endif
+inline SystemIconMask x11_load_system_icon(SystemIcon icon, int size) {
+    const auto file = x11_system_icon_file(icon, size);
+    if (file.empty()) return {};
+#if defined(__linux__)
+    if (x11_icon_worker_enabled()) {
+        const auto path = x11_icon_cache_file(x11_icon_cache_dir(), file, size);
+        SystemIconMask mask;
+        if (x11_read_icon_cache(path, size, mask)) return mask;
+        // 同尺寸图标批量生成一次；失败时保留原解码路径，不能让图标消失。
+        if (!path.empty() && x11_run_icon_worker(size) && x11_read_icon_cache(path, size, mask)) return mask;
+    }
+#endif
+    return x11_decode_system_icon(file, size);
 }
 #endif
 
@@ -13596,6 +13766,33 @@ inline SystemIconMask load_system_icon(SystemIcon icon, int size) {
     return mask;
 }
 } // namespace detail
+
+inline int system_icon_worker_entry(int argc, char** argv) {
+#if defined(AINO_PLATFORM_X11) && defined(__linux__)
+    if (argc > 1 && std::strcmp(argv[1], "--aino-system-icons-v1") == 0) {
+        if (argc != 4 || !argv[2] || !*argv[2]) return 2;
+        char* end = nullptr; const long size = std::strtol(argv[2], &end, 10);
+        if (!end || *end || size < 1 || size > 512) return 2;
+        detail::x11_icon_theme() = argv[3];
+        const auto dir = detail::x11_icon_cache_dir();
+        if (dir.empty()) return 3;
+        for (size_t i = 0; i < size_t(SystemIcon::Count); ++i) {
+            const auto file = detail::x11_system_icon_file(SystemIcon(i), int(size));
+            const auto path = detail::x11_icon_cache_file(dir, file, int(size));
+            detail::SystemIconMask cached;
+            if (path.empty() || detail::x11_read_icon_cache(path, int(size), cached)) continue;
+            const auto mask = detail::x11_decode_system_icon(file, int(size));
+            if (!mask.alpha.empty() && !detail::x11_write_icon_cache(path, mask)) return 4;
+        }
+        detail::x11_trim_icon_cache(dir);
+        return 0;
+    }
+    detail::x11_icon_worker_enabled() = true;
+#else
+    (void)argc; (void)argv;
+#endif
+    return -1;
+}
 
 inline bool Ui::system_icon(SystemIcon icon, const Rect& box, const Color& color) {
     if (impl->measure_on) { impl->measure_add(box); return true; }

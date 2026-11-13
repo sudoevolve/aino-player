@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdio>
 int main(int argc, char** argv) {
+    if (const int code = aino::system_icon_worker_entry(argc, argv); code >= 0) return code;
     using namespace player;
     if (argc > 1 && std::string(argv[1]) == "--version") {
         std::printf("aino player %s\n", kVersion); return 0;

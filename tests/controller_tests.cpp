@@ -45,6 +45,7 @@ int main(int argc, char** argv) {
                 platform::sleep_ms(10);
             }
             check(ready, "bounded cover workers drain all queued images");
+            check(g_covers.stats().pixel_bytes <= cover::Store::pixel_budget, "cover cache stays within pixel budget");
             cover_image(base + "/old");
             g_covers.clear();
             const auto clear_deadline = platform::ticks() + 3000;
