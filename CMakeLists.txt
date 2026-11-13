@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(aino_player VERSION 0.2.6 LANGUAGES CXX C)
+project(aino_player VERSION 0.2.7 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
