@@ -10,8 +10,114 @@
 static void check(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
+
+// 不访问音乐网站，覆盖平台编码差异、译文对齐与同曲匹配的拒绝条件。
+static void lyric_checks() {
+    const std::string original = "[00:01.00]First line (stay)\n[00:02.00]Another line\n[00:03.00]Last line";
+    const std::string translation = "[00:01.03]第一行\n[00:02.00]另一行\n[00:03.00]最后一行";
+    auto doc = lyr::qq_lyric_document("MusicJsonCallback({\"code\":0,\"lyric\":" + library::quote(original) +
+        ",\"trans\":" + library::quote(lx::detail::base64_encode(translation)) + "})");
+    check(doc.lines.size() == 3 && doc.lines[0].translation == "第一行", "QQ JSONP decodes original and independent Base64 translation");
+    doc = lyr::qq_lyric_document("{\"code\":0,\"lyric\":" + library::quote(lx::detail::base64_encode("\xef\xbb\xbf" + original)) +
+        ",\"trans\":" + library::quote(translation) + "}");
+    check(doc.lines.size() == 3 && doc.lines[2].text == "Last line" && doc.lines[2].translation == "最后一行",
+        "QQ Base64 original with BOM supports plaintext translations");
+    check(lyr::qq_lyric_document("{\"code\":1101,\"lyric\":\"wrong\"}").empty(), "QQ business error is not displayed as lyrics");
+    auto native = lyr::from_lrc(original, "酷狗");
+    check(lyr::needs_translation(native) && !lyr::needs_translation(doc), "foreign lyrics request missing translation only");
+    check(!lyr::needs_translation(lyr::from_lrc("[00:01]中文歌词\n[00:02]没有翻译\n[00:03]也能显示", "酷我")),
+        "Chinese originals do not trigger translation searches");
+    auto shifted = doc;
+    for (auto& line : shifted.lines) line.ms += 600;
+    check(lyr::supplement_translation(native, shifted) && native.lines[0].ms == 1000 && native.lines[0].translation == "第一行",
+        "supplement aligns exact text while retaining native timestamps");
+    auto wrong = lyr::from_lrc(original, "咪咕");
+    auto different = shifted;
+    different.lines[0].text = "First line (leave)";
+    check(!lyr::supplement_translation(wrong, different) && !lyr::has_translation(wrong),
+        "bracketed lyric content cannot be discarded to force matches");
+    different = shifted;
+    for (auto& line : different.lines) line.ms += 10000;
+    check(!lyr::supplement_translation(wrong, different), "unrelated timelines cannot attach translated lines");
+    auto timed = lyr::from_lrc("[00:01]one\n[00:02]two", "test");
+    lyr::add_translation(timed, "\xef\xbb\xbf[00:01.04]一\n[00:02.20]二");
+    check(timed.lines[0].translation == "一" && timed.lines[1].translation.empty(), "same-platform alignment tolerates rounding, not line shifts");
+    check(lyr::to_lrc(doc).find("[00:01.00]第一行") != std::string::npos, "LRC exports preserve translation timestamps");
+    {
+        net::CancelScope cancel([] { return true; });
+        music::Track track; track.title = "cancelled";
+        check(lyr::fetch(track, {}).error == "歌词加载已取消", "cancelled fetch cannot search external platforms");
+    }
+    const auto providers = platform::fs::path(__FILE__).parent_path().parent_path() / "providers";
+    auto provider_lyric = [&](const char* key, const std::string& mock, const std::string& args) {
+        std::ifstream file(providers / (std::string(key) + ".js"), std::ios::binary);
+        const std::string code((std::istreambuf_iterator<char>(file)), {});
+        check(!code.empty(), "bundled provider fixture exists");
+        prov::Provider provider; std::string error; js::Value result;
+        if (!provider.load(key, mock + "\n" + code, error)) throw std::runtime_error(std::string(key) + ": " + error);
+        if (!provider.request("lyric", args, result, error)) throw std::runtime_error(std::string(key) + ": " + error);
+        return result;
+    };
+    const auto kuwo = provider_lyric("kuwo", R"JS(ctx.http = function(url) {
+        if (!url.includes('musicId=440613')) throw Error('wrong Kuwo song');
+        return {statusCode:200,body:{data:{lrclist:[{time:'1.234',lineLyric:'中文原文'}]}}};
+    };)JS", R"({"id":"440613"})");
+    check(lyr::from_lrc(kuwo["lyric"].str(), "酷我").lines[0].ms == 1234, "Kuwo timestamps preserve millisecond precision");
+    const auto kugou = provider_lyric("kugou", R"JS(ctx.http = function(url) {
+        if (url.includes('/search?')) return {statusCode:200,body:{candidates:[{id:'bad',duration:120000},{id:'match',accesskey:'key',duration:240000}]}};
+        if (!url.includes('id=match') || !url.includes('fmt=lrc')) throw Error('wrong Kugou candidate');
+        return {statusCode:200,body:{fmt:'lrc',content:ctx.b64encode('[00:01]酷狗原文')}};
+    };)JS", R"({"native_id":"da60f11f69affc7107adede9dd17352a","duration_ms":240000,"title":"test"})");
+    check(kugou["lyric"].str() == "[00:01]酷狗原文", "Kugou selects matching duration and decodes LRC");
+    const auto migu = provider_lyric("migu", R"JS(ctx.http = function(url,opts) {
+        if (url.includes('/resourceinfo.do')) {
+            if (opts.method !== 'POST' || opts.body !== 'resourceId=1139116209') throw Error('wrong Migu ID');
+            return {statusCode:200,body:{resource:[{songId:'other',copyrightId:'other',lrcUrl:'https://bad.test/'},{songId:'1139116209',copyrightId:'600ABC',lrcUrl:'https://test/lrc',trcUrl:'https://test/trc',mrcUrl:'https://test/mrc'}]}};
+        }
+        if (url.endsWith('/mrc')) return {statusCode:200,bodyText:'06045c357454a5644d9424fc99d16df07f689a9af7680331cda53eecf2f6e29661b0d9448f011d53dce7d817b32dd38a0ca4e3b519ac61a240ccc84a05df48ba'};
+        return {statusCode:200,bodyText:url.endsWith('/trc')?'[00:01]中文译文':'[00:01]Original'};
+    };)JS", R"({"id":"1139116209","native_id":"600ABC"})");
+    check(migu["lyric"].str() == "[00:01.000]Original" && migu["translation"].str() == "[00:01]中文译文",
+        "Migu selects exact ID, restores MRC timeline and retrieves translation");
+}
+
+static void playlist_completion_checks() {
+    std::string detail = R"({"code":200,"playlist":{"trackCount":205,"tracks":[{"id":205,"name":"last","ar":[{"name":"Artist"}]}],"trackIds":[)";
+    for (int id = 1; id <= 205; ++id) { if (id > 1) detail += ','; detail += "{\"id\":" + std::to_string(id) + "}"; }
+    detail += "]}}";
+    int calls = 0; bool fail = false;
+    auto request = [&](const std::string& url, const std::vector<std::string>&, int) {
+        net::Response r; r.status = 200; ++calls;
+        if (url.find("/playlist/detail?") != std::string::npos) { r.body = detail; return r; }
+        if (fail) { r.status = 500; return r; }
+        const auto start = url.find("ids="); check(start != std::string::npos, "completion calls song details");
+        std::string decoded;
+        for (size_t i = start + 4; i < url.size(); ++i) {
+            if (url[i] == '%' && i + 2 < url.size()) { decoded += char(std::stoul(url.substr(i + 1, 2), nullptr, 16)); i += 2; }
+            else decoded += url[i];
+        }
+        js::Value ids; check(js::parse(decoded, ids), "completion sends JSON ID array");
+        check(ids.array.size() <= 100, "completion batches are bounded");
+        r.body = "{\"code\":200,\"songs\":[";
+        for (size_t i = ids.array.size(); i-- > 0;) {
+            if (i + 1 != ids.array.size()) r.body += ',';
+            r.body += "{\"id\":" + std::to_string(ids[i].integer()) + R"(,"name":"song","artists":[{"name":"Artist"}],"album":{"name":"Album"},"duration":180000})";
+        }
+        r.body += "]}"; return r;
+    };
+    std::string error;
+    auto songs = ne::fetch_playlist({}, "123", error, 1000, nullptr, request);
+    check(error.empty() && songs.size() == 205 && calls == 4, "preview is completed using missing IDs across bounded batches");
+    check(songs.front().current().id == "1" && songs.back().current().id == "205" && songs.front().album == "Album" && songs.front().duration_ms == 180000,
+        "unordered legacy details retain playlist order and metadata");
+    fail = true;
+    check(ne::fetch_playlist({}, "123", error, 1000, nullptr, request).empty() && !error.empty(), "failed completion cannot overwrite saved playlists with previews");
+}
+
 int main(int argc, char** argv) {
     try {
+        lyric_checks();
+        playlist_completion_checks();
         using namespace player;
         static_assert(std::is_const_v<std::remove_reference_t<decltype(ViewModel::library)>>);
         static_assert(std::is_const_v<std::remove_reference_t<decltype(ViewModel::playback)>>);
@@ -187,7 +293,7 @@ int main(int argc, char** argv) {
             g_snapshot.ps = PlayState::Playing; finish_frame(1);
             check(g_fps_hint.load() == 10, "ordinary playback uses lower refresh cadence");
             model.ui.lyrics_open = true; finish_frame(1);
-            check(g_fps_hint.load() == 60, "visible lyrics retain smooth refresh cadence");
+            check(g_fps_hint.load() == 10, "visible lyrics use low playback cadence; scrolling requests its own animation frames");
             model.ui.lyrics_open = false; g_snapshot.ps = PlayState::Idle; finish_frame(1);
         }
         music::Track nav_a, nav_b, nav_c;

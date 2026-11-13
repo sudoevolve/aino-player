@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(aino_player VERSION 0.2.7 LANGUAGES CXX C)
+project(aino_player VERSION 0.2.8 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -146,6 +146,14 @@ foreach(target player_audio player_login player_desktop aino_player)
     target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
   endif()
 endforeach()
+
+# 发布版优先紧凑代码，允许链接器回收独立函数和数据；不压缩或运行时解包主程序。
+if(MSVC)
+  foreach(target player_audio player_login player_desktop quickjs aino_player)
+    target_compile_options(${target} PRIVATE "$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:C,CXX>>:/Os;/Gy;/Gw>")
+  endforeach()
+  target_link_options(aino_player PRIVATE $<$<CONFIG:Release>:/OPT:REF> $<$<CONFIG:Release>:/OPT:ICF>)
+endif()
 
 # 测试程序也会 include 到 business.hpp / sources.hpp 这条链（→ quickjs.h），
 # 所以必须给它们同样的头文件路径，并链接 quickjs（否则链接期 Engine 符号缺失）。

@@ -9,6 +9,10 @@
 // 只要 cookie 里有 MUSIC_U，带 Referer 就能通。
 #pragma once
 
+#include <algorithm>
+#include <functional>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -145,16 +149,17 @@ inline Profile fetch_profile(const std::string& cookie, const std::string& uid_h
 // ---------------------------------------------------------------- 歌单内容
 
 inline std::vector<music::Track> fetch_playlist(const std::string& cookie, const std::string& pid,
-                                                std::string& err, int timeout_ms = 15000, Playlist* metadata = nullptr) {
+    std::string& err, int timeout_ms = 15000, Playlist* metadata = nullptr,
+    const std::function<net::Response(const std::string&, const std::vector<std::string>&, int)>& request = net::get) {
     std::vector<music::Track> out;
     // 公开歌单（热门 / 官方榜）匿名就能读，只有"我喜欢的音乐"这类私有歌单才依赖登录态
     if (pid.empty()) {
         err = "歌单号为空";
         return out;
     }
-    // n=1000：这个接口一次最多给 1000 首，够用了
+    // n 不保证返回完整 tracks；trackIds 才是歌单顺序，缺少的资料需另行批量补齐。
     const std::string url = "https://music.163.com/api/v6/playlist/detail?id=" + pid + "&n=1000&s=0";
-    const net::Response r = net::get(url, ne_headers(cookie), timeout_ms);
+    const net::Response r = request(url, ne_headers(cookie), timeout_ms);
     if (!r.ok()) {
         err = "歌单详情失败（HTTP " + std::to_string(r.status) + "）";
         return out;
@@ -176,10 +181,10 @@ inline std::vector<music::Track> fetch_playlist(const std::string& cookie, const
         metadata->cover = root["playlist"]["coverImgUrl"].str();
         metadata->count = int(root["playlist"]["trackCount"].integer());
     }
-    for (size_t i = 0; i < tracks.size(); ++i) {
-        const js::Value& s = tracks[i];
+    std::map<long long, music::Track> loaded;
+    auto read_song = [&](const js::Value& s) {
         const long long id = s["id"].integer();
-        if (id <= 0) continue;
+        if (id <= 0 || loaded.count(id)) return;
         music::Track t;
         t.title = music::text::decode_entities(s["name"].str());
         // 新旧两套字段名：v6 是 ar/al/dt，老接口是 artists/album/duration
@@ -205,8 +210,55 @@ inline std::vector<music::Track> fetch_playlist(const std::string& cookie, const
         v.needs_login = (fee == 1 || fee == 4);
         music::attach_catalog_metadata(v, s);
         t.variants.push_back(std::move(v));
-        if (t.title.empty()) continue;
-        out.push_back(std::move(t));
+        if (!t.title.empty()) loaded.emplace(id, std::move(t));
+    };
+    for (const auto& song : tracks.array) read_song(song);
+
+    std::vector<long long> order, missing;
+    std::set<long long> seen;
+    const auto& ids = root["playlist"]["trackIds"];
+    const auto& sequence = ids.is_array() && !ids.array.empty() ? ids : tracks;
+    for (const auto& item : sequence.array) {
+        const auto id = item["id"].integer();
+        if (id <= 0 || !seen.insert(id).second) continue;
+        order.push_back(id);
+        if (!loaded.count(id)) missing.push_back(id);
+    }
+    const auto expected = root["playlist"]["trackCount"].integer();
+    if (expected > static_cast<long long>(order.size())) {
+        err = "网易云仅返回部分曲目 ID（" + std::to_string(order.size()) + "/" + std::to_string(expected) + "），请登录后重试";
+        return {};
+    }
+    // 每批最多 100 首，限制 URL 和响应大小；只补缺失资料，不改变顺序或取播放地址。
+    for (size_t begin = 0; begin < missing.size(); begin += 100) {
+        if (net::cancelled()) { err = "歌单加载已取消"; return {}; }
+        const auto end = std::min(missing.size(), begin + 100);
+        std::string request_ids = "[";
+        for (size_t i = begin; i < end; ++i) {
+            if (i != begin) request_ids += ',';
+            request_ids += std::to_string(missing[i]);
+        }
+        request_ids += ']';
+        const auto response = request("https://music.163.com/api/song/detail?ids=" + net::url_encode(request_ids),
+            ne_headers(cookie), timeout_ms);
+        js::Value details;
+        if (!response.ok() || !js::parse(response.body, details, true) ||
+            details["code"].integer() != 200 || !details["songs"].is_array()) {
+            err = "网易云歌单曲目补全失败，请重试（HTTP " + std::to_string(response.status) +
+                "，code " + std::to_string(details["code"].integer()) + "）";
+            return {};
+        }
+        for (const auto& song : details["songs"].array) read_song(song);
+    }
+    if (net::cancelled()) { err = "歌单加载已取消"; return {}; }
+    out.reserve(order.size());
+    for (const auto id : order) {
+        const auto found = loaded.find(id);
+        if (found != loaded.end()) out.push_back(std::move(found->second));
+    }
+    if (!order.empty() && out.size() != order.size()) {
+        err = "网易云未返回完整曲目资料（" + std::to_string(out.size()) + "/" + std::to_string(order.size()) + "），请重试";
+        return {};
     }
     if (out.empty()) err = "歌单里没有可读取的曲目";
     return out;

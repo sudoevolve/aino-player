@@ -28,6 +28,25 @@
       if (!r.data || !Array.isArray(r.data.lists)) throw new Error('酷狗未返回搜索列表');
       return r.data.lists.map(song);
     },
+    lyric(info) {
+      const hash = String(info.native_id || '');
+      if (!/^[a-f0-9]{32}$/i.test(hash)) throw new Error('酷狗歌曲缺少有效 hash');
+      // 歌词检索使用精确音频 hash；不使用未经校验的同名候选。
+      const r = ctx.http('https://lyrics.kugou.com/search?ver=1&man=yes&client=pc&lrctxt=1&keyword=' +
+        encodeURIComponent(info.title || '') + '&hash=' + hash + '&timelength=' + (Number(info.duration_ms) || 0),
+        {headers: {'User-Agent': 'KuGou2012-9020-ExpandSearchManager', 'KG-RC': '1'}});
+      const candidates = ((r.body || {}).candidates || []).filter(c => !info.duration_ms ||
+        !c.duration || Math.abs(Number(c.duration) - Number(info.duration_ms)) < 5000);
+      if (r.error || !candidates.length) throw new Error(r.error || '酷狗未返回匹配歌词');
+      const candidate = candidates[0];
+      const d = ctx.http('https://lyrics.kugou.com/download?ver=1&client=pc&id=' + encodeURIComponent(candidate.id) +
+        '&accesskey=' + encodeURIComponent(candidate.accesskey) + '&fmt=lrc&charset=utf8',
+        {headers: {'User-Agent': 'KuGou2012-9020-ExpandSearchManager', 'KG-RC': '1'}});
+      if (d.error || !d.body || !d.body.content || d.body.fmt !== 'lrc') throw new Error(d.error || '酷狗未返回 LRC 歌词');
+      const bytes = ctx.b64decode(d.body.content);
+      const encoded = Array.from(bytes, b => '%' + b.toString(16).padStart(2, '0')).join('');
+      return {lyric: decodeURIComponent(encoded)};
+    },
     heats() {
       const r = api('https://gateway.kugou.com/api/v3/search/hot_tab?signature=ee44edb9d7155821412d220bcaf509dd&appid=1005&clientver=10026&plat=0',
         {dfid: '1ssiv93oVqMp27cirf2CvoF1', mid: '156798703528610303473757548878786007104',
@@ -36,17 +55,34 @@
     },
     playlists(options) {
       const limit = Math.max(1, Math.min(50, Number((options || {}).limit) || 30));
-      const charts = [['8888', 'TOP 500'], ['6666', '飙升榜'], ['52144', '抖音热歌榜']].map(b =>
+      const charts = (Number((options || {}).page) ? [] : [['8888', 'TOP 500'], ['6666', '飙升榜'], ['52144', '抖音热歌榜']]).map(b =>
         ({id: 'rank:' + b[0], name: b[1], official: true, creator: '酷狗音乐'}));
       if (limit <= charts.length) return charts.slice(0, limit);
-      const r = api('https://m.kugou.com/plist/index?json=true');
+      const r = api('https://m.kugou.com/plist/index?json=true&page=' + ((Number((options || {}).page) || 0) + 1));
       const rows = (((r.plist || {}).list || {}).info);
-      if (!Array.isArray(rows) || !rows.length) throw new Error('酷狗未返回推荐歌单');
-      return charts.concat(rows.filter(p => p.specialid && p.specialname).map(p =>
+      if (!Array.isArray(rows)) throw new Error('酷狗未返回推荐歌单');
+      return {more: rows.length > 0, items: charts.concat(rows.filter(p => p.specialid && p.specialname).map(p =>
         ({id: 'playlist:' + p.specialid, name: p.specialname,
           cover: String(p.imgurl || p.img || '').replace(/\{size\}/g, '300').replace(/^\/\//, 'https://'),
           creator: p.username || p.nickname || '', plays: Number(p.playcount || p.total_play_count) || 0,
-          count: Number(p.songcount) || 0}))).slice(0, limit);
+          count: Number(p.songcount) || 0})))};
+    },
+    playlist_search(options) {
+      options = options || {}; const q = String(options.query || '').trim();
+      const limit = Math.max(1, Math.min(50, Number(options.limit) || 20));
+      const page = Math.max(0, Number(options.page) || 0);
+      if (!q) return {items: [], more: false};
+      const r = api('https://gateway.kugou.com/api/v3/search/special?keyword=' + encodeURIComponent(q) +
+        '&page=' + (page + 1) + '&pagesize=' + limit + '&showtype=10&filter=0&version=7910&sver=2',
+        {'x-router': 'msearchretry.kugou.com'});
+      if (!r.data || (!Array.isArray(r.data.info) && Number(r.data.total) !== 0)) throw new Error("酷狗未返回歌单搜索结果");
+      const data = r.data, rows = Array.isArray(data.info) ? data.info : [];
+      const total = Number(data.total || r.total || 0);
+      return {items: rows.map(p => ({id: 'playlist:' + p.specialid, name: p.specialname || '',
+        cover: String(p.imgurl || '').replace(/\{size\}/g, '300').replace(/^\/\//, 'https://'),
+        creator: p.nickname || '', plays: Number(p.playcount) || 0, count: Number(p.songcount) || 0,
+        description: p.intro || ''})).filter(p => p.id !== 'playlist:undefined' && p.name),
+        more: total ? (page + 1) * limit < total : rows.length >= limit};
     },
     board(id, page, limit) {
       if (/^playlist:\d+$/.test(String(id))) {

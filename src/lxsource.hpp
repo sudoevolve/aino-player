@@ -27,6 +27,7 @@
 #include <chrono>
 #include <functional>
 #include <future>
+#include <stdexcept>
 #include <set>
 #include <string>
 #include <thread>
@@ -367,6 +368,20 @@ public:
     bool music_url(const std::string& platform, const std::string& quality,
                    const std::string& music_info_json, std::string& url, std::string& err, bool background = false);
     void close();
+
+    // 只由后台维护调用，忙碌的脚本直接跳过，避免 GC 阻塞点播或 UI。
+    void collect_idle() {
+        if (foreground_.load() || retired()) return;
+        std::unique_lock<std::timed_mutex> lock(execution_, std::try_to_lock);
+        if (!lock || !rt_ || foreground_.load() || retired()) return;
+        JS_UpdateStackTop(rt_);
+        for (auto it = http_.begin(); it != http_.end();) {
+            if (it->second.cancel->load() && it->second.result.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+                it = http_.erase(it);
+            else ++it;
+        }
+        JS_RunGC(rt_);
+    }
 
     // 调试用：在脚本上下文里跑一段代码，把结果当字符串返回（失败返回错误文本）
     std::string debug_eval(const std::string& code) {
@@ -722,7 +737,7 @@ inline const char* bootstrap_js() {
   const lx = {
     EVENT_NAMES: EN,
     version: '2.0.0',
-    currentScriptInfo: (function () { try { return JSON.parse(__lx.scriptInfo); } catch (e) { return {}; } })(),
+    currentScriptInfo: (function () { try { return JSON.parse(__lx.scriptInfo); } catch (e) { return {}; } finally { delete __lx.scriptInfo; } })(),
     env: 'desktop',
     on: function (name, fn) {
       if (__lx.debug) __lx.log('TRACE on(' + name + ') fn=' + (typeof fn));
@@ -1187,22 +1202,13 @@ inline bool Script::music_url(const std::string& platform, const std::string& qu
 }
 
 
-// 音源脚本目录：AINO_LX_DIR 优先；Windows 使用 EXE 旁目录，Linux 使用用户配置目录。
+// 音源脚本目录：AINO_LX_DIR 优先；其余平台统一使用用户配置目录。
 inline std::string default_dir() {
     if (const char* e = std::getenv("AINO_LX_DIR")) {
         if (*e) return e;
     }
-#ifdef _WIN32
-    wchar_t buf[32768]{};
-    if (GetModuleFileNameW(nullptr, buf, 32768)) {
-        return (std::filesystem::path(buf).parent_path() / "sources").u8string();
-    }
-#endif
-#ifndef _WIN32
-    // 商店 / deb 从只读目录启动时，音源仍需放在用户可写目录。
-    return platform::join(platform::config_dir(), "sources");
-#endif
-    return "sources";
+    const auto config = platform::config_dir();
+    return config.empty() ? std::string{} : platform::join(config, "sources");
 }
 
 // ---------------------------------------------------------------- 音源集合
@@ -1229,6 +1235,7 @@ public:
     // 若加载持锁，UI 线程会死等这把锁，窗口假死。所以先在局部建好新列表，
     // 最后一刻才持锁换入；加载期间 resolve() 继续用旧列表（热替换语义）。
     int load_dir(const std::string& dir) {
+        if (dir.empty()) throw std::runtime_error("无法访问用户音源目录");
         if (!read_preferences()) return -1;
         std::vector<std::string> files;
         std::error_code ec;
@@ -1237,11 +1244,13 @@ public:
             if (it->is_regular_file(ec) && script_file(it->path()))
                 files.push_back(it->path().filename().u8string());
         }
+        if (ec && ec != std::errc::no_such_file_or_directory) throw std::runtime_error("无法读取音源目录：" + ec.message());
         return load_files_impl(dir, std::move(files), true);
     }
 
     // 导入只初始化这批文件，其余已加载音源保留原运行时，不重复执行联网初始化。
     int load_files(const std::string& dir, std::vector<std::string> files) {
+        if (dir.empty()) throw std::runtime_error("无法访问用户音源目录");
         if (!read_preferences()) return -1;
         {
             std::lock_guard<std::mutex> state(state_io_);
@@ -1294,6 +1303,13 @@ public:
         return preferences_error_;
     }
     unsigned revision() const { return revision_.load(); }
+    void set_restoring(bool value) { restoring_.store(value); }
+    bool restoring() const { return restoring_.load(); }
+    void collect_idle() {
+        std::vector<std::shared_ptr<Script>> scripts;
+        { std::lock_guard<std::mutex> lock(mu_); scripts = list_; }
+        for (const auto& script : scripts) { if (net::cancelled()) break; script->collect_idle(); }
+    }
     std::map<std::string, std::map<std::string, std::string>> runtime_errors() const {
         std::lock_guard<std::mutex> lock(mu_);
         return runtime_errors_;
@@ -1548,7 +1564,7 @@ private:
 
 public:
     // 正在后台加载（界面上用来显示"加载中"，而不是等锁卡住）
-    bool loading() const { return busy_.load(); }
+    bool loading() const { return busy_.load() || restoring_.load(); }
 
     bool empty() const {
         std::lock_guard<std::mutex> lock(mu_);
@@ -1680,6 +1696,7 @@ private:
     std::atomic<unsigned> revision_{0};
     std::mutex load_mu_;             // 串行化 load_dir（网络在锁外，见 load_dir 注释）
     std::atomic<bool> busy_{false};  // 正在后台加载
+    std::atomic<bool> restoring_{false};
     std::vector<std::shared_ptr<Script>> list_;   // shared：resolve 锁外持引用时列表可能被整体换掉
     std::vector<std::pair<std::string, std::string>> failed_;
     std::string preferred_;

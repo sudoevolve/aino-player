@@ -5,6 +5,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <functional>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -19,6 +23,7 @@ namespace lyr {
 struct Line {
     long long ms = 0;
     std::string text;
+    std::string translation;
 };
 
 struct Doc {
@@ -130,46 +135,6 @@ inline std::vector<Line> parse(const std::string& raw, bool* synced_out = nullpt
 
 // ---------------------------------------------------------------- 取歌词
 
-inline std::string find_netease_id(const music::Track& t, const music::Settings& st) {
-    for (const auto& v : t.variants)
-        if (v.source == music::Source::Netease && !v.id.empty()) return v.id;
-
-    // 曲目不在网易云上 → 按「歌名 + 歌手」反查。
-    // 反查结果往往混着一堆翻唱（搜「花海 周杰伦」前两条都是 70 秒的改编版），
-    // 所以判据要严格：**原始标题**完全相等才算强命中，时长差是主要过滤器。
-    // 只用 normalize_title 不行 —— 它会把「（治愈版）」这类后缀抹掉，翻唱和原曲同分。
-    std::string err;
-    const auto got = music::search_netease(t.title + " " + t.artist, 10, 6000, err, st);
-    const std::string want_raw = trim_copy(t.title);
-    const std::string want = music::text::normalize_title(t.title);
-    std::string best_id;
-    double best_score = -1e9;
-    for (const auto& v : got) {
-        if (v.id.empty()) continue;
-        const std::string have_raw = trim_copy(v.title);
-        const std::string have = music::text::normalize_title(v.title);
-        double s = 0.0;
-        if (have_raw == want_raw) s += 60.0;
-        else if (have == want) s += 8.0;   // 只是去括号后相同 —— 多半是某个改编版
-        else if (have.find(want) != std::string::npos || want.find(have) != std::string::npos) s += 4.0;
-        else continue;  // 标题都对不上，不可能是同一首
-
-        if (t.duration_ms > 0 && v.duration_ms > 0) {
-            const double diff = std::abs(double(v.duration_ms - t.duration_ms)) / 1000.0;
-            if (diff > 15.0) continue;     // 同名但时长差 15 秒以上 → 不是同一版本
-            s += 40.0 - diff * 2.5;
-        }
-        if (music::text::normalize_title(v.artist).find(music::text::normalize_title(t.artist)) !=
-            std::string::npos)
-            s += 20.0;
-        if (s > best_score) {
-            best_score = s;
-            best_id = v.id;
-        }
-    }
-    return best_id;
-}
-
 // ---------------------------------------------------------------- 各源直取
 //
 // 网易云与 QQ 的歌词接口：
@@ -179,11 +144,30 @@ inline std::string find_netease_id(const music::Track& t, const music::Settings&
 inline Doc from_lrc(const std::string& raw, const char* origin) {
     Doc d;
     bool synced = true;
-    d.lines = parse(raw, &synced);
+    auto text = raw;
+    if (text.rfind("\xef\xbb\xbf", 0) == 0) text.erase(0, 3);
+    d.lines = parse(text, &synced);
     d.synced = synced;
     d.origin = origin;
     if (d.lines.empty()) d.error = "这首歌没有歌词";
     return d;
+}
+
+// 译文只按时间轴关联，不能用行号配对（间奏、多时间标签会改变行数）。
+inline void add_translation(Doc& doc, const std::string& raw) {
+    const auto translated = parse(raw.rfind("\xef\xbb\xbf", 0) == 0 ? raw.substr(3) : raw);
+    for (const auto& line : translated) {
+        if (line.ms < 0 || line.text.empty()) continue;
+        auto first = std::lower_bound(doc.lines.begin(), doc.lines.end(), line.ms - 50,
+            [](const Line& a, long long time) { return std::max(0LL, a.ms) < time; });
+        auto best = doc.lines.end();
+        for (auto it = first; it != doc.lines.end() && it->ms <= line.ms + 50; ++it)
+            if (it->ms >= 0 && !it->text.empty() && (best == doc.lines.end() || std::llabs(it->ms - line.ms) < std::llabs(best->ms - line.ms))) best = it;
+        if (best != doc.lines.end() && best->text != line.text) {
+            if (!best->translation.empty()) best->translation += " / ";
+            best->translation += line.text;
+        }
+    }
 }
 
 inline Doc fetch_netease_lyric(const std::string& id, const music::Settings& st, int timeout_ms) {
@@ -211,7 +195,37 @@ inline Doc fetch_netease_lyric(const std::string& id, const music::Settings& st,
     }
     std::string raw = root["lrc"]["lyric"].str();
     if (trim_copy(raw).empty()) raw = root["tlyric"]["lyric"].str();  // 少数条目只在翻译里有时间轴
-    return from_lrc(raw, "网易云");
+    auto result = from_lrc(raw, "网易云");
+    add_translation(result, root["tlyric"]["lyric"].str());
+    return result;
+}
+
+// QQ 的原文 / 译文可能分别为明文或 Base64，不能只凭 nobase64 判断两者。
+inline std::string decode_lyric_text(const std::string& raw) {
+    auto text = music::text::decode_entities(raw);
+    if (text.find('[') != std::string::npos) return text;
+    auto compact = text;
+    compact.erase(std::remove_if(compact.begin(), compact.end(), [](char ch) { return ch == '\r' || ch == '\n'; }), compact.end());
+    if (!compact.empty() && compact.size() % 4 == 0 && compact.find_first_not_of(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=") == std::string::npos) {
+        auto decoded = lx::detail::base64_decode(compact);
+        if (decoded.find('[') != std::string::npos || decoded.find('\n') != std::string::npos)
+            return music::text::decode_entities(decoded);
+    }
+    return text;
+}
+inline Doc qq_lyric_document(const std::string& response) {
+    const auto first = response.find('{'), last = response.rfind('}');
+    js::Value root;
+    if (first == std::string::npos || last == std::string::npos || last < first ||
+        !js::parse(response.substr(first, last - first + 1), root, true)) {
+        Doc d; d.origin = "QQ"; d.error = "QQ 歌词返回格式异常"; return d;
+    }
+    const auto code = root["code"].integer(root["retcode"].integer());
+    if (code != 0) { Doc d; d.origin = "QQ"; d.error = "QQ 歌词返回 code " + std::to_string(code); return d; }
+    auto doc = from_lrc(decode_lyric_text(root["lyric"].str()), "QQ");
+    add_translation(doc, decode_lyric_text(root["trans"].str()));
+    return doc;
 }
 
 inline Doc fetch_qq_lyric(const std::string& mid, const std::string& cookie, int timeout_ms) {
@@ -234,23 +248,90 @@ inline Doc fetch_qq_lyric(const std::string& mid, const std::string& cookie, int
         d.error = "歌词请求失败（HTTP " + std::to_string(r.status) + "）";
         return d;
     }
-    // 少数情况下外层裹着 MusicJsonCallback({...})，把回调名前缀切掉
-    std::string body = r.body;
-    const size_t brace = body.find('{');
-    if (brace != std::string::npos && brace > 0) body = body.substr(brace);
+    return qq_lyric_document(r.body);
+}
 
-    js::Value root;
-    if (!js::parse(body, root, true)) {
-        d.error = "歌词返回格式异常";
-        return d;
+inline Doc fetch_provider_lyric(const music::Variant& v, int timeout_ms) {
+    Doc doc; doc.origin = music::source_name(v.source);
+    const auto* key = music::provider_key_of(v.source);
+    if (!key) { doc.error = "此平台未提供歌词接口"; return doc; }
+    prov::ExecutionTime budget(timeout_ms);
+    js::Value result;
+    const auto args = "{\"id\":" + lx::detail::js_quote(v.id) + ",\"native_id\":" + lx::detail::js_quote(v.native_id) +
+        ",\"title\":" + lx::detail::js_quote(v.title) + ",\"duration_ms\":" + std::to_string(v.duration_ms) + "}";
+    if (!prov::Host::instance().request(key, "lyric", args, result, doc.error)) return doc;
+    doc = from_lrc(decode_lyric_text(result["lyric"].str()), music::source_name(v.source));
+    add_translation(doc, decode_lyric_text(result["translation"].str()));
+    return doc;
+}
+
+inline bool has_translation(const Doc& doc) {
+    return std::any_of(doc.lines.begin(), doc.lines.end(), [](const Line& line) { return !line.translation.empty(); });
+}
+inline bool needs_translation(const Doc& doc) {
+    int foreign = 0, count = 0;
+    for (const auto& line : doc.lines) {
+        if (line.text.empty()) continue;
+        ++count; int latin = 0, cjk = 0; bool kana_or_hangul = false;
+        for (size_t i = 0; i < line.text.size();) {
+            const auto lead = static_cast<unsigned char>(line.text[i++]);
+            unsigned cp = lead;
+            int continuation = 0;
+            if (lead >= 0xc2 && lead <= 0xdf) { cp &= 0x1f; continuation = 1; }
+            else if (lead >= 0xe0 && lead <= 0xef) { cp &= 0x0f; continuation = 2; }
+            else if (lead >= 0xf0 && lead <= 0xf4) { cp &= 7; continuation = 3; }
+            else if (lead >= 0x80) continue;
+            bool valid = i + continuation <= line.text.size();
+            for (int n = 0; valid && n < continuation; ++n) {
+                const auto next = static_cast<unsigned char>(line.text[i]);
+                if ((next & 0xc0) != 0x80) valid = false;
+                else { cp = (cp << 6) | (next & 0x3f); ++i; }
+            }
+            if (!valid) continue;
+            if ((cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z')) ++latin;
+            if (cp >= 0x4e00 && cp <= 0x9fff) ++cjk;
+            kana_or_hangul |= (cp >= 0x3040 && cp <= 0x30ff) || (cp >= 0xac00 && cp <= 0xd7af) || (cp >= 0x0400 && cp <= 0x052f);
+        }
+        if (kana_or_hangul || (latin >= 4 && cjk == 0)) ++foreign;
     }
-    const long long code = root["code"].integer(root["retcode"].integer(0));
-    if (code != 0) {
-        d.error = "QQ 歌词返回 code " + std::to_string(code);
-        return d;
+    return !has_translation(doc) && foreign >= 3 && foreign * 3 >= count;
+}
+// 歌词匹配保留括号内的正文，不能使用会删除版本注释的歌曲标题规范化。
+inline std::string line_key(const std::string& text) {
+    const auto folded = music::text::lower_ascii(music::text::fold_width(text));
+    std::string key;
+    for (unsigned char ch : folded)
+        if (ch >= 0x80 || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) key += char(ch);
+    return key;
+}
+// 跨平台时间戳可能不同：只给原文一致的行补译文，不把别的平台时间轴强套过来。
+inline bool supplement_translation(Doc& primary, const Doc& translated) {
+    struct Match { size_t target; const Line* source; };
+    std::vector<Match> matches;
+    std::set<size_t> used;
+    int eligible = 0;
+    std::vector<std::string> keys;
+    keys.reserve(translated.lines.size());
+    for (const auto& line : translated.lines) keys.push_back(line_key(line.text));
+    for (size_t i = 0; i < primary.lines.size(); ++i) {
+        const auto& line = primary.lines[i];
+        if (line.text.empty() || !line.translation.empty()) continue;
+        ++eligible;
+        const auto key = line_key(line.text);
+        if (key.empty()) continue;
+        size_t best = translated.lines.size(); long long distance = 5001;
+        for (size_t j = 0; j < translated.lines.size(); ++j) {
+            const auto& other = translated.lines[j];
+            if (used.count(j) || other.translation.empty() || key != keys[j]) continue;
+            const auto delta = std::llabs(line.ms - other.ms);
+            if (delta < distance) { best = j; distance = delta; }
+        }
+        if (best != translated.lines.size()) { used.insert(best); matches.push_back({i, &translated.lines[best]}); }
     }
-    std::string raw = music::text::decode_entities(root["lyric"].str());
-    return from_lrc(raw, "QQ");
+    if (matches.size() < 3 || matches.size() * 3 < size_t(eligible)) return false;
+    for (const auto& match : matches) primary.lines[match.target].translation = match.source->translation;
+    primary.origin += " · 译文：" + translated.origin;
+    return true;
 }
 
 // ---------------------------------------------------------------- 按名反查
@@ -260,39 +341,33 @@ inline Doc fetch_qq_lyric(const std::string& mid, const std::string& cookie, int
 // 反查结果常混着翻唱（搜「花海 周杰伦」前两条是 70 秒改编版），所以判据要严格：
 // **原始标题**完全相等才算强命中，时长差是主要过滤器。
 inline std::string search_netease_id(const music::Track& t, const music::Settings& st) {
+    const auto title = music::text::normalize_title(t.title);
+    const auto artists = music::text::split_artists(t.artist);
+    if (title.empty() || artists.empty()) return {};
     std::string err;
-    const auto got = music::search_netease(t.title + " " + t.artist, 10, 6000, err, st);
-    const std::string want_raw = trim_copy(t.title);
-    const std::string want = music::text::normalize_title(t.title);
-    std::string best_id;
-    double best_score = -1e9;
+    const auto got = music::search_netease(t.title + " " + t.artist, 16, 6000, err, st);
+    std::string best_id; double best_score = -1;
     for (const auto& v : got) {
-        if (v.id.empty()) continue;
-        const std::string have_raw = trim_copy(v.title);
-        const std::string have = music::text::normalize_title(v.title);
-        double s = 0.0;
-        if (have_raw == want_raw) s += 60.0;
-        else if (have == want) s += 8.0;
-        else if (have.find(want) != std::string::npos || want.find(have) != std::string::npos) s += 4.0;
-        else continue;
-
+        if (v.id.empty() || music::text::normalize_title(v.title) != title) continue;
+        const auto candidates = music::text::split_artists(v.artist);
+        bool same_artist = false;
+        for (const auto& a : artists) for (const auto& b : candidates) if (!a.empty() && a == b) same_artist = true;
+        if (!same_artist) continue;
+        double score = 100;
         if (t.duration_ms > 0 && v.duration_ms > 0) {
-            const double diff = std::abs(double(v.duration_ms - t.duration_ms)) / 1000.0;
-            if (diff > 15.0) continue;
-            s += 40.0 - diff * 2.5;
+            const double delta = std::abs(double(t.duration_ms) - v.duration_ms);
+            if (delta > 5000) continue;
+            score -= delta / 1000;
         }
-        if (music::text::normalize_title(v.artist).find(music::text::normalize_title(t.artist)) !=
-            std::string::npos)
-            s += 20.0;
-        if (s > best_score) {
-            best_score = s;
-            best_id = v.id;
-        }
+        if (score > best_score) { best_score = score; best_id = v.id; }
     }
     return best_id;
 }
 
-inline Doc fetch(const music::Track& t, const music::Settings& st, int timeout_ms = 8000) {
+inline Doc fetch(const music::Track& t, const music::Settings& st, int timeout_ms = 8000,
+                 const std::function<void(const Doc&)>& publish = {}) {
+    prov::ExecutionTime total_budget(std::max(1000, timeout_ms) * 3);
+    prov::Host::instance().set_credentials(st.netease_cookie, st.qq_cookie);
     if (!t.variants.empty() && t.current().source == music::Source::Local) {
         Doc d; d.origin = "本地 LRC";
         auto path = platform::fs::u8path(t.current().id); path.replace_extension(".lrc");
@@ -309,39 +384,44 @@ inline Doc fetch(const music::Track& t, const music::Settings& st, int timeout_m
     // 顺序：当前选中的源 → 其它源。每家用自己那条曲目的 id，不去猜。
     std::vector<int> order;
     if (!t.variants.empty()) {
-        const int first = std::min<int>(t.chosen, int(t.variants.size()) - 1);
+        const int first = std::clamp<int>(t.chosen, 0, int(t.variants.size()) - 1);
         order.push_back(first);
         for (int i = 0; i < int(t.variants.size()); ++i)
             if (i != first) order.push_back(i);
     }
 
-    std::string last_err;
+    std::string last_err; Doc primary; std::set<std::string> tried_netease;
+    auto take = [&](Doc doc) {
+        if (doc.empty()) { if (!doc.error.empty()) last_err = doc.origin + "：" + doc.error; return false; }
+        if (primary.empty()) { primary = std::move(doc); if (publish) publish(primary); }
+        else if (has_translation(doc)) supplement_translation(primary, doc);
+        return !needs_translation(primary);
+    };
     for (int i : order) {
-        const music::Variant& v = t.variants[size_t(i)];
+        if (net::cancelled()) break;
+        const auto& v = t.variants[size_t(i)];
         if (v.id.empty()) continue;
-        Doc d;
+        Doc doc;
         switch (v.source) {
-            case music::Source::Netease: d = fetch_netease_lyric(v.id, st, timeout_ms); break;
-            case music::Source::QQ: d = fetch_qq_lyric(v.id, st.qq_cookie, timeout_ms); break;
+            case music::Source::Netease: tried_netease.insert(v.id); doc = fetch_netease_lyric(v.id, st, timeout_ms); break;
+            case music::Source::QQ: doc = fetch_qq_lyric(v.id, st.qq_cookie, timeout_ms); break;
+            case music::Source::Kuwo: case music::Source::Kugou: case music::Source::Migu:
+                doc = fetch_provider_lyric(v, timeout_ms); break;
             default: continue;
         }
-        if (!d.lines.empty()) return d;
-        if (!d.error.empty()) last_err = std::string(music::source_name(v.source)) + "：" + d.error;
+        if (take(std::move(doc))) return primary;
     }
-
-    const std::string id = search_netease_id(t, st);
-    if (!id.empty()) {
-        Doc d = fetch_netease_lyric(id, st, timeout_ms);
-        if (!d.lines.empty()) {
-            d.origin = "网易云（按名反查）";
-            return d;
+    if (!net::cancelled()) {
+        const auto id = search_netease_id(t, st);
+        if (!id.empty() && !tried_netease.count(id)) {
+            auto doc = fetch_netease_lyric(id, st, timeout_ms);
+            doc.origin = "网易云（同曲匹配）";
+            take(std::move(doc));
         }
-        if (!d.error.empty()) last_err = d.error;
     }
-
-    Doc d;
-    d.error = last_err.empty() ? "没有找到可用的歌词" : last_err;
-    return d;
+    if (!primary.empty()) return primary;
+    primary.error = net::cancelled() ? "歌词加载已取消" : last_err.empty() ? "没有找到可用的歌词" : last_err;
+    return primary;
 }
 
 
@@ -362,6 +442,10 @@ inline std::string to_lrc(const Doc& d) {
             out += l.text;
         }
         out += "\r\n";
+        if (!l.translation.empty()) {
+            if (l.ms >= 0) out += buf;
+            out += l.translation + "\r\n";
+        }
     }
     return out;
 }

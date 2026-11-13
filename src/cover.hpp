@@ -126,6 +126,16 @@ public:
     Stats stats() { std::lock_guard<std::mutex> lock(m_); return {map_.size(), pixel_bytes_}; }
     void set_notifier(std::function<void()> fn) { notify_ = std::move(fn); }
     void clear() { std::lock_guard<std::mutex> lock(m_); ++generation_; map_.clear(); pending_.clear(); pixel_bytes_ = 0; }
+    void trim_idle(unsigned long long now) {
+        std::lock_guard<std::mutex> lock(m_);
+        for (auto it = map_.begin(); it != map_.end();) {
+            const auto& entry = it->second;
+            if (entry.state != 1 && now > entry.last_used + 120000 && (!entry.img || entry.img.use_count() == 1)) {
+                if (entry.img) pixel_bytes_ -= entry.img->rgba.size();
+                it = map_.erase(it);
+            } else ++it;
+        }
+    }
 
     // 就绪返回图；没就绪返回空（并确保后台已经在取）。UI 线程每帧调它。
     std::shared_ptr<const Image> get(const std::string& url) {
@@ -136,12 +146,14 @@ public:
             auto it = map_.find(url);
             if (it != map_.end()) {
                 it->second.touched = ++clock_;
+                it->second.last_used = platform::ticks();
                 if (it->second.state == 2) return it->second.img;
                 return nullptr;
             }
             if (pending_.size() >= 32) return nullptr;
             map_[url].state = 1;
             map_[url].touched = ++clock_;
+            map_[url].last_used = platform::ticks();
             pending_.push_back({url, generation_});
             if (workers_ < 2) { ++workers_; launch = true; }
         }
@@ -166,6 +178,7 @@ private:
         int state = 0;  // 0 未知 / 1 下载中 / 2 就绪 / 3 失败
         std::shared_ptr<const Image> img;
         uint64_t touched = 0;
+        unsigned long long last_used = 0;
     };
 
     void load(const std::string& url, unsigned generation) {

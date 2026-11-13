@@ -23,7 +23,9 @@ globalThis.provider = {
   name: '网易云',
   search(keyword, page, limit) { return [/* song */] }, // page 从 0 开始
   heats() { return [{text: '热搜', heat: 0}] },
-  playlists({limit}) { return [{id: '歌单或 rank:榜单ID', name: '标题', cover: '', official: false}] },
+  playlists({page, limit}) { return {items: [{id: '歌单或 rank:榜单ID', name: '标题', cover: '', official: false}], more: false} },
+  playlist_search({query, page, limit}) { return {items: [], more: false} },
+  lyric({id, native_id, title, duration_ms}) { return {lyric: "LRC", translation: "译文 LRC"} }, // 可选
   board(id, page, limit) { return [/* song */] } // rank:榜单ID / playlist:歌单ID，page 从 0 开始
 }
 ```
@@ -38,8 +40,12 @@ globalThis.provider = {
 
 导入、获取或重载后，后台分别对每个脚本的 QQ、网易云样本请求播放地址，最多两项并行，再用 Range 探测音频头。不会播放声音或下载整首；检测优先让位于点播。界面区分待检测、检测中、样本通过、样本失败、不支持及超时未完成，通过的排前面；取流按当前平台的检测结果排序，用户明确指定的源仍优先。可点击“重新检测”。结果仅保留在本次运行，不代表所有歌曲、所有音质可播。各平台的近期取流错误单独保留在详情中，不因单首歌失败或另一个平台样本失败把已通过的源整行标红。
 
-“移除”只记录应用内禁用，不删除 JS。重新加载尊重移除记录；主动“在线获取”会恢复并加载本次成功下载的脚本，汇总下载与初始化失败数量；查看未加载列表也可逐个恢复或重新导入。Windows 的音源目录默认在 EXE 同级 `sources/`，Linux 在用户配置目录的 `sources/`，两者都支持 `AINO_LX_DIR`。运行错误保留具体原因，不把“初始化成功”称为“可播放”。
+“移除”只记录应用内禁用，不删除 JS。重新加载尊重移除记录；主动“在线获取”会恢复并加载本次成功下载的脚本，汇总下载与初始化失败数量；查看未加载列表也可逐个恢复或重新导入。Windows、Linux 均将音源保存在用户配置目录的 `sources/`，支持 `AINO_LX_DIR` 覆盖；正常启动自动后台加载。Windows 自动将当前 EXE 同级旧 `sources/` 中缺失的脚本复制到新目录，不覆盖已有版本，也不删除原文件或解除移除记录。运行错误保留具体原因，不把“初始化成功”称为“可播放”。
 
 LX 宿主契约对照 lx-music-desktop `323e4bac505da428adae8db6b58039fb2b36b86d`：API 版本为 `2.0.0`，`send/on` 返回 Promise，初始化会完成监听器注册。取流保留初始化任务，只清理本次请求的定时器和网络任务；HTTP 独立并行、可取消，每个脚本最多 16 项，JS 回调仍只在运行时线程执行。响应包含 raw 字节和响应头，MD5 / Base64 按字节处理 Buffer，currentScriptInfo 包含 rawScript。
 
 尚未实现 AES / RSA、zlib、multipart formData、脚本的 `lyric` / `pic` 消费及完整 Node API，不能宣称所有脚本兼容；DNS 失败、服务端下线和账号权限也会影响可用性。酷狗榜单通过官方 HTTPS 网关转发，避免旧域名证书不匹配。酷我缺失封面在封面后台队列按需解析，不阻塞榜单读取。各平台播放仍需实际网络与账号确认。
+
+`page` 从 0 开始，`more` 表示平台是否还有下一页；目录宿主继续兼容旧版数组返回值。推荐列表的榜单仅在第一页附加，不截掉该页实际歌单。歌单搜索接入网易云、QQ、酷我、酷狗与咪咕，搜索与发现分别保存查询、页码、错误和结果；加载失败不推进页码，返回重复页面时停止追加。
+
+歌词由播放器优先读取当前平台：网易云 tlyric、QQ trans，以及酷我 / 酷狗原文、咪咕 MRC + trc。MRC 按协议独立实现 64 位 XXTEA 和 UTF-16LE 解码，仅保留行级时间轴，不依赖 Node、机器翻译服务或额外音频库。酷狗目前读取 LRC，未读取 KRC 内嵌翻译。外语原文缺译文时，先校验歌曲标题、歌手和时长，再要求多行原文与时间相符后补网易云译文；原文先发布，补译失败不会隐藏已有歌词。每次请求使用有总时间预算的后台任务，切歌与退出可取消。

@@ -78,18 +78,32 @@ provider.heats = function () {
   if (r.error || !r.body || !r.body.result) throw new Error(r.error || '热搜响应无效');
   return (r.body.result.hots || []).map(w => ({text: w.first || ''}));
 };
+function playlistCard(p) {
+  return {id: String(p.id || ''), name: p.name, cover: p.coverImgUrl || p.picUrl || '',
+    creator: (p.creator || {}).nickname || '', plays: p.playCount || p.subscribedCount || 0, count: p.trackCount || 0};
+}
 provider.playlists = function (args) {
-  const headers = {Referer: 'https://music.163.com/'};
-  const top = http('https://music.163.com/api/toplist', {headers});
-  const cards = (((top.body || {}).list) || []).slice(0, 3).map(p =>
-    ({id: String(p.id), name: p.name, cover: p.coverImgUrl, official: true}));
-  const r = http('https://music.163.com/api/playlist/list?cat=' + encodeURIComponent('全部') +
-    '&order=hot&offset=0&limit=' + (args.limit || 30), {headers});
-  if (r.error || !r.body || !Array.isArray(r.body.playlists)) {
-    if (cards.length) return cards;
-    throw new Error(r.error || '歌单响应无效');
+  const page = Math.max(0, args.page | 0), limit = args.limit || 30;
+  const headers = {Referer: 'https://music.163.com/', Cookie: cookieHeader()};
+  let charts = [];
+  if (!page) {
+    const top = http('https://music.163.com/api/toplist', {headers});
+    charts = (((top.body || {}).list) || []).slice(0, 3).map(p => Object.assign(playlistCard(p), {official: true}));
   }
-  return cards.concat(r.body.playlists.map(p => ({id: String(p.id), name: p.name,
-    cover: p.coverImgUrl || p.picUrl || '', creator: (p.creator || {}).nickname || '',
-    plays: p.playCount || p.subscribedCount || 0, count: p.trackCount || 0})));
+  const r = http('https://music.163.com/api/playlist/list?cat=' + encodeURIComponent('全部') +
+    '&order=hot&offset=' + (page * limit) + '&limit=' + limit, {headers});
+  if (r.error || !r.body || !Array.isArray(r.body.playlists)) throw new Error(r.error || '歌单响应无效');
+  return {items: charts.concat(r.body.playlists.map(playlistCard)), more: typeof r.body.more === 'boolean' ? r.body.more : r.body.playlists.length >= limit};
+};
+provider.playlist_search = function (args) {
+  const page = Math.max(0, args.page | 0), limit = args.limit || 30;
+  const r = http('https://music.163.com/api/search/get/web?s=' + encodeURIComponent(args.query) +
+    '&type=1000&limit=' + limit + '&offset=' + (page * limit),
+    {headers: {Referer: 'https://music.163.com/', 'User-Agent': 'Mozilla/5.0', Cookie: cookieHeader()}});
+  if (r.error || !r.body || !r.body.result || !Array.isArray(r.body.result.playlists)) {
+    if (!r.error && r.body && Number(r.body.code) === 200 && r.body.result && Number(r.body.result.playlistCount) === 0) return {items: [], more: false};
+    throw new Error(r.error || '歌单搜索响应无效');
+  }
+  const result = r.body.result;
+  return {items: result.playlists.map(playlistCard), more: result.playlistCount === undefined ? result.playlists.length >= limit : (page + 1) * limit < Number(result.playlistCount)};
 };

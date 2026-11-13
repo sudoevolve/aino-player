@@ -60,22 +60,25 @@ inline Heats heats(music::Source source, int timeout_ms = 8000) {
     if (out.words.empty()) out.err = "暂无热搜";
     return out;
 }
-inline std::vector<Card> playlists(music::Source source, int limit, std::string& err, int timeout_ms = 10000) {
-    std::vector<Card> out; js::Value rows;
+struct Page { std::vector<Card> cards; bool more = false; };
+inline Page playlists(music::Source source, int page, int limit, const std::string& query, std::string& err, int timeout_ms = 10000) {
+    Page out; js::Value response;
     prov::ExecutionTime budget(timeout_ms);
     const auto* key = music::provider_key_of(source);
-    if (!key) { err = "该平台没有发现目录"; return out; }
-    if (!prov::Host::instance().request(key, "playlists", "{\"limit\":" + std::to_string(limit) + "}", rows, err)) return out;
+    if (!key) { err = "该平台没有歌单目录"; return out; }
+    const auto args = "{\"limit\":" + std::to_string(limit) + ",\"page\":" + std::to_string(page) +
+        ",\"query\":" + lx::detail::js_quote(query) + "}";
+    if (!prov::Host::instance().request(key, query.empty() ? "playlists" : "playlist_search", args, response, err)) return out;
+    const auto& rows = response.is_array() ? response : response["items"];
     if (!rows.is_array()) { err = "歌单响应格式无效"; return out; }
+    out.more = response.is_array() ? int(rows.size()) >= limit : response["more"].truthy();
     for (const auto& row : rows.array) {
         Card c; c.source = source; c.id = row["id"].str();
         c.name = music::text::decode_entities(row["name"].str()); c.cover = row["cover"].str();
         c.creator = music::text::decode_entities(row["creator"].str()); c.official = row["official"].truthy();
         c.plays = row["plays"].integer(); c.count = int(row["count"].integer());
-        if (!c.id.empty() && !c.name.empty()) out.push_back(std::move(c));
-        if (int(out.size()) >= limit) break;
+        if (!c.id.empty() && !c.name.empty()) out.cards.push_back(std::move(c));
     }
-    if (out.empty()) err = "暂无歌单或榜单";
     return out;
 }
 } // namespace disc

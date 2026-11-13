@@ -105,9 +105,28 @@ provider.heats = function () {
 provider.playlists = function (args) {
   const r = http('https://c.y.qq.com/splcloud/fcgi-bin/fcg_get_diss_by_tag.fcg?picmid=1&rnd=0.1' +
     '&g_tk=5381&loginUin=0&hostUin=0&format=json&inCharset=utf8&outCharset=utf-8' +
-    '&notice=0&platform=yqq.json&needNewCode=0&categoryId=10000000&sortId=5&sin=0&ein=' + (args.limit || 30),
+    '&notice=0&platform=yqq.json&needNewCode=0&categoryId=10000000&sortId=5&sin=' + ((args.page || 0) * (args.limit || 30)) + '&ein=' + (((args.page || 0) + 1) * (args.limit || 30) - 1),
     {headers: {Referer: 'https://y.qq.com/'}});
   if (r.error || !r.body || Number(r.body.code) !== 0 || !r.body.data) throw new Error(r.error || '歌单响应无效');
   return (r.body.data.list || []).map(p => ({id: String(p.dissid), name: p.dissname, cover: p.imgurl,
     creator: (p.creator || {}).name || '', plays: Number(p.listennum) || 0}));
+};
+
+provider.playlist_search = function (args) {
+  const page = Math.max(0, args.page | 0), limit = args.limit || 30;
+  const headers = {'Content-Type': 'application/json', Referer: 'https://y.qq.com/', 'User-Agent': 'Mozilla/5.0'};
+  const ck = ctx.cookie('qq') || ''; if (ck) headers.Cookie = ck;
+  const body = JSON.stringify({comm: {ct: '19', cv: '1859', uin: '0'}, req: {
+    method: 'DoSearchForQQMusicDesktop', module: 'music.search.SearchCgiService',
+    param: {grp: 1, num_per_page: limit, page_num: page + 1, query: args.query, search_type: 3}}});
+  const r = http('https://u.y.qq.com/cgi-bin/musicu.fcg', {method: 'POST', body, headers});
+  const req = (r.body || {}).req || {};
+  if (r.error || !r.body || Number(r.body.code || 0) !== 0 || Number(req.code) !== 0) throw new Error(r.error || 'QQ 歌单搜索失败（code ' + req.code + '）');
+  const result = ((req.data || {}).body || {}).songlist;
+  if (!result || !Array.isArray(result.list)) throw new Error('QQ 未返回歌单搜索列表');
+  const rows = result.list;
+  return {items: rows.map(p => ({id: String(p.dissid || p.tid || ''), name: p.dissname || p.name || '',
+    cover: p.imgurl || p.logo || '', creator: (p.creator || {}).name || p.creator_name || '',
+    plays: Number(p.listennum || p.listennum_str) || 0, count: Number(p.song_count || p.songnum) || 0})),
+    more: ((req.data || {}).meta || {}).sum === undefined ? rows.length >= limit : (page + 1) * limit < Number(req.data.meta.sum)};
 };

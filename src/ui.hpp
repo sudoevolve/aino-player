@@ -206,19 +206,134 @@ static bool metadata_link(Ctx& c, const std::string& text, const Rect& box, cons
     return clicked;
 }
 
+// 选择只保存稳定歌曲 ID；后台刷新和虚拟列表滚动不会把选择错配到新行。
+struct BatchSelection {
+    std::string scope, anchor;
+    std::set<std::string> ids;
+    std::vector<std::string> order;
+    int revision = -1;
+};
+static std::map<std::string, BatchSelection> batch_selections;
+static BatchSelection* row_selection = nullptr;
+static BatchSelection* focused_selection = nullptr;
+static void select_song(Ctx& c, const std::string& uid) {
+    auto& selection = *row_selection;
+    focused_selection = row_selection; c.ui.set_focus(nullptr);
+    if (c.ui.input().shift() && !selection.anchor.empty()) {
+        auto first = std::find(selection.order.begin(), selection.order.end(), selection.anchor);
+        auto last = std::find(selection.order.begin(), selection.order.end(), uid);
+        if (first != selection.order.end() && last != selection.order.end()) {
+            if (!c.ui.input().ctrl()) selection.ids.clear();
+            if (first > last) std::swap(first, last);
+            for (; first <= last; ++first) selection.ids.insert(*first);
+            return;
+        }
+    }
+    if (!c.ui.input().ctrl() && !c.ui.input().shift()) selection.ids.clear();
+    if (c.ui.input().ctrl() && selection.ids.count(uid)) selection.ids.erase(uid);
+    else selection.ids.insert(uid);
+    selection.anchor = uid;
+}
+static float batch_toolbar(Ctx& c, const std::string& key, const std::string& scope, int revision,
+    const std::vector<music::Track>& tracks, const std::vector<int>* rows, const Rect& box,
+    bool remove = false, const std::string& playlist_key = {}) {
+    auto& selection = batch_selections[key]; row_selection = &selection;
+    if (selection.scope != scope) { selection = {}; selection.scope = scope; }
+    if (selection.revision != revision) {
+        selection.revision = revision; selection.order.clear();
+        auto add = [&](int index) { if (index >= 0 && index < int(tracks.size())) selection.order.push_back(track_uid(tracks[size_t(index)])); };
+        if (rows) for (int index : *rows) add(index); else for (int i = 0; i < int(tracks.size()); ++i) add(i);
+        std::set<std::string> valid(selection.order.begin(), selection.order.end());
+        for (auto it = selection.ids.begin(); it != selection.ids.end();) if (!valid.count(*it)) it = selection.ids.erase(it); else ++it;
+    }
+    // 键盘快捷键只在列表未聚焦输入框时生效，避免拦截中文输入法和文本编辑。
+    const bool keyboard = focused_selection == &selection && c.ui.focused_id() == nullptr && c.ui.pointer_available();
+    if (keyboard && c.ui.input().ctrl_of('A')) {
+        selection.ids.insert(selection.order.begin(), selection.order.end());
+        if (!selection.order.empty()) selection.anchor = selection.order.back();
+    }
+    if (keyboard && c.ui.input().key_pressed[KEY_ESC]) {
+        selection.ids.clear(); selection.anchor.clear();
+    }
+    if (keyboard && c.ui.input().key_pressed[KEY_ENTER] && !selection.ids.empty()) {
+        const auto id = selection.ids.count(selection.anchor) ? selection.anchor : *selection.ids.begin();
+        for (int index = 0; index < int(tracks.size()); ++index) if (track_uid(tracks[size_t(index)]) == id) {
+            if (key == "queue") start_play(index);
+            else if (key == "search") play_search_result(index);
+            else if (key == "recent") recent_play(size_t(index));
+            else playlist_play(index);
+            break;
+        }
+    }
+    // 工具栏高度固定，单击选择后列表不会突然跳动；选择行为与桌面列表一致。
+    const float action_w = 100;
+    const float action_x = box.right() - action_w;
+    if (selection.ids.empty()) {
+        const std::string hint = "单击选择 · Ctrl 增减 · Shift 连选 · 双击播放";
+        const Rect text{box.x, box.y + 3, box.w, 24};
+        c.ui.muted_text(ellipsize(c.ui, hint, text.w, 10), text, Style().font(10));
+        c.ui.tooltip(text, hint);
+    } else {
+        const Rect label{box.x, box.y + 3, std::max(38.0f, box.w - 202), 24};
+        const auto count = "已选 " + std::to_string(selection.ids.size()) + " 首";
+        c.ui.draw_text(ellipsize(c.ui, count, label.w, 10.5f), label, c.th.tint, Style().font(10.5f).semi_bold());
+        c.ui.tooltip(label, count);
+        if (c.ui.button("全选", {action_x - 96, box.y + 2, 42, 26}, Style().ghost().font(10.5f))) { focused_selection = &selection; c.ui.set_focus(nullptr); selection.ids.insert(selection.order.begin(), selection.order.end()); }
+        if (c.ui.button("清空", {action_x - 48, box.y + 2, 42, 26}, Style().ghost().font(10.5f))) { focused_selection = &selection; c.ui.set_focus(nullptr); selection.ids.clear(); selection.anchor.clear(); }
+    }
+    std::vector<std::string> items{"加入播放队列", "收藏所选歌曲", "下载所选歌曲"};
+    if (remove) items.push_back(key == "queue" ? "从队列移除" : "从本地歌单移除");
+    int action = -1; auto style = Style().font(10.5f); style.disabled = selection.ids.empty();
+    if (!selection.ids.empty() && c.ui.menu("批量操作", items, &action, {action_x, box.y + 2, action_w, 26}, style)) {
+        std::vector<music::Track> chosen;
+        auto take = [&](const music::Track& track) { if (selection.ids.count(track_uid(track))) chosen.push_back(track); };
+        if (rows) for (int i : *rows) take(tracks[size_t(i)]); else for (const auto& track : tracks) take(track);
+        batch_tracks(std::move(chosen), action == 0 ? BatchAction::Enqueue : action == 1 ? BatchAction::Favorite : action == 2 ? BatchAction::Download : key == "queue" ? BatchAction::RemoveQueue : BatchAction::RemovePlaylist, playlist_key);
+        if (action == 3) { selection.ids.clear(); selection.anchor.clear(); }
+    }
+    return 32;
+}
+static void draw_row_selection(Ctx& c, const music::Track& track, const Rect& box) {
+    if (!row_selection || !row_selection->ids.count(track_uid(track))) return;
+    c.ui.fill_rect(box, c.th.tint.scaled_alpha(0.20f), 6);
+    c.ui.fill_rect({box.x, box.y + 8, 3, box.h - 16}, c.th.tint, 1.5f);
+}
+
 struct SongMenuState {
     bool active = false;
     music::Track track;
     Rect anchor;
     Vec2 position;
+    std::vector<music::Track> selected;
+    bool can_remove = false;
+    BatchAction removal = BatchAction::RemoveQueue;
+    std::string playlist_key;
 };
 static SongMenuState song_menu;
 static void capture_song_menu(Ctx& c, const music::Track& track, const Rect& row, const Rect& viewport) {
     const auto& in = c.ui.input();
     const auto visible = row.intersect(viewport);
     if (!song_menu.active && c.ui.pointer_available() && in.pressed[1] && visible.contains(in.mouse.x, in.mouse.y) && !track.variants.empty()) {
+        if (row_selection) { focused_selection = row_selection; c.ui.set_focus(nullptr); }
+        if (row_selection && row_selection->ids.count(track_uid(track)) == 0) {
+            row_selection->ids.clear(); row_selection->anchor = track_uid(track); row_selection->ids.insert(row_selection->anchor);
+        }
         // 菜单不依赖虚拟列表的行索引；滚动、搜索刷新后仍操作右键时的歌曲。
         song_menu = {true, track, visible, in.mouse};
+        if (row_selection && row_selection->ids.size() > 1 && row_selection->ids.count(track_uid(track))) {
+            const bool queue = row_selection == &batch_selections["queue"];
+            const bool search = row_selection == &batch_selections["search"];
+            const bool recent = row_selection == &batch_selections["recent"];
+            const auto& tracks = queue ? c.s.tracks : search ? c.s.results : recent ? c.model.library.recent : c.model.playlist.playlist.tracks;
+            std::map<std::string, const music::Track*> by_id;
+            for (const auto& item : tracks) by_id[track_uid(item)] = &item;
+            for (const auto& id : row_selection->order) if (row_selection->ids.count(id)) {
+                auto found = by_id.find(id); if (found != by_id.end()) song_menu.selected.push_back(*found->second);
+            }
+            song_menu.can_remove = queue || (!search && !recent && c.model.playlist.saved);
+            song_menu.removal = queue ? BatchAction::RemoveQueue : BatchAction::RemovePlaylist;
+            song_menu.playlist_key = c.model.playlist.playlist.key;
+        }
     }
 }
 static void draw_song_menu(Ctx& c) {
@@ -227,8 +342,14 @@ static void draw_song_menu(Ctx& c) {
     const bool downloading = download != c.model.downloads.end() && !download->second.done && !download->second.failed;
     std::vector<std::string> items{"下一首播放", "添加到播放列表",
         c.model.library.contains(song_menu.track) ? "取消收藏" : "收藏歌曲", downloading ? "取消下载" : "下载歌曲"};
-    const bool has_artist = !music::track_artists(song_menu.track).empty();
-    const bool has_album = !music::track_album(song_menu.track).empty();
+    const bool group = !song_menu.selected.empty();
+    if (group) {
+        const auto count = std::to_string(song_menu.selected.size());
+        items = {"加入队列（" + count + " 首）", "收藏所选歌曲", "下载所选歌曲"};
+        if (song_menu.can_remove) items.push_back(song_menu.removal == BatchAction::RemoveQueue ? "从队列移除" : "从本地歌单移除");
+    }
+    const bool has_artist = !group && !music::track_artists(song_menu.track).empty();
+    const bool has_album = !group && !music::track_album(song_menu.track).empty();
     const bool bili = song_menu.track.current().source == music::Source::Bilibili;
     if (has_artist) items.push_back(bili ? "查看 UP 主" : "查看歌手");
     if (has_album) items.push_back(bili ? "查看视频分 P" : "查看专辑");
@@ -243,7 +364,8 @@ static void draw_song_menu(Ctx& c) {
     const auto& in = c.ui.raw_input();
     if (picked) {
         const auto track = song_menu.track;
-        if (chosen == 0) queue_play_next(track);
+        if (group) batch_tracks(song_menu.selected, chosen == 0 ? BatchAction::Enqueue : chosen == 1 ? BatchAction::Favorite : chosen == 2 ? BatchAction::Download : song_menu.removal, song_menu.playlist_key);
+        else if (chosen == 0) queue_play_next(track);
         else if (chosen == 1) toast(queue_push(track) ? "已添加到播放列表：" + track.title : "播放列表中已有这首歌曲");
         else if (chosen == 2) favorite_toggle(track);
         else if (chosen == 3) { if (downloading) cancel_download(track_uid(track)); else start_download(track, c.model.ui.settings); }
@@ -251,7 +373,7 @@ static void draw_song_menu(Ctx& c) {
         else if (has_album && chosen == (has_artist ? 5 : 4)) open_track_album(track);
     }
     if (picked || in.key_pressed[KEY_ESC] || ((in.pressed[0] || in.pressed[1]) && !menu.contains(in.mouse.x, in.mouse.y)))
-        song_menu.active = false;
+        song_menu = {};
 }
 
 // 没有封面图时的兜底：按歌名哈希生成的渐变 + 首字（纯程序化，零请求）
@@ -496,12 +618,16 @@ static void result_row(Ctx& c, const music::Track& t, int index, const Rect& box
     for (int i = 0; i < pill_n; ++i)
         if (c.ui.item("", "", "", pill_rect[i], Style().corner(9))) pill_clicked = i;
 
+    const Rect play_cover{box.x + 10, box.y + 10, 44, 44};
+    const bool cover_clicked = c.ui.item("", "", "", play_cover, Style().ghost());
     // ---- 2) 整行 ----
     const bool row_clicked = c.ui.item("", "", "", box, Style().corner(8).padded(0, 0));
     if (is_playing) c.ui.fill_rect(box, c.th.tint.scaled_alpha(0.15f), 8.0f);
+    draw_row_selection(c, t, box);
 
     const Rect cov{box.x + 10, box.y + 10, 44, 44};
     cover_art(c, t.cover_url, t.title, cov, 7.0f);
+    if (row_hover) { c.ui.fill_rect(cov, Color(0, 0, 0, 95), 7); c.ui.system_icon(SystemIcon::Play, cov.center(18, 18), Color(255, 255, 255)); }
     if (is_playing) {
         // 垫一层暗底：封面底色偏浅时白条会"消失"（七里香那张就是白底图）
         const Rect ind{cov.right() - 17.0f, cov.y + 3.0f, 14.0f, 14.0f};
@@ -572,6 +698,10 @@ static void result_row(Ctx& c, const music::Track& t, int index, const Rect& box
 
     c.ui.fill_rect({box.x + 10, box.bottom() - 1, box.w - 20, 1}, c.th.separator.scaled_alpha(0.6f));
 
+    c.ui.tooltip({text_x, box.y + 7, max_text, 44}, t.title + (sub.empty() ? "" : "\n" + sub));
+    c.ui.tooltip(favorite, saved ? "取消收藏" : "收藏歌曲");
+    c.ui.tooltip(qa, "添加到播放队列");
+    c.ui.tooltip(dl, dl_failed ? "下载失败，点击重试" : dl_done ? "已下载" : "下载歌曲");
     if (dl_clicked) start_download(t, c.model.ui.settings);
     if (favorite_clicked) favorite_toggle(t);
     if (parts_clicked) bilibili_open_parts(t);
@@ -584,9 +714,14 @@ static void result_row(Ctx& c, const music::Track& t, int index, const Rect& box
         if (playlist_mode) playlist_choose_source(index, pill_clicked, is_playing);
         else choose_search_source(index, pill_clicked, is_playing);
     }
-    if (row_clicked) {
-        if (playlist_mode) playlist_play(index);
-        else play_search_result(index);
+    if (cover_clicked) { if (playlist_mode) playlist_play(index); else play_search_result(index); }
+    else if (row_clicked) {
+        if (row_selection) {
+            if (c.ui.input().double_click) { if (playlist_mode) playlist_play(index); else play_search_result(index); }
+            else select_song(c, uid);
+            return;
+        }
+        if (playlist_mode) playlist_play(index); else play_search_result(index);
     }
 }
 
@@ -710,8 +845,7 @@ static void discover_chips(Ctx& c, const Rect& box, const disc::Heats& h, float*
     *used_h = (y - box.y) + row_h;
 }
 
-static void discover_card_row(Ctx& c, int index, const Rect& box) {
-    const disc::Card& cd = c.model.discovery.cards[size_t(index)];
+static void discover_card_row(Ctx& c, const disc::Card& cd, const Rect& box) {
     const bool save_clicked = c.ui.button("保存", {box.right() - 110, box.y + box.h * 0.5f - 12, 52, 24}, Style().font(10.5f));
     const bool hover = c.ui.pointer_available() && box.contains(c.ui.input().mouse.x, c.ui.input().mouse.y);
     const bool clicked = c.ui.item("", "", "", box, Style().corner(9));
@@ -751,7 +885,7 @@ static void discover_card_row(Ctx& c, int index, const Rect& box) {
         playlist.key = std::string(music::source_key(cd.source)) + "#" + cd.id;
         playlist.name = cd.name; playlist.cover = cd.cover;
         library_fetch(std::move(playlist));
-    } else if (clicked) disc_open(index);
+    } else if (clicked) open_playlist_card(cd);
 }
 
 static void tab_discover(Ctx& c) {
@@ -805,7 +939,13 @@ static void tab_discover(Ctx& c) {
     const Rect list{mx, y, mw, c.H - kBarHeight - y - 12};
     if (list.h < 60) return;
     const int n = int(d.cards.size());
-    c.ui.scroll(list, n, 60.0f, [&](int i, const Rect& row) { discover_card_row(c, i, row); });
+    c.ui.scroll(list, n + 1, 60.0f, [&](int i, const Rect& row) {
+        if (i < n) discover_card_row(c, d.cards[size_t(i)], row);
+        else {
+            auto load = Style().font(11); load.disabled = d.loading || !d.more;
+            if (c.ui.button(d.loading ? "加载中…" : d.more ? "加载更多歌单" : "没有更多新歌单", {row.cx() - 80, row.y + 12, 160, 30}, load)) disc_more();
+        }
+    });
 }
 
 static void queue_row(Ctx& c, const music::Track& track, int index, const Rect& box, bool current) {
@@ -815,10 +955,14 @@ static void queue_row(Ctx& c, const music::Track& track, int index, const Rect& 
     const bool saved = c.model.library.contains(track);
     const bool save_clicked = c.ui.icon_button("", favorite, Style().ghost());
     const bool remove_clicked = hover && c.ui.icon_button("", remove, Style().ghost());
+    const Rect play_cover{box.x + 8, box.y + 10, 40, 40};
+    const bool cover_clicked = c.ui.item("", "", "", play_cover, Style().ghost());
     const bool clicked = c.ui.item("", "", "", box, Style().corner(6));
     if (current) c.ui.fill_rect(box, c.th.tint.scaled_alpha(0.08f), 6);
+    draw_row_selection(c, track, box);
     const Rect cover{box.x + 8, box.y + 10, 40, 40};
     cover_art(c, track.cover_url, track.title, cover, 5);
+    if (hover) { c.ui.fill_rect(cover, Color(0, 0, 0, 95), 5); c.ui.system_icon(SystemIcon::Play, cover.center(18, 18), Color(255, 255, 255)); }
     const float x = cover.right() + 10, width = std::max(1.0f, favorite.x - x - 6);
     c.ui.draw_text(ellipsize(c.ui, track.title, width, 12, 600), {x, box.y + 10, width, 19}, current ? c.th.tint : c.th.label, Style().font(12).weight(600));
     const auto detail = track.artist + (track.duration_ms > 0 ? " · " + fmt_time(track.duration_ms) : "");
@@ -827,7 +971,8 @@ static void queue_row(Ctx& c, const music::Track& track, int index, const Rect& 
     if (hover) c.ui.system_icon(SystemIcon::Close, remove.center(10, 10), c.th.label3);
     if (save_clicked) favorite_toggle(track);
     else if (remove_clicked) queue_remove(index);
-    else if (clicked) start_play(index);
+    else if (cover_clicked) start_play(index);
+    else if (clicked) { if (row_selection) { if (c.ui.input().double_click) start_play(index); else select_song(c, track_uid(track)); } else start_play(index); }
 }
 struct QueueDrag { std::string uid; int target = -1; float last_scroll = 0; };
 static QueueDrag queue_drag;
@@ -842,7 +987,8 @@ static void queue_panel(Ctx& c, const Rect& box) {
         c.ui.muted_text("右键歌曲可选择下一首播放\n或添加到播放列表", {box.x + 24, box.y + 132, box.w - 48, 56}, Style().font(11).center().wrap_text());
         return;
     }
-    const Rect list{box.x + 8, box.y + 42, box.w - 16, box.h - 50};
+    const float batch_h = batch_toolbar(c, "queue", "queue", c.s.tracks_version, c.s.tracks, nullptr, {box.x + 12, box.y + 36, box.w - 24, 32}, true);
+    const Rect list{box.x + 8, box.y + 42 + batch_h, box.w - 16, box.h - 50 - batch_h};
     if (list.h < 30) return;
     const auto& drag_input = c.ui.input();
     const bool drag_available = c.ui.pointer_available();
@@ -909,6 +1055,7 @@ static void local_playlist_row(Ctx& c, int index, const Rect& box) {
 }
 
 static void catalog_detail(Ctx& c) {
+    row_selection = nullptr;
     const float mx = kSidebar + 24.0f, mw = c.W - mx - 24.0f - right_panel_width(c);
     const auto& view = c.model.playlist;
     const auto& target = view.catalog;
@@ -957,6 +1104,7 @@ static void catalog_detail(Ctx& c) {
     const auto count = int(albums ? view.album_rows.size() : view.rows.size());
     const bool more = albums ? view.albums_more : view.tracks_more;
     const bool initial_albums = albums && !view.albums_loaded;
+    if (!albums) list_y += batch_toolbar(c, "catalog", std::string(music::source_key(target.source)) + "/" + std::to_string(int(target.kind)) + "/" + target.id + "\x01" + c.model.ui.playlist_filter + std::to_string(c.model.ui.playlist_sort), int(view.playlist.tracks.size()), view.playlist.tracks, &view.rows, {mx, list_y, mw, 32});
     const Rect list{mx, list_y, mw, c.bar_y - list_y - 12};
     if (list.h < kRowHeight) return;
     if (count == 0) {
@@ -1011,7 +1159,11 @@ static void playlist_detail(Ctx& c) {
         std::string(music::source_name(playlist.source)) + (view.saved ? " · 已保存快照" : playlist.source == music::Source::Bilibili ? " · 视频分 P" : " · 在线歌单") : "本地歌单";
     c.ui.muted_text(origin + " · " + std::to_string(playlist.tracks.size()) + " 首", {mx, 98, mw, 18}, Style().font(11));
     if (view.loading) { c.ui.spinner({mx + mw / 2 - 11, 174, 22, 22}); return; }
-    if (!view.error.empty()) { c.ui.empty_state("歌单加载失败", view.error, {mx, 158, mw, 140}); return; }
+    if (!view.error.empty()) {
+        c.ui.empty_state("歌单加载失败", view.error, {mx, 158, mw, 140});
+        if (!view.saved && c.ui.button("重新加载", {mx + mw / 2 - 48, 306, 96, 30}, Style().font(11))) playlist_open_remote(playlist);
+        return;
+    }
     auto& state = c.model.ui;
     Style play = Style().primary().font(11.5f); play.disabled = view.rows.empty();
     if (c.ui.button(state.playlist_filter.empty() ? "播放全部" : "播放筛选结果", {mx, 130, 112, 30}, play)) playlist_play(-1);
@@ -1025,18 +1177,12 @@ static void playlist_detail(Ctx& c) {
     if (view.saved && state.playlist_manage) {
         c.ui.input(&state.playlist_rename, {mx, 210, mw - 84, 28}, Style().font(11).hint("歌单名称"));
         if (c.ui.button("重命名", {mx + mw - 76, 210, 76, 28}, Style().font(11))) playlist_rename_local();
-        if (c.ui.button("全选", {mx, 246, 54, 28}, Style().font(11))) {
-            for (const auto index : view.rows) state.playlist_selected.insert(track_uid(playlist.tracks[size_t(index)]));
-        }
-        if (c.ui.button("取消选择", {mx + 62, 246, 76, 28}, Style().font(11))) state.playlist_selected.clear();
-        c.ui.muted_text("已选 " + std::to_string(state.playlist_selected.size()) + " 首", {mx + 148, 246, mw - 252, 28}, Style().font(10.5f));
-        auto remove = Style().font(11).destructive(); remove.disabled = state.playlist_selected.empty();
-        if (c.ui.button("移除所选", {mx + mw - 94, 246, 94, 28}, remove)) playlist_remove_selected();
-        c.ui.input(&state.library_transfer_path, {mx, 282, mw - 94, 28}, Style().font(11).hint("导出 JSON 文件的完整路径"));
-        if (c.ui.button("导出歌单", {mx + mw - 86, 282, 86, 28}, Style().font(10.5f))) library_export(true);
-        c.ui.muted_text("管理只修改本地歌单，保留原音乐文件", {mx, 316, mw, 18}, Style().font(10.5f));
-        list_top = 344;
+        c.ui.input(&state.library_transfer_path, {mx, 246, mw - 94, 28}, Style().font(11).hint("导出 JSON 文件的完整路径"));
+        if (c.ui.button("导出歌单", {mx + mw - 86, 246, 86, 28}, Style().font(10.5f))) library_export(true);
+        c.ui.muted_text("管理只修改本地歌单，保留原音乐文件", {mx, 280, mw, 18}, Style().font(10.5f));
+        list_top = 308;
     }
+    list_top += batch_toolbar(c, "playlist", std::string(music::source_key(playlist.source)) + "/" + playlist.key + "#" + playlist.remote_id + "\x01" + state.playlist_filter + std::to_string(state.playlist_sort), int(view.library_revision) + int(playlist.tracks.size()), playlist.tracks, &view.rows, {mx, list_top, mw, 32}, view.saved, playlist.key);
     if (playlist.tracks.empty()) { c.ui.empty_state("歌单是空的", "收藏歌曲或导入音乐文件夹后会显示在这里", {mx, list_top + 12, mw, 120}); return; }
     if (view.rows.empty()) { c.ui.empty_state("没有匹配的歌曲", "试试其他关键词，或清空歌单内搜索", {mx, list_top + 12, mw, 120}); return; }
     const Rect list{mx, list_top, mw, c.bar_y - list_top - 12};
@@ -1046,15 +1192,6 @@ static void playlist_detail(Ctx& c) {
         const int i = view.rows[size_t(visible)];
         const auto& track = playlist.tracks[size_t(i)];
         auto song = row;
-        if (view.saved && c.model.ui.playlist_manage) {
-            const auto uid = track_uid(track);
-            bool selected = c.model.ui.playlist_selected.count(uid) != 0;
-            if (c.ui.checkbox(&selected, "", {row.x, row.cy() - 10, 22, 20})) {
-                if (selected) c.model.ui.playlist_selected.insert(uid); else c.model.ui.playlist_selected.erase(uid);
-            }
-            song.x += 28; song.w -= 28;
-            if (selected) c.ui.fill_rect(song, c.th.tint.scaled_alpha(0.10f), 6);
-        }
         capture_song_menu(c, track, song, list);
         result_row(c, track, i, song, track_uid(track) == c.s.now_uid, true);
     });
@@ -1176,17 +1313,40 @@ static void tab_search(Ctx& c) {
     const float mw = c.W - mx - right_pad;
 
     const bool compact = mw < 470.0f;
-    c.ui.heading("在线搜索", {mx, 20, compact ? mw : 108.0f, 30});
-    const float field_y = compact ? 58.0f : 20.0f;
-    const float field_x = compact ? mx : mx + 116.0f;
+    c.ui.heading("在线搜索", {mx, 20, compact ? mw - 130 : 108.0f, 30});
+    // 类型切换不改动输入框实现，保留已确认正常的 IME 路径。
+    if (c.ui.segmented({"歌曲", "歌单"}, &c.model.ui.search_kind, {mx + mw - 126, 20, 126, 28}, Style().font(11))) song_menu = {};
+    const float field_y = 58.0f;
+    const float field_x = mx;
     const float search_btn = compact ? 76.0f : 84.0f;
     const Rect field{field_x, field_y, std::max(60.0f, mw - (field_x - mx) - search_btn - 8.0f), 32};
-    c.ui.search_field(&c.model.ui.query, field, Style().font(12).hint("歌曲 / 歌手 / 专辑"));
-    if (c.ui.button(c.s.searching ? "搜索中…" : "搜索", {field.right() + 8.0f, field_y, search_btn, 32},
+    c.ui.search_field(&c.model.ui.query, field, Style().font(12).hint(c.model.ui.search_kind ? "输入在线歌单名称" : "歌曲 / 歌手 / 专辑"));
+    if (c.ui.button((c.model.ui.search_kind ? c.model.playlist_search.loading : c.s.searching) ? "搜索中…" : "搜索", {field.right() + 8.0f, field_y, search_btn, 32},
                     Style().primary().font(12.5f))) {
-        start_search();
+        if (c.model.ui.search_kind) search_playlists(); else start_search();
     }
-    if (c.ui.pointer_available() && c.ui.input().key_pressed[KEY_ENTER]) start_search();
+    if (c.ui.pointer_available() && c.ui.focused_id() == &c.model.ui.query && c.ui.input().key_pressed[KEY_ENTER]) {
+        if (c.model.ui.search_kind) search_playlists(); else start_search();
+    }
+    if (c.model.ui.search_kind) {
+        const auto& result = c.model.playlist_search;
+        if (c.ui.segmented({"网易云", "QQ", "酷我", "酷狗", "咪咕"}, &c.model.ui.playlist_search_site, {mx, field_y + 42, std::min(mw, 400.0f), 26}, Style().font(11)) && !music::text::trim(c.model.ui.query).empty()) search_playlists();
+        float y = field_y + 82;
+        if (!result.err.empty()) { error_notice(c, "歌单搜索失败", result.err, {mx, y, mw, 28}); y += 32; }
+        const Rect list{mx, y, mw, c.bar_y - y - 14};
+        const int count = int(result.cards.size());
+        if (count == 0) {
+            if (result.loading) c.ui.spinner({list.cx() - 11, list.y + 40, 22, 22});
+            else c.ui.empty_state(result.query.empty() ? "搜索在线歌单" : "没有找到歌单", "支持网易云、QQ、酷我、酷狗和咪咕歌单，可打开、收藏快照和继续加载", {mx, y + 24, mw, 110});
+        } else if (list.h >= 60) c.ui.scroll(list, count + 1, 60, [&](int i, const Rect& row) {
+            if (i < count) discover_card_row(c, result.cards[size_t(i)], row);
+            else {
+                auto style = Style().font(11); style.disabled = result.loading || !result.more;
+                if (c.ui.button(result.loading ? "搜索中…" : result.more ? "加载更多歌单" : "已显示全部结果", {row.cx() - 80, row.y + 12, 160, 30}, style)) search_playlists(true);
+            }
+        });
+        return;
+    }
 
     // 平台筛选。
     // 注意：平台下标不是连续的（网易云 0 / QQ 1 / B 站 4），而 toggle_group_multi
@@ -1226,7 +1386,7 @@ static void tab_search(Ctx& c) {
     }
     c.ui.draw_text(status, {mx, filter_y + 28, mw, 18}, c.th.label3, st);
 
-    const float list_y = filter_y + 54;
+    const float list_y = filter_y + 54 + batch_toolbar(c, "search", "search", c.s.results_version, c.s.results, nullptr, {mx, filter_y + 54, mw, 32});
     const Rect list{mx, list_y, mw, c.H - kBarHeight - list_y - 14};
     if (list.h < kRowHeight) return;
 
@@ -1633,8 +1793,8 @@ static void update_settings(Ctx& c, float x, float w, float y) {
     if (c.ui.button("发布页", {x + 118, card.y + 154, 72, 28}, Style().ghost().font(11))) open_update(false);
     if (update.status == UpdateStatus::Available && c.ui.button(update.installer ? "下载并安装" : "下载新版", {x + w - 116, card.y + 154, 96, 28}, Style().primary().font(11))) open_update(true);
     if (update.status == UpdateStatus::Downloading) c.ui.muted_text("下载 " + std::to_string(update.progress) + "%", {x + 20, card.bottom() + 14, w - 40, 20}, Style().font(11));
-    c.ui.muted_text("Windows 使用安装器覆盖升级；Linux 完成系统授权后覆盖安装 deb，无需卸载旧版。更新保留配置、收藏和歌单。", {x + 2, card.bottom() + 48, w - 4, 64}, Style().font(11).wrap_text().top());
-    update_notes(c, x, w, y + 390, true);
+    c.ui.muted_text("Windows 使用安装器覆盖升级；Linux 完成系统授权后覆盖安装 deb，无需卸载旧版。更新保留配置、收藏和歌单。", {x + 2, card.bottom() + 44, w - 4, 52}, Style().font(11).wrap_text().top());
+    update_notes(c, x, w, card.bottom() + 116, true);
 }
 static void about_settings(Ctx& c, float x, float w, float y) {
     draw_brand(c, {x + w / 2 - 32, y + 6, 64, 64});
@@ -1694,17 +1854,25 @@ static void tab_recent(Ctx& c) {
     c.ui.draw_text("最近播放", {x, 24, w, 36}, c.th.label, Style().font(25).weight(700));
     c.ui.muted_text("播放至少 5 秒后记录 · 最近 200 首 · 保存在本机", {x, 70, w - 90, 26}, Style().font(11));
     if (c.ui.button("清空记录", {x + w - 84, 68, 84, 28}, Style().font(11))) recent_clear();
-    const Rect list{x, 112, w, c.bar_y - 128};
     const auto& tracks = c.model.library.recent;
+    const float batch_h = batch_toolbar(c, "recent", "recent", int(c.model.library_revision), tracks, nullptr, {x, 108, w, 32});
+    const Rect list{x, 112 + batch_h, w, c.bar_y - 128 - batch_h};
     if (tracks.empty()) { c.ui.empty_state("还没有播放记录", "听过的歌曲会显示在这里", list); return; }
     c.ui.scroll(list, int(tracks.size()), 64, [&](int index, const Rect& row) {
         const auto& track = tracks[size_t(index)]; capture_song_menu(c, track, row, list);
+        const Rect cover{row.x + 8, row.y + 8, 46, 46};
+        const bool play = c.ui.item("", "", "", cover, Style().ghost());
         const bool clicked = c.ui.item("", "", "", row, Style().corner(7));
-        cover_art(c, track.cover_url, track.title, {row.x + 8, row.y + 8, 46, 46}, 6);
+        draw_row_selection(c, track, row);
+        cover_art(c, track.cover_url, track.title, cover, 6);
+        if (c.ui.pointer_available() && row.contains(c.ui.input().mouse.x, c.ui.input().mouse.y)) {
+            c.ui.fill_rect(cover, Color(0, 0, 0, 95), 6); c.ui.system_icon(SystemIcon::Play, cover.center(18, 18), Color(255, 255, 255));
+        }
         const float tx = row.x + 66, tw = std::max(20.0f, row.w - 80);
         c.ui.draw_text(ellipsize(c.ui, track.title, tw, 12.5f), {tx, row.y + 10, tw, 20}, c.th.label, Style().font(12.5f));
         c.ui.draw_text(ellipsize(c.ui, track.artist + " · " + track.album, tw, 10.5f), {tx, row.y + 34, tw, 18}, c.th.label2, Style().font(10.5f));
-        if (clicked) recent_play(size_t(index));
+        if (play || (clicked && c.ui.input().double_click)) recent_play(size_t(index));
+        else if (clicked) select_song(c, track_uid(track));
     });
 }
 static void tab_settings(Ctx& c) {
@@ -1937,7 +2105,9 @@ static void player_bar(Ctx& c) {
     if (busy) status = c.s.pending_paused ? "已暂停，准备完成后等待播放" : c.s.ps == PlayState::Buffering ? "缓冲 " + std::to_string(int(c.s.buffer * 100)) + "%" : "正在解析…";
     else if (c.s.ps == PlayState::Failed) status = "播放失败 · 点击播放重试：" + c.s.error;
     c.ui.tooltip(cover, status);
+    auto* selection = row_selection; row_selection = nullptr;
     capture_song_menu(c, track, song, song);
+    row_selection = selection;
     const float duration = std::max(1.0f, c.model.ui.dur_ms);
     const Rect progress{tx + 39, y + 54, std::max(1.0f, tw - 78), 18};
     static SeekBar seek;
@@ -2009,10 +2179,12 @@ static void draw_toast(Ctx& c) {
 // 折行结果缓存：只有歌词或宽度变了才重算。60 行的歌词每字宽度都量一遍是
 // 千把次 text_width，每帧都做会把帧时间顶上去。
 struct LyricLayout {
-    const void* owner = nullptr;
+    std::shared_ptr<const lyr::Doc> owner;
+    bool translated = true;
     float width = -1.0f;
     std::vector<int> src;          // 显示行 → 原行下标
     std::vector<std::string> text;
+    std::vector<bool> translation;
     std::vector<float> top;        // 相对内容顶部的 y
     float total = 0.0f;
 };
@@ -2020,52 +2192,36 @@ static LyricLayout g_lyr_layout;
 static float g_lyr_scroll = 0.0f;
 static int g_lyr_cur = -2;
 
-static void build_lyric_layout(aino::Ui& ui, const lyr::Doc& doc, float width) {
-    g_lyr_layout.owner = &doc;
+static void build_lyric_layout(aino::Ui& ui, const std::shared_ptr<const lyr::Doc>& doc, float width, bool translated) {
+    g_lyr_layout = {};
+    g_lyr_layout.owner = doc;
     g_lyr_layout.width = width;
-    g_lyr_layout.src.clear();
-    g_lyr_layout.text.clear();
-    g_lyr_layout.top.clear();
-
-    const float line_h = 23.0f;
-    const float para_gap = 9.0f;
-    float y = 0.0f;
-    bool first = true;
-    for (int i = 0; i < int(doc.lines.size()); ++i) {
-        const std::string& t = doc.lines[i].text;
-        if (t.empty()) continue;  // LRC 里的空行（间奏）直接跳过，不占位
-        if (!first) y += para_gap;
-        first = false;
-
-        if (ui.text_width(t, 13.0f) <= width) {
-            g_lyr_layout.src.push_back(i);
-            g_lyr_layout.text.push_back(t);
-            g_lyr_layout.top.push_back(y);
-            y += line_h;
-            continue;
-        }
-        // 超宽：按 UTF-8 字符断行（中文没有空格，硬断才是对的）
+    g_lyr_layout.translated = translated;
+    float y = 0;
+    auto append = [&](const std::string& text, int source, bool translation) {
+        const float font = translation ? 11.0f : 13.0f;
+        const float height = translation ? 20.0f : 23.0f;
+        auto emit = [&](const std::string& line) {
+            g_lyr_layout.src.push_back(source); g_lyr_layout.text.push_back(line);
+            g_lyr_layout.translation.push_back(translation); g_lyr_layout.top.push_back(y); y += height;
+        };
+        if (ui.text_width(text, font) <= width) { emit(text); return; }
         std::string line;
-        for (size_t k = 0; k < t.size();) {
-            const size_t step = utf8_step(t, k);
-            const std::string probe = line + t.substr(k, step);
-            if (!line.empty() && ui.text_width(probe, 13.0f) > width) {
-                g_lyr_layout.src.push_back(i);
-                g_lyr_layout.text.push_back(line);
-                g_lyr_layout.top.push_back(y);
-                y += line_h;
-                line = t.substr(k, step);
-            } else {
-                line = probe;
-            }
+        for (size_t k = 0; k < text.size();) {
+            const auto step = utf8_step(text, k);
+            auto probe = line + text.substr(k, step);
+            if (!line.empty() && ui.text_width(probe, font) > width) { emit(line); line = text.substr(k, step); }
+            else line = std::move(probe);
             k += step;
         }
-        if (!line.empty()) {
-            g_lyr_layout.src.push_back(i);
-            g_lyr_layout.text.push_back(line);
-            g_lyr_layout.top.push_back(y);
-            y += line_h;
-        }
+        if (!line.empty()) emit(line);
+    };
+    for (int i = 0; i < int(doc->lines.size()); ++i) {
+        const auto& line = doc->lines[size_t(i)];
+        if (line.text.empty()) continue;
+        if (!g_lyr_layout.text.empty()) y += 9;
+        append(line.text, i, false);
+        if (translated && !line.translation.empty()) append(line.translation, i, true);
     }
     g_lyr_layout.total = y;
 }
@@ -2075,6 +2231,9 @@ static void lyrics_panel(Ctx& c, const Rect& box) {
     const auto& uid = c.model.lyrics.uid;
     const bool loading = c.model.lyrics.loading;
 
+    static bool show_translation = true;
+    bool has_translation = doc && std::any_of(doc->lines.begin(), doc->lines.end(), [](const auto& line) { return !line.translation.empty(); });
+    if (has_translation && c.ui.button(show_translation ? "译文：开" : "译文：关", {box.right() - 140, box.bottom() - 28, 72, 24}, Style().ghost().font(10))) show_translation = !show_translation;
     const Rect tools_button{box.right() - 64, box.bottom() - 28, 54, 24};
     if (c.ui.button(c.model.ui.lyric_tools ? "收起" : "校准", tools_button, Style().ghost().font(10))) c.model.ui.lyric_tools = !c.model.ui.lyric_tools;
     const float extra = c.model.ui.lyric_tools ? 126.0f : 0.0f;
@@ -2090,7 +2249,9 @@ static void lyrics_panel(Ctx& c, const Rect& box) {
         c.ui.input(&c.model.ui.lyric_file_path, {x, y + 60, w - 66, 27}, Style().font(10).hint("UTF-8 LRC 文件完整路径"));
         if (c.ui.button("选择…", {x + w - 60, y + 60, 60, 27}, Style().font(10))) choose_local_lyrics();
         if (c.ui.button("使用本地歌词", {x, y + 94, 110, 25}, Style().font(10))) use_local_lyrics();
-        if (c.ui.button("恢复默认", {x + 120, y + 94, 90, 25}, Style().font(10))) use_local_lyrics(true);
+        if (c.ui.button("恢复默认", {x + 118, y + 94, 80, 25}, Style().font(10))) use_local_lyrics(true);
+        auto refresh = Style().ghost().font(10); refresh.disabled = loading;
+        if (c.ui.button("刷新", {x + 206, y + 94, w - 206, 25}, refresh)) request_current_lyrics(true);
     }
 
     // 歌词属于"当前正在播的这首"才算数；切歌瞬间新旧对不上时先显示加载态
@@ -2113,13 +2274,15 @@ static void lyrics_panel(Ctx& c, const Rect& box) {
         s.font_size = 11.5f;
         s.align = Align::Center;
         s.wrap_text();
-        c.ui.draw_text(doc->error, {area.x + 14, area.y + area.h * 0.3f, area.w - 28, 60}, c.th.label3, s);
+        c.ui.draw_text(doc->error, {area.x + 14, area.y + area.h * 0.3f, area.w - 28, 70}, c.th.label2, s);
+        auto retry = Style().font(11); retry.disabled = loading;
+        if (c.ui.button(loading ? "正在重试…" : "重新获取歌词", {area.cx() - 56, area.y + area.h * 0.3f + 82, 112, 30}, retry)) request_current_lyrics(true);
         return;
     }
 
     const float text_w = area.w - 26.0f;
-    if (g_lyr_layout.owner != doc.get() || std::fabs(g_lyr_layout.width - text_w) > 0.5f)
-        build_lyric_layout(c.ui, *doc, text_w);
+    if (g_lyr_layout.owner != doc || g_lyr_layout.translated != show_translation || std::fabs(g_lyr_layout.width - text_w) > 0.5f)
+        build_lyric_layout(c.ui, doc, text_w, show_translation);
 
     const int cur_line = doc->synced ? lyr::current_line(doc->lines, (long long)c.model.ui.pos_ms - offset) : -1;
     int disp_cur = -1;
@@ -2152,6 +2315,7 @@ static void lyrics_panel(Ctx& c, const Rect& box) {
     const float k = 1.0f - std::exp(-dt / tau);
     g_lyr_scroll += (target - g_lyr_scroll) * k;
     if (std::fabs(target - g_lyr_scroll) < 0.5f) g_lyr_scroll = target;
+    else c.ui.request_animation_frame();
 
     c.ui.push_clip(area);
     const float base_y = area.y - g_lyr_scroll;
@@ -2183,11 +2347,12 @@ static void lyrics_panel(Ctx& c, const Rect& box) {
             press_line = -1;
         }
         Style s;
-        s.font_size = active ? 13.5f : 12.5f;
-        s.font_weight = active ? 600 : 400;
+        const bool translation = g_lyr_layout.translation[size_t(i)];
+        s.font_size = translation ? 11.0f : active ? 13.5f : 12.5f;
+        s.font_weight = active && !translation ? 600 : 400;
         s.align = Align::Center;   // 歌词居中，左对齐在抽屉里很难看
         c.ui.draw_text(g_lyr_layout.text[size_t(i)], {area.x, ty, area.w, 22},
-                       active ? c.th.tint : c.th.label2, s);
+                       active ? c.th.tint : translation ? c.th.label3 : c.th.label2, s);
     }
     if (c.ui.input().released[0]) press_line = -1;
     c.ui.pop_clip();
@@ -2211,8 +2376,10 @@ static void lyrics_panel(Ctx& c, const Rect& box) {
     Style f;
     f.font_size = 9.5f;
     f.valign = VAlign::Middle;
-    c.ui.draw_text(doc->origin.empty() ? std::string() : ("歌词来自 " + doc->origin),
-                   {box.x + 20, box.bottom() - 26, box.w - 98, 16}, c.th.label4, f);
+    const std::string origin = loading ? "正在补充译文…" : doc->origin.empty() ? "" : "歌词来自 " + doc->origin;
+    const Rect source{box.x + 16, box.bottom() - 26, box.w - (has_translation ? 164 : 88), 18};
+    c.ui.draw_text(ellipsize(c.ui, origin, source.w, 9.5f), source, c.th.label3, f);
+    c.ui.tooltip(source, origin);
 }
 
 static void listening_panel(Ctx& c, const Rect& box) {
@@ -2292,6 +2459,8 @@ static void error_details_dialog(Ctx& c) {
 }
 
 static void compose(aino::Ui& ui, Ctx& c) {
+    row_selection = nullptr;
+    if (!c.model.ui.lyrics_open && g_lyr_layout.owner) { g_lyr_layout = {}; g_lyr_scroll = 0; g_lyr_cur = -1; }
     if (c.model.ui.tab == 2) { c.model.ui.tab = 1; c.model.ui.queue_open = true; c.model.ui.lyrics_open = false; }
     ui.fill_rect({0, 0, c.W, c.H}, c.th.window_bg);
     sidebar(c);

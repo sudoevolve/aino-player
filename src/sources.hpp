@@ -1397,6 +1397,9 @@ inline bool resolve_via_source(const Variant& v, int quality, ResolveResult& out
         return false;
     }
     auto& engine = lx::Engine::instance();
+    // 启动恢复在后台进行；第一次点播等待恢复完成，切歌或退出可立即取消。
+    while (engine.restoring() && !net::cancelled()) platform::sleep_ms(20);
+    if (net::cancelled()) { if (why) *why = "取流已取消"; return false; }
     if (!engine.supports(key)) {
         if (why) *why = std::string("没有音源声明支持 ") + key;
         return false;
