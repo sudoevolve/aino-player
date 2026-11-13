@@ -52,4 +52,3 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 cpack --config build/CPackConfig.cmake -G DEB -B dist
 ```
-
