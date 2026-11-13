@@ -26,10 +26,10 @@
 
 在 [GitHub Releases](https://github.com/sudoevolve/aino-player/releases/latest) 下载：
 
-| 系统 | 推荐下载 |
-| --- | --- |
-| Windows x64 | `setup-windows-x64.exe` 安装器；也提供便携 EXE |
-| Ubuntu 22.04+ / Debian 12+ amd64 | `.deb` 安装包 |
+| 系统                             | 推荐下载                                         |
+| -------------------------------- | ------------------------------------------------ |
+| Windows x64                      | `setup-windows-x64.exe` 安装器；也提供便携 EXE |
+| Ubuntu 22.04+ / Debian 12+ amd64 | `.deb` 安装包                                  |
 
 Linux 可直接覆盖升级，无需先卸载：
 
@@ -50,5 +50,3 @@ sudo apt install ./aino-player_0.2.6_amd64.deb
 [构建指南](docs/BUILDING.md) · [架构与验证记录](docs/ADR-001-portable-player.md) · [Linux 内存实测](docs/Linux-memory-profile.md) · [第三方依赖](vendor/README.md)
 
 Apache-2.0 · 作者 [sudoevolve](https://github.com/sudoevolve) · [aino UI 库](https://github.com/sudoevolve/aino)
-
-“Aino” 是芬兰女性名字，意为“独立”或“唯一”。
