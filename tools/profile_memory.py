@@ -14,6 +14,95 @@ import threading
 import time
 import zlib
 
+if os.name == 'nt':
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    psapi = ctypes.WinDLL('psapi', use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+    psapi.QueryWorkingSet.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+    psapi.EnumProcessModulesEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
+    psapi.GetModuleFileNameExW.argtypes = [wintypes.HANDLE, wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
+    class MemoryCounters(ctypes.Structure):
+        _fields_ = [('cb', wintypes.DWORD), ('PageFaultCount', wintypes.DWORD)] + [
+            (name, ctypes.c_size_t) for name in ('PeakWorkingSetSize', 'WorkingSetSize', 'QuotaPeakPagedPoolUsage',
+                'QuotaPagedPoolUsage', 'QuotaPeakNonPagedPoolUsage', 'QuotaNonPagedPoolUsage', 'PagefileUsage', 'PeakPagefileUsage', 'PrivateUsage')]
+    class ProcessEntry(ctypes.Structure):
+        _fields_ = [('dwSize', wintypes.DWORD), ('cntUsage', wintypes.DWORD), ('th32ProcessID', wintypes.DWORD),
+            ('th32DefaultHeapID', ctypes.c_size_t), ('th32ModuleID', wintypes.DWORD), ('cntThreads', wintypes.DWORD),
+            ('th32ParentProcessID', wintypes.DWORD), ('pcPriClassBase', wintypes.LONG), ('dwFlags', wintypes.DWORD),
+            ('szExeFile', wintypes.WCHAR * 260)]
+    kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
+    kernel.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
+
+
+def windows_memory(pid):
+    handle = kernel.OpenProcess(0x0400 | 0x0010, False, pid)
+    if not handle:
+        return None
+    try:
+        counters = MemoryCounters(); counters.cb = ctypes.sizeof(counters)
+        if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+            return None
+        # WorkingSet 的 Shared 位区分私有驻留页；PrivateUsage 另列为私有提交，不能混用。
+        count = counters.WorkingSetSize // 4096 + 4096
+        for _ in range(3):
+            pages = (ctypes.c_size_t * (count + 1))()
+            if psapi.QueryWorkingSet(handle, pages, ctypes.sizeof(pages)):
+                break
+            count = max(count * 2, int(pages[0]) + 4096)
+        else:
+            raise ctypes.WinError(ctypes.get_last_error())
+        private_kib = sum(not (pages[i] & (1 << 8)) for i in range(1, int(pages[0]) + 1)) * 4
+        return {'VmRSS': counters.WorkingSetSize // 1024, 'VmHWM': counters.PeakWorkingSetSize // 1024,
+                'Private': private_kib, 'PrivateCommit': counters.PrivateUsage // 1024, 'Pss': 0}
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def windows_children(pid):
+    snapshot = kernel.CreateToolhelp32Snapshot(2, 0)
+    if snapshot == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    parents = {}
+    try:
+        entry = ProcessEntry(); entry.dwSize = ctypes.sizeof(entry)
+        exists = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
+        while exists:
+            parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+            exists = kernel.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel.CloseHandle(snapshot)
+    found = {pid}
+    while True:
+        more = {child for child, parent in parents.items() if parent in found}
+        if more <= found:
+            return sorted(found - {pid})
+        found |= more
+
+
+def windows_modules(pid):
+    handle = kernel.OpenProcess(0x0400 | 0x0010, False, pid)
+    if not handle:
+        return []
+    try:
+        modules = (wintypes.HMODULE * 2048)(); needed = wintypes.DWORD()
+        if not psapi.EnumProcessModulesEx(handle, modules, ctypes.sizeof(modules), ctypes.byref(needed), 3):
+            raise ctypes.WinError(ctypes.get_last_error())
+        result = []
+        for module in modules[:min(len(modules), needed.value // ctypes.sizeof(wintypes.HMODULE))]:
+            name = ctypes.create_unicode_buffer(32768)
+            if psapi.GetModuleFileNameExW(handle, module, name, len(name)):
+                result.append(name.value)
+        return result
+    finally:
+        kernel.CloseHandle(handle)
+
 
 def prepare(source):
     source = Path(source)
@@ -46,9 +135,33 @@ def prepare(source):
     }
 ''')
     cover.write_text(text, encoding='utf-8')
+    # 仅在临时诊断源中选择相同的实时 null 音频设备；两个系统仍执行完整消费回调。
+    audio = source / 'src/audio.cpp'
+    text = audio.read_text(encoding='utf-8')
+    anchor = '        auto config = ma_engine_config_init();'
+    assert text.count(anchor) == 2
+    text = text.replace(anchor, anchor + '''
+        static ma_context context;
+        static const ma_result initialized = [] {
+            const ma_backend backend = ma_backend_null;
+            return ma_context_init(&backend, 1, nullptr, &context);
+        }();
+        if (initialized != MA_SUCCESS) { p.error = "diagnostic null audio context failed"; return false; }
+        config.pContext = &context;
+''')
+    audio.write_text(text, encoding='utf-8')
+    framework = source / 'src/aino.hpp'
+    text = framework.read_text(encoding='utf-8')
+    anchor = 'inline SystemIconMask load_system_icon(SystemIcon icon, int size) {\n    SystemIconMask mask;'
+    assert text.count(anchor) == 1
+    text = text.replace(anchor, anchor + '\n    if (std::getenv("AINO_MEMORY_NO_ICONS")) return mask;')
+    # 诊断消融实验只屏蔽图标；不得把它当作可以接受的产品修复。
+    framework.write_text(text, encoding='utf-8')
 
 
 def read_memory(pid):
+    if os.name == 'nt':
+        return windows_memory(pid)
     result = {}
     try:
         for file in ('status', 'smaps_rollup'):
@@ -63,6 +176,8 @@ def read_memory(pid):
 
 
 def descendants(pid):
+    if os.name == 'nt':
+        return windows_children(pid)
     children = []
     try:
         # 子进程可由任意解码工作线程创建，不能只读主线程的 children。
@@ -90,9 +205,14 @@ def fixtures(root):
     return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 192, 192, 8, 2, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(pixels)) + chunk(b'IEND', b'')
 
 
-def run(binary, output, scale):
+def run(binary, output, scale, fixture_directory=None, no_icons=False):
     output = Path(output).resolve(); output.mkdir(parents=True, exist_ok=True)
-    root = output / 'fixtures'; png = fixtures(root)
+    root = output / 'fixtures'
+    if fixture_directory:
+        shutil.copytree(fixture_directory, root)
+        png = (root / 'cover.png').read_bytes()
+    else:
+        png = fixtures(root)
     class Handler(http.server.SimpleHTTPRequestHandler):
         def do_GET(self):
             if self.path.startswith('/cover/'):
@@ -104,9 +224,11 @@ def run(binary, output, scale):
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), functools.partial(Handler, directory=str(root)))
     thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
     env = dict(os.environ)
-    for key in ('HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'TMPDIR'):
+    for key in ('HOME', 'APPDATA', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'TMPDIR', 'TEMP', 'TMP'):
         directory = output / key.lower(); directory.mkdir(); env[key] = str(directory)
     env.update(AINO_MEMORY_ROOT=str(root), AINO_MEMORY_URL=f'http://127.0.0.1:{server.server_port}', AINO_SCALE=str(scale), PULSE_SINK='aino_memory')
+    if no_icons:
+        env['AINO_MEMORY_NO_ICONS'] = '1'
     rows = []; traces = []; last_phase = ''; sampled_phases = set()
     with (output / 'player.log').open('w', encoding='utf-8') as log:
         process = subprocess.Popen([str(Path(binary).resolve())], env=env, stdout=subprocess.PIPE, stderr=log, text=True, encoding='utf-8', errors='replace')
@@ -126,7 +248,7 @@ def run(binary, output, scale):
                     if mem:
                         row = dict(trace, **mem)
                         child_memory = [value for pid in descendants(process.pid) if (value := read_memory(pid))]
-                        for key in ('VmRSS', 'Pss', 'Private'):
+                        for key in ('VmRSS', 'Pss', 'Private', 'PrivateCommit'):
                             row['children_' + key] = sum(value.get(key, 0) for value in child_memory)
                             row['tree_' + key] = row.get(key, 0) + row['children_' + key]
                         rows.append(row)
@@ -135,7 +257,10 @@ def run(binary, output, scale):
                         # 各场景结束前保留完整内存映射，供后续归因。
                         phase = trace['phase']
                         if phase not in sampled_phases or int(trace['seconds'] * 2) % 4 == 0:
-                            (output / f'{phase}-smaps.txt').write_text(Path(f'/proc/{process.pid}/smaps').read_text())
+                            if os.name == 'nt':
+                                (output / f'{phase}-modules.json').write_text(json.dumps(windows_modules(process.pid), indent=2))
+                            else:
+                                (output / f'{phase}-smaps.txt').write_text(Path(f'/proc/{process.pid}/smaps').read_text())
                             sampled_phases.add(phase)
                 time.sleep(.5)
             reader.join(timeout=5)
@@ -157,32 +282,42 @@ def run(binary, output, scale):
             raise RuntimeError(f'{phase}: no sustained playback; memory data must not be presented as successful playback')
     if not rows or not all(abs(r['scale'] - scale) < .01 for r in rows):
         raise RuntimeError('actual window DPI does not match requested scale')
-    (output / 'validated.json').write_text(json.dumps({'scale': scale, 'sustained_playback': True, 'samples': len(rows)}))
+    if not all(r['physical_w'] == int(1180 * scale) and r['physical_h'] == int(760 * scale) for r in rows):
+        raise RuntimeError('physical window dimensions do not match')
+    (output / 'validated.json').write_text(json.dumps({'platform': os.name, 'audio': 'miniaudio null realtime device', 'scale': scale,
+        'icons_disabled_for_diagnosis': no_icons, 'sustained_playback': True, 'samples': len(rows)}))
 
 
 def report(root):
-    lines = ['# Linux playback memory profile', '', 'Ubuntu 22.04 / Xvfb, 1180×760 logical window; PulseAudio software sink; identical fixtures and lyrics.',
-             'All values below are MiB. Parent = player process; tree = player + decoder descendants. This is not a desktop Wayland measurement.', '',
-             '| Build / scale | Phase | Parent RSS median / peak | Parent PSS median | Parent private median | Tree PSS median / peak | Cover pixels at end |',
+    lines = ['# Cross-platform playback memory attribution', '',
+             'Identical generated audio, 1180x760 logical window, lyrics and miniaudio realtime null device.',
+             'MiB. RSS/working set and private resident pages are separate from Windows private committed bytes.',
+             'Windows PSS is unavailable. no-icons is a diagnostic ablation, not an acceptable product fix.', '',
+             '| Variant | Phase | Parent RSS median / peak | Private resident median | Windows private commit median | Decoder RSS median | Tree RSS median / peak |',
              '|---|---|---:|---:|---:|---:|---:|']
     summary = {}
     for path in sorted(Path(root).glob('*/samples.json')):
-        rows = json.loads(path.read_text()); label = path.parent.name
+        rows = json.loads(path.read_text(encoding='utf-8')); label = path.parent.name
         if not (path.parent / 'validated.json').exists():
-            lines.append(f'\n**{label}: INVALID / playback not validated.**'); continue
+            lines.append(f'INVALID: {label}'); continue
         summary[label] = {}
         for phase in ('idle', 'local_mp3_lyrics', 'http_aac_lyrics', 'cover_pressure', 'settled'):
             samples = [r for r in rows if r['phase'] == phase]
-            # 排除每阶段最初两秒的切换与分配峰值，但另保留全阶段 peak。
             stable = [r for r in samples if r['seconds'] >= samples[0]['seconds'] + 2] or samples
-            values = {key + '_median_mib': statistics.median(r[key] for r in stable) / 1024 for key in ('VmRSS', 'Pss', 'Private', 'tree_Pss')}
-            values.update(rss_peak_mib=max(r['VmRSS'] for r in samples) / 1024, tree_pss_peak_mib=max(r['tree_Pss'] for r in samples) / 1024,
-                          cover_end_mib=samples[-1]['cover_bytes'] / 1048576, glyph_end_mib=samples[-1]['glyph_bytes'] / 1048576,
-                          tasks_end=samples[-1]['background_tasks'])
+            keys = ('VmRSS', 'Private', 'children_VmRSS', 'tree_VmRSS')
+            if 'PrivateCommit' in stable[0]: keys += ('PrivateCommit',)
+            if stable[0].get('Pss', 0): keys += ('Pss', 'tree_Pss')
+            values = {key + '_median_mib': statistics.median(r[key] for r in stable) / 1024 for key in keys}
+            values.update(rss_peak_mib=max(r['VmRSS'] for r in samples) / 1024,
+                          tree_rss_peak_mib=max(r['tree_VmRSS'] for r in samples) / 1024,
+                          cover_end_mib=samples[-1]['cover_bytes'] / 1048576,
+                          buffer_mib=samples[-1]['window_buffer_bytes'] / 1048576,
+                          buffer_type=samples[-1]['window_buffer_type'])
             summary[label][phase] = values
-            lines.append(f'| {label} | {phase} | {values["VmRSS_median_mib"]:.2f} / {values["rss_peak_mib"]:.2f} | {values["Pss_median_mib"]:.2f} | {values["Private_median_mib"]:.2f} | {values["tree_Pss_median_mib"]:.2f} / {values["tree_pss_peak_mib"]:.2f} | {values["cover_end_mib"]:.2f} |')
-    Path(root, 'summary.json').write_text(json.dumps(summary, indent=2))
-    Path(root, 'summary.md').write_text('\n'.join(lines) + '\n')
+            commit = f"{values['PrivateCommit_median_mib']:.2f}" if 'PrivateCommit_median_mib' in values else 'n/a'
+            lines.append(f"| {label} | {phase} | {values['VmRSS_median_mib']:.2f} / {values['rss_peak_mib']:.2f} | {values['Private_median_mib']:.2f} | {commit} | {values['children_VmRSS_median_mib']:.2f} | {values['tree_VmRSS_median_mib']:.2f} / {values['tree_rss_peak_mib']:.2f} |")
+    Path(root, 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+    Path(root, 'summary.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
     print('\n'.join(lines))
 
 
@@ -190,8 +325,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__); commands = parser.add_subparsers(dest='command', required=True)
     p = commands.add_parser('prepare'); p.add_argument('source')
     p = commands.add_parser('run'); p.add_argument('binary'); p.add_argument('output'); p.add_argument('--scale', type=float, required=True)
+    p.add_argument('--fixtures'); p.add_argument('--no-icons', action='store_true')
+    p = commands.add_parser('fixtures'); p.add_argument('directory')
     p = commands.add_parser('report'); p.add_argument('root')
     args = parser.parse_args()
     if args.command == 'prepare': prepare(args.source)
-    elif args.command == 'run': run(args.binary, args.output, args.scale)
+    elif args.command == 'run': run(args.binary, args.output, args.scale, args.fixtures, args.no_icons)
+    elif args.command == 'fixtures':
+        target = Path(args.directory); png = fixtures(target); (target / 'cover.png').write_bytes(png)
     else: report(args.root)

@@ -16,6 +16,17 @@ inline const char* phase(int value) {
 inline void initialize(aino::Window& win) {
     root = platform::env("AINO_MEMORY_ROOT"); base = platform::env("AINO_MEMORY_URL");
     if (root.empty() || base.empty()) throw std::runtime_error("missing isolated memory fixtures");
+#ifdef _WIN32
+    // 诊断构建强制同样的客户区像素，避免 runner 桌面工作区自动缩小窗口。
+    const float scale = std::stof(platform::env("AINO_SCALE"));
+    win.impl->scale = scale;
+    auto* native = static_cast<aino::detail::Win32State*>(win.impl->native);
+    RECT outer{0, 0, LONG(1180 * scale), LONG(760 * scale)};
+    AdjustWindowRectEx(&outer, DWORD(GetWindowLongPtrW(native->hwnd, GWL_STYLE)), FALSE,
+        DWORD(GetWindowLongPtrW(native->hwnd, GWL_EXSTYLE)));
+    SetWindowPos(native->hwnd, nullptr, 0, 0, outer.right - outer.left, outer.bottom - outer.top,
+        SWP_NOZORDER | SWP_NOACTIVATE);
+#endif
     began = platform::ticks();
     // 空闲阶段也按相同频率采样，不依赖鼠标事件触发重绘。
     ticker = std::thread([&win] { while (!finished.load()) { win.wake(); platform::sleep_ms(100); } });
@@ -70,13 +81,21 @@ inline void step(aino::Window& win) {
     }
     if (now - reported >= 500) {
         reported = now;
-        const auto stats = static_cast<aino::detail::X11TextRenderer*>(win.impl->text)->cache_stats();
+        size_t glyph_bytes = 0; unsigned long buffer_type = 0;
+#ifdef AINO_PLATFORM_X11
+        glyph_bytes = static_cast<aino::detail::X11TextRenderer*>(win.impl->text)->cache_stats().glyph_bytes;
+#elif defined(_WIN32)
+        auto* native = static_cast<aino::detail::Win32State*>(win.impl->native);
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(native->bits, &region, sizeof(region))) buffer_type = region.Type;
+#endif
         const auto cover_stats = g_covers.memory_profile_stats();
         size_t tasks; { std::lock_guard<std::mutex> lock(background::mutex); tasks = background::tasks.size(); }
         const auto error = library::quote(g_snapshot.error);
-        std::printf("AINO_MEMORY {\"phase\":\"%s\",\"seconds\":%.3f,\"position_ms\":%lld,\"playing\":%s,\"state\":%d,\"error\":%s,\"scale\":%.3f,\"physical_w\":%d,\"physical_h\":%d,\"glyph_bytes\":%zu,\"cover_bytes\":%zu,\"cover_entries\":%zu,\"background_tasks\":%zu}\n",
+        std::printf("AINO_MEMORY {\"phase\":\"%s\",\"seconds\":%.3f,\"position_ms\":%lld,\"playing\":%s,\"state\":%d,\"error\":%s,\"scale\":%.3f,\"physical_w\":%d,\"physical_h\":%d,\"glyph_bytes\":%zu,\"cover_bytes\":%zu,\"cover_entries\":%zu,\"background_tasks\":%zu,\"window_buffer_bytes\":%zu,\"window_buffer_type\":%lu}\n",
             phase(stage), elapsed, g_player.position_ms(), g_player.is_playing() ? "true" : "false", int(g_snapshot.ps), error.c_str(),
-            win.dpi_scale(), win.impl->client_w, win.impl->client_h, stats.glyph_bytes, cover_stats.second, cover_stats.first, tasks);
+            win.dpi_scale(), win.impl->client_w, win.impl->client_h, glyph_bytes, cover_stats.second, cover_stats.first, tasks,
+            size_t(win.impl->client_w) * win.impl->client_h * 4, buffer_type);
         std::fflush(stdout);
         if (g_snapshot.ps == PlayState::Failed) failed = true;
     }
