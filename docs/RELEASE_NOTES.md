@@ -26,3 +26,7 @@
 Linux 使用 X11 / XWayland。本版未修改已确认正常的 Windows 输入法逻辑。
 
 第三方音源受服务可用性、会员与地区限制；静默样本成功不保证每首歌都可播放。依赖 AES、RSA、zlib 或 multipart 的音源脚本仍可能不兼容。新增平台的歌单读取目前最多 200 首，尚不包含这些平台的完整账号和歌手目录功能。
+
+### 发布验证
+
+Windows 6 项、Linux 8 项回归通过，包括交互、业务、隔离浏览器登录回传与内置音频解码。Linux 另通过 DPI / 字体缓存、AppStream、v0.2.6 → v0.2.7 deb 覆盖升级与安装后 Xvfb 启动检查。两端均构建自同一标签提交 `4453d10`；Windows 使用[首次构建的已通过产物](https://github.com/sudoevolve/aino-player/actions/runs/43462680753)，Linux 使用[修正旧版校验清单 CRLF 兼容后的产物](https://github.com/sudoevolve/aino-player/actions/runs/43463833870)。实机账号、全部在线音源和音频设备不在自动验证范围内。
