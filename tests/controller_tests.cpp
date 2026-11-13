@@ -249,6 +249,9 @@ int main(int argc, char** argv) {
         { std::lock_guard<std::mutex> lock(g_mu);
           check(explicit_next >= 0 && track_uid(g_as.tracks[size_t(explicit_next)]) == track_uid(nav_a), "explicit next overrides shuffle"); }
         // 失败跳过使用同一队列规则，但不重试本轮失败曲，也不受单曲循环困住。
+        { std::lock_guard<std::mutex> lock(g_mu);
+          // 前面的“下一首播放”会重排队列；此组断言明确使用 a、c、b 的顺序。
+          g_as.tracks = {nav_a, nav_c, nav_b}; ++g_as.tracks_version; g_play_next.clear(); }
         std::set<std::string> failed{track_uid(nav_a)};
         mark_current(nav_a, 0); set_play_mode(PlayMode::RepeatOne);
         check(next_queue_index(1, false, true, &failed) == 1, "failed song bypasses repeat one");
@@ -423,8 +426,15 @@ int main(int argc, char** argv) {
             std::lock_guard<std::mutex> lock(g_mu); g_search_worker = true; g_as.searching = true;
         }
         const auto saved_mask = model.ui.src_mask; model.ui.src_mask = 0;
-        model.ui.query = "older"; start_search(); const int obsolete_search = g_search_gen.load();
-        model.ui.query = "latest"; start_search();
+        const int disabled_search = g_search_gen.load();
+        model.ui.query = "disabled"; start_search();
+        check(g_search_gen.load() == disabled_search, "search with no enabled source is rejected");
+        auto dispatch_offline = [&](const char* keyword) {
+            SearchRequest request; request.keyword = keyword; request.settings = offline_search;
+            dispatch_search(std::move(request));
+        };
+        dispatch_offline("older"); const int obsolete_search = g_search_gen.load();
+        dispatch_offline("latest");
         {
             std::lock_guard<std::mutex> lock(g_mu);
             check(g_pending_search.keyword == "latest" && g_pending_search.generation > obsolete_search,
@@ -433,7 +443,7 @@ int main(int argc, char** argv) {
         }
         { SearchRequest request; request.keyword = "older"; request.settings = offline_search; request.generation = obsolete_search; do_search(g_win, std::move(request)); }
         check(g_as.searching, "obsolete search cannot clear latest request status");
-        model.ui.query = "独立的在线搜索词"; start_search();
+        model.ui.query = "独立的在线搜索词"; dispatch_offline("独立的在线搜索词");
         const auto search_deadline = platform::ticks() + 3000;
         bool searching = true;
         while (searching && platform::ticks() < search_deadline) {
@@ -463,7 +473,10 @@ int main(int argc, char** argv) {
         check(platform::exists(original), "removing playlist preserves music files");
         music::Track missing = scanned.tracks[0]; missing.variants[0].id += ".missing";
         int local_gen;
-        { std::lock_guard<std::mutex> lock(g_mu); local_gen = ++g_as.gen; }
+        { std::lock_guard<std::mutex> lock(g_mu);
+          local_gen = ++g_as.gen; g_as.tracks = {missing}; ++g_as.tracks_version;
+          g_as.now_uid = track_uid(missing); g_as.now_track = missing; g_as.playing = 0;
+          g_play_next.clear(); g_failed_tracks.clear(); }
         do_play(g_win, missing, model.ui.settings, local_gen); tick();
         check(model.playback.ps == PlayState::Failed && model.playback.error.find("移动或删除") != std::string::npos,
             "missing local file fails offline without online substitution");

@@ -1,4 +1,4 @@
-## aino player v0.2.4
+## aino player v0.2.5
 
 ### 新增功能
 
@@ -18,8 +18,8 @@
 
 ### 安装与升级
 
-- **Windows x64**：推荐 `aino-player-v0.2.4-setup-windows-x64.exe`，按当前用户安装，无需管理员权限；另提供 `aino-player-v0.2.4-windows-x64.exe` 便携版。
-- **Ubuntu 22.04+ / Debian 12+ amd64**：下载 `aino-player_0.2.4_amd64.deb`，使用软件安装器或 `sudo apt install ./aino-player_0.2.4_amd64.deb`。建议安装 `fonts-noto-cjk`；应用内安装需要 `pkexec`。
+- **Windows x64**：推荐 `aino-player-v0.2.5-setup-windows-x64.exe`，按当前用户安装，无需管理员权限；另提供 `aino-player-v0.2.5-windows-x64.exe` 便携版。
+- **Ubuntu 22.04+ / Debian 12+ amd64**：下载 `aino-player_0.2.5_amd64.deb`，使用软件安装器或 `sudo apt install ./aino-player_0.2.5_amd64.deb`。建议安装 `fonts-noto-cjk`；应用内安装需要 `pkexec`。
 - 更新保留配置、收藏、歌单和下载文件。旧版本的软件安装器若只显示灰色“已安装”，可用上述 apt 命令直接覆盖升级。
 - 升级到此版后，后续更新可在应用内查看 Release 更新说明。
 
