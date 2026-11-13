@@ -64,7 +64,7 @@ def windows_memory(pid):
         counters = MemoryCounters(); counters.cb = ctypes.sizeof(counters)
         if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
             return None
-        # WorkingSet 的 Shared 位区分私有驻留页；PrivateUsage 另列为私有提交，不能混用。
+        # Shared=0 统计不可共享驻留页；PrivateUsage 另列私有提交。两者也不等同于 Linux Private_Clean。
         count = counters.WorkingSetSize // 4096 + 4096
         for _ in range(3):
             pages = (ctypes.c_size_t * (count + 1))()
@@ -126,11 +126,13 @@ def prepare(source):
     text = main.read_text(encoding='utf-8')
     replacements = {
         '#include "ui.hpp"': '#include "ui.hpp"\n#include "memory_probe.hpp"',
+        '    using namespace player;': '    using namespace player;\n    if (argc > 1 && std::string(argv[1]) == "--memory-assets") return memory_probe::assets();',
         'if (smoke_test) initial_search = false;': 'initial_search = false; smoke_test = false;',
         'initialize(smoke_test)': 'initialize(true)',
         'bool autostart = true;': 'memory_probe::initialize(win);\n    bool autostart = true;',
         'bootstrap(initial_search, smoke_test)': 'bootstrap(false, true)',
         '        tick();': '        memory_probe::step(win);\n        tick();',
+        '        ui::draw(ui, model);': '        ui::draw(ui, model);\n        memory_probe::rendered();',
         '    shutdown(smoke_test);': '    memory_probe::shutdown();\n    shutdown(true);\n    if (memory_probe::failed) return 2;',
     }
     for old, new in replacements.items():
@@ -245,16 +247,28 @@ def run(binary, output, scale, fixture_directory=None, no_icons=False):
     env.update(AINO_MEMORY_ROOT=str(root), AINO_MEMORY_URL=f'http://127.0.0.1:{server.server_port}', AINO_SCALE=str(scale), PULSE_SINK='aino_memory')
     if no_icons:
         env['AINO_MEMORY_NO_ICONS'] = '1'
-    rows = []; traces = []; last_phase = ''; sampled_phases = set()
+    rows = []; traces = []; last_phase = ''; sampled_phases = set(); startup = []; first_frame = []
     with (output / 'player.log').open('w', encoding='utf-8') as log:
         process = subprocess.Popen([str(Path(binary).resolve())], env=env, stdout=subprocess.PIPE, stderr=log, text=True, encoding='utf-8', errors='replace')
+        started = time.monotonic()
         def consume():
             for line in process.stdout:
                 log.write(line); log.flush()
                 if line.startswith('AINO_MEMORY '):
                     traces.append(json.loads(line[len('AINO_MEMORY '):]))
+                elif line.startswith('AINO_FIRST_FRAME'):
+                    first_frame.append(time.monotonic() - started)
         reader = threading.Thread(target=consume, daemon=True); reader.start()
-        started = time.monotonic()
+        def sample_startup():
+            while process.poll() is None and time.monotonic() - started < 4:
+                parent = read_memory(process.pid)
+                if parent:
+                    children = [value for pid in descendants(process.pid) if (value := read_memory(pid))]
+                    startup.append(dict(seconds=time.monotonic() - started, parent_rss_kib=parent['VmRSS'],
+                        tree_rss_kib=parent['VmRSS'] + sum(value['VmRSS'] for value in children),
+                        tree_pss_kib=parent['Pss'] + sum(value['Pss'] for value in children), children=len(children)))
+                time.sleep(.02)
+        startup_reader = threading.Thread(target=sample_startup, daemon=True); startup_reader.start()
         try:
             while process.poll() is None:
                 if time.monotonic() - started > 75:
@@ -301,6 +315,9 @@ def run(binary, output, scale, fixture_directory=None, no_icons=False):
                 try: process.wait(timeout=10)
                 except subprocess.TimeoutExpired: process.kill(); process.wait()
             server.shutdown(); server.server_close(); thread.join()
+            startup_reader.join(timeout=5)
+            (output / 'startup.json').write_text(json.dumps({'first_frame_seconds': first_frame[0] if first_frame else None,
+                'samples': startup}, indent=2), encoding='utf-8')
             (output / 'samples.json').write_text(json.dumps(rows, indent=2), encoding='utf-8')
             if rows:
                 with (output / 'samples.csv').open('w', newline='') as csvfile:
@@ -320,9 +337,9 @@ def run(binary, output, scale, fixture_directory=None, no_icons=False):
 def report(root):
     lines = ['# Cross-platform playback memory attribution', '',
              'Identical generated audio, 1180x760 logical window, lyrics and miniaudio realtime null device.',
-             'MiB. RSS/working set and private resident pages are separate from Windows private committed bytes.',
-             'Windows PSS is unavailable. no-icons is a diagnostic ablation, not an acceptable product fix.', '',
-             '| Variant | Phase | Parent RSS median / peak | Private resident median | Windows private commit median | Decoder RSS median | Tree RSS median / peak |',
+             'MiB. Linux Private_Clean+Private_Dirty and Windows nonshareable working-set pages have different sharing rules; neither is Windows private commit.',
+             'Tree RSS/working-set sums include shared-page double counting. Windows PSS is unavailable. no-icons is a diagnostic ablation, not a product fix.', '',
+             '| Variant | Phase | Parent RSS median / peak | OS-specific private resident median | Windows private commit median | Decoder + host RSS median | Tree RSS median / peak |',
              '|---|---|---:|---:|---:|---:|---:|']
     summary = {}
     for path in sorted(Path(root).glob('*/samples.json')):

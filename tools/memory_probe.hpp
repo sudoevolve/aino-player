@@ -103,4 +103,59 @@ inline void step(aino::Window& win) {
     if (elapsed >= 50) win.close();
 }
 inline void shutdown() { finished.store(true); if (ticker.joinable()) ticker.join(); }
+inline void rendered() {
+    static bool reported = false;
+    if (!reported) { std::puts("AINO_FIRST_FRAME"); std::fflush(stdout); reported = true; }
+}
+
+// 同一组字体、字重和全部系统图标逐像素比较；十二秒后引入新字，覆盖冷 face 重开。
+inline int assets() {
+#ifdef AINO_PLATFORM_X11
+    if (!XInitThreads()) return 2;
+    const auto dir = platform::env("AINO_ASSET_OUTPUT");
+    if (dir.empty() || !platform::make_dirs(dir)) return 2;
+    auto* icons = platform::fopen(platform::join(dir, "icons.bin"), "wb");
+    if (!icons) return 2;
+    int ready = 0;
+    for (int size : {16, 24, 32}) for (size_t i = 0; i < size_t(aino::SystemIcon::Count); ++i) {
+        const auto mask = aino::detail::load_system_icon(aino::SystemIcon(i), size);
+        uint32_t header[]{uint32_t(i), uint32_t(size), uint32_t(mask.width), uint32_t(mask.height)};
+        std::fwrite(header, sizeof header, 1, icons);
+        if (!mask.alpha.empty()) { std::fwrite(mask.alpha.data(), 1, mask.alpha.size(), icons); ++ready; }
+    }
+    if (std::fclose(icons) || ready < 60) return 3;
+    aino::WindowConfig cfg; cfg.width = 1180; cfg.height = 760; cfg.title = "Aino asset comparison";
+    aino::Window win(cfg); if (!win.ok()) return 4;
+    win.set_theme(aino::Theme::light());
+    const auto begin = platform::ticks();
+    bool initial = false, reopened = false;
+    win.run([&](aino::Ui& ui) {
+        const auto elapsed = platform::ticks() - begin;
+        ui.fill_rect({0, 0, float(win.width()), float(win.height())}, aino::Color::white());
+        for (int row = 0; row < 4; ++row) {
+            const std::string text = elapsed >= 12000 ? "中文预览：独立、唯一与音乐 ABC 123 新增汉字重开字体" :
+                "中文预览：独立、唯一与音乐 ABC 123";
+            ui.draw_text(text, {30, float(30 + row * 70), 1000, 60}, aino::Color::black(),
+                aino::Style().font(float(12 + row * 6)).weight(row % 2 ? 700 : 400));
+        }
+        for (size_t i = 0; i < size_t(aino::SystemIcon::Count); ++i)
+            ui.system_icon(aino::SystemIcon(i), {float(30 + i % 16 * 65), float(340 + i / 16 * 70), 32, 32}, aino::Color::black());
+        const auto save = [&](const char* name) {
+            auto* output = platform::fopen(platform::join(dir, name), "wb");
+            if (!output) { failed = true; return; }
+            const auto& canvas = win.impl->canvas;
+            if (std::fwrite(canvas.px, 1, size_t(canvas.stride) * canvas.h, output) != size_t(canvas.stride) * canvas.h) failed = true;
+            std::fclose(output);
+        };
+        if (elapsed >= 500 && !initial) { save("initial.rgba"); initial = true; }
+        if (elapsed >= 12500 && !reopened) { save("reopened.rgba"); reopened = true; }
+        if (elapsed >= 13000) win.close();
+        win.wake();
+    });
+    std::printf("asset icons ready=%d initial=%d reopened=%d\n", ready, int(initial), int(reopened));
+    return failed || !initial || !reopened ? 5 : 0;
+#else
+    return 0;
+#endif
+}
 } // namespace memory_probe

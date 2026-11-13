@@ -1,115 +1,80 @@
-name: Cross-platform playback memory attribution
-# 只运行用户明确授权的内存专项，不运行回归或发布。
+name: Linux icon and font memory improvement
+# 用户授权的内存收益专项；不运行整套回归或发布。
 on:
   push:
     branches: ['diagnostics/linux-memory-20261112']
 permissions:
   contents: read
 jobs:
-  fixtures:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
-      - run: python3 tools/profile_memory.py fixtures build/fixtures
-      - uses: actions/upload-artifact@v7.0.2
-        with:
-          name: memory-fixtures
-          path: build/fixtures/
   linux:
-    if: "!contains(github.event.head_commit.message, '[windows-only]')"
-    needs: fixtures
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: actions/download-artifact@v8.0.2
         with:
-          name: memory-fixtures
-          path: build/fixtures
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential python3 libx11-dev libgdk-pixbuf-2.0-0 librsvg2-common adwaita-icon-theme libcurl4-openssl-dev libfreetype6 libfontconfig1 fonts-noto-cjk xvfb
+          fetch-depth: 0
+      - name: Build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y build-essential python3 libx11-dev libgdk-pixbuf-2.0-0 librsvg2-common adwaita-icon-theme libcurl4-openssl-dev libfreetype6 libfontconfig1 fonts-noto-cjk xvfb ffmpeg
       - run: python3 tools/build_ffmpeg.py --jobs 2
-      - name: Prepare temporary instrumented source
+      - run: python3 tools/profile_memory.py fixtures build/fixtures
+      - name: Prepare before, icons-only, and complete builds
+        shell: python
         run: |
-          mkdir -p build/memory-src
-          git archive HEAD | tar -x -C build/memory-src
-          python3 tools/profile_memory.py prepare build/memory-src
-      - name: Build player only
+          from pathlib import Path
+          import subprocess, tarfile
+          for variant in ('before', 'icons-only', 'after'):
+              target = Path('build') / (variant + '-src')
+              target.mkdir(parents=True)
+              archive = Path('build') / (variant + '.tar')
+              subprocess.run(['git', 'archive', 'd634019' if variant == 'before' else 'HEAD', '-o', str(archive)], check=True)
+              with tarfile.open(archive) as package:
+                  package.extractall(target, filter='data')
+              if variant == 'icons-only':
+                  baseline = Path('build/before-src/src/aino.hpp').read_text()
+                  header = target / 'src/aino.hpp'
+                  text = header.read_text()
+                  begin = 'class X11TextRenderer : public TextRenderer {'
+                  end = 'struct X11State {'
+                  text = text[:text.index(begin)] + baseline[baseline.index(begin):baseline.index(end)] + text[text.index(end):]
+                  header.write_text(text)
+              subprocess.run(['python3', 'tools/profile_memory.py', 'prepare', str(target)], check=True)
+      - name: Compile player targets only
+        shell: bash
         run: |
-          cmake -S build/memory-src -B build/memory-player -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DAINO_FFMPEG_EXECUTABLE="$GITHUB_WORKSPACE/build/codec/ffmpeg"
-          cmake --build build/memory-player --target aino_player --parallel 2
-      - name: Measure full rendering and isolate icon loading
+          for variant in before icons-only after; do
+            cmake -S "build/$variant-src" -B "build/$variant" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DAINO_FFMPEG_EXECUTABLE="$GITHUB_WORKSPACE/build/codec/ffmpeg"
+            cmake --build "build/$variant" --target aino_player --parallel 2
+          done
+      - name: Check identical icons and text before and after cold font reopen
+        shell: bash
+        run: |
+          for variant in before after; do
+            mkdir -p "build/assets-$variant/cache" "build/assets-$variant/output"
+            XDG_CACHE_HOME="$GITHUB_WORKSPACE/build/assets-$variant/cache" AINO_ASSET_OUTPUT="$GITHUB_WORKSPACE/build/assets-$variant/output" AINO_SCALE=1 xvfb-run -a -s '-screen 0 3200x2000x24' "build/$variant/aino_player" --memory-assets
+          done
+          for image in icons.bin initial.rgba reopened.rgba; do
+            cmp "build/assets-before/output/$image" "build/assets-after/output/$image"
+          done
+          sha256sum build/assets-*/output/*
+      - name: Measure the same playback workload
         shell: bash
         run: |
           for scale in 1 2; do
-            xvfb-run -a -s '-screen 0 3200x2000x24' python3 tools/profile_memory.py run build/memory-player/aino_player "build/memory-results/linux-scale$scale" --scale "$scale" --fixtures build/fixtures
+            for variant in before after; do
+              xvfb-run -a -s '-screen 0 3200x2000x24' python3 tools/profile_memory.py run "build/$variant/aino_player" "build/memory-results/$variant-scale$scale" --scale "$scale" --fixtures build/fixtures
+            done
           done
-          xvfb-run -a -s '-screen 0 3200x2000x24' python3 tools/profile_memory.py run build/memory-player/aino_player build/memory-results/linux-no-icons-scale1 --scale 1 --fixtures build/fixtures --no-icons
+          xvfb-run -a -s '-screen 0 3200x2000x24' python3 tools/profile_memory.py run build/icons-only/aino_player build/memory-results/icons-only-scale1 --scale 1 --fixtures build/fixtures
           python3 tools/profile_memory.py report build/memory-results | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:
-          name: linux-memory-attribution
+          name: linux-memory-improvement
           path: |
             build/memory-results/**/samples.*
+            build/memory-results/**/startup.json
             build/memory-results/**/validated.json
             build/memory-results/**/*-smaps.txt
             build/memory-results/**/player.log
             build/memory-results/summary.*
-  windows:
-    needs: fixtures
-    runs-on: windows-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/download-artifact@v8.0.2
-        with:
-          name: memory-fixtures
-          path: build/fixtures
-      - uses: msys2/setup-msys2@v2
-        with:
-          msystem: UCRT64
-          install: mingw-w64-ucrt-x86_64-gcc make
-      - name: Build shared minimal audio decoder
-        shell: pwsh
-        run: |
-          $env:Path = "C:\msys64\ucrt64\bin;C:\msys64\usr\bin;$env:Path"
-          python tools/build_ffmpeg.py --jobs 2
-      - name: Prepare temporary instrumented source
-        shell: python
-        run: |
-          import pathlib, subprocess, tarfile
-          target = pathlib.Path('build/memory-src')
-          target.mkdir(parents=True)
-          archive = pathlib.Path('build/memory-src.tar')
-          subprocess.run(['git', 'archive', 'HEAD', '-o', str(archive)], check=True)
-          with tarfile.open(archive) as package:
-              package.extractall(target, filter='data')
-          subprocess.run(['python', 'tools/profile_memory.py', 'prepare', str(target)], check=True)
-      - name: Build player only
-        shell: pwsh
-        run: |
-          cmake -S build/memory-src -B build/memory-player -A x64 -DBUILD_TESTING=OFF "-DAINO_FFMPEG_EXECUTABLE=$pwd/build/codec/ffmpeg.exe"
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build build/memory-player --config Release --target aino_player --parallel 2
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-      - name: Measure same pixels and sustained playback
-        shell: pwsh
-        run: |
-          foreach ($scale in 1, 2) {
-            python tools/profile_memory.py run build/memory-player/Release/aino_player.exe "build/memory-results/windows-scale$scale" --scale $scale --fixtures build/fixtures
-            if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          }
-          python tools/profile_memory.py report build/memory-results | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
-      - uses: actions/upload-artifact@v7.0.2
-        if: always()
-        with:
-          name: windows-memory-attribution
-          path: |
-            build/memory-results/**/samples.*
-            build/memory-results/**/validated.json
-            build/memory-results/**/*-modules.json
-            build/memory-results/**/player.log
-            build/memory-results/summary.*
+            build/assets-*/output/*
