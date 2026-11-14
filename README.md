@@ -4,6 +4,7 @@
 <h1 align="center">Aino Player</h1>
 <p align="center">极简界面，多源音乐。Windows · Linux</p>
 <p align="center">
+  <a href="https://sudoevolve.github.io/aino-player/">项目主页</a> ·
   <a href="https://github.com/sudoevolve/aino-player/releases/latest">下载最新版</a> ·
   <a href="docs/RELEASE_NOTES.md">更新内容</a> ·
   <a href="https://github.com/sudoevolve/aino-player/issues">反馈问题</a>

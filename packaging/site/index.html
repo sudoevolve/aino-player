@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Aino Player 是一款开源桌面音乐播放器，支持 Windows 和 Linux、多平台音乐、同步歌词及本地歌单。">
+  <meta name="theme-color" content="#f4f4f4">
+  <title>Aino Player — 简洁的桌面音乐播放器</title>
+  <link rel="icon" href="assets/aino.svg" type="image/svg+xml">
+  <style>
+    :root { color-scheme: light; font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; color: #333; background: #f4f4f4; font-size: 14px; }
+    * { box-sizing: border-box; }
+    body { margin: 0; line-height: 1.7; }
+    a { color: #1764a4; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    a:focus-visible, summary:focus-visible { outline: 2px solid #1764a4; outline-offset: 4px; }
+    .skip { position: absolute; top: -60px; left: 16px; padding: 8px; background: white; z-index: 2; }
+    .skip:focus { top: 8px; }
+    .wrap { max-width: 1000px; margin: 0 auto; padding: 0 28px; }
+    header { border-bottom: 1px solid #ccc; background: #fff; }
+    .brand { display: flex; align-items: center; gap: 13px; padding-top: 25px; padding-bottom: 23px; }
+    .brand img { width: 44px; height: 44px; }
+    .brand a { color: #222; font-size: 27px; line-height: 1.2; letter-spacing: -.7px; }
+    .brand p { margin: 4px 0 0; color: #666; font-size: 12px; }
+    .top-nav { background: #e9e9e9; border-bottom: 1px solid #ccc; }
+    .top-nav .wrap { display: flex; flex-wrap: wrap; }
+    .top-nav a { padding: 8px 21px; color: #444; border-left: 1px solid transparent; border-right: 1px solid transparent; }
+    .top-nav a:first-child { padding-left: 0; padding-right: 24px; }
+    .layout { display: grid; grid-template-columns: 153px minmax(0, 1fr); gap: 30px; padding-top: 30px; padding-bottom: 40px; }
+    aside { font-size: 13px; }
+    aside h2 { font-size: 13px; margin: 0 0 7px; color: #555; }
+    aside nav { margin-bottom: 25px; }
+    aside nav a { display: block; padding: 4px 0; }
+    aside p { margin: 4px 0; color: #777; font-size: 12px; }
+    main { min-width: 0; background: #fff; padding: 23px 29px 29px; border: 1px solid #d7d7d7; }
+    h1 { margin: 0; color: #222; font-size: 28px; font-weight: 400; line-height: 1.4; letter-spacing: -.5px; }
+    .intro { margin: 7px 0 15px; color: #555; font-size: 15px; }
+    .features { padding-left: 20px; margin: 0 0 19px; }
+    .features li { padding: 2px 0; }
+    .platforms { color: #777; font-size: 12px; margin-top: -6px; }
+    h2 { color: #333; font-size: 19px; font-weight: 500; margin: 30px 0 13px; padding-bottom: 6px; border-bottom: 1px solid #ddd; scroll-margin-top: 18px; }
+    h3 { font-size: 14px; font-weight: 600; margin: 17px 0 7px; }
+    p { margin: 8px 0; }
+    .download-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 9px; }
+    .download-heading small { font-size: 12px; font-weight: 400; color: #777; }
+    .download-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .download-table th, .download-table td { padding: 10px 12px; text-align: left; border: 1px solid #ddd; vertical-align: top; }
+    .download-table th { background: #f3f3f3; font-weight: 600; color: #555; }
+    .download-table td:first-child { width: 28%; }
+    .download-table td a { display: inline-block; margin-right: 12px; }
+    .download-table small { display: block; color: #777; font-size: 11px; margin-top: 2px; }
+    .download-links { font-size: 12px; margin: 10px 0 16px; display: flex; flex-wrap: wrap; gap: 5px 15px; }
+    pre { overflow-x: auto; border: 1px solid #d7d7d7; background: #f7f7f7; padding: 11px 13px; margin: 8px 0; font-size: 12px; line-height: 1.7; }
+    code { font-family: Consolas, "Liberation Mono", monospace; }
+    .note { font-size: 12px; color: #777; }
+    .screenshot { margin: 17px 0; }
+    .screenshot img { width: 100%; height: auto; display: block; border: 1px solid #ddd; }
+    figcaption { text-align: center; font-size: 12px; color: #777; margin-top: 5px; }
+    details { border-bottom: 1px solid #e5e5e5; padding: 10px 0; }
+    summary { cursor: pointer; color: #1764a4; }
+    details p { font-size: 13px; padding-left: 17px; color: #555; }
+    .support-links { display: flex; gap: 8px 20px; flex-wrap: wrap; margin: 11px 0; }
+    footer { border-top: 1px solid #ccc; font-size: 12px; color: #777; }
+    footer .wrap { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding-top: 17px; padding-bottom: 23px; }
+    @media (max-width: 700px) {
+      .wrap { padding-left: 16px; padding-right: 16px; }
+      .brand { padding-top: 20px; padding-bottom: 19px; }
+      .top-nav a { padding: 8px 12px; }
+      .top-nav a:first-child { padding-right: 12px; }
+      .layout { display: block; padding-top: 18px; }
+      aside { display: none; }
+      main { padding: 19px 17px 24px; }
+      h1 { font-size: 25px; }
+      .download-table th, .download-table td { padding: 9px 8px; }
+      .download-table td:first-child { width: 32%; }
+      .download-table td a { display: block; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip" href="#main">跳到正文</a>
+  <header>
+    <div class="wrap brand">
+      <img src="assets/aino.svg" width="44" height="44" alt="">
+      <div><a href="./">Aino Player</a><p>简洁的桌面音乐播放器</p></div>
+    </div>
+  </header>
+  <nav class="top-nav" aria-label="主导航">
+    <div class="wrap">
+      <a href="./" aria-current="page">首页</a><a href="#download">下载</a><a href="#screenshots">截图</a><a href="#help">常见问题</a><a href="#donate">捐赠</a><a href="https://github.com/sudoevolve/aino-player">GitHub</a>
+    </div>
+  </nav>
+  <div class="wrap layout">
+    <aside aria-label="页面导航">
+      <nav aria-label="播放器">
+        <h2>Aino Player</h2>
+        <a href="#main">关于播放器</a><a href="#download">下载 @VERSION@</a><a href="#screenshots">界面截图</a><a href="https://github.com/sudoevolve/aino-player/releases/tag/v@VERSION@">更新内容</a><a href="https://github.com/sudoevolve/aino-player/releases">历史版本</a>
+      </nav>
+      <nav aria-label="帮助与支持">
+        <h2>帮助与支持</h2>
+        <a href="#help">常见问题</a><a href="apt/">Linux APT 软件源</a><a href="https://github.com/sudoevolve/aino-player/issues">问题反馈</a><a href="#donate">支持项目</a><a href="mailto:sudoevolve@gmail.com">联系作者</a>
+      </nav>
+      <p>Windows · Linux</p><p>免费开源 · Apache-2.0</p>
+    </aside>
+    <main id="main">
+      <h1>Aino Player</h1>
+      <p class="intro">一个播放器，听在线音乐，也听自己的收藏。</p>
+      <ul class="features">
+        <li>简洁的界面，支持浅色与深色主题</li>
+        <li>多平台搜索、发现音乐和在线歌单</li>
+        <li>智能选择可用且加载快的音源，也可固定使用一个源</li>
+        <li>同步歌词、中文译文与播放队列</li>
+        <li>本地音乐、收藏、文件夹歌单和资料库备份</li>
+        <li>内置精简 FFmpeg，支持 AAC / M4A 播放</li>
+      </ul>
+      <p class="platforms">网易云 · QQ 音乐 · 酷我 · 酷狗 · 咪咕 · B 站</p>
+
+      <h2 id="download" class="download-heading">下载 Aino Player @VERSION@ <small>正式版</small></h2>
+      <table class="download-table">
+        <thead><tr><th scope="col">系统</th><th scope="col">下载</th></tr></thead>
+        <tbody>
+          <tr><td>Windows x64</td><td><a href="https://github.com/sudoevolve/aino-player/releases/download/v@VERSION@/aino-player-v@VERSION@-setup-windows-x64.exe">下载安装器</a><a href="https://github.com/sudoevolve/aino-player/releases/download/v@VERSION@/aino-player-v@VERSION@-windows-x64.exe">下载便携 EXE</a><small>安装器支持覆盖升级；便携版直接运行。</small></td></tr>
+          <tr><td>Linux amd64</td><td><a href="https://github.com/sudoevolve/aino-player/releases/download/v@VERSION@/aino-player_@VERSION@_amd64.deb">下载 DEB 安装包</a><a href="apt/">使用 APT 软件源</a><small>Ubuntu 22.04+ / Debian 12+，X11 / XWayland。</small></td></tr>
+        </tbody>
+      </table>
+      <div class="download-links"><a href="https://github.com/sudoevolve/aino-player/releases/tag/v@VERSION@">更新内容</a><a href="https://github.com/sudoevolve/aino-player/releases">历史版本</a><a href="https://github.com/sudoevolve/aino-player/releases/download/v@VERSION@/SHA256SUMS.txt">SHA-256 校验</a><a href="https://github.com/sudoevolve/aino-player/blob/master/LICENSE">许可协议</a><a href="https://github.com/sudoevolve/aino-player">源代码</a></div>
+      <h3>Linux 一键安装</h3>
+      <pre><code>curl -fsSL https://sudoevolve.github.io/aino-player/install.sh | bash</code></pre>
+      <p class="note">添加项目签名 APT 源并安装播放器，之后可通过系统更新器升级。<a href="apt/">查看手动安装与签名信息</a></p>
+
+      <h2 id="screenshots">界面截图</h2>
+      <figure class="screenshot"><a href="assets/player-light.png"><img src="assets/player-light.png" width="1180" height="760" alt="Aino Player 浅色主题，显示导航栏、歌曲列表和底部播放控制" loading="lazy"></a><figcaption>浅色主题</figcaption></figure>
+      <details><summary>查看深色主题与歌词界面</summary><figure class="screenshot"><a href="assets/player-dark.png"><img src="assets/player-dark.png" width="1180" height="760" alt="Aino Player 深色主题的同步歌词界面" loading="lazy"></a><figcaption>深色主题 · 同步歌词</figcaption></figure></details>
+      <p class="note">截图使用示例曲目，不代表平台推荐内容。点击图片可查看原图。</p>
+
+      <h2 id="help">常见问题</h2>
+      <details><summary>需要登录或安装浏览器扩展吗？</summary><p>无需浏览器扩展。网易云、QQ 的账号登录使用外部官网登录并自动回传，支持 Chrome / Edge / Chromium。第三方音源与自带接口分别管理；平台会员和地区限制仍然生效。</p></details>
+      <details><summary>如何添加音源？为什么没有一直测速？</summary><p>在“音源”页导入兼容的 LX 脚本，或使用在线获取；重启会自动恢复。启动只静默测速一轮，之后可手动重新检测。智能切换默认开启，关闭后固定使用一个源。脚本接口、歌曲版权与音质都会影响可播性。<a href="https://github.com/sudoevolve/aino-player/blob/master/providers/README.md">支持范围</a></p></details>
+      <details><summary>如何播放本地音乐？</summary><p>拖入歌曲或文件夹，也可按 Ctrl+O 多选打开；当前播放队列可以保存为本地歌单。在设置中可配置默认音乐播放器。收藏、歌单与本地文件都由你自己管理。</p></details>
+      <details><summary>Linux 有什么要求？</summary><p>提供 amd64 的 DEB 包，支持 Ubuntu 22.04+ / Debian 12+。界面使用 X11 / XWayland，建议安装 fonts-noto-cjk；托盘显示取决于桌面环境支持。<a href="apt/">APT 软件源说明</a></p></details>
+
+      <h2 id="donate">捐赠与支持</h2>
+      <p>Aino Player 免费开源。如果它对你有帮助，欢迎支持项目的持续维护。</p>
+      <p class="note">捐赠方式暂未开放。你也可以反馈问题、贡献代码，或在 GitHub 为项目点一颗 Star。</p>
+      <div class="support-links"><a href="https://github.com/sudoevolve/aino-player">在 GitHub 支持项目</a><a href="https://github.com/sudoevolve/aino-player/issues">反馈问题</a><a href="mailto:sudoevolve@gmail.com">联系作者</a></div>
+    </main>
+  </div>
+  <footer><div class="wrap"><span>© 2026 <a href="https://github.com/sudoevolve">sudoevolve</a> · Aino Player</span><span><a href="https://github.com/sudoevolve/aino-player/blob/master/LICENSE">Apache-2.0</a> · <a href="mailto:sudoevolve@gmail.com">sudoevolve@gmail.com</a></span></div></footer>
+</body>
+</html>

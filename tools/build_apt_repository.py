@@ -162,10 +162,16 @@ def build(output, fingerprint, check):
     subprocess.run(["gpgv", "--keyring", str(apt / KEY_NAME), str(release.parent / "InRelease")], check=True)
     if check:
         verify_apt(apt)
-    html = (ROOT / "packaging/apt/index.html").read_text(encoding="utf-8")
-    html = html.replace("@FINGERPRINT@", fingerprint).replace("@VERSION@", versions[0])
-    (output / "index.html").write_text(html, encoding="utf-8")
-    (apt / "index.html").write_text(html, encoding="utf-8")
+    for template, target in (("packaging/site/index.html", output / "index.html"),
+                             ("packaging/apt/index.html", apt / "index.html")):
+        html = (ROOT / template).read_text(encoding="utf-8")
+        html = html.replace("@FINGERPRINT@", fingerprint).replace("@VERSION@", versions[0])
+        target.write_text(html, encoding="utf-8")
+    assets = output / "assets"
+    assets.mkdir()
+    shutil.copy2(ROOT / "assets/aino.svg", assets / "aino.svg")
+    for name in ("player-light.png", "player-dark.png"):
+        shutil.copy2(ROOT / "docs/screenshots" / name, assets / name)
     (output / ".nojekyll").touch()
     print("APT source ready:", BASE_URL, "candidate", versions[0], flush=True)
 
