@@ -1481,7 +1481,7 @@ static bool lane_toggle(Ctx& c, music::Lane lane, const Rect& box) {
 
 // ---------- 页签一：第三方音源 ----------
 static void source_tab_scripts(Ctx& c, const Rect& area) {
-    const auto all = lx_source_status();
+    const auto& all = lx_source_status();
     std::vector<LxSourceView> good, bad;
     for (const auto& item : all) (item.ok ? good : bad).push_back(item);
     const bool show_bad = c.model.ui.sources_show_failed;
@@ -1511,7 +1511,7 @@ static void source_tab_scripts(Ctx& c, const Rect& area) {
         : source_task == LxTask::Fetch ? std::string("正在下载并加载音源脚本；本次获取的脚本会恢复到应用中")
         : source_task == LxTask::Import ? std::string("正在导入所选脚本，移除的源可通过重新导入恢复")
         : (g_lx_fetch_summary.empty()
-            ? std::string("免登录 · 只负责把歌曲换成可播放的直链，不参与搜索与榜单。")
+            ? std::string("可用优先、加载快优先 · 按平台与音质自动选源，失败继续切换。")
             : g_lx_fetch_summary);
     c.ui.muted_text(ellipsize(c.ui, note, head.w - 240, 10.5f),
                     {head.x + 20, head.y + 46, head.w - 240, 18}, Style().font(10.5f));

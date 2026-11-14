@@ -1132,6 +1132,7 @@ static void do_play(HostCallbacks* win, music::Track track, music::Settings st, 
         win->wake();
 
         const auto result = music::resolve(v, st, [&](const music::ResolveResult& rr, std::string& candidate_error) {
+            const auto loading_begin = std::chrono::steady_clock::now();
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(45);
             net::CancelScope candidate([parent = net::cancel_current, deadline] {
                 return (parent && parent()) || std::chrono::steady_clock::now() >= deadline;
@@ -1173,7 +1174,10 @@ static void do_play(HostCallbacks* win, music::Track track, music::Settings st, 
                 { std::lock_guard<std::mutex> lock(g_mu); spec.start_ms = g_as.position_ms; }
                 std::string error;
                 auto stream = audio::Stream::open(spec, st.cancelled, error);
-                if (stream && !net::cancelled()) { finish_stream(win, v, spec, std::move(stream), gen, rr.detail); return true; }
+                if (stream && !net::cancelled()) {
+                    if (rr.load_timing) rr.load_timing->ready_ms = int(std::clamp<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - loading_begin).count(), 1, 300000));
+                    finish_stream(win, v, spec, std::move(stream), gen, rr.detail); return true;
+                }
                 if (st.cancelled()) return true;
                 if (net::cancelled()) { candidate_error = "音源已移除或缓冲超时"; return false; }
                 // 尾部 moov 等需要随机访问的容器，退回原有完整下载与文件解码。
@@ -2098,16 +2102,22 @@ struct LxSourceView {
     bool ok = false;
     bool removed = false;
     int health_rank = 1;
+    int latency_ms = 300001;
     std::string health;
 };
 
 // 音源引擎是否正在后台加载（界面上显示"加载中"，而不是等锁卡住）
 bool lx_sources_loading() { return lx::Engine::instance().loading(); }
 
-std::vector<LxSourceView> lx_source_status() {
+const std::vector<LxSourceView>& lx_source_status() {
+    static std::vector<LxSourceView> cached;
+    static unsigned cached_revision = ~0u;
+    const auto revision = lx::Engine::instance().revision();
+    if (revision == cached_revision) return cached;
     std::vector<LxSourceView> out;
     const auto errors = lx::Engine::instance().runtime_errors();
     const auto checks = lx::Engine::instance().health();
+    const auto timings = lx::Engine::instance().timings();
     for (const auto& e : lx::Engine::instance().entries()) {
         LxSourceView v;
         v.name = e.first; v.file = e.second; v.ok = true;
@@ -2125,7 +2135,7 @@ std::vector<LxSourceView> lx_source_status() {
             }
         }
         const auto health = checks.find(key);
-        int passed = 0, failed = 0;
+        int passed = 0, failed = 0, measured = 0, total_latency = 0;
         for (const auto& platform : {std::string("tx"), std::string("wy")}) {
             const lx::Engine::Health* h = nullptr;
             if (health != checks.end()) {
@@ -2135,17 +2145,40 @@ std::vector<LxSourceView> lx_source_status() {
             if (!v.health.empty()) v.health += " · ";
             v.health += platform == "tx" ? "QQ " : "网易云 ";
             v.health += !h || h->state == 0 ? "待检测" : h->state == 1 ? "检测中" : h->state == 2 ? "样本通过" : h->state == 4 ? "不支持" : h->state == 5 ? "检测未完成" : "样本失败";
-            if (h && h->state == 2) ++passed;
+            if (h && h->state == 2) {
+                ++passed;
+                if (h->load_ms > 0) {
+                    v.health += " " + std::to_string(h->load_ms) + "ms";
+                    total_latency += h->load_ms; ++measured;
+                }
+            }
             if (h && !h->reason.empty()) {
                 if (!v.error.empty()) v.error += "\n";
                 v.error += (platform == "tx" ? "QQ 样本：" : "网易云样本：") + h->reason;
+                if (h->state == 2) v.error += "；音质 " + h->quality + "；取址 " + std::to_string(h->resolve_ms) + "ms；取址与样本加载共 " + std::to_string(h->load_ms) + "ms";
             }
             if (h && h->state == 3) ++failed;
         }
+        const auto metrics = timings.find(key);
+        if (metrics != timings.end()) for (const auto& platform : metrics->second) for (const auto& quality : platform.second) {
+            const auto& value = quality.second;
+            if (!value.samples && !value.failures) continue;
+            std::string name = platform.first;
+            for (const auto& p : music::kPlatformInfo) if (p.lx_key && platform.first == p.lx_key) { name = p.name; break; }
+            if (!v.error.empty()) v.error += "\n";
+            v.error += name + " · " + quality.first + "：平滑取址 " + std::to_string(value.resolve_ms) + "ms";
+            if (value.load_ms) v.error += "，样本加载 " + std::to_string(value.load_ms) + "ms";
+            if (value.ready_ms) v.error += "，实际首段就绪 " + std::to_string(value.ready_ms) + "ms";
+            v.error += "，有效测速 " + std::to_string(value.samples) + " 次";
+            if (value.failures) v.error += "，近期失败 " + std::to_string(value.failures) + " 次";
+        }
         v.health_rank = passed ? -passed : failed ? 2 : 1;
+        if (measured) v.latency_ms = total_latency / measured;
         out.push_back(std::move(v));
     }
-    std::stable_sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.health_rank < b.health_rank; });
+    std::stable_sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+        return std::tie(a.health_rank, a.latency_ms, a.file) < std::tie(b.health_rank, b.latency_ms, b.file);
+    });
     const auto dir = lx::default_dir();
     for (const auto& f : lx::Engine::instance().failures()) {
         LxSourceView v;
@@ -2161,7 +2194,8 @@ std::vector<LxSourceView> lx_source_status() {
         LxSourceView v; v.name = file; v.file = platform::join(dir, file); v.removed = true;
         v.error = "已从应用移除 · 源文件保留"; out.push_back(std::move(v));
     }
-    return out;
+    cached = std::move(out); cached_revision = revision;
+    return cached;
 }
 
 void lx_reload_sources() {

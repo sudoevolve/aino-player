@@ -2,7 +2,7 @@
 //
 // 提供四件事：
 //   get / post        —— 小响应（JSON 接口），整段读进内存
-//   probe_audio       —— 只取前 2 字节判断"这条直链到底能不能出声"
+//   probe_audio       —— 有界读取音频头；静默测速最多读取 64 KiB
 //   download          —— 带进度、可取消的流式落盘
 //   url_encode        —— 查询参数编码（中文关键词必须）
 #pragma once
@@ -442,7 +442,8 @@ struct AudioProbe {
 
 // 小范围读取容器头，既拒绝 HTML/JSON，也支持 MP3/FLAC/WAV/M4A/Ogg/WebM。
 inline AudioProbe probe_audio(const std::string& url, const std::vector<std::string>& headers,
-                              int timeout_ms = 6000) {
+                              int timeout_ms = 6000, size_t sample_bytes = 12) {
+    sample_bytes = std::clamp<size_t>(sample_bytes, 12, 64 * 1024);
     detail::RequestControl cancellation;
     AudioProbe out;
     detail::Session s;
@@ -453,7 +454,7 @@ inline AudioProbe probe_audio(const std::string& url, const std::vector<std::str
     Request req;
     req.url = url;
     req.headers = headers;
-    req.headers.push_back("Range: bytes=0-11");
+    req.headers.push_back("Range: bytes=0-" + std::to_string(sample_bytes - 1));
     req.timeout_ms = timeout_ms;
 
     HINTERNET conn = nullptr;
@@ -485,25 +486,29 @@ inline AudioProbe probe_audio(const std::string& url, const std::vector<std::str
         try { out.total_bytes = std::stoll(cr.substr(slash + 1)); } catch (...) {}
     }
 
-    char head[12]{};
+    std::vector<char> head(sample_bytes);
     DWORD read = 0;
-    while (read < sizeof head) {
+    bool read_ok = true;
+    while (read < head.size()) {
         DWORD received = 0;
-        if (!detail::read(hreq, head + read, DWORD(sizeof head) - read, &received) || !received) break;
+        if (!detail::read(hreq, head.data() + read, DWORD(head.size()) - read, &received)) { read_ok = false; break; }
+        if (!received) break;
         read += received;
     }
     detail::close_request(hreq);
     WinHttpCloseHandle(conn);
 
-    const bool looks_audio = audio_prefix(head, read);
+    const bool looks_audio = audio_prefix(head.data(), read);
     const bool audio_type = out.content_type.find("audio") != std::string::npos ||
                             out.content_type.find("octet-stream") != std::string::npos ||
                             out.content_type.find("mpeg") != std::string::npos ||
                             out.content_type.find("mp4") != std::string::npos ||
                             out.content_type.find("webm") != std::string::npos;
-    out.playable = (out.status == 200 || out.status == 206) && looks_audio;
+    out.playable = read_ok && !net::cancelled() && (out.status == 200 || out.status == 206) && looks_audio;
     if (!out.playable) {
-        if (out.status == 404) out.reason = "已下架 / 无版权";
+        if (net::cancelled()) out.reason = "音频加载已取消";
+        else if (!read_ok) out.reason = "音频读取失败或超时";
+        else if (out.status == 404) out.reason = "已下架 / 无版权";
         else if (out.status == 403) out.reason = "直链被拒（可能需要登录）";
         else if (!looks_audio && audio_type) out.reason = "返回内容不是音频";
         else if (out.status == 200 && !audio_type) out.reason = "需要登录或会员";

@@ -220,6 +220,7 @@ struct ResolveResult {
     std::vector<std::string> headers;  // 下载/探测时要带的头
     std::string reason;                // 结构化原因（失败时）
     std::string detail;                // 人话补充（渠道 · 实现 · 音质 · 容器）
+    std::shared_ptr<lx::Engine::LoadTiming> load_timing;
 };
 // 消费端确认候选能实际使用后才结束取流；拒绝时将原因交给下一候选。
 using ResolveAccept = std::function<bool(const ResolveResult&, std::string&)>;
@@ -1407,16 +1408,19 @@ inline bool resolve_via_source(const Variant& v, int quality, ResolveResult& out
     const std::string q = lx::quality_key(quality);
     const std::string info = lx_music_info(v, key);
     std::string url, err, by;
+    auto timing = std::make_shared<lx::Engine::LoadTiming>();
     if (!engine.resolve(key, q, info, url, err, &by,
         [&](const std::string& candidate, const std::string& name, const std::string& actual_quality, std::string& error) {
             ResolveResult rr;
             rr.ok = true; rr.lane = Lane::JsSource; rr.engine = name; rr.url = candidate;
             rr.headers = {"User-Agent: Mozilla/5.0"}; rr.reason = "ok";
             rr.detail = "音源 · " + name + " · " + actual_quality;
+            rr.load_timing = timing;
             if (!accept_resolved(rr, accept, error)) return false;
+            timing->verified = bool(accept);
             out = std::move(rr);
             return true;
-        })) {
+        }, timing.get())) {
         if (why) *why = err.empty() ? "音源没有返回链接" : err;
         return false;
     }

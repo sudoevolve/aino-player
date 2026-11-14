@@ -32,6 +32,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <tuple>
 
 #include "json.hpp"
 #include "net.hpp"
@@ -1221,7 +1222,18 @@ public:
         // 0 等待检测，1 检测中，2 样本通过，3 样本失败，4 未声明支持，5 超时未完成。
         int state = 0;
         std::string reason;
+        int resolve_ms = 0, load_ms = 0;
+        std::string quality;
     };
+    struct Timing {
+        int resolve_ms = 0, load_ms = 0, ready_ms = 0;
+        unsigned samples = 0, failures = 0;
+        unsigned long long failed_at = 0;
+        bool verified = false;
+    };
+    // 消费方只报告“已收到有效音频 / 首段可播”，不把整首下载或转码耗时当加载速度。
+    struct LoadTiming { int ready_ms = 0; bool verified = false; };
+    using Timings = std::map<std::string, std::map<std::string, Timing>>; // 平台 → 实际音质 → 测量
     using Checks = std::map<std::string, Health>;
     explicit Engine(std::string preferences_file = {}) : preferences_file_(std::move(preferences_file)) {}
     static Engine& instance() {
@@ -1285,6 +1297,7 @@ public:
             ++revision_;
             runtime_errors_.erase(name);
             health_.erase(name);
+            timings_.erase(name);
             for (auto it = list_.begin(); it != list_.end();) {
                 if (file_key((*it)->path()) == name) {
                     (*it)->retire(); retired.push_back(std::move(*it)); it = list_.erase(it);
@@ -1317,6 +1330,9 @@ public:
     std::map<std::string, Checks> health() const {
         std::lock_guard<std::mutex> lock(mu_); return health_;
     }
+    std::map<std::string, Timings> timings() const {
+        std::lock_guard<std::mutex> lock(mu_); return timings_;
+    }
     std::vector<std::string> removed_files() const {
         std::lock_guard<std::mutex> lock(mu_); return {removed_.begin(), removed_.end()};
     }
@@ -1339,9 +1355,14 @@ public:
                 const auto stopped = [&] { return epoch != check_epoch_.load() || s->retired() || (cancel && cancel()); };
                 for (const auto& sample : cases) {
                     if (stopped()) return;
+                    const auto quality = s->pick_quality(sample.platform, 1);
                     auto publish = [&](Health state) {
                         { std::lock_guard<std::mutex> lock(mu_);
                           if (stopped() || std::find(list_.begin(), list_.end(), s) == list_.end()) return;
+                          // 检测的中间状态保留上一次已验证结果，避免检测时排序和颜色反复跳变。
+                          auto& previous = health_[file][sample.platform];
+                          if (state.state < 2 && previous.state == 2) return;
+                          if (state.state == 2) record_timing(file, sample.platform, state.quality, state.resolve_ms, state.load_ms, true);
                           health_[file][sample.platform] = std::move(state); ++revision_; }
                         if (wake) wake();
                     };
@@ -1351,11 +1372,13 @@ public:
                       if (!force && it != health_[file].end() && (it->second.state == 2 || it->second.state == 3)) continue; }
                     // 点播优先。检测被打断后保留“待检测”，不会把抢占记成失败。
                     if (s->playback_waiting()) { publish({0, "等待播放请求完成"}); continue; }
-                    publish({1, "静默请求播放地址并探测音频头"});
+                    publish({1, "静默取址并测速，最多加载 64 KiB，不播放声音"});
                     std::string url, error;
                     bool playable = false;
                     std::atomic<bool> preempted{false};
                     bool timed_out = false;
+                    int resolve_ms = 0, load_ms = 0;
+                    const auto begin = std::chrono::steady_clock::now();
                     {
                         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
                         net::CancelScope budget([&] {
@@ -1363,18 +1386,21 @@ public:
                             timed_out = std::chrono::steady_clock::now() >= deadline;
                             return stopped() || preempted.load() || timed_out;
                         });
-                        const auto q = s->pick_quality(sample.platform, 1);
+                        const auto& q = quality;
                         if (q.empty()) error = "未声明标准或高品质音质";
                         else if (s->music_url(sample.platform, q, sample.info, url, error, true)) {
-                            const auto probe = net::probe_audio(url, {"User-Agent: Mozilla/5.0"}, 2500);
+                            resolve_ms = elapsed_ms(begin);
+                            const auto probe = net::probe_audio(url, {"User-Agent: Mozilla/5.0"}, 2500, 64 * 1024);
                             playable = probe.playable;
+                            load_ms = elapsed_ms(begin);
                             if (!playable) error = probe.reason;
                         }
                     }
                     if (stopped()) return;
                     timed_out = timed_out || error.find("超时") != std::string::npos || error.find("timeout") != std::string::npos;
                     if (preempted.load() || s->playback_waiting()) publish({0, "检测让位于播放，可重新检测"});
-                    else publish({playable ? 2 : timed_out ? 5 : 3, playable ? "样本音频头有效" : error.empty() ? "样本请求失败" : error});
+                    else publish({playable ? 2 : timed_out ? 5 : 3, playable ? "静默加载音频样本有效（最多 64 KiB）" : error.empty() ? "样本请求失败" : error,
+                                  resolve_ms, load_ms, quality});
                 }
             }
         };
@@ -1384,6 +1410,26 @@ public:
     }
 
 private:
+    static int elapsed_ms(std::chrono::steady_clock::time_point begin) {
+        return int(std::clamp<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count(), 1, 300000));
+    }
+    // mu_ 已持有；平滑波动，取消不调用此入口，单曲失败不覆盖样本状态。
+    void record_timing(const std::string& file, const std::string& platform, const std::string& quality,
+                       int resolve_ms, int load_ms, bool success, int ready_ms = 0) {
+        auto& value = timings_[file][platform][quality];
+        const auto smooth = [](int previous, int current) { return previous > 0 ? (previous * 3 + current + 2) / 4 : current; };
+        if (success) {
+            if (resolve_ms > 0) value.resolve_ms = smooth(value.resolve_ms, resolve_ms);
+            if (load_ms > 0) value.load_ms = smooth(value.load_ms, load_ms);
+            if (ready_ms > 0) value.ready_ms = smooth(value.ready_ms, ready_ms);
+            if (load_ms > 0 || ready_ms > 0) value.samples = std::min(value.samples + 1, 100000u);
+            if (load_ms > 0 || ready_ms > 0) value.verified = true;
+            value.failures = 0; value.failed_at = 0;
+        } else {
+            if (platform::ticks() >= value.failed_at + 60000) value.failures = 0;
+            value.failures = std::min(value.failures + 1, 3u); value.failed_at = platform::ticks();
+        }
+    }
     static std::string file_key(const std::string& file) {
         auto name = std::filesystem::u8path(file).filename().u8string();
 #ifdef _WIN32
@@ -1556,7 +1602,7 @@ private:
                 if (std::find(list_.begin(), list_.end(), old) == list_.end()) old->retire();
             ++revision_;
             failed_.swap(new_failed);
-            for (const auto& file : files) { runtime_errors_.erase(file_key(file)); health_.erase(file_key(file)); }
+            for (const auto& file : files) { runtime_errors_.erase(file_key(file)); health_.erase(file_key(file)); timings_.erase(file_key(file)); }
         }
         // 被替换的运行时在 mu_ 锁外释放，避免清理脚本时阻塞界面读取状态。
         return ok_count.load();
@@ -1598,41 +1644,65 @@ public:
         return false;
     }
 
-    // 依次尝试：先选中的源，再其它源。任一成功即返回。
+    // 按平台和实际音质选择已验证且加载快的源；失败后继续后续候选。
     // by 回传真正给出链接的脚本名 —— 界面上要显示"哪个音源"，不能只说"音源"。
     // 持锁只做拷贝：music_url 是同步网络请求（秒级），跑在锁外，否则取流期间
     // 界面每帧读状态会卡死窗口。
     bool resolve(const std::string& key, const std::string& quality, const std::string& info_json,
                  std::string& url, std::string& err, std::string* by = nullptr,
-                 const std::function<bool(const std::string&, const std::string&, const std::string&, std::string&)>& accept = {}) {
+                 const std::function<bool(const std::string&, const std::string&, const std::string&, std::string&)>& accept = {},
+                 LoadTiming* load_timing = nullptr) {
         std::vector<std::shared_ptr<Script>> order;
+        const int wanted = quality == "128k" ? 0 : quality == "flac" || quality == "flac24bit" ? 2 : 1;
         {
             std::lock_guard<std::mutex> lock(mu_);
             for (auto& s : list_)
                 if (!s->retired() && s->supports(key, "musicUrl")) order.push_back(s);
-            // 按当前平台的实测结果排序；明确选中的音源仍优先。
+            // 未测或不同音质不能伪装成最快；连续失败暂时降级，60 秒后允许自然重试。
+            const auto now = platform::ticks();
             const auto rank = [&](const auto& s) {
-                const auto h = health_.find(file_key(s->path()));
-                if (h == health_.end()) return 1;
-                const auto p = h->second.find(key);
-                return p == h->second.end() ? 1 : p->second.state == 2 ? 0 : p->second.state == 3 ? 2 : 1;
+                const auto file = file_key(s->path());
+                const auto actual = s->pick_quality(key, wanted);
+                int availability = 1, latency = 300001, penalty = 0;
+                const auto h = health_.find(file);
+                if (h != health_.end()) {
+                    const auto p = h->second.find(key);
+                    if (p != h->second.end()) {
+                        if (p->second.state == 2) availability = 0;
+                        else if (p->second.state == 3 || p->second.state == 5) availability = 2;
+                    }
+                }
+                const auto f = timings_.find(file);
+                if (f != timings_.end()) {
+                    const auto p = f->second.find(key);
+                    if (p != f->second.end()) {
+                        const auto q = p->second.find(actual);
+                        if (q != p->second.end()) {
+                            const auto& value = q->second;
+                            if (value.verified) availability = 0;
+                            if (value.samples) latency = value.ready_ms > 0 ? value.ready_ms : value.load_ms;
+                            if (value.failures && now < value.failed_at + 60000) {
+                                penalty = int(value.failures) * 1500;
+                                if (value.failures >= 2) availability = 2;
+                            }
+                        }
+                    }
+                }
+                if (actual.empty()) availability = 3;
+                return std::make_tuple(availability, latency + penalty, file_key(preferred_) == file ? 0 : 1, file);
             };
             std::stable_sort(order.begin(), order.end(), [&](const auto& a, const auto& b) { return rank(a) < rank(b); });
-            const std::string preferred = preferred_;
-            if (!preferred.empty()) {
-                std::stable_sort(order.begin(), order.end(), [&preferred](const std::shared_ptr<Script>& a,
-                                                                           const std::shared_ptr<Script>& b) {
-                    return a->info().file == preferred && b->info().file != preferred;
-                });
-            }
         }
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-        const auto report = [&](const std::shared_ptr<Script>& script, const std::string& error) {
+        const auto report = [&](const std::shared_ptr<Script>& script, const std::string& quality, const std::string& error, int resolve_ms = 0, int ready_ms = 0) {
             std::lock_guard<std::mutex> lock(mu_);
             const auto file = file_key(script->path());
             if (!removed_.count(file) && std::find(list_.begin(), list_.end(), script) != list_.end()) {
                 if (error.empty()) runtime_errors_[file].erase(key);
                 else runtime_errors_[file][key] = error;
+                record_timing(file, key, quality, resolve_ms, 0, error.empty(), ready_ms);
+                if (error.empty() && (load_timing ? load_timing->verified : bool(accept))) timings_[file][key][quality].verified = true;
+                ++revision_;
             }
         };
         std::string last;
@@ -1641,16 +1711,18 @@ public:
             if (std::chrono::steady_clock::now() >= deadline) { last += "；音源解析已达到 30 秒，尝试其他渠道"; break; }
             if (s->retired()) continue;
             std::string u, e;
-            const int wanted = quality == "128k" ? 0 : quality == "flac" || quality == "flac24bit" ? 2 : 1;
             const std::string q = s->pick_quality(key, wanted);
-            if (q.empty()) { last = s->info().name + ": 不支持所选音质或更低档位"; report(s, last); continue; }
+            if (q.empty()) { last = s->info().name + ": 不支持所选音质或更低档位"; continue; }
             bool resolved;
+            const auto begin = std::chrono::steady_clock::now();
+            if (load_timing) *load_timing = {};
             {
                 net::CancelScope time_limit([parent = net::cancel_current, deadline] {
                     return (parent && parent()) || std::chrono::steady_clock::now() >= deadline;
                 });
                 resolved = s->music_url(key, q, info_json, u, e);
             }
+            const int resolve_ms = elapsed_ms(begin);
             if (resolved && !s->retired()) {
                 // URL 只是候选：探测、下载或解码拒绝它后，继续同平台的下一个脚本。
                 net::CancelScope network([s, parent = net::cancel_current] {
@@ -1658,16 +1730,18 @@ public:
                 });
                 if (accept && !accept(u, s->info().name, q, e)) {
                     last = s->info().name + ": " + (e.empty() ? "候选音频不可用" : e);
-                    if (!net::cancelled()) report(s, last);
+                    if (!net::cancelled()) report(s, q, last);
                     continue;
                 }
-                report(s, "");
+                if (net::cancelled()) { err = "取流已取消"; return false; }
+                report(s, q, "", resolve_ms, load_timing && load_timing->ready_ms > 0 ? resolve_ms + load_timing->ready_ms : 0);
                 url = u;
                 if (by) *by = s->info().name;
                 return true;
             }
+            if (!resolved && e.empty()) e = "音源未返回有效播放地址";
             if (!e.empty()) {
-                if (!net::cancelled()) report(s, e);
+                if (!net::cancelled()) report(s, q, e);
                 if (!last.empty()) last += "；";
                 last += s->info().name + ": " + e;
             }
@@ -1690,6 +1764,7 @@ private:
     std::string preferences_file_;
     std::map<std::string, std::map<std::string, std::string>> runtime_errors_;
     std::map<std::string, Checks> health_;
+    std::map<std::string, Timings> timings_;
     std::mutex check_mu_;
     std::atomic<unsigned> check_epoch_{0};
     bool preferences_valid_ = true;

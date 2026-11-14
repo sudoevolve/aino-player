@@ -151,29 +151,31 @@ struct AudioProbe {
     int status = 0;
     std::string reason;
 };
-inline AudioProbe probe_audio(const std::string& url, const std::vector<std::string>& headers, int timeout_ms = 6000) {
+inline AudioProbe probe_audio(const std::string& url, const std::vector<std::string>& headers, int timeout_ms = 6000, size_t sample_bytes = 12) {
+    sample_bytes = std::clamp<size_t>(sample_bytes, 12, 64 * 1024);
     AudioProbe out;
     Request req{url, {}, headers, timeout_ms, true};
-    req.headers.push_back("Range: bytes=0-11");
+    req.headers.push_back("Range: bytes=0-" + std::to_string(sample_bytes - 1));
     detail::Transfer transfer;
     if (!transfer.setup(req)) { out.reason = "网络初始化失败"; return out; }
-    std::string first;
+    struct Sample { std::string first; size_t limit; } sample{{}, sample_bytes};
     curl_easy_setopt(transfer.handle, CURLOPT_WRITEFUNCTION, +[](char* p, size_t a, size_t b, void* data) -> size_t {
-        auto& first = *static_cast<std::string*>(data);
+        auto& sample = *static_cast<Sample*>(data);
+        auto& first = sample.first;
         const auto n = a * b;
-        first.append(p, std::min(n, size_t(12) - first.size()));
-        return first.size() >= 12 ? 0 : n;
+        first.append(p, std::min(n, sample.limit - first.size()));
+        return first.size() >= sample.limit ? 0 : n;
     });
-    curl_easy_setopt(transfer.handle, CURLOPT_WRITEDATA, &first);
+    curl_easy_setopt(transfer.handle, CURLOPT_WRITEDATA, &sample);
     const auto rc = curl_easy_perform(transfer.handle);
     Response response;
     transfer.response(response);
     out.status = response.status; out.content_type = response.content_type; out.final_url = response.final_url;
     const auto slash = transfer.content_range.find('/');
     if (slash != std::string::npos) { try { out.total_bytes = std::stoll(transfer.content_range.substr(slash + 1)); } catch (...) {} }
-    out.playable = (rc == CURLE_OK || rc == CURLE_WRITE_ERROR) && audio_prefix(first.data(), first.size()) &&
+    out.playable = !net::cancelled() && (rc == CURLE_OK || (rc == CURLE_WRITE_ERROR && sample.first.size() == sample.limit)) && audio_prefix(sample.first.data(), sample.first.size()) &&
         (out.status == 200 || out.status == 206);
-    if (!out.playable) out.reason = "取流失败 HTTP " + std::to_string(out.status);
+    if (!out.playable) out.reason = net::cancelled() ? "音频加载已取消" : rc == CURLE_OPERATION_TIMEDOUT ? "音频读取超时" : "取流失败 HTTP " + std::to_string(out.status);
     return out;
 }
 inline bool download(const std::string& url, const std::string& path, const std::vector<std::string>& headers,
