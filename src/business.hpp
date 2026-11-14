@@ -1799,7 +1799,18 @@ void start_download(music::Track track, music::Settings st) {
             }
             next();
         }
-    }, [] { std::lock_guard<std::mutex> lock(g_dlm); if (g_download_workers > 0) --g_download_workers; });
+    }, [] {
+        std::lock_guard<std::mutex> lock(g_dlm);
+        if (g_download_workers > 0) --g_download_workers;
+        if (!g_download_workers) {
+            g_download_pending.clear();
+            for (auto& entry : g_dls) if (!entry.second.done && !entry.second.failed && !entry.second.publishing) {
+                entry.second.failed = true;
+                entry.second.err = "后台下载任务未能启动，请重试";
+            }
+            ++g_download_revision;
+        }
+    });
 }
 
 // =============================================================================
@@ -2118,7 +2129,10 @@ static void request_cards(DiscState& state, int site, std::string query, bool ap
           owner->err = error; owner->loading = false; ++owner->version;
         }
         if (g_win) g_win->wake();
-    }, [owner, request] { std::lock_guard<std::mutex> lock(owner->m); if (owner->request == request) { owner->loading = false; ++owner->version; } });
+    }, [owner, request] {
+        std::lock_guard<std::mutex> lock(owner->m);
+        if (owner->request == request) { owner->loading = false; owner->err = "加载失败，请重试；完整原因见通知"; ++owner->version; }
+    });
 }
 void disc_refresh(int site) { request_cards(g_disc, site, {}, false, true); }
 void disc_more() { request_cards(g_disc, g_ui.disc_site, {}, true, true); }
@@ -2893,7 +2907,7 @@ void choose_local_audio() {
             if (!error.empty()) toast(error, 6000);
             if (!paths.empty()) open_local_files(std::move(paths));
         });
-    }, [] { g_ui.choosing_local = false; });
+    }, [] { g_ui.choosing_local = false; g_folder_selecting = false; });
 }
 void configure_default_player() {
     if (g_ui.setting_default_player || g_shutdown.load()) return;
@@ -3551,7 +3565,9 @@ void playlist_open_remote(library::Playlist playlist) {
             playlist_filter_rows();
             g_ui.scroll_to_top = true;
         });
-    }, [generation] { if (generation == g_playlist_generation.load()) g_playlist_view.loading = false; });
+    }, [generation] {
+        if (generation == g_playlist_generation.load()) { g_playlist_view.loading = false; g_playlist_view.error = "加载失败，请重试；完整原因见通知"; }
+    });
 }
 
 void playlist_load_more() {
@@ -3592,7 +3608,9 @@ void playlist_load_more() {
             }
             playlist_filter_rows();
         });
-    }, [generation] { if (generation == g_playlist_generation.load()) g_playlist_view.loading_more = false; });
+    }, [generation] {
+        if (generation == g_playlist_generation.load()) { g_playlist_view.loading_more = false; g_playlist_view.more_error = "加载失败，请重试；完整原因见通知"; }
+    });
 }
 
 static music::CatalogPage local_catalog(const music::CatalogTarget& target, const library::Library& saved,
@@ -3705,7 +3723,12 @@ static void catalog_request(bool albums, bool append) {
             if (!append && g_ui.catalog_section == (albums ? 1 : 0)) g_ui.scroll_to_top = true;
             if (!albums && g_ui.catalog_section == 1 && !view.albums_loaded && view.albums_error.empty()) catalog_request(true, false);
         });
-    }, [generation] { if (generation == g_playlist_generation.load()) { g_playlist_view.loading = false; g_playlist_view.loading_more = false; } });
+    }, [generation, albums, append] {
+        if (generation != g_playlist_generation.load()) return;
+        g_playlist_view.loading = false; g_playlist_view.loading_more = false;
+        auto& error = albums ? g_playlist_view.albums_error : g_playlist_view.error;
+        error = "加载失败，请重试；完整原因见通知";
+    });
 }
 static void open_catalog(music::CatalogTarget target, music::Track seed = {}, int artist_index = 0) {
     detail_begin();

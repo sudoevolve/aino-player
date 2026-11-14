@@ -60,8 +60,13 @@ struct Transfer {
         curl_easy_setopt(handle, CURLOPT_TIMEOUT_MS, long(req.timeout_ms));
         curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, req.follow_redirects ? 1L : 0L);
         curl_easy_setopt(handle, CURLOPT_MAXREDIRS, 5L);
+#if LIBCURL_VERSION_NUM >= 0x075500
+        curl_easy_setopt(handle, CURLOPT_PROTOCOLS_STR, "http,https");
+        curl_easy_setopt(handle, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#else
         curl_easy_setopt(handle, CURLOPT_PROTOCOLS, long(CURLPROTO_HTTP | CURLPROTO_HTTPS));
         curl_easy_setopt(handle, CURLOPT_REDIR_PROTOCOLS, long(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
         curl_easy_setopt(handle, CURLOPT_USERAGENT, "aino-player/1.0");
         curl_easy_setopt(handle, CURLOPT_NOPROGRESS, 0L);
         curl_easy_setopt(handle, CURLOPT_XFERINFOFUNCTION, +[](void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int { return net::cancelled() ? 1 : 0; });
