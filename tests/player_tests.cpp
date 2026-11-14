@@ -428,7 +428,8 @@ int main(int argc, char** argv) {
                 const auto path = platform::join(dir, name);
                 auto* output = platform::fopen(path, "wb"); check(output != nullptr, "metadata fixture file");
                 check(std::fwrite(bytes.data(),1,bytes.size(),output) == bytes.size(), "metadata fixture write"); std::fclose(output);
-                return path;
+                // 扫描器使用 canonical 目录；Windows 的混合分隔符也要使用同一口径。
+                return platform::fs::canonical(platform::fs::u8path(path)).u8string();
             };
             const auto title = tag::id3_frame("TIT2", std::string(1,char(1)) + tag::utf16le_bom("中文标题"));
             const auto artist = tag::id3_frame("TPE1", std::string(1,char(3)) + "Artist");
