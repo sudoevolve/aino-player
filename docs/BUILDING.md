@@ -41,7 +41,7 @@ python tools/build_installer.py --exe build/Release/aino_player.exe --output bui
 
 ## 发布流程
 
-`CMakeLists.txt` 中的项目版本是版本号来源。仅在明确要求发布新版本时运行回归，普通提交不触发 CI。推送对应 `v*` 标签后，`release.yml` 分别在 Windows 和 Ubuntu 编译精简 FFmpeg、嵌入播放器并运行无系统解码器的回归；Linux 生成 deb 后验证安装与 Xvfb 启动。两端成功后发布 exe、deb、FFmpeg 官方原始源码包、构建信息、许可及 `SHA256SUMS.txt`。当前 `0.2.7` 对应标签 `v0.2.7`，标签与程序版本不符或缺少内置解码器会中止发布；不会覆盖旧版标签或安装包。
+`CMakeLists.txt` 中的项目版本是版本号来源。仅在明确要求发布新版本时运行回归，普通提交不触发 CI。推送对应 `v*` 标签后，`release.yml` 分别在 Windows 和 Ubuntu 编译精简 FFmpeg、嵌入播放器并运行无系统解码器的回归；Linux 生成 deb 后验证安装与 Xvfb 启动。两端成功后发布 exe、deb、FFmpeg 官方原始源码包、构建信息、许可及 `SHA256SUMS.txt`。项目版本如 `0.2.9` 对应标签 `v0.2.9`，标签与程序版本不符或缺少内置解码器会中止发布；不会覆盖旧版标签或安装包。
 
 发布工作流手动执行时可选择单个平台，仅构建、验证并上传产物，不自动发布。可用于只恢复失败的平台；复用另一平台的产物前须确认同一标签、同一提交且其验证任务成功。
 
