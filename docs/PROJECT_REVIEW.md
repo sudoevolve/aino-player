@@ -296,3 +296,12 @@ P1 表示优先解决的稳定性和数据风险，不表示已发生用户数�
 
 
 首次 v0.4.0 原生构建在 GCC 暴露右键批量菜单的条件表达式歧义：SharedTracks 与 vector 可以互相转换，MSVC 接受此处写法，而 GCC 无法推断共同类型。Ubuntu 与 Arch 因编译失败未发布；取消剩余候选任务以避免重复工作。修复为显式 const vector 引用，保持共享存储和零复制读取，再以独立 v0.4.1 标签验证，旧标签未移动。
+
+
+最终以 `4e79c0c` / [v0.4.1](https://github.com/sudoevolve/aino-player/releases/tag/v0.4.1) 正式发布，并设为 latest。[发布工作流 43622283961](https://github.com/sudoevolve/aino-player/actions/runs/43622283961) 的 Windows 7/7、Ubuntu 9/9、Fedora 8/8 全部通过；Arch 原生打包、安装和窗口启动通过，Ubuntu 验证 0.3.3 → 0.4.1 无需卸载的覆盖升级。Windows 第一次在未改动的浏览器交接代码启动握手超时，只有失败任务被重试；第二次所有检查成功，未跳过任何断言或改动登录实现。
+
+发布附件：Windows 安装器 4,662,467 字节、便携 EXE 8,181,760 字节、deb 3,438,536 字节、rpm 2,935,230 字节、Arch 包 3,516,772 字节；另附解码器源码、构建信息与许可。便携 EXE 比 0.3.3 增加 36,352 字节（约 0.45%），没有新增运行依赖。九项载荷的 SHA256SUMS 均与 GitHub digest 一致，公开 Release 正文与仓库说明一致。
+
+[软件源工作流 43623635886](https://github.com/sudoevolve/aino-player/actions/runs/43623635886) 全部成功：APT、DNF、pacman 分别验证签名与软件候选，再合流部署 Pages。公开主页显示 0.4.1，APT Packages 索引含 0.4.1，RPM 元数据和 Arch 数据库签名地址均可用。
+
+Ubuntu CI 的隔离诊断启动记录 RSS 35,848 kB、PSS 25,040 kB；这是 Xvfb 下没有真实账号播放或整批外部源的诊断场景，不代表用户播放内存，也不能与 Windows private 数值直接比较。真实脚本与长期播放的节省量仍未实测。
