@@ -18,7 +18,7 @@ if(WIN32)
   endif()
   # 新 Windows SDK 的 C++/WinRT 使用标准 coroutine；其余模块仍为 C++17。
   target_compile_features(player_desktop PRIVATE cxx_std_20)
-  target_link_libraries(player_desktop PUBLIC user32 shell32 runtimeobject windowsapp)
+  target_link_libraries(player_desktop PUBLIC user32 shell32 advapi32 runtimeobject windowsapp)
 else()
   find_package(X11 REQUIRED)
   find_package(PkgConfig REQUIRED)

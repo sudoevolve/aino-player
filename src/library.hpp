@@ -113,7 +113,42 @@ inline bool parse_link(const std::string& input, music::Source& source, std::str
     id = match[1].str();
     return id.size() <= 24 && id.find_first_not_of('0') != std::string::npos;
 }
-// 扫描路径与有界标签；不跟随链接、不修改原音乐，失败时调用方保留旧歌单。
+inline bool local_audio_file(const platform::fs::path& path) {
+    auto ext = path.extension().u8string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    return ext == ".mp3" || ext == ".flac" || ext == ".wav" || ext == ".wave" || ext == ".m4a" ||
+        ext == ".aac" || ext == ".ogg" || ext == ".oga" || ext == ".opus" || ext == ".webm";
+}
+inline std::string local_path_key(const platform::fs::path& path) {
+#ifdef _WIN32
+    auto value = path.lexically_normal().native();
+    const int length = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_UPPERCASE, value.data(), int(value.size()), nullptr, 0, nullptr, nullptr, 0);
+    if (length > 0) {
+        std::wstring folded(size_t(length), L'\0');
+        LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_UPPERCASE, value.data(), int(value.size()), folded.data(), length, nullptr, nullptr, 0);
+        return platform::fs::path(folded).u8string();
+    }
+#endif
+    return path.lexically_normal().u8string();
+}
+// 文件夹导入、系统打开、拖放共用标签规则，路径规范化后也能识别已有队列歌曲。
+inline music::Track local_track(const platform::fs::path& file) {
+    const auto path = file.u8string();
+    music::Variant v; v.source = music::Source::Local; v.id = path;
+    v.title = file.stem().u8string();
+    const auto split = v.title.find(" - ");
+    if (split != std::string::npos) { v.artist = v.title.substr(0, split); v.title.erase(0, split + 3); }
+    v.album = file.parent_path().filename().u8string();
+    const auto metadata = tag::read_metadata(path);
+    if (!metadata.title.empty()) v.title = metadata.title;
+    if (!metadata.artist.empty()) v.artist = metadata.artist;
+    if (!metadata.album.empty()) v.album = metadata.album;
+    v.duration_ms = int(std::min(metadata.duration_ms, 2147483647LL));
+    if (!metadata.cover.empty()) v.cover_url = "local-cover:" + path;
+    music::Track t; t.title = v.title; t.artist = v.artist; t.album = v.album; t.cover_url = v.cover_url; t.duration_ms = v.duration_ms;
+    t.variants.push_back(std::move(v)); return t;
+}
+// 扫描路径与有界标签；不跟随目录链接、不修改原音乐，失败时调用方保留旧歌单。
 inline Playlist scan_folder(const std::string& input, bool recursive, std::string& error,
                             const std::function<bool()>& cancelled = {}) {
     error.clear();
@@ -128,10 +163,7 @@ inline Playlist scan_folder(const std::string& input, bool recursive, std::strin
     std::vector<std::string> files;
     auto add = [&](const platform::fs::directory_entry& entry) {
         if (entry.is_symlink(ec) || !entry.is_regular_file(ec) || ec) return;
-        auto ext = entry.path().extension().u8string();
-        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
-        if (ext == ".mp3" || ext == ".flac" || ext == ".wav" || ext == ".m4a" || ext == ".aac" ||
-            ext == ".ogg" || ext == ".opus" || ext == ".webm") files.push_back(entry.path().u8string());
+        if (local_audio_file(entry.path())) files.push_back(entry.path().u8string());
     };
     if (recursive) {
         for (platform::fs::recursive_directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec)) {
@@ -150,20 +182,8 @@ inline Playlist scan_folder(const std::string& input, bool recursive, std::strin
     std::sort(files.begin(), files.end());
     files.erase(std::unique(files.begin(), files.end()), files.end());
     for (const auto& path : files) {
-        music::Variant v; v.source = music::Source::Local; v.id = path;
-        v.title = platform::fs::u8path(path).stem().u8string();
-        const auto split = v.title.find(" - ");
-        if (split != std::string::npos) { v.artist = v.title.substr(0, split); v.title.erase(0, split + 3); }
-        v.album = platform::fs::u8path(path).parent_path().filename().u8string();
         if (cancelled && cancelled()) { error = "扫描已取消"; return out; }
-        const auto metadata = tag::read_metadata(path);
-        if (!metadata.title.empty()) v.title = metadata.title;
-        if (!metadata.artist.empty()) v.artist = metadata.artist;
-        if (!metadata.album.empty()) v.album = metadata.album;
-        v.duration_ms = int(std::min(metadata.duration_ms, 2147483647LL));
-        if (!metadata.cover.empty()) v.cover_url = "local-cover:" + path;
-        music::Track t; t.title = v.title; t.artist = v.artist; t.album = v.album; t.cover_url = v.cover_url; t.duration_ms = v.duration_ms;
-        t.variants.push_back(std::move(v)); out.tracks.push_back(std::move(t));
+        out.tracks.push_back(local_track(platform::fs::u8path(path)));
     }
     if (!out.tracks.empty()) out.cover = out.tracks.front().cover_url;
     if (out.tracks.empty()) error = "文件夹内没有支持的音频文件，原歌单已保留";

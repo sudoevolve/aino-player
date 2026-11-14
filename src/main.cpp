@@ -115,13 +115,9 @@ int main(int argc, char** argv) {
     // 后台任务调用 wake() 前，必须先初始化 Xlib 的线程支持。
     if (!XInitThreads()) { std::fprintf(stderr, "Xlib thread initialization failed\n"); return 1; }
 #endif
-    // provider（搜索脚本）放后台加载：纯本地解析、不联网，不影响首帧。
-    // 音源脚本【启动时绝不自动加载】——加载什么时候发生由用户按按钮决定
-    //（在线获取 / 导入音源 / 重新加载），不然按钮就没有存在的意义。
-    background::start([] { prov::Host::instance().ensure_loaded(); });
-
     auto& startup_ui = view_model().ui;
-    bool initial_search = argc > 1;
+    std::vector<std::string> arguments;
+    for (int i = 1; i < argc; ++i) arguments.emplace_back(argv[i]);
     bool smoke_test = argc > 1 && std::string(argv[1]) == "--smoke-test";
 #ifdef AINO_PLATFORM_X11
     const bool diagnostics = argc > 1 && std::string(argv[1]) == "--diagnostics";
@@ -130,15 +126,35 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     int count = 0;
     if (auto args = CommandLineToArgvW(GetCommandLineW(), &count)) {
-        initial_search = count > 1;
-        if (initial_search) startup_ui.query = net::narrow(args[1]);
+        arguments.clear();
+        for (int i = 1; i < count; ++i) arguments.push_back(net::narrow(args[i]));
         LocalFree(args);
     }
-#else
-    if (initial_search) startup_ui.query = argv[1];
 #endif
-    if (smoke_test) initial_search = false;
+    bool open_mode = !arguments.empty() && (arguments.front() == "--open" || arguments.front() == "--");
+    if (open_mode) arguments.erase(arguments.begin());
+    if (!open_mode && !smoke_test) for (const auto& value : arguments) {
+        const auto decoded = platform::local_file_path(value);
+        std::error_code ec;
+        if (value.rfind("file:", 0) == 0 || (!decoded.empty() &&
+            (library::local_audio_file(platform::fs::u8path(decoded)) || platform::fs::exists(platform::fs::u8path(decoded), ec) ||
+             decoded.find_first_of("/\\") != std::string::npos))) { open_mode = true; break; }
+    }
+    std::vector<std::string> startup_files;
+    if (open_mode && !smoke_test) {
+        for (const auto& value : arguments) {
+            const auto decoded = platform::local_file_path(value);
+            std::error_code ec;
+            const auto absolute = decoded.empty() ? platform::fs::path() : platform::fs::absolute(platform::fs::u8path(decoded), ec);
+            startup_files.push_back(ec || decoded.empty() ? value : absolute.lexically_normal().u8string());
+        }
+        if (!startup_files.empty() && platform::forward_local_files(startup_files)) return 0;
+    }
+    const bool initial_search = !open_mode && !smoke_test && !arguments.empty();
+    if (initial_search) startup_ui.query = arguments.front();
     if (initial_search) startup_ui.tab = 0;
+    // 文件转交成功即可退出，只有真正启动播放器的进程才创建后台任务。
+    background::start([] { prov::Host::instance().ensure_loaded(); });
     if (!initialize(smoke_test)) return 1;
 #ifdef _WIN32
     SetCurrentProcessExplicitAppUserModelID(L"sudoevolve.AinoPlayer");
@@ -224,9 +240,14 @@ int main(int argc, char** argv) {
     bool autostart = true;
     win.run([&](aino::Ui& ui) {
         const auto begin = std::chrono::steady_clock::now();
+        std::vector<std::string> opened_files;
         for (const auto& event : desktop.events()) {
             if (event.action == platform::MediaAction::Show) { desktop.show(); win.activate(); }
             else if (event.action == platform::MediaAction::Quit) win.close();
+            else if (event.action == platform::MediaAction::OpenFiles) {
+                opened_files.insert(opened_files.end(), event.files.begin(), event.files.end());
+                desktop.show(); win.activate();
+            }
             else media_action(event);
         }
         startup_ui.window_hidden = desktop.hidden();
@@ -237,7 +258,11 @@ int main(int argc, char** argv) {
             theme_dark = model.ui.dark;
             ui.set_theme(theme_dark ? aino::Theme::dark() : aino::Theme::light());
         }
-        if (autostart) { autostart = false; bootstrap(initial_search, smoke_test); }
+        if (autostart) {
+            autostart = false; bootstrap(initial_search, smoke_test);
+            if (!startup_files.empty()) open_local_files(std::move(startup_files));
+        }
+        if (!opened_files.empty()) open_local_files(std::move(opened_files));
         if (!smoke_test) {
             const auto& playing = model.playback;
             platform::MediaState state;

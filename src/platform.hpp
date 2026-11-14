@@ -41,8 +41,13 @@ extern char** environ;
 #endif
 
 namespace platform {
-enum class MediaAction { Toggle, Play, Pause, Stop, Next, Previous, SeekRelative, SeekAbsolute, Volume, Show, Quit, Shuffle, Loop };
-struct MediaEvent { MediaAction action; long long value = 0; std::string track; };
+enum class MediaAction { Toggle, Play, Pause, Stop, Next, Previous, SeekRelative, SeekAbsolute, Volume, Show, Quit, Shuffle, Loop, OpenFiles };
+struct MediaEvent { MediaAction action; long long value = 0; std::string track; std::vector<std::string> files; };
+// 系统打开与拖放只接受本地路径 / file URI，不把外部地址当音乐搜索词或执行命令。
+std::string local_file_path(const std::string& value);
+std::vector<std::string> local_uri_list(const std::string& value);
+bool set_default_music_player(std::string& error, const std::function<bool()>& cancelled = {});
+bool forward_local_files(const std::vector<std::string>& paths);
 struct MediaState {
     std::string uid, title, artist, album, artwork;
     long long position_ms = 0, duration_ms = 0;
@@ -502,9 +507,10 @@ inline void CALLBACK cancel_folder_picker(HWND window, UINT, UINT_PTR, DWORD) {
 }
 #endif
 #ifndef _WIN32
-std::string choose_desktop_file(bool folder, const std::atomic<bool>& cancelled, std::string& error);
+std::string choose_desktop_file(bool folder, const std::atomic<bool>& cancelled, std::string& error,
+    int kind = 0, std::vector<std::string>* multi = nullptr);
 #endif
-// kind：0 普通（音乐文件夹 / lrc 歌词），2 音源脚本 .js
+// kind：0 歌词 / 文件夹，1 本地音频，2 音源脚本。
 // multi 非空时开启多选，所有选中的路径都填进去（selected 仍返回第一个，兼容旧调用）。
 inline std::string choose_music_folder(void* owner, const std::atomic<bool>& cancelled, std::string& error,
                                        bool folder = true, int kind = 0,
@@ -522,10 +528,13 @@ inline std::string choose_music_folder(void* owner, const std::atomic<bool>& can
         | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR
         | (multi && !folder ? FOS_ALLOWMULTISELECT : 0));
     if (SUCCEEDED(result)) result = dialog->SetTitle(folder ? L"选择音乐文件夹"
-                                                    : (kind == 2 ? L"选择音源脚本（.js）" : L"选择本地歌词"));
+                                                    : (kind == 2 ? L"选择音源脚本（.js）" : kind == 1 ? L"打开本地音乐" : L"选择本地歌词"));
     if (!folder && SUCCEEDED(result)) {
         if (kind == 2) {
             const COMDLG_FILTERSPEC filters[]{{L"音源脚本 (*.js)", L"*.js"}, {L"所有文件", L"*.*"}};
+            result = dialog->SetFileTypes(2, filters);
+        } else if (kind == 1) {
+            const COMDLG_FILTERSPEC filters[]{{L"音乐文件", L"*.mp3;*.flac;*.wav;*.wave;*.m4a;*.aac;*.ogg;*.oga;*.opus;*.webm"}, {L"所有文件", L"*.*"}};
             result = dialog->SetFileTypes(2, filters);
         } else {
             const COMDLG_FILTERSPEC filters[]{{L"LRC 歌词", L"*.lrc"}, {L"所有文件", L"*.*"}};
@@ -580,8 +589,13 @@ inline std::string choose_music_folder(void* owner, const std::atomic<bool>& can
     return selected;
 #else
     (void)owner;
-    return choose_desktop_file(folder, cancelled, error);
+    return choose_desktop_file(folder, cancelled, error, kind, multi);
 #endif
+}
+inline std::vector<std::string> choose_audio_files(void* owner, const std::atomic<bool>& cancelled, std::string& error) {
+    std::vector<std::string> files;
+    choose_music_folder(owner, cancelled, error, false, 1, &files);
+    return files;
 }
 // 音源脚本选择器（.js）
 inline std::string choose_js_file(void* owner, const std::atomic<bool>& cancelled, std::string& error) {

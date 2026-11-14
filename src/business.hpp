@@ -30,6 +30,8 @@
 #include <mutex>
 #include <random>
 #include <set>
+#include <unordered_map>
+#include <unordered_set>
 #include <numeric>
 #include <shared_mutex>
 #include <string>
@@ -216,6 +218,7 @@ struct UiState {
     int playlist_sort = 0;
     bool playlist_manage = false;
     bool importing_playlist = false;
+    bool opening_local = false, choosing_local = false, setting_default_player = false;
     int catalog_section = 0;
     int library_add_mode = -1; // 收起 / 文件夹 / 在线链接 / 当前队列
     std::string remove_playlist_key;
@@ -350,6 +353,9 @@ void seek_playback(int milliseconds);
 void choose_source(int index, int variant, bool replay);
 void library_remove(size_t index);
 void library_choose_folder();
+void open_local_files(std::vector<std::string> paths);
+void choose_local_audio();
+void configure_default_player();
 void playlist_filter_rows();
 void playlist_rename_local();
 void library_export(bool playlist_only);
@@ -378,6 +384,7 @@ void retry_failed_downloads();
 void clear_finished_downloads();
 void retry_download(const std::string& uid);
 void reveal_download(const std::string& uid);
+void reveal_local_track(const music::Track& track);
 void recent_play(size_t index);
 void recent_clear();
 int lyric_offset();
@@ -2612,6 +2619,135 @@ static void start_play_attempt(int index, bool keep_failures) {
 
 void start_play(int index) { start_play_attempt(index, false); }
 
+// 请求队列仅由 UI 线程持有；一次只扫描一批，标签读取始终留在后台。
+struct LocalOpenRequest { std::vector<std::string> paths; unsigned serial; int play_generation; };
+static std::deque<LocalOpenRequest> g_local_open_requests;
+static unsigned g_local_open_serial = 0;
+static void process_local_open() {
+    if (g_local_open_requests.empty() || g_shutdown.load()) { g_ui.opening_local = false; return; }
+    auto request = std::move(g_local_open_requests.front()); g_local_open_requests.pop_front();
+    g_ui.opening_local = true;
+    background::start([request = std::move(request)]() mutable {
+        std::vector<music::Track> tracks;
+        size_t skipped = 0, repeated = 0;
+        bool limited = false;
+        std::string error;
+        std::unordered_set<std::string> seen;
+        constexpr size_t limit = 10000;
+        auto add = [&](const platform::fs::path& input, bool explicit_file) {
+            if (tracks.size() >= limit) { limited = true; return; }
+            std::error_code ec;
+            auto file = platform::fs::canonical(input, ec);
+            if (ec || !platform::fs::is_regular_file(file, ec) || ec) { ++skipped; return; }
+            if (!library::local_audio_file(file)) { if (explicit_file) ++skipped; return; }
+            if (!seen.insert(library::local_path_key(file)).second) { ++repeated; return; }
+            if (platform::fs::file_size(file, ec) == 0 || ec) { ++skipped; return; }
+            auto* check = platform::fopen(file.u8string(), "rb");
+            if (!check) { ++skipped; return; }
+            std::fclose(check);
+            try { tracks.push_back(library::local_track(file)); }
+            catch (const std::exception&) { ++skipped; }
+        };
+        for (const auto& value : request.paths) {
+            if (g_shutdown.load() || limited) break;
+            try {
+                const auto decoded = platform::local_file_path(value);
+                if (decoded.empty()) { ++skipped; continue; }
+                const auto path = platform::fs::u8path(decoded);
+                std::error_code ec;
+                if (!platform::fs::is_directory(path, ec)) { add(path, true); continue; }
+                // 每个文件夹内部按路径排序；跳过无权限目录及目录链接，避免循环遍历。
+                std::vector<platform::fs::path> files;
+                const auto options = platform::fs::directory_options::skip_permission_denied;
+                for (platform::fs::recursive_directory_iterator it(path, options, ec), end; !ec && it != end; it.increment(ec)) {
+                    if (g_shutdown.load()) return;
+                    std::error_code entry_error;
+                    if (!it->is_symlink(entry_error) && it->is_regular_file(entry_error) && !entry_error && library::local_audio_file(it->path())) {
+                        files.push_back(it->path());
+                        if (files.size() >= limit) { limited = true; break; }
+                    }
+                }
+                if (ec) ++skipped;
+                std::sort(files.begin(), files.end());
+                for (const auto& file : files) { if (g_shutdown.load()) return; add(file, false); }
+            } catch (const std::exception&) { ++skipped; error = "部分路径无法读取"; }
+        }
+        if (g_shutdown.load()) return;
+        post_ui([serial = request.serial, generation = request.play_generation, tracks = std::move(tracks), skipped, repeated, limited, error]() mutable {
+            int first = -1;
+            size_t added = 0, duplicates = repeated;
+            {
+                std::lock_guard<std::mutex> lock(g_mu);
+                std::unordered_map<std::string, int> existing;
+                for (size_t i = 0; i < g_as.tracks.size(); ++i)
+                    for (const auto& variant : g_as.tracks[i].variants)
+                        if (variant.source == music::Source::Local) existing.emplace(library::local_path_key(platform::fs::u8path(variant.id)), int(i));
+                for (auto& track : tracks) {
+                    const auto key = library::local_path_key(platform::fs::u8path(track.current().id));
+                    const auto found = existing.find(key);
+                    int index = found == existing.end() ? int(g_as.tracks.size()) : found->second;
+                    if (found == existing.end()) { existing.emplace(key, index); g_as.tracks.push_back(std::move(track)); ++added; }
+                    else ++duplicates;
+                    if (first < 0) first = index;
+                }
+                if (added) ++g_as.tracks_version;
+            }
+            if (added) queue_mark_dirty();
+            if (first >= 0) {
+                g_ui.queue_open = true; g_ui.lyrics_open = false;
+                // 后台扫描不能覆盖用户刚切换的歌曲；多批拖入只让最新一批自动起播。
+                if (serial == g_local_open_serial && generation == g_play_generation.load()) {
+                    g_resume_on_start = 0; start_play(first);
+                }
+            }
+            std::string message = first < 0 ? "没有可播放的本地音频" : "已加入 " + std::to_string(added) + " 首本地歌曲";
+            if (duplicates) message += "，复用 / 忽略重复 " + std::to_string(duplicates) + " 首";
+            if (skipped) message += "，跳过失效或不支持的文件 " + std::to_string(skipped) + " 项";
+            if (limited) message += "（每批最多 10000 首，请分批打开）";
+            if (!error.empty()) message += "，" + error;
+            toast(message, 6000);
+            process_local_open();
+        });
+    });
+}
+void open_local_files(std::vector<std::string> paths) {
+    if (paths.empty() || g_shutdown.load()) return;
+    if (g_local_open_requests.size() >= 8) { toast("正在处理多批本地文件，请稍候"); return; }
+    if (paths.size() > 10000) { paths.resize(10000); toast("一次最多打开 10000 个文件或文件夹", 6000); }
+    g_local_open_requests.push_back({std::move(paths), ++g_local_open_serial, g_play_generation.load()});
+    if (!g_ui.opening_local) { toast("正在后台读取本地音乐…"); process_local_open(); }
+}
+void choose_local_audio() {
+    if (g_folder_selecting || g_ui.choosing_local || g_shutdown.load()) return;
+    g_folder_selecting = true; g_ui.choosing_local = true; g_folder_cancel.store(false);
+    void* owner = g_host.native_window ? g_host.native_window() : nullptr;
+    background::start([owner] {
+        std::string error;
+        auto paths = platform::choose_audio_files(owner, g_folder_cancel, error);
+        post_ui([paths = std::move(paths), error]() mutable {
+            g_folder_selecting = false; g_ui.choosing_local = false;
+            if (!error.empty()) toast(error, 6000);
+            if (!paths.empty()) open_local_files(std::move(paths));
+        });
+    });
+}
+void configure_default_player() {
+    if (g_ui.setting_default_player || g_shutdown.load()) return;
+    g_ui.setting_default_player = true;
+    background::start([] {
+        std::string error;
+        const bool ok = platform::set_default_music_player(error, [] { return g_shutdown.load(); });
+        post_ui([ok, error] {
+            g_ui.setting_default_player = false;
+#ifdef _WIN32
+            toast(ok ? "已打开系统默认应用，请选择 Aino Player 并设置音乐文件关联" : error, 8000);
+#else
+            toast(ok ? "已将 Aino Player 设为默认音乐播放器" : error, 8000);
+#endif
+        });
+    });
+}
+
 void toggle_pause() {
     PlayState ps;
     {
@@ -2874,8 +3010,9 @@ void batch_tracks(std::vector<music::Track> tracks, BatchAction action, std::str
             }
         }, [] { toast("批量修改已保存，原音乐文件保留"); });
     } else if (action == BatchAction::Download) {
-        for (const auto& track : tracks) start_download(track, g_ui.settings);
-        toast("已将所选歌曲加入下载任务");
+        size_t online = 0;
+        for (const auto& track : tracks) if (!track.variants.empty() && track.current().source != music::Source::Local) { start_download(track, g_ui.settings); ++online; }
+        toast(online ? "已将所选在线歌曲加入下载任务，本地歌曲已跳过" : "所选歌曲已在本机，无需下载");
     } else {
         std::set<std::string> ids;
         for (const auto& track : tracks) ids.insert(track_uid(track));
@@ -2928,6 +3065,14 @@ void reveal_download(const std::string& uid) {
     { std::lock_guard<std::mutex> lock(g_dlm); auto it = g_dls.find(uid); if (it != g_dls.end()) path = it->second.path; }
     if (path.empty() || !platform::exists(path)) { toast("下载文件已移动或删除"); return; }
     background::start([path] { platform::open_folder(platform::fs::u8path(path).parent_path().u8string()); });
+}
+void reveal_local_track(const music::Track& track) {
+    if (track.variants.empty() || track.current().source != music::Source::Local) return;
+    const auto path = track.current().id;
+    background::start([path] {
+        if (!platform::exists(path)) { toast("音乐文件已移动或删除：" + path, 6000); return; }
+        if (!platform::open_folder(platform::fs::u8path(path).parent_path().u8string())) toast("无法打开音乐文件所在文件夹", 6000);
+    });
 }
 void recent_play(size_t index) {
     if (index >= g_library->recent.size()) return;

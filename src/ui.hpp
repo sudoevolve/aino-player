@@ -340,8 +340,9 @@ static void draw_song_menu(Ctx& c) {
     if (!song_menu.active) return;
     const auto download = c.model.downloads.find(track_uid(song_menu.track));
     const bool downloading = download != c.model.downloads.end() && !download->second.done && !download->second.failed;
+    const bool local = song_menu.track.current().source == music::Source::Local;
     std::vector<std::string> items{"下一首播放", "添加到播放列表",
-        c.model.library.contains(song_menu.track) ? "取消收藏" : "收藏歌曲", downloading ? "取消下载" : "下载歌曲"};
+        c.model.library.contains(song_menu.track) ? "取消收藏" : "收藏歌曲", local ? "打开所在文件夹" : downloading ? "取消下载" : "下载歌曲"};
     const bool group = !song_menu.selected.empty();
     if (group) {
         const auto count = std::to_string(song_menu.selected.size());
@@ -368,7 +369,7 @@ static void draw_song_menu(Ctx& c) {
         else if (chosen == 0) queue_play_next(track);
         else if (chosen == 1) toast(queue_push(track) ? "已添加到播放列表：" + track.title : "播放列表中已有这首歌曲");
         else if (chosen == 2) favorite_toggle(track);
-        else if (chosen == 3) { if (downloading) cancel_download(track_uid(track)); else start_download(track, c.model.ui.settings); }
+        else if (chosen == 3) { if (local) reveal_local_track(track); else if (downloading) cancel_download(track_uid(track)); else start_download(track, c.model.ui.settings); }
         else if (has_artist && chosen == 4) choose_track_artist(track);
         else if (has_album && chosen == (has_artist ? 5 : 4)) open_track_album(track);
     }
@@ -984,7 +985,7 @@ static void queue_panel(Ctx& c, const Rect& box) {
     if (!count) {
         queue_drag = {};
         c.ui.draw_text("待播清单为空", {box.x + 24, box.y + 98, box.w - 48, 24}, c.th.label2, Style().font(13).weight(600).center());
-        c.ui.muted_text("右键歌曲可选择下一首播放\n或添加到播放列表", {box.x + 24, box.y + 132, box.w - 48, 56}, Style().font(11).center().wrap_text());
+        c.ui.muted_text("拖入本地音乐，或按 Ctrl+O 打开\n右键在线歌曲可加入队列", {box.x + 24, box.y + 132, box.w - 48, 56}, Style().font(11).center().wrap_text());
         return;
     }
     const float batch_h = batch_toolbar(c, "queue", "queue", c.s.tracks_version, c.s.tracks, nullptr, {box.x + 12, box.y + 36, box.w - 24, 32}, true);
@@ -1208,10 +1209,15 @@ static void tab_playlists(Ctx& c) {
 
     if (c.model.ui.pl_site == 2) {
         auto& state = c.model.ui;
+        Style open_style = Style().font(11); open_style.disabled = state.choosing_local;
+        const Rect open_button{mx + mw - 104, 20, 104, 30};
+        if (c.ui.button(state.choosing_local ? "选择中…" : "打开音乐", open_button, open_style)) choose_local_audio();
+        c.ui.tooltip(open_button, "Ctrl+O 打开多首音频；也可将文件或文件夹拖入窗口播放");
         c.ui.muted_text(std::to_string(c.model.library.playlists.size()) + " 个本地歌单", {mx, 102, mw - 112, 30}, Style().font(11));
         if (c.ui.button(state.library_add_mode < 0 ? "添加歌单" : "收起", {mx + mw - 104, 102, 104, 30}, Style().font(11)))
             state.library_add_mode = state.library_add_mode < 0 ? 0 : -1;
-        float list_y = 144;
+        float list_y = 170;
+        if (state.library_add_mode < 0) c.ui.muted_text(state.opening_local ? "正在后台读取本地音乐…" : "拖入文件或文件夹即可播放，队列可另存为歌单", {mx, 140, mw, 22}, Style().font(10.5f));
         if (state.library_add_mode >= 0) {
             c.ui.segmented({"本地文件夹", "在线歌单", "当前队列"}, &state.library_add_mode, {mx, 142, std::min(mw, 340.0f), 28}, Style().font(11));
             Style action = Style().primary().font(11); action.disabled = state.importing_playlist;
@@ -1883,7 +1889,7 @@ static void tab_settings(Ctx& c) {
     auto& selected = c.model.ui.settings_tab;
     const bool changed = c.ui.segmented({"通用", "账号", "播放", "下载", "数据", "关于"}, &selected, {x, 78, w, 32}, Style().font(11.5f));
     if (changed) c.model.ui.update_settings = false;
-    const float content_height = selected == 4 ? 700.0f : selected == 5 ? 510.0f : selected == 3 ? 350.0f : selected == 2 ? 470.0f : selected == 1 ? 360.0f : c.model.ui.update_settings ? 390.0f + update_notes(c, x, w, 0, false) : 520.0f;
+    const float content_height = selected == 4 ? 700.0f : selected == 5 ? 510.0f : selected == 3 ? 350.0f : selected == 2 ? 470.0f : selected == 1 ? 360.0f : c.model.ui.update_settings ? 390.0f + update_notes(c, x, w, 0, false) : 690.0f;
     const Rect viewport{x, 132, w, c.bar_y - 148};
     if (changed) c.ui.scroll_to_index(viewport, 0, content_height, 1);
     c.ui.scroll(viewport, 1, content_height, [&](int, const Rect& area) {
@@ -1967,6 +1973,17 @@ static void tab_settings(Ctx& c) {
         settings_label(c, "关闭窗口时", {x, desktop.y + 62, w, 62});
         if (c.ui.select({"每次询问", "最小化到托盘", "直接退出"}, &c.model.ui.close_behavior, {x + w - 178, desktop.y + 79, 162, 28}, Style().font(11))) c.model.ui.config_dirty = true;
         c.ui.muted_text(std::string(c.model.ui.media_available ? "系统媒体控制已连接。" : "系统媒体控制暂不可用。") + (c.model.ui.tray_available ? "托盘已就绪。" : "无可用托盘时关闭窗口仍会退出。"), {x + 2, desktop.bottom() + 14, w - 4, 42}, Style().font(10.5f).wrap_text());
+        const Rect local{x, desktop.bottom() + 102, w, 62};
+        settings_group(c, "本地播放", local);
+        settings_label(c, "默认音乐播放器", local);
+        Style association = Style().font(11); association.disabled = c.model.ui.setting_default_player;
+        if (c.ui.button(c.model.ui.setting_default_player ? "处理中…" : "设置默认", {x + w - 104, local.y + 17, 88, 28}, association)) configure_default_player();
+#ifdef _WIN32
+        const char* local_hint = "在系统设置中选择 Aino Player，完成音乐文件关联。Ctrl+O 或拖入文件即可播放。";
+#else
+        const char* local_hint = "为当前用户关联支持的音频文件。Ctrl+O 或拖入文件、文件夹即可播放。";
+#endif
+        c.ui.muted_text(local_hint, {x + 2, local.bottom() + 12, w - 4, 42}, Style().font(10.5f).wrap_text().top());
     });
 }
 
@@ -2460,6 +2477,8 @@ static void error_details_dialog(Ctx& c) {
 
 static void compose(aino::Ui& ui, Ctx& c) {
     row_selection = nullptr;
+    if (ui.pointer_available() && !song_menu.active && !c.model.ui.close_dialog && !artist_chooser.open && !error_details.open &&
+        c.model.ui.remove_playlist_key.empty() && c.model.ui.clear_action == ClearAction::None && ui.input().ctrl_of('O')) choose_local_audio();
     if (!c.model.ui.lyrics_open && g_lyr_layout.owner) { g_lyr_layout = {}; g_lyr_scroll = 0; g_lyr_cur = -1; }
     if (c.model.ui.tab == 2) { c.model.ui.tab = 1; c.model.ui.queue_open = true; c.model.ui.lyrics_open = false; }
     ui.fill_rect({0, 0, c.W, c.H}, c.th.window_bg);

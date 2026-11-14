@@ -35,6 +35,7 @@ UsePreviousAppDir=yes
 CloseApplications=yes
 CloseApplicationsFilter=aino_player.exe
 RestartApplications=no
+ChangesAssociations=yes
 UninstallDisplayName=Aino Player
 
 [Tasks]
@@ -46,6 +47,35 @@ Source: "..\LICENSE"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "..\LICENSE-aino"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "..\vendor\LICENSE.FFmpeg.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "..\vendor\README.md"; DestDir: "{app}\licenses"; DestName: "Third-party.md"; Flags: ignoreversion
+
+[Registry]
+Root: HKCU; Subkey: "Software\AinoPlayer\Capabilities"; ValueType: string; ValueName: "ApplicationName"; ValueData: "Aino Player"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\AinoPlayer\Capabilities"; ValueType: string; ValueName: "ApplicationDescription"; ValueData: "Local and online music player"
+Root: HKCU; Subkey: "Software\AinoPlayer\Capabilities"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: """{app}\aino_player.exe"",0"
+Root: HKCU; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "AinoPlayer"; ValueData: "Software\AinoPlayer\Capabilities"; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\AinoPlayer.Audio"; ValueType: string; ValueData: "Aino music file"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\AinoPlayer.Audio\DefaultIcon"; ValueType: string; ValueData: """{app}\aino_player.exe"",0"
+Root: HKCU; Subkey: "Software\Classes\AinoPlayer.Audio\shell\open\command"; ValueType: string; ValueData: """{app}\aino_player.exe"" --open ""%1"""
+Root: HKCU; Subkey: "Software\AinoPlayer\Capabilities\FileAssociations"; ValueType: string; ValueName: ".mp3"; ValueData: "AinoPlayer.Audio"
+Root: HKCU; Subkey: "Software\Classes\.mp3\OpenWithProgids"; ValueType: string; ValueName: "AinoPlayer.Audio"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\AinoPlayer\Capabilities\FileAssociations"; ValueType: string; ValueName: ".flac"; ValueData: "AinoPlayer.Audio"
+Root: HKCU; Subkey: "Software\Classes\.flac\OpenWithProgids"; ValueType: string; ValueName: "AinoPlayer.Audio"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\AinoPlayer\Capabilities\FileAssociations"; ValueType: string; ValueName: ".wav"; ValueData: "AinoPlayer.Audio"
+Root: HKCU; Subkey: "Software\Classes\.wav\OpenWithProgids"; ValueType: string; ValueName: "AinoPlayer.Audio"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\AinoPlayer\Capabilities\FileAssociations"; ValueType: string; ValueName: ".wave"; ValueData: "AinoPlayer.Audio"
+Root: HKCU; Subkey: "Software\Classes\.wave\OpenWithProgids"; ValueType: string; ValueName: "AinoPlayer.Audio"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\AinoPlayer\Capabilities\FileAssociations"; ValueType: string; ValueName: ".m4a"; ValueData: "AinoPlayer.Audio"
+Root: HKCU; Subkey: "Software\Classes\.m4a\OpenWithProgids"; ValueType: string; ValueName: "AinoPlayer.Audio"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\AinoPlayer\Capabilities\FileAssociations"; ValueType: string; ValueName: ".aac"; ValueData: "AinoPlayer.Audio"
+Root: HKCU; Subkey: "Software\Classes\.aac\OpenWithProgids"; ValueType: string; ValueName: "AinoPlayer.Audio"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\AinoPlayer\Capabilities\FileAssociations"; ValueType: string; ValueName: ".ogg"; ValueData: "AinoPlayer.Audio"
+Root: HKCU; Subkey: "Software\Classes\.ogg\OpenWithProgids"; ValueType: string; ValueName: "AinoPlayer.Audio"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\AinoPlayer\Capabilities\FileAssociations"; ValueType: string; ValueName: ".oga"; ValueData: "AinoPlayer.Audio"
+Root: HKCU; Subkey: "Software\Classes\.oga\OpenWithProgids"; ValueType: string; ValueName: "AinoPlayer.Audio"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\AinoPlayer\Capabilities\FileAssociations"; ValueType: string; ValueName: ".opus"; ValueData: "AinoPlayer.Audio"
+Root: HKCU; Subkey: "Software\Classes\.opus\OpenWithProgids"; ValueType: string; ValueName: "AinoPlayer.Audio"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\AinoPlayer\Capabilities\FileAssociations"; ValueType: string; ValueName: ".webm"; ValueData: "AinoPlayer.Audio"
+Root: HKCU; Subkey: "Software\Classes\.webm\OpenWithProgids"; ValueType: string; ValueName: "AinoPlayer.Audio"; ValueData: ""; Flags: uninsdeletevalue
 
 [Icons]
 Name: "{autoprograms}\Aino Player"; Filename: "{app}\aino_player.exe"; AppUserModelID: "sudoevolve.AinoPlayer"

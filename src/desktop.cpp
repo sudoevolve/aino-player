@@ -2,6 +2,8 @@
 #include "platform.hpp"
 #include <deque>
 #include <cmath>
+#include <fstream>
+#include <sstream>
 #ifdef _WIN32
 #include <SystemMediaTransportControlsInterop.h>
 #include <winrt/Windows.Foundation.h>
@@ -10,13 +12,69 @@
 #else
 #include <dbus/dbus.h>
 #include <X11/Xlib.h>
+#include <X11/Xatom.h>
 #undef None
 #undef Status
 #undef Bool
 #endif
 
 namespace platform {
+std::string local_file_path(const std::string& value) {
+    if (value.empty() || value.find('\0') != std::string::npos) return {};
+    if (value.rfind("file:", 0) != 0) {
+        if (value.find("://") != std::string::npos) return {};
+        return value;
+    }
+    size_t begin = 5;
+    if (value.compare(begin, 2, "//") == 0) {
+        begin += 2;
+        const auto end = value.find('/', begin);
+        if (end == std::string::npos) return {};
+        const auto host = value.substr(begin, end - begin);
+        if (!host.empty() && host != "localhost") return {};
+        begin = end;
+    }
+    if (begin >= value.size() || value[begin] != '/' || value.find_first_of("?#", begin) != std::string::npos) return {};
+    std::string path;
+    const auto nibble = [](unsigned char c) -> int { if (c >= '0' && c <= '9') return c - '0'; if (c >= 'a' && c <= 'f') return c - 'a' + 10; if (c >= 'A' && c <= 'F') return c - 'A' + 10; return -1; };
+    for (size_t i = begin; i < value.size(); ++i) {
+        if (value[i] != '%') { path += value[i]; continue; }
+        if (i + 2 >= value.size()) return {};
+        const int hi = nibble(value[i + 1]), lo = nibble(value[i + 2]);
+        if (hi < 0 || lo < 0 || (hi == 0 && lo == 0)) return {};
+        path += char(hi * 16 + lo); i += 2;
+    }
+#ifdef _WIN32
+    if (path.size() >= 3 && path[0] == '/' && path[2] == ':') path.erase(0, 1);
+#endif
+    return path;
+}
+std::vector<std::string> local_uri_list(const std::string& value) {
+    std::vector<std::string> paths;
+    if (value.size() > 2 * 1024 * 1024) return paths;
+    std::istringstream lines(value); std::string line;
+    while (paths.size() < 10000 && std::getline(lines, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line[0] == '#' || line.rfind("file:", 0) != 0) continue;
+        auto path = local_file_path(line);
+        if (!path.empty()) paths.push_back(std::move(path));
+    }
+    return paths;
+}
 namespace {
+constexpr uintptr_t kOpenFilesMessage = 0x41494e4f;
+const char* const audio_mimes[]{"audio/mpeg", "audio/flac", "audio/x-flac", "audio/wav", "audio/x-wav",
+    "audio/mp4", "audio/x-m4a", "audio/aac", "audio/x-aac", "audio/ogg", "audio/x-vorbis+ogg", "application/ogg", "audio/opus", "audio/webm"};
+#ifndef _WIN32
+// 拖拽源可随时关闭窗口；只忽略独立拖放连接上的 BadWindow，其他连接仍使用原处理器。
+std::atomic<Display*> drop_error_display{nullptr};
+std::atomic<XErrorHandler> previous_x_error{nullptr};
+int drop_x_error(Display* display, XErrorEvent* event) {
+    if (display == drop_error_display.load() && event->error_code == BadWindow) return 0;
+    const auto previous = previous_x_error.load();
+    return previous ? previous(display, event) : 0;
+}
+#endif
 struct EventQueue {
     std::mutex mutex;
     std::deque<MediaEvent> pending;
@@ -24,14 +82,15 @@ struct EventQueue {
     bool closed = false;
     unsigned long long last = 0;
     MediaAction last_action = MediaAction::Show;
-    void push(MediaEvent event) {
+    bool push(MediaEvent event) {
         std::lock_guard<std::mutex> lock(mutex);
-        if (closed) return;
+        if (closed) return false;
         const auto now = ticks();
-        if (event.action == MediaAction::Toggle && last_action == event.action && now < last + 80) return;
-        if (pending.size() >= 64) return;
+        if (event.action == MediaAction::Toggle && last_action == event.action && now < last + 80) return true;
+        if (pending.size() >= 64) return false;
         last = now; last_action = event.action; pending.push_back(std::move(event));
         if (wake) wake();
+        return true;
     }
 };
 }
@@ -54,6 +113,34 @@ struct Desktop::Impl {
     static LRESULT CALLBACK procedure(HWND window, UINT message, WPARAM w, LPARAM l) {
         auto* self = static_cast<Impl*>(GetPropW(window, L"AinoPlayerDesktop"));
         if (!self) return DefWindowProcW(window, message, w, l);
+        if (message == WM_DROPFILES) {
+            const auto drop = reinterpret_cast<HDROP>(w);
+            std::vector<std::string> files;
+            const auto count = std::min<UINT>(DragQueryFileW(drop, 0xffffffff, nullptr, 0), 10000);
+            for (UINT i = 0; i < count; ++i) {
+                const auto length = DragQueryFileW(drop, i, nullptr, 0);
+                if (!length || length > 32767) continue;
+                std::wstring path(length + 1, L'\0');
+                if (DragQueryFileW(drop, i, path.data(), length + 1)) { path.resize(length); files.push_back(narrow(path)); }
+            }
+            DragFinish(drop);
+            if (!files.empty()) self->queue->push({MediaAction::OpenFiles, 0, {}, std::move(files)});
+            return 0;
+        }
+        if (message == WM_COPYDATA) {
+            const auto* data = reinterpret_cast<const COPYDATASTRUCT*>(l);
+            if (!data || data->dwData != kOpenFilesMessage || !data->lpData || !data->cbData || data->cbData > 2 * 1024 * 1024) return FALSE;
+            const auto* raw = static_cast<const char*>(data->lpData);
+            if (raw[data->cbData - 1] != '\0') return FALSE;
+            std::vector<std::string> paths;
+            for (size_t begin = 0; begin < data->cbData && paths.size() < 10000;) {
+                const auto length = size_t(std::find(raw + begin, raw + data->cbData, '\0') - (raw + begin));
+                if (length) paths.emplace_back(raw + begin, length);
+                begin += length + 1;
+            }
+            if (paths.empty()) return FALSE;
+            return self->queue->push({MediaAction::OpenFiles, 0, {}, std::move(paths)}) ? TRUE : FALSE;
+        }
         if (message == self->taskbar_created) { self->tray.store(false); self->sync_tray(); return 0; }
         if (message == WM_APP + 117) {
             const auto action = LOWORD(l);
@@ -157,6 +244,94 @@ struct Desktop::Impl {
     Display* display = nullptr;
     ::Window window = 0;
     std::thread worker;
+    Display* drops = nullptr; // 独立 X11 连接接收 XdndProxy 事件，不取走 aino 的键鼠 / IME 事件。
+    ::Window drop_proxy = 0, drop_source = 0;
+    Atom xdnd_enter = 0, xdnd_position = 0, xdnd_leave = 0, xdnd_drop = 0, xdnd_status = 0, xdnd_finished = 0;
+    Atom xdnd_selection = 0, uri_list = 0, drop_property = 0, copy_action = 0;
+    unsigned long long drop_deadline = 0;
+    int drop_version = 0;
+    bool drop_supported = false, drop_waiting = false;
+    void drop_reply(Atom message, bool accepted) {
+        if (!drops || !drop_source) return;
+        XEvent reply{}; reply.xclient.type = ClientMessage; reply.xclient.display = drops;
+        reply.xclient.window = drop_source; reply.xclient.message_type = message; reply.xclient.format = 32;
+        reply.xclient.data.l[0] = window;
+        reply.xclient.data.l[1] = accepted ? 1 : 0;
+        if (message == xdnd_status) reply.xclient.data.l[4] = accepted ? copy_action : 0;
+        else if (drop_version >= 5) reply.xclient.data.l[2] = accepted ? copy_action : 0;
+        XSendEvent(drops, drop_source, False, NoEventMask, &reply); XFlush(drops);
+    }
+    void start_drops() {
+        drops = XOpenDisplay(nullptr); if (!drops) return;
+        drop_error_display.store(drops); previous_x_error = XSetErrorHandler(drop_x_error);
+        drop_proxy = XCreateSimpleWindow(drops, DefaultRootWindow(drops), 0, 0, 1, 1, 0, 0, 0);
+        auto atom = [&](const char* name) { return XInternAtom(drops, name, False); };
+        xdnd_enter = atom("XdndEnter"); xdnd_position = atom("XdndPosition"); xdnd_leave = atom("XdndLeave");
+        xdnd_drop = atom("XdndDrop"); xdnd_status = atom("XdndStatus"); xdnd_finished = atom("XdndFinished");
+        xdnd_selection = atom("XdndSelection"); uri_list = atom("text/uri-list"); drop_property = atom("_AINO_PLAYER_DROP"); copy_action = atom("XdndActionCopy");
+        const auto proxy = atom("XdndProxy"), aware = atom("XdndAware"); const unsigned long version = 5;
+        XChangeProperty(drops, drop_proxy, proxy, XA_WINDOW, 32, PropModeReplace, reinterpret_cast<const unsigned char*>(&drop_proxy), 1);
+        XChangeProperty(drops, window, proxy, XA_WINDOW, 32, PropModeReplace, reinterpret_cast<const unsigned char*>(&drop_proxy), 1);
+        XChangeProperty(drops, window, aware, XA_ATOM, 32, PropModeReplace, reinterpret_cast<const unsigned char*>(&version), 1);
+        XChangeProperty(drops, drop_proxy, aware, XA_ATOM, 32, PropModeReplace, reinterpret_cast<const unsigned char*>(&version), 1);
+        XFlush(drops);
+    }
+    void poll_drops() {
+        while (drops && XPending(drops)) {
+            XEvent event{}; XNextEvent(drops, &event);
+            if (event.type == ClientMessage) {
+                const auto& data = event.xclient.data.l;
+                if (event.xclient.format != 32) continue;
+                if (event.xclient.message_type == xdnd_enter) {
+                    if (drop_waiting) drop_reply(xdnd_finished, false);
+                    drop_source = static_cast<::Window>(data[0]); drop_version = int((data[1] >> 24) & 255);
+                    drop_waiting = false; drop_supported = false;
+                    if (!drop_source || drop_version < 3) continue;
+                    if (!(data[1] & 1)) { for (int i = 2; i < 5; ++i) drop_supported |= Atom(data[i]) == uri_list; }
+                    else {
+                        Atom type = 0; int format = 0; unsigned long count = 0, remaining = 0; unsigned char* bytes = nullptr;
+                        if (XGetWindowProperty(drops, drop_source, XInternAtom(drops, "XdndTypeList", False), 0, 256, False,
+                            XA_ATOM, &type, &format, &count, &remaining, &bytes) == Success && type == XA_ATOM && format == 32) {
+                            const auto* types = reinterpret_cast<const Atom*>(bytes);
+                            for (unsigned long i = 0; i < count; ++i) drop_supported |= types[i] == uri_list;
+                        }
+                        if (bytes) XFree(bytes);
+                    }
+                } else if (static_cast<::Window>(data[0]) == drop_source) {
+                    if (event.xclient.message_type == xdnd_position) drop_reply(xdnd_status, drop_supported && !drop_waiting);
+                    else if (event.xclient.message_type == xdnd_leave && !drop_waiting) { drop_source = 0; drop_supported = false; }
+                    else if (event.xclient.message_type == xdnd_drop) {
+                        if (!drop_supported || drop_waiting) { drop_reply(xdnd_finished, false); continue; }
+                        drop_waiting = true; drop_deadline = ticks() + 5000;
+                        XConvertSelection(drops, xdnd_selection, uri_list, drop_property, drop_proxy, data[2] ? Time(data[2]) : CurrentTime);
+                        XFlush(drops);
+                    }
+                }
+            } else if (event.type == SelectionNotify && drop_waiting && event.xselection.selection == xdnd_selection) {
+                std::vector<std::string> files;
+                if (event.xselection.property == drop_property) {
+                    Atom type = 0; int format = 0; unsigned long count = 0, remaining = 0; unsigned char* bytes = nullptr;
+                    if (XGetWindowProperty(drops, drop_proxy, drop_property, 0, 512 * 1024, True, AnyPropertyType,
+                        &type, &format, &count, &remaining, &bytes) == Success && type == uri_list && format == 8 && !remaining && bytes)
+                        files = local_uri_list(std::string(reinterpret_cast<const char*>(bytes), count));
+                    if (bytes) XFree(bytes);
+                    XDeleteProperty(drops, drop_proxy, drop_property); // 不接收无界 INCR 传输。
+                }
+                const bool accepted = !files.empty() && queue->push({MediaAction::OpenFiles, 0, {}, std::move(files)});
+                drop_reply(xdnd_finished, accepted); drop_waiting = false; drop_source = 0;
+            }
+        }
+        if (drop_waiting && ticks() > drop_deadline) { drop_reply(xdnd_finished, false); drop_waiting = false; drop_source = 0; }
+    }
+    void stop_drops() {
+        if (!drops) return;
+        if (drop_waiting) drop_reply(xdnd_finished, false);
+        XDeleteProperty(drops, window, XInternAtom(drops, "XdndProxy", False));
+        XDeleteProperty(drops, window, XInternAtom(drops, "XdndAware", False));
+        if (drop_proxy) XDestroyWindow(drops, drop_proxy);
+        XCloseDisplay(drops); drops = nullptr;
+        XSetErrorHandler(previous_x_error.load()); drop_error_display.store(nullptr);
+    }
     DBusConnection* bus = nullptr; // 只由 worker 使用和关闭。
     std::string bus_name, watcher;
     bool registered = false;
@@ -207,7 +382,9 @@ struct Desktop::Impl {
             else if (key == "HasTrackList" || key == "CanSetFullscreen" || key == "Fullscreen") b(false);
             else if (key == "Identity") str("Aino Player");
             else if (key == "DesktopEntry") str("aino-player");
-            else if (key == "SupportedUriSchemes" || key == "SupportedMimeTypes") container(it, DBUS_TYPE_VARIANT, "as", [&](auto& v) { container(v, DBUS_TYPE_ARRAY, "s", [&](auto&) {}); });
+            else if (key == "SupportedUriSchemes" || key == "SupportedMimeTypes") container(it, DBUS_TYPE_VARIANT, "as", [&](auto& v) { container(v, DBUS_TYPE_ARRAY, "s", [&](auto& values) {
+                if (key == "SupportedUriSchemes") string(values, "file"); else for (const auto* mime : audio_mimes) string(values, mime);
+            }); });
             else return false;
         } else if (iface == tray_iface) {
             if (key == "Category") str("ApplicationStatus");
@@ -304,6 +481,19 @@ struct Desktop::Impl {
             }
         } else if (iface == root_iface && path == "/org/mpris/MediaPlayer2") {
             if (member == "Raise") queue->push({MediaAction::Show}); else if (member == "Quit") queue->push({MediaAction::Quit}); else valid = false;
+        } else if (iface == "io.github.sudoevolve.AinoPlayer" && member == "OpenFiles" && path == "/org/mpris/MediaPlayer2" && arg(in, DBUS_TYPE_ARRAY)) {
+            DBusMessageIter values; dbus_message_iter_recurse(&in, &values);
+            std::vector<std::string> paths; size_t bytes = 0, count = 0;
+            while (arg(values, DBUS_TYPE_STRING) && count++ < 10000) {
+                const auto raw = read_string(values); bytes += raw.size() + 1;
+                if (bytes > 2 * 1024 * 1024) { valid = false; break; }
+                const auto path = local_file_path(raw);
+                if (!path.empty()) paths.push_back(path);
+                dbus_message_iter_next(&values);
+            }
+            if (valid && !paths.empty() && dbus_message_iter_get_arg_type(&values) == DBUS_TYPE_INVALID)
+                valid = queue->push({MediaAction::OpenFiles, 0, {}, std::move(paths)});
+            else valid = false;
         } else if (iface == player_iface && path == "/org/mpris/MediaPlayer2") {
             if (member == "PlayPause") queue->push({MediaAction::Toggle});
             else if (member == "Play") queue->push({MediaAction::Play});
@@ -311,6 +501,11 @@ struct Desktop::Impl {
             else if (member == "Stop") queue->push({MediaAction::Stop});
             else if (member == "Next") queue->push({MediaAction::Next});
             else if (member == "Previous") queue->push({MediaAction::Previous});
+            else if (member == "OpenUri" && arg(in, DBUS_TYPE_STRING)) {
+                const auto path = local_file_path(read_string(in));
+                if (path.empty()) valid = false;
+                else valid = queue->push({MediaAction::OpenFiles, 0, {}, {path}});
+            }
             else if (member == "Seek" && arg(in, DBUS_TYPE_INT64)) { int64_t v; dbus_message_iter_get_basic(&in, &v); queue->push({MediaAction::SeekRelative, v / 1000}); }
             else if (member == "SetPosition" && arg(in, DBUS_TYPE_OBJECT_PATH)) {
                 const auto id = read_string(in); dbus_message_iter_next(&in);
@@ -391,7 +586,8 @@ struct Desktop::Impl {
             };
             if (path == "/org/mpris/MediaPlayer2") {
                 interface_xml(root_iface, "<method name='Raise'/><method name='Quit'/>");
-                interface_xml(player_iface, "<method name='PlayPause'/><method name='Play'/><method name='Pause'/><method name='Stop'/><method name='Next'/><method name='Previous'/><method name='Seek'><arg direction='in' type='x'/></method><method name='SetPosition'><arg direction='in' type='o'/><arg direction='in' type='x'/></method><signal name='Seeked'><arg type='x'/></signal>");
+                interface_xml(player_iface, "<method name='PlayPause'/><method name='Play'/><method name='Pause'/><method name='Stop'/><method name='Next'/><method name='Previous'/><method name='OpenUri'><arg direction='in' type='s'/></method><method name='Seek'><arg direction='in' type='x'/></method><method name='SetPosition'><arg direction='in' type='o'/><arg direction='in' type='x'/></method><signal name='Seeked'><arg type='x'/></signal>");
+                interface_xml("io.github.sudoevolve.AinoPlayer", "<method name='OpenFiles'><arg direction='in' type='as'/></method>");
             } else if (path == "/StatusNotifierItem") {
                 interface_xml(tray_iface, "<method name='Activate'><arg direction='in' type='i'/><arg direction='in' type='i'/></method><method name='SecondaryActivate'><arg direction='in' type='i'/><arg direction='in' type='i'/></method><method name='ContextMenu'><arg direction='in' type='i'/><arg direction='in' type='i'/></method><method name='Scroll'><arg direction='in' type='i'/><arg direction='in' type='s'/></method><signal name='NewIcon'/><signal name='NewStatus'><arg type='s'/></signal><signal name='NewToolTip'/>");
             } else {
@@ -425,14 +621,18 @@ struct Desktop::Impl {
         if (!available && tray.exchange(available) && hidden.load()) queue->push({MediaAction::Show}); else tray.store(available);
     }
     void run() {
+        start_drops();
+        struct Cleanup { Impl* self; ~Cleanup() { self->stop_drops(); } } cleanup{this};
         dbus_threads_init_default();
-        bus = dbus_bus_get_private(DBUS_BUS_SESSION, nullptr); if (!bus) return;
+        bus = dbus_bus_get_private(DBUS_BUS_SESSION, nullptr);
+        if (!bus) { while (!stopping.load()) { poll_drops(); sleep_ms(100); } return; }
         dbus_connection_set_exit_on_disconnect(bus, false);
         bus_name = "org.mpris.MediaPlayer2.aino.instance" + std::to_string(getpid());
         if (dbus_bus_request_name(bus, bus_name.c_str(), DBUS_NAME_FLAG_DO_NOT_QUEUE, nullptr) != DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER) { dbus_connection_close(bus); dbus_connection_unref(bus); bus = nullptr; return; }
         media.store(true); unsigned long long checked = 0;
         MediaState prior; bool prior_enabled = !enabled.load();
         while (!stopping.load() && dbus_connection_get_is_connected(bus)) {
+            poll_drops();
             const auto now = ticks();
             if (now > checked + 2000) { sync_watcher(); checked = now; }
             std::unique_lock<std::mutex> lock(mutex);
@@ -462,7 +662,8 @@ struct Desktop::Impl {
 };
 #ifndef _WIN32
 // 门户由桌面提供原生选择器；独立连接和后台线程避免阻塞播放器窗口。
-std::string choose_desktop_file(bool folder, const std::atomic<bool>& cancelled, std::string& error) {
+std::string choose_desktop_file(bool folder, const std::atomic<bool>& cancelled, std::string& error,
+    int kind, std::vector<std::string>* multi) {
     dbus_threads_init_default();
     auto* bus = dbus_bus_get_private(DBUS_BUS_SESSION, nullptr);
     if (!bus) { error = "无法连接桌面文件选择器，请粘贴路径"; return {}; }
@@ -473,7 +674,7 @@ std::string choose_desktop_file(bool folder, const std::atomic<bool>& cancelled,
     if (!request) { cleanup(); error = "无法创建文件选择请求"; return {}; }
     DBusMessageIter args, options;
     dbus_message_iter_init_append(request, &args);
-    const char* parent = ""; const char* title = folder ? "选择音乐文件夹" : "选择本地歌词";
+    const char* parent = ""; const char* title = folder ? "选择音乐文件夹" : kind == 1 ? "打开本地音乐" : kind == 2 ? "选择音源脚本" : "选择本地歌词";
     dbus_message_iter_append_basic(&args, DBUS_TYPE_STRING, &parent); dbus_message_iter_append_basic(&args, DBUS_TYPE_STRING, &title);
     dbus_message_iter_open_container(&args, DBUS_TYPE_ARRAY, "{sv}", &options);
     const auto option = [&](const char* key, const char* signature, int type, const void* value) {
@@ -485,8 +686,34 @@ std::string choose_desktop_file(bool folder, const std::atomic<bool>& cancelled,
         dbus_message_iter_close_container(&row, &variant); dbus_message_iter_close_container(&options, &row);
     };
     const auto token_text = "aino" + std::to_string(getpid()) + "_" + std::to_string(ticks());
-    const char* token = token_text.c_str(); dbus_bool_t directory = folder, multiple = false;
+    const char* token = token_text.c_str(); dbus_bool_t directory = folder, multiple = multi && !folder;
     option("handle_token", "s", DBUS_TYPE_STRING, &token); option("directory", "b", DBUS_TYPE_BOOLEAN, &directory); option("multiple", "b", DBUS_TYPE_BOOLEAN, &multiple);
+    if (!folder) {
+        DBusMessageIter row, variant, filters;
+        const char* key = "filters";
+        dbus_message_iter_open_container(&options, DBUS_TYPE_DICT_ENTRY, nullptr, &row);
+        dbus_message_iter_append_basic(&row, DBUS_TYPE_STRING, &key);
+        dbus_message_iter_open_container(&row, DBUS_TYPE_VARIANT, "a(sa(us))", &variant);
+        dbus_message_iter_open_container(&variant, DBUS_TYPE_ARRAY, "(sa(us))", &filters);
+        const auto filter = [&](const char* title, bool all) {
+            DBusMessageIter group, patterns;
+            dbus_message_iter_open_container(&filters, DBUS_TYPE_STRUCT, nullptr, &group);
+            dbus_message_iter_append_basic(&group, DBUS_TYPE_STRING, &title);
+            dbus_message_iter_open_container(&group, DBUS_TYPE_ARRAY, "(us)", &patterns);
+            const auto pattern = [&](dbus_uint32_t type, const char* value) {
+                DBusMessageIter item; dbus_message_iter_open_container(&patterns, DBUS_TYPE_STRUCT, nullptr, &item);
+                dbus_message_iter_append_basic(&item, DBUS_TYPE_UINT32, &type); dbus_message_iter_append_basic(&item, DBUS_TYPE_STRING, &value);
+                dbus_message_iter_close_container(&patterns, &item);
+            };
+            if (all) pattern(0, "*");
+            else if (kind == 1) for (const auto* mime : audio_mimes) pattern(1, mime);
+            else pattern(0, kind == 2 ? "*.[jJ][sS]" : "*.[lL][rR][cC]");
+            dbus_message_iter_close_container(&group, &patterns); dbus_message_iter_close_container(&filters, &group);
+        };
+        filter(kind == 1 ? "音乐文件" : kind == 2 ? "音源脚本" : "LRC 歌词", false); filter("所有文件", true);
+        dbus_message_iter_close_container(&variant, &filters); dbus_message_iter_close_container(&row, &variant);
+        dbus_message_iter_close_container(&options, &row);
+    }
     dbus_message_iter_close_container(&args, &options);
     auto* response = dbus_connection_send_with_reply_and_block(bus, request, 3000, nullptr); dbus_message_unref(request);
     std::string handle, selected;
@@ -515,18 +742,15 @@ std::string choose_desktop_file(bool folder, const std::atomic<bool>& cancelled,
                             if (key && std::string(key) == "uris" && dbus_message_iter_get_arg_type(&row) == DBUS_TYPE_VARIANT) {
                                 dbus_message_iter_recurse(&row, &variant);
                                 if (dbus_message_iter_get_arg_type(&variant) == DBUS_TYPE_ARRAY) {
-                                    dbus_message_iter_recurse(&variant, &uris); const char* uri = nullptr;
-                                    if (dbus_message_iter_get_arg_type(&uris) == DBUS_TYPE_STRING) dbus_message_iter_get_basic(&uris, &uri);
-                                    const std::string value = uri ? uri : "";
-                                    if (value.rfind("file:///", 0) == 0) {
-                                        for (size_t i = 7; i < value.size(); ++i) {
-                                            if (value[i] == '%' && i + 2 < value.size()) {
-                                                const auto a = std::string("0123456789abcdef").find(char(std::tolower(static_cast<unsigned char>(value[i+1]))));
-                                                const auto b = std::string("0123456789abcdef").find(char(std::tolower(static_cast<unsigned char>(value[i+2]))));
-                                                if (a > 15 || b > 15 || a * 16 + b == 0) { selected.clear(); break; }
-                                                selected += char(a * 16 + b); i += 2;
-                                            } else selected += value[i];
+                                    dbus_message_iter_recurse(&variant, &uris);
+                                    while (dbus_message_iter_get_arg_type(&uris) == DBUS_TYPE_STRING) {
+                                        const char* uri = nullptr; dbus_message_iter_get_basic(&uris, &uri);
+                                        const auto path = local_file_path(uri ? uri : "");
+                                        if (!path.empty()) {
+                                            if (selected.empty()) selected = path;
+                                            if (multi && multi->size() < 10000) multi->push_back(path);
                                         }
+                                        dbus_message_iter_next(&uris);
                                     }
                                 }
                             }
@@ -546,6 +770,137 @@ std::string choose_desktop_file(bool folder, const std::atomic<bool>& cancelled,
     cleanup(); return cancelled.load() ? std::string() : selected;
 }
 #endif
+bool forward_local_files(const std::vector<std::string>& paths) {
+    if (paths.empty() || paths.size() > 10000) return false;
+    size_t bytes = 0;
+    for (const auto& path : paths) { bytes += path.size() + 1; if (bytes > 2 * 1024 * 1024) return false; }
+#ifdef _WIN32
+    struct Search { HWND target = nullptr; } search;
+    EnumWindows([](HWND window, LPARAM data) -> BOOL {
+        if (!GetPropW(window, L"AinoPlayerDesktop")) return TRUE;
+        reinterpret_cast<Search*>(data)->target = window; return FALSE;
+    }, reinterpret_cast<LPARAM>(&search));
+    if (!search.target) return false;
+    std::string payload;
+    for (const auto& path : paths) { payload += path; payload += '\0'; }
+    if (payload.size() > 2 * 1024 * 1024) return false;
+    COPYDATASTRUCT data{}; data.dwData = kOpenFilesMessage; data.cbData = DWORD(payload.size()); data.lpData = payload.data();
+    DWORD_PTR accepted = 0;
+    return SendMessageTimeoutW(search.target, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&data), SMTO_ABORTIFHUNG | SMTO_BLOCK, 2000, &accepted) && accepted;
+#else
+    dbus_threads_init_default(); auto* bus = dbus_bus_get_private(DBUS_BUS_SESSION, nullptr);
+    if (!bus) return false;
+    dbus_connection_set_exit_on_disconnect(bus, false);
+    std::vector<std::string> players;
+    auto* request = dbus_message_new_method_call(DBUS_SERVICE_DBUS, DBUS_PATH_DBUS, DBUS_INTERFACE_DBUS, "ListNames");
+    auto* reply = request ? dbus_connection_send_with_reply_and_block(bus, request, 1000, nullptr) : nullptr;
+    if (request) dbus_message_unref(request);
+    if (reply) {
+        DBusMessageIter root, names;
+        if (dbus_message_iter_init(reply, &root) && dbus_message_iter_get_arg_type(&root) == DBUS_TYPE_ARRAY) {
+            dbus_message_iter_recurse(&root, &names);
+            while (dbus_message_iter_get_arg_type(&names) == DBUS_TYPE_STRING) {
+                const char* name = nullptr; dbus_message_iter_get_basic(&names, &name);
+                if (name && std::string(name).rfind("org.mpris.MediaPlayer2.aino.instance", 0) == 0) players.emplace_back(name);
+                dbus_message_iter_next(&names);
+            }
+        }
+        dbus_message_unref(reply);
+    }
+    bool accepted = false;
+    for (const auto& name : players) {
+        request = dbus_message_new_method_call(name.c_str(), "/org/mpris/MediaPlayer2", "io.github.sudoevolve.AinoPlayer", "OpenFiles");
+        if (!request) continue;
+        DBusMessageIter root, files; dbus_message_iter_init_append(request, &root);
+        dbus_message_iter_open_container(&root, DBUS_TYPE_ARRAY, "s", &files);
+        for (const auto& path : paths) { const char* text = path.c_str(); dbus_message_iter_append_basic(&files, DBUS_TYPE_STRING, &text); }
+        dbus_message_iter_close_container(&root, &files);
+        reply = dbus_connection_send_with_reply_and_block(bus, request, 1000, nullptr); dbus_message_unref(request);
+        if (reply) { accepted = dbus_message_get_type(reply) == DBUS_MESSAGE_TYPE_METHOD_RETURN; dbus_message_unref(reply); }
+        if (accepted) break;
+    }
+    dbus_connection_close(bus); dbus_connection_unref(bus); return accepted;
+#endif
+}
+bool set_default_music_player(std::string& error, const std::function<bool()>& cancelled) {
+    error.clear();
+    if (cancelled && cancelled()) return false;
+#ifdef _WIN32
+    wchar_t path[32768]{}; const auto length = GetModuleFileNameW(nullptr, path, 32768);
+    if (!length || length >= 32768) { error = "无法读取播放器路径"; return false; }
+    const std::wstring executable(path, length);
+    auto write = [&](const std::wstring& key, const wchar_t* name, const std::wstring& value) {
+        HKEY handle = nullptr;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr, &handle, nullptr) != ERROR_SUCCESS) return false;
+        const auto code = RegSetValueExW(handle, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(value.c_str()), DWORD((value.size() + 1) * sizeof(wchar_t)));
+        RegCloseKey(handle); return code == ERROR_SUCCESS;
+    };
+    const std::wstring capabilities = L"Software\\AinoPlayer\\Capabilities", progid = L"Software\\Classes\\AinoPlayer.Audio";
+    bool ok = write(capabilities, L"ApplicationName", L"Aino Player") && write(capabilities, L"ApplicationDescription", L"本地与在线音乐播放器") &&
+        write(capabilities, L"ApplicationIcon", L"\"" + executable + L"\",0") &&
+        write(L"Software\\RegisteredApplications", L"AinoPlayer", capabilities) && write(progid, nullptr, L"Aino 音乐文件") &&
+        write(progid + L"\\DefaultIcon", nullptr, L"\"" + executable + L"\",0") &&
+        write(progid + L"\\shell\\open\\command", nullptr, L"\"" + executable + L"\" --open \"%1\"");
+    for (const auto* extension : {L".mp3", L".flac", L".wav", L".wave", L".m4a", L".aac", L".ogg", L".oga", L".opus", L".webm"}) {
+        ok = write(capabilities + L"\\FileAssociations", extension, L"AinoPlayer.Audio") && ok;
+        HKEY handle = nullptr;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, (std::wstring(L"Software\\Classes\\") + extension + L"\\OpenWithProgids").c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr, &handle, nullptr) == ERROR_SUCCESS) {
+            ok = RegSetValueExW(handle, L"AinoPlayer.Audio", 0, REG_NONE, nullptr, 0) == ERROR_SUCCESS && ok; RegCloseKey(handle);
+        } else ok = false;
+    }
+    if (!ok) { error = "无法注册音乐文件关联，请检查当前用户的注册表权限"; return false; }
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+    // Windows 保护 UserChoice；注册可选应用后由用户在系统设置中完成选择。
+    if (reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", L"ms-settings:defaultapps?registeredAppUser=AinoPlayer", nullptr, nullptr, SW_SHOWNORMAL)) <= 32) {
+        error = "文件类型已注册，请到 Windows 设置 → 应用 → 默认应用选择 Aino Player"; return false;
+    }
+    return true;
+#else
+    std::error_code ec;
+    const auto executable = fs::read_symlink("/proc/self/exe", ec);
+    if (ec || !executable.is_absolute()) { error = "无法读取播放器路径"; return false; }
+    if (!fs::is_regular_file(executable, ec) || ec) { error = "播放器文件已移动或更新，请重启后再设置默认应用"; return false; }
+    auto data_home = env("XDG_DATA_HOME");
+    if (data_home.empty()) { const auto home_dir = env("HOME"); if (!home_dir.empty()) data_home = join(home_dir, ".local/share"); }
+    if (data_home.empty() || !fs::u8path(data_home).is_absolute()) { error = "无法读取用户应用目录"; return false; }
+    const auto applications = fs::u8path(data_home) / "applications";
+    fs::create_directories(applications, ec);
+    if (ec) { error = "无法创建用户应用目录：" + ec.message(); return false; }
+    const auto file = applications / "aino-player.desktop";
+    const bool system_entry = fs::is_regular_file("/usr/share/applications/aino-player.desktop", ec);
+    ec.clear();
+    const bool user_entry = fs::exists(file, ec);
+    if (ec) { error = "无法读取用户应用入口：" + ec.message(); return false; }
+    // 安装版使用包提供的 desktop；便携版 / 自定义路径使用用户级入口。
+    if (executable != fs::path("/usr/bin/aino_player") || !system_entry || user_entry) {
+        std::string quoted = "\"";
+        for (char ch : executable.u8string()) {
+            if (ch == '\n' || ch == '\r') { error = "播放器路径不能包含换行"; return false; }
+            if (ch == '%') quoted += '%';
+            if (ch == '\\') quoted += "\\\\\\\\";
+            else { if (ch == '"' || ch == '$' || ch == '`') quoted += "\\\\"; quoted += ch; }
+        }
+        quoted += "\"";
+        std::string entry = "[Desktop Entry]\nType=Application\nName=Aino Player\nExec=" + quoted + " --open %U\nIcon=audio-x-generic\nTerminal=false\nCategories=AudioVideo;Audio;Player;\nStartupWMClass=aino-player\nMimeType=";
+        for (const auto* mime : audio_mimes) entry += std::string(mime) + ";";
+        entry += '\n';
+        const auto temporary = file.u8string() + ".tmp";
+        { std::ofstream output(fs::u8path(temporary), std::ios::binary | std::ios::trunc); output << entry; output.close(); if (!output) { error = "无法保存用户应用入口"; return false; } }
+        fs::rename(fs::u8path(temporary), file, ec);
+        if (ec) { error = "无法更新用户应用入口：" + ec.message(); return false; }
+    }
+    // 刷新用户入口的 MIME 索引；精简桌面未装此工具时，仍可由 xdg-mime 设置关联。
+    run_process({"update-desktop-database", applications.u8string()}, 3000, cancelled);
+    bool ok = true;
+    const auto deadline = ticks() + 15000;
+    for (const auto* mime : audio_mimes) {
+        if ((cancelled && cancelled()) || ticks() > deadline) { ok = false; break; }
+        if (run_process({"xdg-mime", "default", "aino-player.desktop", mime}, 3000, cancelled) != 0) ok = false;
+    }
+    if (!ok) error = "部分文件类型设置失败，请在系统的“打开方式”中选择 Aino Player";
+    return ok;
+#endif
+}
 Desktop::Desktop() : impl_(std::make_unique<Impl>()) {}
 Desktop::~Desktop() { stop(); }
 void Desktop::start(void* window, void* display, unsigned long xid, std::function<void()> wake) {
@@ -555,6 +910,7 @@ void Desktop::start(void* window, void* display, unsigned long xid, std::functio
     if (!SetPropW(impl_->window, L"AinoPlayerDesktop", impl_.get())) return;
     impl_->previous = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(impl_->window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(Impl::procedure)));
     if (!impl_->previous) { RemovePropW(impl_->window, L"AinoPlayerDesktop"); return; }
+    DragAcceptFiles(impl_->window, TRUE);
     impl_->taskbar_created = RegisterWindowMessageW(L"TaskbarCreated"); impl_->sync_tray(); impl_->start_media();
 #else
     impl_->display = static_cast<Display*>(display); impl_->window = xid;
@@ -570,7 +926,7 @@ void Desktop::stop() {
         impl_->controls = nullptr;
     }
     if (impl_->tray.exchange(false)) Shell_NotifyIconW(NIM_DELETE, &impl_->notify);
-    if (impl_->window && impl_->previous && IsWindow(impl_->window)) { SetWindowLongPtrW(impl_->window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(impl_->previous)); RemovePropW(impl_->window, L"AinoPlayerDesktop"); }
+    if (impl_->window && impl_->previous && IsWindow(impl_->window)) { DragAcceptFiles(impl_->window, FALSE); SetWindowLongPtrW(impl_->window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(impl_->previous)); RemovePropW(impl_->window, L"AinoPlayerDesktop"); }
     impl_->window = nullptr;
 #else
     impl_->stopping.store(true); if (impl_->worker.joinable()) impl_->worker.join();
