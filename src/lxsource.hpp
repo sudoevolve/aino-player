@@ -527,7 +527,14 @@ inline JSValue http_response(JSContext* ctx, const net::Response& r) {
         if (!syntax) { JS_FreeValue(ctx, out); return JS_Throw(ctx, exception); }
         JS_FreeValue(ctx, exception);
         js::Value parsed;
-        body = js::parse(r.body, parsed, true) ? to_js_value(ctx, parsed) : to_js(ctx, r.body);
+        // 宽松解析器只读取裸词前缀，不能把 "plain response" 截成 "plain"。
+        // 仅为结构化的非标准 JSON 启用兼容回退，其它文本保留完整原文。
+        auto first = r.body.find_first_not_of(" \t\r\n");
+        while (first != std::string::npos && r.body.compare(first, 3, "\xEF\xBB\xBF") == 0)
+            first = r.body.find_first_not_of(" \t\r\n", first + 3);
+        const bool structured = first != std::string::npos &&
+            (r.body[first] == '{' || r.body[first] == '[' || r.body[first] == '\'');
+        body = structured && js::parse(r.body, parsed, true) ? to_js_value(ctx, parsed) : to_js(ctx, r.body);
     }
     if (JS_IsException(body)) { JS_FreeValue(ctx, out); return body; }
     JS_DefinePropertyValueStr(ctx, out, "body", body, JS_PROP_C_W_E);

@@ -88,7 +88,11 @@ int main(int argc, char** argv) {
             const std::pair<std::string, std::string> bodies[]{
                 {R"({"title":"译文","items":[1,true,null]})", R"({"title":"译文","items":[1,true,null]})"},
                 {"{'code':200,'title':'译文'}", R"({"code":200,"title":"译文"})"},
-                {"plain response", R"("plain response")"}
+                {"plain response", R"("plain response")"},
+                {"  plain response  ", R"("  plain response  ")"},
+                {"译文 plain response", R"("译文 plain response")"},
+                {"  {'code':200,'title':'译文'}", R"({"code":200,"title":"译文"})"},
+                {"\xEF\xBB\xBF {'code':200}", R"({"code":200})"}
             };
             for (const auto& sample : bodies) {
                 net::Response response; response.status = 200; response.body = sample.first;
@@ -96,7 +100,8 @@ int main(int argc, char** argv) {
                 check(!JS_IsException(result.value), "HTTP bridge accepts JSON, lenient JSON and text");
                 prov::detail::JsValueOwner body(context.get(), JS_GetPropertyStr(context.get(), result.value, "body"));
                 prov::detail::JsValueOwner json(context.get(), JS_JSONStringify(context.get(), body.value, JS_UNDEFINED, JS_UNDEFINED));
-                check(lx::detail::from_js(context.get(), json.value) == sample.second, "HTTP bridge preserves parsed body and Unicode");
+                const auto encoded = lx::detail::from_js(context.get(), json.value);
+                check(encoded == sample.second, ("HTTP bridge body mismatch: expected " + sample.second + "; got " + encoded).c_str());
                 prov::detail::JsValueOwner raw(context.get(), JS_GetPropertyStr(context.get(), result.value, "raw"));
                 size_t size = 0; const auto* bytes = JS_GetUint8Array(context.get(), &size, raw.value);
                 check(bytes && size == sample.first.size() && std::memcmp(bytes, sample.first.data(), size) == 0,
