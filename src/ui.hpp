@@ -1529,7 +1529,7 @@ static void source_tab_scripts(Ctx& c, const Rect& area) {
         : source_task == LxTask::Fetch ? std::string("正在下载并加载音源脚本；本次获取的脚本会恢复到应用中")
         : source_task == LxTask::Import ? std::string("正在导入所选脚本，移除的源可通过重新导入恢复")
         : (source_fetch_summary().empty()
-            ? std::string("按") + music::source_name(source_order_platform()) + " · " + music::quality_name(c.model.ui.settings.quality) + "的实际选源顺序排列；失败源仅作兜底。"
+            ? std::string("按") + music::source_name(source_order_platform()) + " · " + music::quality_name(c.model.ui.settings.quality) + "排序；排除样本失败，不跨平台补歌，不自动删除 JS。"
             : source_fetch_summary());
     c.ui.muted_text(ellipsize(c.ui, note, head.w - 240, 10.5f),
                     {head.x + 20, head.y + 46, head.w - 240, 18}, Style().font(10.5f));

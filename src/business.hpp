@@ -996,7 +996,6 @@ static std::shared_ptr<PreparedMedia> prepare_next(const std::shared_ptr<Preload
     std::vector<int> order;
     if (track.variants.empty() || st.cancelled()) return {};
     order.push_back(std::clamp(track.chosen, 0, int(track.variants.size()) - 1));
-    if (st.source_smart_switch) for (int i = 0; i < int(track.variants.size()); ++i) if (i != order[0]) order.push_back(i);
     for (int index : order) {
         if (st.cancelled()) return {};
         auto media = std::make_shared<PreparedMedia>();
@@ -1137,10 +1136,9 @@ static void finish_stream(HostCallbacks* win, const music::Variant& variant, con
     if (win) win->wake();
 }
 
-// 取流 + 下载；失败沿其它源换源（跨源自动换源）
+// 取流和下载只使用用户所选平台；脚本候选由音源引擎在该平台内切换。
 //
 static void do_play(HostCallbacks* win, music::Track track, music::Settings st, int gen, bool stream_allowed = true) {
-    const auto queue_uid = track_uid(track);
     st.cancelled = [gen] { return g_shutdown.load() || gen != g_play_generation.load(); };
     const auto playback_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
     net::CancelScope network([cancel = st.cancelled, playback_deadline] {
@@ -1169,10 +1167,8 @@ static void do_play(HostCallbacks* win, music::Track track, music::Settings st, 
     }
     std::vector<int> order;
     if (!track.variants.empty()) {
-        const int first = std::min<int>(track.chosen, int(track.variants.size()) - 1);
+        const int first = std::clamp(track.chosen, 0, int(track.variants.size()) - 1);
         order.push_back(first);
-        for (int i = 0; i < int(track.variants.size()); ++i)
-            if (st.source_smart_switch && i != first) order.push_back(i);
     }
 
     std::string reasons;
@@ -1187,20 +1183,6 @@ static void do_play(HostCallbacks* win, music::Track track, music::Settings st, 
     music::Variant preview_variant;
     music::ResolveResult preview_rr;
     long long preview_bytes = 0;
-
-    // 补位成功时把候选写回列表：药丸上就能看到它，下次直接命中，不用再搜一遍
-    auto publish_variant = [&](const music::Variant& v) {
-        std::lock_guard<std::mutex> lk(g_mu);
-        if (gen != g_as.gen) return;
-        // 解析期间可能通过右键重排队列，不能再写回启动任务时的旧行号。
-        const auto found = std::find_if(g_as.tracks.begin(), g_as.tracks.end(), [&](const auto& item) { return track_uid(item) == queue_uid; });
-        if (found == g_as.tracks.end()) return;
-        music::Track& t = *found;
-        for (const auto& x : t.variants)
-            if (music::same_variant(x, v)) return;
-        t.variants.push_back(v);
-        ++g_as.tracks_version;
-    };
 
     // 一个候选的完整尝试：取流 → 探测完整性 → 缓冲或下载 → 交给播放器。
     // 返回 true = 不必再试别的候选（成功了，或者用户已经切歌）。
@@ -1312,40 +1294,12 @@ static void do_play(HostCallbacks* win, music::Track track, music::Settings st, 
         return result.ok || st.cancelled();
     };
 
-    // 一、列表里已有的候选，按"选中的源优先"逐个试
+    // 不把其它平台变体当兜底，保留用户选择的歌曲和平台身份。
     for (int idx : order) {
         if (attempt(track.variants[size_t(idx)])) return;
     }
 
-    // 二、列表里一条能播的都没有 → 按「歌名 + 歌手」去别的源补位。
-    //     歌单里的曲目只有本源那一条 id，本源不可用时只在列表内换源是死路，
-    //     必须真的去搜 —— 这就是"自动换源"。
-    const bool selected_part = track.current().source == music::Source::Bilibili && !track.current().native_id.empty();
-    if (st.source_smart_switch && !track.title.empty() && !selected_part) {
-        for (int si = 0; si < music::kSourceCount; ++si) {
-            if (g_shutdown.load()) return;
-            if (!st.enable[si]) continue;
-            bool already = false;
-            for (const auto& v : track.variants)
-                if (int(v.source) == si) { already = true; break; }
-            if (already) continue;
-
-            music::Variant got;
-            std::string e;
-            if (!music::find_on_source(music::Source(si), track, st, got, e)) {
-                add_reason(e);
-                continue;
-            }
-            const bool done = attempt(got);
-            if (done) {
-                publish_variant(got);
-                return;
-            }
-            track.variants.push_back(got);  // 记下来，后面的源不再重复搜同一个
-        }
-    }
-
-    // 三、只有试听片段：放最长的那段，并在音质栏写明
+    // 仅原平台可用的试听片段，仍按既有行为明确标注。
     if (have_preview) {
         const std::string path = g_temp_dir + "track-" + std::to_string(gen) + ".mp3";
         std::atomic<bool> cancel{false};
@@ -1659,7 +1613,7 @@ void start_download(music::Track track, music::Settings st) {
         };
 
         for (size_t i = 0; i < track.variants.size(); ++i) {
-            if (!st.source_smart_switch && i != size_t(std::clamp(track.chosen, 0, int(track.variants.size()) - 1))) continue;
+            if (i != size_t(std::clamp(track.chosen, 0, int(track.variants.size()) - 1))) continue;
             const auto& v = track.variants[i];
             if (st.cancelled()) return;
             if (try_one(v, false)) {
@@ -1667,30 +1621,6 @@ void start_download(music::Track track, music::Settings st) {
                 break;
             }
         }
-        // 没有网易云变体时，按标题和歌手寻找时长匹配的同曲候选。
-        if (!saved && st.source_smart_switch) {
-            const bool has_netease =
-                std::any_of(track.variants.begin(), track.variants.end(), [](const music::Variant& v) {
-                    return v.source == music::Source::Netease;
-                });
-            if (!has_netease) {
-                std::string serr;
-                const auto cands =
-                    music::search_netease(track.title + " " + track.artist, 6, 6000, serr, st);
-                const std::string want = music::text::normalize_title(track.title);
-                for (const auto& v : cands) {
-                    if (music::text::normalize_title(v.title) != want) continue;
-                    if (track.duration_ms > 0 && v.duration_ms > 0 &&
-                        std::abs(v.duration_ms - track.duration_ms) > 10000)
-                        continue;
-                    if (try_one(v, false)) {
-                        saved = true;
-                        break;
-                    }
-                }
-            }
-        }
-
         if (!saved && !best_url.empty()) {
             auto& cancel = *token;
             std::string err;
@@ -2200,7 +2130,7 @@ void set_source_smart_switch(bool enabled) {
     request_frame();
 }
 std::string source_routing_status() {
-    if (g_ui.settings.source_smart_switch) return "按歌曲平台选择已验证且加载快的源，失败时尝试后续候选";
+    if (g_ui.settings.source_smart_switch) return "仅在歌曲原平台内选源；跳过样本失败及冷却中的源，单曲失败不判定整个源失效";
     const auto fixed = lx::Engine::instance().fixed_source();
     if (fixed.file.empty()) return "固定源将在本轮测速完成或首次播放时选择";
     return "固定使用：" + fixed.name + " · " + std::to_string(fixed.verified_platforms) +
@@ -2310,6 +2240,7 @@ const std::vector<LxSourceView>& lx_source_status() {
     cached_smart = g_ui.settings.source_smart_switch;
     cached_platform = int(platform); cached_quality = g_ui.settings.quality; cached_until = now + 60000;
     const auto order = lx::Engine::instance().selection_order(music::lx_platform_key(platform), g_ui.settings.quality);
+    if (std::any_of(order.begin(), order.end(), [](const auto& item) { return item.availability == 4; })) cached_until = now + 1000;
     std::vector<LxSourceView> out;
     const auto errors = lx::Engine::instance().runtime_errors();
     const auto checks = lx::Engine::instance().health();
@@ -2379,7 +2310,9 @@ const std::vector<LxSourceView>& lx_source_status() {
                 checking = check != health->second.end() && check->second.state == 1;
             }
             v.health = std::string(music::source_name(platform)) + " · " + rank->quality + " · " +
-                (rank->availability == 0 ? "样本可用" : rank->availability == 2 ? "失败兜底" : checking ? "静默测速中" : "未检测") +
+                (rank->availability == 0 ? "已验证可用" : rank->availability == 2 ? "样本失败 · 已排除" :
+                 rank->availability == 4 ? "临时网络错误 · 冷却中" : rank->availability == 3 ? "不支持当前音质" :
+                 checking ? "静默测速中" : "未检测") +
                 (rank->latency_ms < 300001 ? " · " + std::to_string(rank->latency_ms) + "ms" + (rank->estimated ? "（估算）" : "") : " · 未测速");
         }
         out.push_back(std::move(v));

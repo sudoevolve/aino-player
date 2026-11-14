@@ -1243,6 +1243,7 @@ public:
     using Checks = std::map<std::string, Health>;
     struct Selection {
         std::string file, name, quality;
+        // 0 已验证，1 未验证，2 样本失败，3 不支持音质，4 临时网络冷却。
         int availability = 1, latency_ms = 300001;
         bool estimated = false;
     };
@@ -1265,12 +1266,11 @@ public:
         Selection out;
         out.quality = quality;
         if (quality.empty()) { out.availability = 3; return out; }
-        // 失败只能由同音质重新验证清除，不能让旧测速在一分钟后自动恢复优先级。
-        const bool failed_quality = exact && exact->failures;
-        const bool failed_check = health && (health->state == 3 || health->state == 5) &&
+        // 样本失败影响平台排名；单曲错误和未完成检测不能判定整个平台失效。
+        const bool failed_check = health && health->state == 3 &&
             health->quality == quality && (!exact || exact->verified_revision <= health->checked_revision);
         const bool passed = (exact && exact->verified) || (health && health->state == 2 && health->quality == quality);
-        out.availability = failed_quality || failed_check ? 2 : passed ? 0 : 1;
+        out.availability = failed_check ? 2 : passed ? 0 : 1;
         // 先比较同一口径的样本延迟，不能把一个源的首段解码时间与另一个的 64 KiB 下载直接混排。
         if (exact && exact->load_ms > 0) { out.latency_ms = exact->load_ms; out.estimated = exact->cached; }
         else if (health && health->state == 2 && health->load_ms > 0) {
@@ -1311,7 +1311,7 @@ public:
             for (const auto* platform : {"wy", "tx", "kw", "kg", "mg"}) {
                 if (!script->supports(platform, "musicUrl")) continue;
                 const auto score = selection_locked(script, platform, wanted);
-                if (score.availability == 3) continue;
+                if (score.availability >= 2) continue;
                 ++choice.supported_platforms;
                 if (score.availability == 0) { ++choice.verified_platforms; verified_ms += score.latency_ms; }
                 else if (score.availability == 1 && score.latency_ms < 300001) { ++estimates; estimated_ms += score.latency_ms; }
@@ -1329,7 +1329,9 @@ public:
         if (network.empty()) return;
         const auto signature = detail::md5_hex(network);
         std::lock_guard<std::mutex> lock(mu_);
-        if (!network_hash_.empty() && network_hash_ != signature) { timings_.clear(); health_.clear(); ++revision_; }
+        if (!network_hash_.empty() && network_hash_ != signature) {
+            timings_.clear(); health_.clear(); song_failures_.clear(); platform_retry_at_.clear(); ++revision_;
+        }
         network_hash_ = signature;
     }
     void save_metrics(const std::string& network) {
@@ -1458,6 +1460,10 @@ public:
             runtime_errors_.erase(name);
             health_.erase(name);
             timings_.erase(name);
+            platform_retry_at_.erase(name);
+            for (auto it = song_failures_.begin(); it != song_failures_.end();) {
+                if (it->second.file == name) it = song_failures_.erase(it); else ++it;
+            }
             for (auto it = list_.begin(); it != list_.end();) {
                 if (file_key((*it)->path()) == name) {
                     (*it)->retire(); retired.push_back(std::move(*it)); it = list_.erase(it);
@@ -1509,6 +1515,13 @@ public:
         {
             std::lock_guard<std::mutex> lock(mu_);
             scripts = list_;
+            // 手动/启动的一轮检测是显式恢复入口，不沿用这些平台的临时冷却和单曲失败。
+            for (const auto& sample : cases) {
+                for (auto it = song_failures_.begin(); it != song_failures_.end();) {
+                    if (it->second.platform == sample.platform) it = song_failures_.erase(it); else ++it;
+                }
+                for (auto& file : platform_retry_at_) file.second.erase(sample.platform);
+            }
             if (cases.size() == 1) std::stable_sort(scripts.begin(), scripts.end(), [&](const auto& a, const auto& b) {
                 const auto first = selection_locked(a, cases.front().platform, wanted);
                 const auto second = selection_locked(b, cases.front().platform, wanted);
@@ -1534,7 +1547,7 @@ public:
                           if (state.state < 2 && previous.state == 2 && previous.quality == quality) return;
                           if (state.state >= 2) state.checked_revision = ++outcome_revision_;
                           if (state.quality.empty()) state.quality = quality;
-                          if (state.state == 2 || state.state == 3 || state.state == 5)
+                          if (state.state == 2 || state.state == 3)
                               record_timing(file, sample.platform, state.quality, state.resolve_ms, state.load_ms, state.state == 2);
                           health_[file][sample.platform] = std::move(state); ++revision_; }
                         if (wake) wake();
@@ -1579,7 +1592,7 @@ public:
                         }
                         return;
                     }
-                    timed_out = timed_out || error.find("超时") != std::string::npos || error.find("timeout") != std::string::npos;
+                    timed_out = timed_out || transient_error(error);
                     if (preempted.load() || s->playback_waiting()) publish({0, "检测让位于播放，需要时可手动重新检测"});
                     else publish({playable ? 2 : timed_out ? 5 : 3, playable ? "静默加载音频样本有效（最多 64 KiB）" : error.empty() ? "样本请求失败" : error,
                                   resolve_ms, load_ms, quality});
@@ -1592,6 +1605,21 @@ public:
     }
 
 private:
+    struct SongFailure {
+        std::string file, platform;
+        unsigned long long until = 0;
+    };
+    static std::string song_failure_key(const std::string& file, const std::string& platform,
+                                       const std::string& quality, const std::string& info) {
+        return file + ":" + platform + ":" + quality + ":" + detail::md5_hex(info);
+    }
+    static bool transient_error(std::string error) {
+        std::transform(error.begin(), error.end(), error.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        for (const auto* word : {"timeout", "timed out", "超时", "connection", "connect failed", "连接失败", "网络", "dns",
+                                 "winhttp", "http 5", "http 429", "could not resolve", "couldn't resolve", "couldn't connect"})
+            if (error.find(word) != std::string::npos) return true;
+        return false;
+    }
     static int elapsed_ms(std::chrono::steady_clock::time_point begin) {
         return int(std::clamp<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count(), 1, 300000));
     }
@@ -1614,7 +1642,7 @@ private:
         } else {
             if (platform::ticks() >= value.failed_at + 60000) value.failures = 0;
             value.failures = std::min(value.failures + 1, 3u); value.failed_at = platform::ticks();
-            value.verified = false;
+            // 一首歌的版权、试听或格式问题不撤销已验证的其它歌曲/样本。
         }
     }
     Selection selection_locked(const std::shared_ptr<Script>& script, const std::string& platform, int wanted) const {
@@ -1639,6 +1667,11 @@ private:
         auto result = selection_score(actual, health, exact, fallback, platform::ticks());
         result.file = file;
         result.name = script->info().name;
+        const auto retry = platform_retry_at_.find(file);
+        if (retry != platform_retry_at_.end()) {
+            const auto until = retry->second.find(platform);
+            if (until != retry->second.end() && platform::ticks() < until->second) result.availability = 4;
+        }
         return result;
     }
     static std::string file_key(const std::string& file) {
@@ -1814,6 +1847,13 @@ private:
             ++revision_;
             failed_.swap(new_failed);
             for (const auto& file : files) { runtime_errors_.erase(file_key(file)); health_.erase(file_key(file)); timings_.erase(file_key(file)); }
+            for (const auto& file : files) {
+                const auto key = file_key(file);
+                platform_retry_at_.erase(key);
+                for (auto it = song_failures_.begin(); it != song_failures_.end();) {
+                    if (it->second.file == key) it = song_failures_.erase(it); else ++it;
+                }
+            }
         }
         // 被替换的运行时在 mu_ 锁外释放，避免清理脚本时阻塞界面读取状态。
         return ok_count.load();
@@ -1871,15 +1911,30 @@ public:
             const auto file = file_key(script->path());
             if (!removed_.count(file) && std::find(list_.begin(), list_.end(), script) != list_.end()) {
                 const bool verified = error.empty() && (load_timing ? load_timing->verified : bool(accept));
-                if (verified) runtime_errors_[file].erase(key);
-                else if (!error.empty()) runtime_errors_[file][key] = error;
+                const auto failure_key = song_failure_key(file, key, quality, info_json);
+                if (verified) {
+                    runtime_errors_[file].erase(key);
+                    song_failures_.erase(failure_key);
+                    platform_retry_at_[file].erase(key);
+                } else if (!error.empty()) {
+                    runtime_errors_[file][key] = error;
+                    if (song_failures_.size() >= 512) {
+                        auto oldest = std::min_element(song_failures_.begin(), song_failures_.end(), [](const auto& a, const auto& b) {
+                            return a.second.until < b.second.until;
+                        });
+                        song_failures_.erase(oldest);
+                    }
+                    const bool transient = transient_error(error);
+                    song_failures_[failure_key] = {file, key, platform::ticks() + (transient ? 30000 : 600000)};
+                    if (transient) platform_retry_at_[file][key] = platform::ticks() + 30000;
+                }
                 record_timing(file, key, quality, resolve_ms, 0, error.empty(), ready_ms, verified);
                 ++revision_;
             }
         };
-        std::string last = smart_switch ? "" : fixed.file.empty() ? "没有可固定使用的音源" :
-            "固定音源「" + fixed.name + "」不支持当前平台或音质；可手动重新检测或开启智能切换";
+        std::string last;
         std::set<std::string> attempted;
+        bool excluded_failed = false, skipped_song = false, cooling_down = false;
         for (;;) {
             std::shared_ptr<Script> s;
             Selection score;
@@ -1891,7 +1946,11 @@ public:
                     if (candidate->retired() || !candidate->supports(key, "musicUrl") ||
                         attempted.count(file_key(candidate->path()))) continue;
                     const auto rank = selection_locked(candidate, key, wanted);
+                    if (rank.availability == 2) { excluded_failed = true; continue; }
+                    if (rank.availability == 4) { cooling_down = true; continue; }
                     if (rank.availability == 3) continue;
+                    const auto failure = song_failures_.find(song_failure_key(rank.file, key, rank.quality, info_json));
+                    if (failure != song_failures_.end() && platform::ticks() < failure->second.until) { skipped_song = true; continue; }
                     if (!s || std::tie(rank.availability, rank.latency_ms, rank.file) <
                         std::tie(score.availability, score.latency_ms, score.file)) { s = candidate; score = rank; }
                 }
@@ -1907,18 +1966,20 @@ public:
             if (q.empty()) { last = s->info().name + ": 不支持所选音质或更低档位"; continue; }
             bool resolved;
             const auto begin = std::chrono::steady_clock::now();
-            const auto candidate_deadline = std::min(deadline, begin + std::chrono::seconds(score.availability >= 2 ? 5 : 15));
+            const auto candidate_deadline = std::min(deadline, begin + std::chrono::seconds(15));
             const auto owner_cancelled = net::cancel_current;
             net::CancelScope candidate_budget([parent = owner_cancelled, candidate_deadline] {
                 return (parent && parent()) || std::chrono::steady_clock::now() >= candidate_deadline;
             });
             if (load_timing) *load_timing = {};
             {
-                const auto source_deadline = std::min(deadline, begin + std::chrono::milliseconds(score.availability >= 2 ? 3000 : 8000));
+                const auto source_deadline = std::min(deadline, begin + std::chrono::seconds(8));
                 net::CancelScope time_limit([parent = net::cancel_current, source_deadline] {
                     return (parent && parent()) || std::chrono::steady_clock::now() >= source_deadline;
                 });
                 resolved = s->music_url(key, q, info_json, u, e);
+                if (!resolved && !(owner_cancelled && owner_cancelled()) && std::chrono::steady_clock::now() >= source_deadline)
+                    e = "音源取址超时" + (e.empty() ? std::string() : "：" + e);
             }
             const int resolve_ms = elapsed_ms(begin);
             if (resolved && !s->retired()) {
@@ -1928,8 +1989,8 @@ public:
                 });
                 if (accept && !accept(u, s->info().name, q, e)) {
                     last = s->info().name + ": " + (e.empty() ? "候选音频不可用" : e);
-                    // 候选超时记失败；用户切歌 / 退出仍不污染健康统计。
-                    if (!s->retired() && !(owner_cancelled && owner_cancelled()) && std::chrono::steady_clock::now() >= candidate_deadline) report(s, q, last);
+                    // 候选预算到期属于临时超时，不能当成该曲长期不可用。
+                    if (!s->retired() && !(owner_cancelled && owner_cancelled()) && std::chrono::steady_clock::now() >= candidate_deadline) report(s, q, "音源启动超时：" + last);
                     else if (!net::cancelled()) report(s, q, last);
                     continue;
                 }
@@ -1946,6 +2007,13 @@ public:
                 last += s->info().name + ": " + e;
             }
         }
+        if (last.empty()) {
+            if (cooling_down) last = "当前平台部分音源因临时网络错误冷却中，可稍后再播或手动重新检测";
+            else if (skipped_song) last = "已跳过近期无法播放这首歌曲的音源，可稍后重试或手动重新检测";
+            else if (excluded_failed) last = "当前平台或音质的样本失败音源已排除，请手动重新检测";
+            else if (!smart_switch) last = fixed.file.empty() ? "没有可固定使用的音源" :
+                "固定音源「" + fixed.name + "」不支持当前平台或音质；可手动重新检测或开启智能切换";
+        }
         err = last.empty() ? "没有支持该平台的音源" : last;
         return false;
     }
@@ -1961,6 +2029,8 @@ private:
     std::map<std::string, std::map<std::string, std::string>> runtime_errors_;
     std::map<std::string, Checks> health_;
     std::map<std::string, Timings> timings_;
+    std::map<std::string, SongFailure> song_failures_; // 有界单曲失败缓存；不影响该源其它歌曲的可用状态。
+    std::map<std::string, std::map<std::string, unsigned long long>> platform_retry_at_; // 临时网络错误冷却；不触发后台复测。
     unsigned long long outcome_revision_ = 0;
     std::mutex check_mu_;
     std::atomic<unsigned> check_epoch_{0};

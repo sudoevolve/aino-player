@@ -282,10 +282,11 @@ int main(int argc, char** argv) {
             check(lx::Engine::selection_score("320k", &health, &timing, nullptr, 1000).availability == 0,
                 "new audio verification recovers a previously failed source");
             timing.failures = 1; timing.failed_at = 900;
-            check(lx::Engine::selection_score("320k", nullptr, &timing, nullptr, 1000).availability == 2,
-                "one recent playback failure ranks behind healthy sources regardless of old speed");
-            check(lx::Engine::selection_score("320k", nullptr, &timing, nullptr, 120000).availability == 2,
-                "failed quality does not regain priority when a cooldown expires");
+            check(lx::Engine::selection_score("320k", nullptr, &timing, nullptr, 1000).availability == 0,
+                "single song failure does not invalidate verified platform health");
+            health.state = 5;
+            check(lx::Engine::selection_score("320k", &health, &timing, nullptr, 1000).availability == 0,
+                "unfinished sample check does not invalidate verified platform health");
             health.state = 2; health.load_ms = 135;
             score = lx::Engine::selection_score("flac", &health, nullptr, nullptr, 1000);
             check(score.availability == 1 && score.latency_ms == 135 && score.estimated,
@@ -512,6 +513,36 @@ int main(int argc, char** argv) {
                         if (candidate.find("/bad") != std::string::npos) { reason = "fixture rejects media"; return false; }
                         return true;
                     }) && candidates == 2 && url == "https://example.invalid/good", "rejected media advances to next script");
+                check(engine.load_dir(scripts) == 2, "reset fixture outcomes before per-song checks");
+                candidates = 0;
+                check(!engine.resolve("wy", "320k", "{\"id\":\"missing\"}", url, error, nullptr,
+                    [&](const auto&, const auto&, const auto&, auto& reason) {
+                        ++candidates; reason = "song unavailable"; return false;
+                    }) && candidates == 2, "unavailable song tries each unknown candidate once");
+                check(!engine.resolve("wy", "320k", "{\"id\":\"missing\"}", url, error, nullptr,
+                    [&](const auto&, const auto&, const auto&, auto&) { ++candidates; return true; }) && candidates == 2,
+                    "same unavailable song skips cached failed candidates");
+                check(engine.resolve("wy", "320k", "{\"id\":\"another\"}", url, error, nullptr,
+                    [&](const auto&, const auto&, const auto&, auto&) { ++candidates; return true; }) && candidates == 3,
+                    "another song still uses a source that rejected the unavailable song");
+                candidates = 0;
+                check(!engine.resolve("tx", "320k", "{}", url, error, nullptr,
+                    [&](const auto&, const auto&, const auto&, auto&) { ++candidates; return true; }) && candidates == 0,
+                    "QQ request never falls back to a Netease-only fixture");
+                check(engine.entries().size() == 2 && platform::exists(bad) && platform::exists(good),
+                    "playback failures never delete loaded script files");
+                candidates = 0;
+                check(!engine.resolve("wy", "320k", "{\"id\":\"network\"}", url, error, nullptr,
+                    [&](const auto&, const auto&, const auto&, auto& reason) {
+                        ++candidates; reason = "connection timeout"; return false;
+                    }) && candidates == 2, "temporary network errors finish the current candidate set");
+                const auto cooling = engine.selection_order("wy", 1);
+                check(cooling.size() == 2 && std::all_of(cooling.begin(), cooling.end(), [](const auto& item) {
+                    return item.availability == 4;
+                }), "network errors use temporary cooldown rather than failed sample health");
+                check(!engine.resolve("wy", "320k", "{\"id\":\"during-cooldown\"}", url, error, nullptr,
+                    [&](const auto&, const auto&, const auto&, auto&) { ++candidates; return true; }) && candidates == 2,
+                    "next song skips temporarily cooling sources without background probes");
                 check(engine.remove_source(bad, error) && platform::exists(bad), "app removal preserves source file");
                 check(engine.entries().size() == 1 && engine.load_dir(scripts) == 1, "reload does not restore removed script");
                 check(engine.refresh_files(scripts, {"01-bad.js", "02-good.js"}) == 1 && engine.entries().size() == 1,
