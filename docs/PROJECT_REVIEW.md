@@ -257,4 +257,16 @@ P1 表示优先解决的稳定性和数据风险，不表示已发生用户数�
 
 [v0.3.0](https://github.com/sudoevolve/aino-player/releases/tag/v0.3.0) 已设为 latest，正文仅包含功能变化与修复，没有安装与更新章节。Windows 安装器 4,631,472 字节、便携 EXE 8,096,256 字节、deb 3,365,558 字节。[APT 同步 43564839115](https://github.com/sudoevolve/aino-player/actions/runs/43564839115) 成功，公开索引已提供 0.3.0，deb SHA-256 为 `c1b7829bbe5c2fca0be4135b34baec9ddbf0a6a5c028945acd002a62c9a8006c`。真实账号权限、第三方脚本服务可用性和各桌面环境交互仍不由离线回归保证。
 
+## 12. v0.3.3 发布与多格式软件源
+
+用户明确要求发布并追加网站系统主题与 PR #1 整合后，最终以 `eeddd4f` / [v0.3.3](https://github.com/sudoevolve/aino-player/releases/tag/v0.3.3) 发布。v0.3.1 因需求整合取消、v0.3.2 因 HTTP 文本回退断言失败，均未发布；旧标签未移动。HTTP 修复与候选记录见 ADR 末尾。
+
+[发布工作流 43582634167](https://github.com/sudoevolve/aino-player/actions/runs/43582634167) 全部成功：Windows 7/7、Ubuntu 9/9、Fedora 8/8；Arch 原生 makepkg、pacman 安装、内置解码器版本和 Xvfb 启动通过。Ubuntu 另验证 0.3.0 → 0.3.3 不卸载覆盖升级及 AppStream / 发布者元数据。发布包括 Windows 安装器 4,649,313 字节、便携 EXE 8,145,408 字节、deb 3,406,342 字节、rpm 2,911,370 字节、Arch 包 3,488,227 字节，以及源码与许可附件；9 个附件的 GitHub digest 均与发布 SHA256SUMS 相符。Release 为 latest，正文只列功能与修复。
+
+[PR #1](https://github.com/sudoevolve/aino-player/pull/1) 以合并提交 `9a1d09e` 处理，保留 FarnaHerry 的贡献历史；整合时补齐 Arch 一键安装，修正 RPM 索引 / 包签名顺序、公钥指纹校验及 ELF 自动依赖。软件源首次部署发现迁移后的指纹文件仍有一处 APT 复制旧引用，已由 `d4db273` 修正，仅重建索引，未重编译播放器或重跑回归。
+
+[软件源部署 43583207397，第二次执行](https://github.com/sudoevolve/aino-player/actions/runs/43583207397) 成功。APT 临时源候选检查、DNF 隔离 rpmdb / 元数据验签与候选查询、pacman 隔离 keyring / 数据库和实际下载包签名验证均通过，三棵仓库在同一次 Pages 部署合流。公开主页为 0.3.3，深浅主题由 prefers-color-scheme 响应系统；主页正文、两个一键脚本和仓库配置与当前源码逐字节核对（HTML 按发布器规范化换行），APT 索引含 0.3.3，RPM 元数据签名和 Arch 数据库签名公开地址均返回成功。
+
+网站本地浏览器检查与脚本替身场景见 ADR。没有声称验证真实在线音乐账号、所有第三方脚本或每一种桌面系统栏效果。Fedora 当前支持范围固定为 44+；Arch / RPM 用户通过对应包管理器更新，应用内 Linux 安装入口仍面向 DEB。
+
 发布后下载全部八个附件，逐项核对文件大小、SHA256SUMS 与 GitHub digest，全部一致；线上 Release 正文与仓库发布说明一致。APT 公开条目的 deb 摘要也与同一附件一致。
