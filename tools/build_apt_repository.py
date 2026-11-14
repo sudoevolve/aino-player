@@ -153,7 +153,7 @@ def build(output, fingerprint, check):
                         "--local-user", fingerprint, "--digest-algo", "SHA256", "--output", str(release.parent / filename),
                         *flags, str(release)], check=True)
     shutil.copy2(key, apt / KEY_NAME)
-    shutil.copy2(ROOT / "packaging/apt/signing-key-fingerprint.txt", apt / "signing-key-fingerprint.txt")
+    shutil.copy2(ROOT / "packaging/signing-key-fingerprint.txt", apt / "signing-key-fingerprint.txt")
     shutil.copy2(ROOT / "packaging/apt/aino-player.sources", apt / "aino-player.sources")
     installer = ROOT / "packaging/apt/install.sh"
     subprocess.run(["bash", "-n", str(installer)], check=True)
