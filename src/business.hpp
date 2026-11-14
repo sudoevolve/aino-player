@@ -2265,6 +2265,12 @@ static void maintain_source_checks() {
                 [&] { return cancelled() || std::chrono::steady_clock::now() >= deadline; }, [] { request_frame(); }, settings.quality, int(std::min<long long>(6000, remaining)), only_file);
             ++completed;
         }
+        {
+            // 检测时间预算已耗尽时也回收临时对象；退出仍取消，忙碌脚本直接跳过。
+            net::CancelScope maintenance([] { return g_shutdown.load(); });
+            engine.collect_idle();
+            if (!g_shutdown.load()) platform::release_unused_memory();
+        }
         if (!cancelled()) post_ui([generation, completed, missing, reselect, only_file] {
             if (generation != g_lx_check_generation.load()) return;
             lx::Engine::instance().choose_fixed_source(g_ui.settings.quality, reselect);
@@ -2290,6 +2296,7 @@ static void lx_source_task(LxTask kind, std::function<void()> action) {
         try { action(); lx_check_sources(); }
         catch (const std::exception& error) { const auto message = std::string("音源操作失败：") + error.what(); post_ui([message] { toast(message, 6000); }); }
         catch (...) { post_ui([] { toast("音源操作失败，请重试", 6000); }); }
+        if (!g_shutdown.load()) platform::release_unused_memory();
     }, [] { g_lx_task.store(LxTask::None); });
 }
 

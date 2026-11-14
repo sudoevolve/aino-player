@@ -62,6 +62,8 @@ inline std::string instance_scope() {
 }
 /** @brief 本机活动网络接口地址；仅用于本地测速缓存签名，不发送或显示。 */
 std::string network_signature();
+/** @brief 后台批处理结束后归还分配器的空闲页；不移除活跃对象或强制裁剪工作集。 */
+void release_unused_memory();
 struct MediaState {
     std::string uid, title, artist, album, artwork;
     long long position_ms = 0, duration_ms = 0;

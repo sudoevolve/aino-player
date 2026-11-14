@@ -507,6 +507,7 @@ inline bool http_request(JSContext* ctx, int argc, JSValueConst* argv, net::Requ
 
 inline JSValue http_response(JSContext* ctx, const net::Response& r) {
     JSValue out = JS_NewObject(ctx);
+    if (JS_IsException(out)) return out;
     if (!r.error.empty()) {
         JS_DefinePropertyValueStr(ctx, out, "error", to_js(ctx, r.error), JS_PROP_C_W_E);
         return out;
@@ -515,14 +516,21 @@ inline JSValue http_response(JSContext* ctx, const net::Response& r) {
     JS_DefinePropertyValueStr(ctx, out, "statusCode", JS_NewInt32(ctx, r.status), JS_PROP_C_W_E);
     JS_DefinePropertyValueStr(ctx, out, "status", JS_NewInt32(ctx, r.status), JS_PROP_C_W_E);
     JS_DefinePropertyValueStr(ctx, out, "statusMessage", to_js(ctx, "OK"), JS_PROP_C_W_E);
-    {
+    // 标准 JSON 直接进入脚本运行时，避免先建 C++ 树再逐节点复制到 JS。
+    JSValue body = JS_ParseJSON(ctx, r.body.c_str(), r.body.size(), "<http-body>");
+    if (JS_IsException(body)) {
+        JSValue exception = JS_GetException(ctx);
+        JSValue name = JS_IsObject(exception) ? JS_GetPropertyStr(ctx, exception, "name") : JS_UNDEFINED;
+        const bool syntax = JS_IsString(name) && from_js(ctx, name) == "SyntaxError";
+        if (JS_IsException(name)) { JSValue nested = JS_GetException(ctx); JS_FreeValue(ctx, nested); }
+        JS_FreeValue(ctx, name);
+        if (!syntax) { JS_FreeValue(ctx, out); return JS_Throw(ctx, exception); }
+        JS_FreeValue(ctx, exception);
         js::Value parsed;
-        if (js::parse(r.body, parsed, true)) {
-            JS_DefinePropertyValueStr(ctx, out, "body", to_js_value(ctx, parsed), JS_PROP_C_W_E);
-        } else {
-            JS_DefinePropertyValueStr(ctx, out, "body", to_js(ctx, r.body), JS_PROP_C_W_E);
-        }
+        body = js::parse(r.body, parsed, true) ? to_js_value(ctx, parsed) : to_js(ctx, r.body);
     }
+    if (JS_IsException(body)) { JS_FreeValue(ctx, out); return body; }
+    JS_DefinePropertyValueStr(ctx, out, "body", body, JS_PROP_C_W_E);
     JS_DefinePropertyValueStr(ctx, out, "bytes", JS_NewInt32(ctx, int(r.body.size())), JS_PROP_C_W_E);
     // 原始文本也留一份：有些接口返回单引号 JSON，严格解析会失败，脚本可以自己兜
     JS_DefinePropertyValueStr(ctx, out, "bodyText", to_js(ctx, r.body), JS_PROP_C_W_E);
@@ -740,7 +748,7 @@ inline const char* bootstrap_js() {
   const lx = {
     EVENT_NAMES: EN,
     version: '2.0.0',
-    currentScriptInfo: (function () { try { return JSON.parse(__lx.scriptInfo); } catch (e) { return {}; } finally { delete __lx.scriptInfo; } })(),
+    currentScriptInfo: (function () { const info = __lx.scriptInfo; delete __lx.scriptInfo; return info; })(),
     env: 'desktop',
     on: function (name, fn) {
       if (__lx.debug) __lx.log('TRACE on(' + name + ') fn=' + (typeof fn));
@@ -1003,11 +1011,13 @@ inline bool Script::load(const std::string& path, const std::string& script, std
     JS_SetPropertyStr(ctx_, api, "log", JS_NewCFunction(ctx_, detail::cb_log, "log", 1));
     JS_SetPropertyStr(ctx_, api, "debug", JS_NewBool(ctx_, std::getenv("LX_TRACE") != nullptr));
     {
-        const std::string json = "{\"name\":" + detail::js_quote(info_.name) + ",\"version\":" +
-            detail::js_quote(info_.version) + ",\"author\":" + detail::js_quote(info_.author) +
-            ",\"description\":" + detail::js_quote(info_.description) + ",\"homepage\":" +
-            detail::js_quote(info_.homepage) + ",\"rawScript\":" + detail::js_quote(script) + "}";
-        JS_SetPropertyStr(ctx_, api, "scriptInfo", detail::to_js(ctx_, json));
+        // 直接传对象，不再转义整份源代码、构造大 JSON 字符串后再解析一遍。
+        JSValue info = JS_NewObject(ctx_);
+        for (const auto& field : {std::make_pair("name", &info_.name), std::make_pair("version", &info_.version),
+             std::make_pair("author", &info_.author), std::make_pair("description", &info_.description), std::make_pair("homepage", &info_.homepage)})
+            JS_SetPropertyStr(ctx_, info, field.first, detail::to_js(ctx_, *field.second));
+        JS_SetPropertyStr(ctx_, info, "rawScript", detail::to_js(ctx_, script));
+        JS_SetPropertyStr(ctx_, api, "scriptInfo", info);
     }
     JS_SetPropertyStr(ctx_, gl, "__lx", api);
     JS_FreeValue(ctx_, gl);
@@ -1158,6 +1168,7 @@ inline bool Script::init(std::string& err) {
     if (!has_request) { err = "脚本未注册取流处理器"; return false; }
     inited_ = true;
     declarations_frozen_ = true;
+    JS_RunGC(rt_);
     return true;
 }
 

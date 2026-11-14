@@ -80,6 +80,29 @@ int main(int argc, char** argv) {
         }
         {
         using namespace music::providers;
+        {
+            std::unique_ptr<JSRuntime, decltype(&JS_FreeRuntime)> runtime(JS_NewRuntime(), JS_FreeRuntime);
+            check(runtime != nullptr, "HTTP bridge runtime");
+            std::unique_ptr<JSContext, decltype(&JS_FreeContext)> context(JS_NewContext(runtime.get()), JS_FreeContext);
+            check(context != nullptr, "HTTP bridge context");
+            const std::pair<std::string, std::string> bodies[]{
+                {R"({"title":"译文","items":[1,true,null]})", R"({"title":"译文","items":[1,true,null]})"},
+                {"{'code':200,'title':'译文'}", R"({"code":200,"title":"译文"})"},
+                {"plain response", R"("plain response")"}
+            };
+            for (const auto& sample : bodies) {
+                net::Response response; response.status = 200; response.body = sample.first;
+                prov::detail::JsValueOwner result(context.get(), lx::detail::http_response(context.get(), response));
+                check(!JS_IsException(result.value), "HTTP bridge accepts JSON, lenient JSON and text");
+                prov::detail::JsValueOwner body(context.get(), JS_GetPropertyStr(context.get(), result.value, "body"));
+                prov::detail::JsValueOwner json(context.get(), JS_JSONStringify(context.get(), body.value, JS_UNDEFINED, JS_UNDEFINED));
+                check(lx::detail::from_js(context.get(), json.value) == sample.second, "HTTP bridge preserves parsed body and Unicode");
+                prov::detail::JsValueOwner raw(context.get(), JS_GetPropertyStr(context.get(), result.value, "raw"));
+                size_t size = 0; const auto* bytes = JS_GetUint8Array(context.get(), &size, raw.value);
+                check(bytes && size == sample.first.size() && std::memcmp(bytes, sample.first.data(), size) == 0,
+                    "HTTP bridge preserves original response bytes");
+            }
+        }
         const auto child_start = platform::ticks();
         check(platform::run_process({argv[0], "--child-sleep"}, 100) == 124 && platform::ticks() - child_start < 2500,
             "optional source tool timeout terminates and reaps child");
@@ -573,6 +596,7 @@ int main(int argc, char** argv) {
                 check(engine.load_files(scripts, {"01-bad.js"}) == 1 && engine.entries().size() == 2, "explicit import or online fetch restores selected script");
                 lx::Script script;
                 check(script.load(good, code("good"), error) && script.init(error), "standalone script fixture");
+                check(script.debug_eval("lx.currentScriptInfo.rawScript") == code("good"), "script info keeps exact original source without JSON roundtrip");
                 {
                     net::CancelScope cancelled([] { return true; });
                     check(!script.music_url("wy", "128k", "{}", url, error), "cancelled script request returns promptly");

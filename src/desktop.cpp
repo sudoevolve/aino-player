@@ -6,6 +6,7 @@
 #include <sstream>
 #include <tuple>
 #ifdef _WIN32
+#include <malloc.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
@@ -23,12 +24,24 @@
 #include <X11/Xutil.h>
 #include <dlfcn.h>
 #include <poll.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 #undef None
 #undef Status
 #undef Bool
 #endif
 
 namespace platform {
+void release_unused_memory() {
+#ifdef _WIN32
+    HEAP_OPTIMIZE_RESOURCES_INFORMATION info{};
+    info.Version = HEAP_OPTIMIZE_RESOURCES_CURRENT_VERSION;
+    HeapSetInformation(reinterpret_cast<HANDLE>(_get_heap_handle()), HeapOptimizeResources, &info, sizeof info);
+#elif defined(__GLIBC__)
+    malloc_trim(0);
+#endif
+}
 std::string network_signature() {
     std::vector<std::string> addresses;
 #ifdef _WIN32
