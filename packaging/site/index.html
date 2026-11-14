@@ -98,7 +98,7 @@
       </nav>
       <nav aria-label="帮助与支持">
         <h2>帮助与支持</h2>
-        <a href="#help">常见问题</a><a href="apt/">Linux APT 软件源</a><a href="https://github.com/sudoevolve/aino-player/issues">问题反馈</a><a href="#donate">支持项目</a><a href="mailto:sudoevolve@gmail.com">联系作者</a>
+        <a href="#help">常见问题</a><a href="apt/">Linux APT 软件源</a><a href="rpm/">Linux RPM 软件源</a><a href="arch/">Arch 软件源</a><a href="https://github.com/sudoevolve/aino-player/issues">问题反馈</a><a href="#donate">支持项目</a><a href="mailto:sudoevolve@gmail.com">联系作者</a>
       </nav>
       <p>Windows · Linux</p><p>免费开源 · Apache-2.0</p>
     </aside>
@@ -120,13 +120,18 @@
         <thead><tr><th scope="col">系统</th><th scope="col">下载</th></tr></thead>
         <tbody>
           <tr><td>Windows x64</td><td><a href="https://github.com/sudoevolve/aino-player/releases/download/v@VERSION@/aino-player-v@VERSION@-setup-windows-x64.exe">下载安装器</a><a href="https://github.com/sudoevolve/aino-player/releases/download/v@VERSION@/aino-player-v@VERSION@-windows-x64.exe">下载便携 EXE</a><small>安装器支持覆盖升级；便携版直接运行。</small></td></tr>
-          <tr><td>Linux amd64</td><td><a href="https://github.com/sudoevolve/aino-player/releases/download/v@VERSION@/aino-player_@VERSION@_amd64.deb">下载 DEB 安装包</a><a href="apt/">使用 APT 软件源</a><small>Ubuntu 22.04+ / Debian 12+，X11 / XWayland。</small></td></tr>
+          <tr><td>Ubuntu 22.04+ / Debian 12+ amd64</td><td><a href="https://github.com/sudoevolve/aino-player/releases/download/v@VERSION@/aino-player_@VERSION@_amd64.deb">下载 DEB 安装包</a><a href="apt/">使用 APT 软件源</a><small>X11 / XWayland。</small></td></tr>
+          <tr><td>Fedora 41+ / openSUSE x86_64</td><td><a href="https://github.com/sudoevolve/aino-player/releases/download/v@VERSION@/aino-player-@VERSION@-1.x86_64.rpm">下载 RPM 安装包</a><a href="rpm/">使用 RPM 软件源</a><small>X11 / XWayland。</small></td></tr>
+          <tr><td>Arch x86_64</td><td><a href="https://github.com/sudoevolve/aino-player/releases/download/v@VERSION@/aino-player-@VERSION@-1-x86_64.pkg.tar.zst">下载 Arch 安装包</a><a href="arch/">使用 Arch 软件源</a><small>X11 / XWayland。</small></td></tr>
         </tbody>
       </table>
       <div class="download-links"><a href="https://github.com/sudoevolve/aino-player/releases/tag/v@VERSION@">更新内容</a><a href="https://github.com/sudoevolve/aino-player/releases">历史版本</a><a href="https://github.com/sudoevolve/aino-player/releases/download/v@VERSION@/SHA256SUMS.txt">SHA-256 校验</a><a href="https://github.com/sudoevolve/aino-player/blob/master/LICENSE">许可协议</a><a href="https://github.com/sudoevolve/aino-player">源代码</a></div>
       <h3>Linux 一键安装</h3>
+      <p>Ubuntu / Debian（APT 源）：</p>
       <pre><code>curl -fsSL https://sudoevolve.github.io/aino-player/install.sh | bash</code></pre>
-      <p class="note">添加项目签名 APT 源并安装播放器，之后可通过系统更新器升级。<a href="apt/">查看手动安装与签名信息</a></p>
+      <p>Fedora / openSUSE（RPM 源）：</p>
+      <pre><code>curl -fsSL https://sudoevolve.github.io/aino-player/install-rpm.sh | bash</code></pre>
+      <p class="note">添加项目签名软件源并安装播放器，之后可通过系统更新器升级。<a href="apt/">APT 手动安装</a> · <a href="rpm/">RPM 手动安装</a> · <a href="arch/">Arch 手动安装</a></p>
 
       <h2 id="screenshots">界面截图</h2>
       <figure class="screenshot"><a href="assets/player-light.png"><img src="assets/player-light.png" width="1180" height="760" alt="Aino Player 浅色主题，显示导航栏、歌曲列表和底部播放控制" loading="lazy"></a><figcaption>浅色主题</figcaption></figure>
@@ -137,7 +142,7 @@
       <details><summary>需要登录或安装浏览器扩展吗？</summary><p>无需浏览器扩展。网易云、QQ 的账号登录使用外部官网登录并自动回传，支持 Chrome / Edge / Chromium。第三方音源与自带接口分别管理；平台会员和地区限制仍然生效。</p></details>
       <details><summary>如何添加音源？为什么没有一直测速？</summary><p>在“音源”页导入兼容的 LX 脚本，或使用在线获取；重启会自动恢复。启动只静默测速一轮，之后可手动重新检测。智能切换默认开启，关闭后固定使用一个源。脚本接口、歌曲版权与音质都会影响可播性。<a href="https://github.com/sudoevolve/aino-player/blob/master/providers/README.md">支持范围</a></p></details>
       <details><summary>如何播放本地音乐？</summary><p>拖入歌曲或文件夹，也可按 Ctrl+O 多选打开；当前播放队列可以保存为本地歌单。在设置中可配置默认音乐播放器。收藏、歌单与本地文件都由你自己管理。</p></details>
-      <details><summary>Linux 有什么要求？</summary><p>提供 amd64 的 DEB 包，支持 Ubuntu 22.04+ / Debian 12+。界面使用 X11 / XWayland，建议安装 fonts-noto-cjk；托盘显示取决于桌面环境支持。<a href="apt/">APT 软件源说明</a></p></details>
+      <details><summary>Linux 有什么要求？</summary><p>支持 Ubuntu 22.04+ / Debian 12+（DEB）、Fedora 41+ / openSUSE（RPM）和 Arch 及衍生发行版（pacman 源），均为 x86_64 / amd64。界面使用 X11 / XWayland，建议安装 CJK 字体；托盘显示取决于桌面环境支持。<a href="apt/">APT 软件源</a> · <a href="rpm/">RPM 软件源</a> · <a href="arch/">Arch 软件源</a></p></details>
 
       <h2 id="donate">捐赠与支持</h2>
       <p>Aino Player 免费开源。如果它对你有帮助，欢迎支持项目的持续维护。</p>

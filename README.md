@@ -34,14 +34,20 @@
 | -------------------------------- | ------------------------------------------------ |
 | Windows x64                      | `setup-windows-x64.exe` 安装器；也提供便携 EXE |
 | Ubuntu 22.04+ / Debian 12+ amd64 | `.deb` 安装包                                  |
+| Fedora 41+ / openSUSE x86_64     | `.rpm` 安装包                                  |
+| Arch x86_64                      | `.pkg.tar.zst` 安装包或 [Arch 软件源](docs/ARCH.md) |
 
-Linux 一键安装（Ubuntu 22.04+ / Debian 12+，amd64）：
+Linux 一键安装（amd64 / x86_64）：
 
 ```bash
+# Ubuntu 22.04+ / Debian 12+
 curl -fsSL https://sudoevolve.github.io/aino-player/install.sh | bash
+
+# Fedora 41+ / openSUSE
+curl -fsSL https://sudoevolve.github.io/aino-player/install-rpm.sh | bash
 ```
 
-自动添加签名 [APT 软件源](docs/APT.md) 并安装；之后可用 `sudo apt install aino-player` 和系统更新器。也可下载 deb 直接安装。升级保留配置、收藏和歌单。
+自动添加签名软件源（[APT](docs/APT.md) / [RPM](docs/RPM.md)）并安装；之后可用 `sudo apt install aino-player`、`sudo dnf install aino-player` 和系统更新器。Arch 用户见 [Arch 软件源](docs/ARCH.md)。也可下载 deb / rpm 直接安装。升级保留配置、收藏和歌单。
 
 ## 使用提示
 

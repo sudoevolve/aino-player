@@ -1,0 +1,7 @@
+[aino-player]
+name=Aino Player
+baseurl=https://sudoevolve.github.io/aino-player/rpm
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://sudoevolve.github.io/aino-player/rpm/aino-player.asc

@@ -1,0 +1,190 @@
+name: Publish package repositories
+# Only indexes existing Release packages. No builds, player execution or regression tests.
+# APT/RPM/pacman 三棵仓库树共用同一把签名密钥，并在一个 Pages 部署中原子合流：
+# Pages 部署是整站替换，拆成多个工作流会互相清空对方的子树。
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+  schedule:
+    - cron: '23 3 * * 1'
+permissions:
+  contents: read
+concurrency:
+  group: apt-pages
+  cancel-in-progress: false
+jobs:
+  apt:
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Install repository tools
+        run: sudo apt-get update && sudo apt-get install -y apt-utils gnupg
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: master
+          persist-credentials: false
+      - name: Import dedicated signing key
+        env:
+          APT_SIGNING_PRIVATE_KEY: ${{ secrets.APT_SIGNING_PRIVATE_KEY }}
+        shell: python
+        run: |
+          import os, pathlib, subprocess
+          home = pathlib.Path(os.environ["RUNNER_TEMP"]) / "aino-signing-gnupg"
+          home.mkdir(mode=0o700)
+          os.environ["GNUPGHOME"] = str(home)
+          key = os.environ["APT_SIGNING_PRIVATE_KEY"]
+          if not key:
+              raise SystemExit("Missing dedicated APT_SIGNING_PRIVATE_KEY secret")
+          subprocess.run(["gpg", "--batch", "--import"], input=key.encode(), check=True)
+          fingerprint = pathlib.Path("packaging/signing-key-fingerprint.txt").read_text().strip()
+          listing = subprocess.check_output(["gpg", "--batch", "--with-colons", "--list-secret-keys", fingerprint], text=True)
+          if not any(line.startswith("fpr:") and line.split(":")[9] == fingerprint for line in listing.splitlines()):
+              raise SystemExit("Signing key does not match the committed public fingerprint")
+          with open(os.environ["GITHUB_ENV"], "a") as environment:
+              environment.write(f"GNUPGHOME={home}\nSIGNING_FINGERPRINT={fingerprint}\n")
+      - name: Build signed indexes and check APT candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LC_ALL: C.UTF-8
+        run: python3 tools/build_apt_repository.py --output build/site --fingerprint "$SIGNING_FINGERPRINT" --verify-apt
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pages-apt
+          path: build/site
+          if-no-files-found: error
+      - name: Remove temporary signing material
+        if: always()
+        shell: python
+        run: |
+          import os, pathlib, shutil, subprocess
+          home = pathlib.Path(os.environ["RUNNER_TEMP"]) / "aino-signing-gnupg"
+          if home.exists():
+              subprocess.run(["gpgconf", "--homedir", str(home), "--kill", "gpg-agent"], check=False)
+              shutil.rmtree(home)
+  rpm:
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container: fedora:latest
+    steps:
+      - name: Install repository tools
+        run: dnf install -y git createrepo_c rpm-sign gnupg2
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: master
+          persist-credentials: false
+      - name: Import dedicated signing key
+        env:
+          APT_SIGNING_PRIVATE_KEY: ${{ secrets.APT_SIGNING_PRIVATE_KEY }}
+        shell: python
+        run: |
+          import os, pathlib, subprocess
+          home = pathlib.Path(os.environ["RUNNER_TEMP"]) / "aino-signing-gnupg"
+          home.mkdir(mode=0o700)
+          os.environ["GNUPGHOME"] = str(home)
+          key = os.environ["APT_SIGNING_PRIVATE_KEY"]
+          if not key:
+              raise SystemExit("Missing dedicated APT_SIGNING_PRIVATE_KEY secret")
+          subprocess.run(["gpg", "--batch", "--import"], input=key.encode(), check=True)
+          fingerprint = pathlib.Path("packaging/signing-key-fingerprint.txt").read_text().strip()
+          listing = subprocess.check_output(["gpg", "--batch", "--with-colons", "--list-secret-keys", fingerprint], text=True)
+          if not any(line.startswith("fpr:") and line.split(":")[9] == fingerprint for line in listing.splitlines()):
+              raise SystemExit("Signing key does not match the committed public fingerprint")
+          with open(os.environ["GITHUB_ENV"], "a") as environment:
+              environment.write(f"GNUPGHOME={home}\nSIGNING_FINGERPRINT={fingerprint}\n")
+      - name: Build signed RPM repository and check DNF candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/build_rpm_repository.py --output build/site --fingerprint "$SIGNING_FINGERPRINT" --verify-dnf
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pages-rpm
+          path: build/site
+          if-no-files-found: error
+      - name: Remove temporary signing material
+        if: always()
+        shell: python
+        run: |
+          import os, pathlib, shutil, subprocess
+          home = pathlib.Path(os.environ["RUNNER_TEMP"]) / "aino-signing-gnupg"
+          if home.exists():
+              subprocess.run(["gpgconf", "--homedir", str(home), "--kill", "gpg-agent"], check=False)
+              shutil.rmtree(home)
+  arch:
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container: archlinux:base-devel
+    steps:
+      - name: Install repository tools
+        run: pacman -Syu --noconfirm --needed git gnupg python
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: master
+          persist-credentials: false
+      - name: Import dedicated signing key
+        env:
+          APT_SIGNING_PRIVATE_KEY: ${{ secrets.APT_SIGNING_PRIVATE_KEY }}
+        shell: python
+        run: |
+          import os, pathlib, subprocess
+          home = pathlib.Path(os.environ["RUNNER_TEMP"]) / "aino-signing-gnupg"
+          home.mkdir(mode=0o700)
+          os.environ["GNUPGHOME"] = str(home)
+          key = os.environ["APT_SIGNING_PRIVATE_KEY"]
+          if not key:
+              raise SystemExit("Missing dedicated APT_SIGNING_PRIVATE_KEY secret")
+          subprocess.run(["gpg", "--batch", "--import"], input=key.encode(), check=True)
+          fingerprint = pathlib.Path("packaging/signing-key-fingerprint.txt").read_text().strip()
+          listing = subprocess.check_output(["gpg", "--batch", "--with-colons", "--list-secret-keys", fingerprint], text=True)
+          if not any(line.startswith("fpr:") and line.split(":")[9] == fingerprint for line in listing.splitlines()):
+              raise SystemExit("Signing key does not match the committed public fingerprint")
+          with open(os.environ["GITHUB_ENV"], "a") as environment:
+              environment.write(f"GNUPGHOME={home}\nSIGNING_FINGERPRINT={fingerprint}\n")
+      - name: Build signed pacman repository and check candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/build_arch_repository.py --output build/site --fingerprint "$SIGNING_FINGERPRINT" --verify-pacman
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pages-arch
+          path: build/site
+          if-no-files-found: error
+      - name: Remove temporary signing material
+        if: always()
+        shell: python
+        run: |
+          import os, pathlib, shutil, subprocess
+          home = pathlib.Path(os.environ["RUNNER_TEMP"]) / "aino-signing-gnupg"
+          if home.exists():
+              subprocess.run(["gpgconf", "--homedir", str(home), "--kill", "gpg-agent"], check=False)
+              shutil.rmtree(home)
+  deploy:
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    needs: [apt, rpm, arch]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: build/site
+          merge-multiple: true
+          pattern: pages-*
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: build/site
+      - name: Deploy repository
+        id: deployment
+        uses: actions/deploy-pages@v4
