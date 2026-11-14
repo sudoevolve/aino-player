@@ -129,6 +129,15 @@ def sign(output, fingerprint):
                         "--detach-sign", "--output", str(pkg) + ".sig", str(pkg)], check=True)
     database = output / "aino-player.db.tar.gz"
     subprocess.run(["repo-add", "--key", fingerprint, str(database), *(str(p) for p in packages)], check=True)
+    # pacman 请求规范名 <repo>.db 与 <repo>.db.sig，且签名请求不做扩展名回退；
+    # 在仓库目录补放规范名副本，让 SigLevel = Required 也能取到数据库签名。
+    database_sig = output / "aino-player.db.tar.gz.sig"
+    if not database_sig.exists():
+        database_sig = output / "aino-player.db.sig"
+    if not database_sig.exists():
+        raise ValueError("repo-add did not sign the database")
+    shutil.copy2(database, output / "aino-player.db")
+    shutil.copy2(database_sig, output / "aino-player.db.sig")
     key = output.parent / KEY_NAME
     key.write_bytes(run("gpg", "--armor", "--export", fingerprint))
     return key
