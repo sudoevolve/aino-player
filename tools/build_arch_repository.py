@@ -128,7 +128,8 @@ def sign(output, fingerprint):
         subprocess.run(["gpg", "--batch", "--yes", "--pinentry-mode", "loopback", "--passphrase", "",
                         "--detach-sign", "--output", str(pkg) + ".sig", str(pkg)], check=True)
     database = output / "aino-player.db.tar.gz"
-    subprocess.run(["repo-add", "--key", fingerprint, str(database), *(str(p) for p in packages)], check=True)
+    # --key 只指定密钥，必须配合 -s 才会真正签名。
+    subprocess.run(["repo-add", "--sign", "--key", fingerprint, str(database), *(str(p) for p in packages)], check=True)
     # pacman 请求规范名 <repo>.db 与 <repo>.db.sig，且签名请求不做扩展名回退；
     # 在仓库目录补放规范名副本，让 SigLevel = Required 也能取到数据库签名。
     database_sig = output / "aino-player.db.tar.gz.sig"
