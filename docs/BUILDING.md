@@ -38,6 +38,14 @@ python tools/build_installer.py --exe build/Release/aino_player.exe --output bui
 
 精简 FFmpeg 只需首次构建，之后直接构建播放器。再次运行解码器脚本会复用相同源码版本、编译选项和工具链的配置，执行 GNU make 增量检查；产物不变时保留时间戳，不触发应用重新嵌入。已有构建目录如已开启测试，可用 `-DAINO_BUILD_TESTS=OFF` 关闭，或用 `cmake --build build --config Release --target aino_player --parallel 2` 只编译程序。
 
+主程序沿用 main、UI 和业务的少文件布局：`main.cpp` 定义 `AINO_PLAYER_INTERFACE`，只编译业务声明；业务实现由现有 `cover_decode.cpp` 在 `AINO_PLAYER_BUSINESS_UNIT` 构建宏下承载，后者同时保留 Linux 封面解码职责。业务实现只编译一份，UI 通过业务动作与 ViewModel 访问，不直接访问业务全局变量。测试目标保留原来的头文件实现方式。
+
+`AINO_PLAYER_PCH=ON` 默认缓存稳定的 aino 解析结果，可用 `-DAINO_PLAYER_PCH=OFF` 禁用；业务单元跳过该 PCH，避免 X11 宏污染业务类型。没有修改上游 aino、输入法或引入运行依赖。首次构建需要生成 PCH，收益主要针对后续 UI 修改，不能把单次编译日志当成跨机器性能保证。
+
+自有代码使用 `.editorconfig` 和 `.clang-format` 约定，只整理正在修改的范围。上游 `aino.hpp`、miniaudio、vendor、资源和构建产物排除在格式化之外；纯格式修改独立提交，不对整个仓库自动格式化。`python tools/check_file_associations.py` 静态核对扫描器公共格式清单、Windows 安装器和 Linux desktop 的文件关联声明，安装器构建与下次 Linux 发布都会执行它。
+
+日常 Linux 编译可手动运行 `desktop-build.yml`，仅在 Ubuntu 22.04 / 24.04 编译 `aino_player`，明确关闭测试，不执行发布和桌面交互。回归仍只在用户明确要求发布时运行。
+
 
 ## 发布流程
 
