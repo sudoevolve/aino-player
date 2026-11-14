@@ -458,6 +458,7 @@ void lx_import_source();
 void lx_fetch_online_sources();
 void lx_reload_sources();
 void lx_check_sources(bool force = false);
+const std::string& source_check_status();
 void lx_remove_source(const std::string& path);
 void lx_restore_source(const std::string& path);
 void request_frame();
@@ -2168,21 +2169,95 @@ void disc_open(int idx) {
 
 // ---- 落雪音源（界面用） ----
 static std::atomic<LxTask> g_lx_task{LxTask::None};
+static std::atomic<bool> g_lx_check_running{false};
+static std::atomic<unsigned> g_lx_check_generation{0};
+static uint32_t g_lx_check_force = 0; // UI 线程，按平台消费手动检测请求。
+static std::string g_lx_check_note;
+const std::string& source_check_status() { return g_lx_check_note; }
 void lx_check_sources(bool force) {
-    run_task([force] {
-        std::vector<lx::Engine::Check> cases;
-        for (const auto source : {music::Source::Netease, music::Source::QQ}) {
-            music::Variant v; v.source = source;
-            if (source == music::Source::Netease) {
-                v.id = "347230"; v.title = "海阔天空"; v.artist = "Beyond"; v.duration_ms = 326000;
+    post_ui([force] {
+        if (force) {
+            for (const auto source : music::kPlatforms) if (music::lx_platform_key(source)) g_lx_check_force |= 1u << int(source);
+            ++g_lx_check_generation;
+        }
+        g_lx_check_note = "将自动静默测速，优先当前平台与音质；播放打断后自动继续";
+    });
+}
+// 自动检查只提交一个平台任务，不把所有平台检测堆到业务线程池中。
+static void maintain_source_checks() {
+    static int last_platform = -1, last_quality = -1;
+    static unsigned ticket = 0;
+    static unsigned observed_generation = ~0u;
+    static unsigned long long poll_at = 0;
+    static std::array<unsigned long long, music::kSourceCount> retry_at{};
+    const auto priority = source_order_platform();
+    const int wanted = g_ui.settings.quality;
+    if (last_platform != int(priority) || last_quality != wanted) {
+        last_platform = int(priority); last_quality = wanted; ++g_lx_check_generation;
+    }
+    auto& engine = lx::Engine::instance();
+    if (g_shutdown.load() || !g_ui.settings.lane_enable[0] || g_lx_check_running.load() || engine.preflighting() || engine.loading() || g_lx_task.load() != LxTask::None) return;
+    const auto current_generation = g_lx_check_generation.load();
+    if (observed_generation == current_generation && platform::ticks() < poll_at) return;
+    observed_generation = current_generation;
+    poll_at = platform::ticks() + 1000;
+    std::vector<music::Source> platforms{priority};
+    for (const auto source : music::kPlatforms) if (source != priority && music::lx_platform_key(source)) platforms.push_back(source);
+    for (const auto source : platforms) {
+        const auto* key = music::lx_platform_key(source);
+        if (!key || !engine.supports(key)) continue;
+        const bool force = (g_lx_check_force & (1u << int(source))) != 0;
+        if (!force && (platform::ticks() < retry_at[size_t(source)] || !engine.needs_check(key, wanted))) continue;
+        g_lx_check_force &= ~(1u << int(source));
+        retry_at[size_t(source)] = platform::ticks() + 5000;
+        const auto generation = g_lx_check_generation.load();
+        const auto settings = g_ui.settings;
+        const auto task_ticket = ++ticket;
+        g_lx_check_running.store(true);
+        g_lx_check_note = std::string("正在自动静默测速：") + music::source_name(source) + " · " + music::quality_name(wanted) + "（最多两个并行，不播放声音）";
+        run_task([source, wanted, generation, settings, force] {
+            struct Done { ~Done() { g_lx_check_running.store(false); request_frame(); } } done;
+            const auto cancelled = [generation] { return g_shutdown.load() || generation != g_lx_check_generation.load(); };
+            net::CancelScope cancellation(cancelled);
+            static std::map<music::Source, music::Variant> samples; // 唯一自动检测任务所有。
+            music::Variant sample;
+            const auto cached = samples.find(source);
+            if (cached != samples.end()) sample = cached->second;
+            else if (source == music::Source::Netease) {
+                sample.source = source; sample.id = "347230"; sample.title = "海阔天空"; sample.artist = "Beyond"; sample.duration_ms = 326000;
+            } else if (source == music::Source::QQ) {
+                sample.source = source; sample.id = "0039MnYb0qxYhV"; sample.title = "晴天"; sample.artist = "周杰伦"; sample.duration_ms = 269000;
             } else {
-                v.id = "0039MnYb0qxYhV"; v.title = "晴天"; v.artist = "周杰伦"; v.duration_ms = 269000;
+                // 从平台目录取得真实 ID、酷狗各音质 hash、咪咕 copyrightId，禁止编造通用样本 ID。
+                std::string error;
+                const auto songs = music::search_platform(source, "海阔天空 Beyond", 3, 6000, error, settings);
+                if (cancelled()) return;
+                const auto found = std::find_if(songs.begin(), songs.end(), [source](const auto& song) {
+                    return !song.id.empty() && (source != music::Source::Kugou || !song.native_id.empty()) &&
+                        (source != music::Source::Migu || !song.native_id.empty());
+                });
+                if (found == songs.end()) {
+                    post_ui([source, error] {
+                        retry_at[size_t(source)] = platform::ticks() + 60000;
+                        g_lx_check_note = std::string(music::source_name(source)) + " 测速样本获取失败，一分钟后自动重试";
+                        toast(g_lx_check_note + (error.empty() ? "" : "：" + error), 6000);
+                    });
+                    return;
+                }
+                sample = *found; samples[source] = sample;
             }
             const auto* key = music::lx_platform_key(source);
-            cases.push_back({key, music::lx_music_info(v, key)});
-        }
-        lx::Engine::instance().check_sources(cases, force, [] { return g_shutdown.load(); }, [] { if (g_win) g_win->wake(); });
-    });
+            lx::Engine::instance().check_sources({{key, music::lx_music_info(sample, key)}}, force, cancelled,
+                [] { request_frame(); }, wanted);
+            if (!cancelled()) post_ui([source] { g_lx_check_note = std::string(music::source_name(source)) + " 本轮测速完成；未完成项和过期结果会自动复测"; });
+        }, [source, task_ticket] {
+            if (task_ticket != ticket) return;
+            g_lx_check_running.store(false);
+            retry_at[size_t(source)] = platform::ticks() + 60000;
+            g_lx_check_note = "测速任务失败，一分钟后自动重试；完整原因见通知";
+        });
+        return;
+    }
 }
 static void lx_source_task(LxTask kind, std::function<void()> action) {
     if (g_shutdown.load()) return;
@@ -2225,9 +2300,6 @@ const std::vector<LxSourceView>& lx_source_status() {
     const auto errors = lx::Engine::instance().runtime_errors();
     const auto checks = lx::Engine::instance().health();
     const auto timings = lx::Engine::instance().timings();
-    for (const auto& file : timings) for (const auto& site : file.second) for (const auto& quality : site.second)
-        if (quality.second.failures && now < quality.second.failed_at + 60000)
-            cached_until = std::min(cached_until, quality.second.failed_at + 60000);
     for (const auto& e : lx::Engine::instance().entries()) {
         LxSourceView v;
         v.name = e.first; v.file = e.second; v.ok = true;
@@ -2245,14 +2317,17 @@ const std::vector<LxSourceView>& lx_source_status() {
             }
         }
         const auto health = checks.find(key);
-        for (const auto& platform : {std::string("tx"), std::string("wy")}) {
+        for (const auto source : music::kPlatforms) {
+            const auto* platform = music::lx_platform_key(source);
+            if (!platform) continue;
             const lx::Engine::Health* h = nullptr;
             if (health != checks.end()) {
                 const auto found = health->second.find(platform);
                 if (found != health->second.end()) h = &found->second;
             }
             if (!v.health.empty()) v.health += " · ";
-            v.health += platform == "tx" ? "QQ " : "网易云 ";
+            const auto label = std::string(music::source_name(source));
+            v.health += label + " ";
             v.health += !h || h->state == 0 ? "待检测" : h->state == 1 ? "检测中" : h->state == 2 ? "样本通过" : h->state == 4 ? "不支持" : h->state == 5 ? "检测未完成" : "样本失败";
             if (h && h->state == 2) {
                 if (h->load_ms > 0) {
@@ -2261,7 +2336,7 @@ const std::vector<LxSourceView>& lx_source_status() {
             }
             if (h && !h->reason.empty()) {
                 if (!v.error.empty()) v.error += "\n";
-                v.error += (platform == "tx" ? "QQ 样本：" : "网易云样本：") + h->reason;
+                v.error += label + " 样本：" + h->reason;
                 if (h->state == 2) v.error += "；音质 " + h->quality + "；取址 " + std::to_string(h->resolve_ms) + "ms；取址与样本加载共 " + std::to_string(h->load_ms) + "ms";
             }
         }
@@ -2283,8 +2358,14 @@ const std::vector<LxSourceView>& lx_source_status() {
         v.latency_ms = rank == order.end() ? 300001 : rank->latency_ms;
         if (rank != order.end()) {
             v.selection_position = int(rank - order.begin());
+            const auto* platform_key = music::lx_platform_key(platform);
+            bool checking = false;
+            if (health != checks.end() && platform_key) {
+                const auto check = health->second.find(platform_key);
+                checking = check != health->second.end() && check->second.state == 1;
+            }
             v.health = std::string(music::source_name(platform)) + " · " + rank->quality + " · " +
-                (rank->availability == 0 ? "可用" : rank->availability == 2 ? "失败兜底" : "待验证") +
+                (rank->availability == 0 ? "样本可用" : rank->availability == 2 ? "失败兜底" : checking ? "静默测速中" : "自动待测") +
                 (rank->latency_ms < 300001 ? " · " + std::to_string(rank->latency_ms) + "ms" + (rank->estimated ? "（估算）" : "") : " · 未测速");
         }
         out.push_back(std::move(v));
@@ -4241,7 +4322,7 @@ void start(HostCallbacks host) {
     }
     // 播放/缓冲/检索期间的刷新泵：只在需要时 wake()，其余时间主循环睡着
     background::service([] {
-        unsigned long long toast_seen = 0, timer_seen = 0, memory_seen = platform::ticks();
+        unsigned long long toast_seen = 0, timer_seen = 0, memory_seen = platform::ticks(), checks_seen = 0;
         while (!g_shutdown.load()) {
             bool busy = false;
             {
@@ -4251,6 +4332,7 @@ void start(HostCallbacks host) {
                        g_as.ps == PlayState::Resolving;
             }
             const unsigned long long now = platform::ticks();
+            if (now >= checks_seen + 5000) { if (g_win && !lx::Engine::instance().empty()) g_win->wake(); checks_seen = now; }
             // 暂停且无输入时也维护缓存；先补一帧更新可见封面的访问时间，再回收离屏资源。
             if (now >= memory_seen + 30000) { if (g_win) g_win->wake(); memory_seen = now; }
             if (g_sleep_deadline.load()) {
@@ -4322,6 +4404,7 @@ void tick() {
         background::reap();
         for (const auto& error : background::take_errors()) toast("后台任务失败：" + error, 8000);
         drain_ui_mail();
+        maintain_source_checks();
         refresh_watched_folders();
         if (platform::ticks() >= g_toast_until.load()) {
             g_ui.toast.clear();

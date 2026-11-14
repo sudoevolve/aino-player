@@ -284,10 +284,12 @@ int main(int argc, char** argv) {
             timing.failures = 1; timing.failed_at = 900;
             check(lx::Engine::selection_score("320k", nullptr, &timing, nullptr, 1000).availability == 2,
                 "one recent playback failure ranks behind healthy sources regardless of old speed");
+            check(lx::Engine::selection_score("320k", nullptr, &timing, nullptr, 120000).availability == 2,
+                "failed quality does not regain priority when a cooldown expires");
             health.state = 2; health.load_ms = 135;
             score = lx::Engine::selection_score("flac", &health, nullptr, nullptr, 1000);
-            check(score.availability == 0 && score.latency_ms == 135 && score.estimated,
-                "unmeasured quality uses an explicit platform latency estimate instead of filename order");
+            check(score.availability == 1 && score.latency_ms == 135 && score.estimated,
+                "lower quality success estimates latency without verifying an unmeasured quality");
         }
         library::Library lib;
         {

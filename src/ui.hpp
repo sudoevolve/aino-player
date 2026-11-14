@@ -1533,13 +1533,16 @@ static void source_tab_scripts(Ctx& c, const Rect& area) {
             : source_fetch_summary());
     c.ui.muted_text(ellipsize(c.ui, note, head.w - 240, 10.5f),
                     {head.x + 20, head.y + 46, head.w - 240, 18}, Style().font(10.5f));
+    c.ui.tooltip({head.x + 20, head.y + 46, head.w - 240, 18}, source_check_status().empty() ? note : source_check_status());
 
     auto check_style = Style().ghost().font(10.5f); check_style.disabled = lx_sources_loading();
     if (c.ui.button("重新检测", {head.right() - 160, head.y + 74, 76, 26}, check_style)) lx_check_sources(true);
     const bool on = lane_toggle(c, music::Lane::JsSource, {head.right() - 62, head.y + 76, 40, 22});
-    c.ui.draw_text(on ? "取流时优先问音源" : "已停用：取流只走自带接口",
+    const auto check_note = on && !source_check_status().empty() ? source_check_status() : on ? std::string("自动静默测速，优先已验证且加载快的音源") : std::string("已停用：取流只走自带接口");
+    c.ui.draw_text(ellipsize(c.ui, check_note, head.w - 200, 11),
                    {head.x + 20, head.y + 78, head.w - 200, 18},
                    on ? c.th.label2 : c.th.destructive, Style().font(11.0f));
+    c.ui.tooltip({head.x + 20, head.y + 78, head.w - 200, 18}, check_note);
 
     const float footer_h = bad.empty() ? 0.0f : 32.0f;
     const Rect body{area.x, head.bottom() + 12, area.w, area.bottom() - head.bottom() - 12 - footer_h};
