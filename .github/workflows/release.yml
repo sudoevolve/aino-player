@@ -131,7 +131,7 @@ jobs:
         with:
           ref: refs/tags/${{ inputs.tag || github.ref_name }}
       - name: Install build dependencies
-        run: dnf install -y git cmake gcc gcc-c++ make python3 pkgconf-pkg-config libX11-devel dbus-devel libcurl-devel rpm-build xorg-x11-server-Xvfb xdg-utils google-noto-sans-cjk-ttc-fonts adwaita-icon-theme gdk-pixbuf2 librsvg2 dbus-libs alsa-lib libpulse curl ca-certificates fontconfig freetype
+        run: dnf install -y git cmake gcc gcc-c++ make python3 pkgconf-pkg-config libX11-devel dbus-devel libcurl-devel rpm-build xorg-x11-server-Xvfb xdg-utils google-noto-sans-cjk-ttc-fonts adwaita-icon-theme gdk-pixbuf2 librsvg2 dbus-libs alsa-lib curl ca-certificates fontconfig freetype
       - run: python3 tools/check_file_associations.py
       - run: python3 tools/build_ffmpeg.py --jobs 2
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DAINO_BUILD_TESTS=ON
@@ -168,9 +168,11 @@ jobs:
         shell: bash
         run: |
           sed -i "s/^pkgver=.*/pkgver=${RELEASE_TAG#v}/" packaging/arch/PKGBUILD
-          mkdir -p /tmp/pkgbuild
-          cp -r . /tmp/pkgbuild/aino-player
-          cd /tmp/pkgbuild/aino-player
+          # PKGBUILD 的 $srcdir 是 startdir/src，把检出放到 makepkg 期望的位置。
+          mkdir -p /tmp/pkgbuild/src
+          cp -r . /tmp/pkgbuild/src/aino-player
+          cp packaging/arch/PKGBUILD /tmp/pkgbuild/
+          cd /tmp/pkgbuild/src/aino-player
           python3 tools/build_ffmpeg.py --jobs 2
           useradd -m builder
           chown -R builder: /tmp/pkgbuild

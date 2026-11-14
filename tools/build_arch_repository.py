@@ -111,9 +111,10 @@ def verify_pacman(tree, key, fingerprint):
         print(info, flush=True)
         if not re.search(r"Version\s*:\s*[0-9]", info):
             raise ValueError("pacman did not find an installable candidate")
-        targets = run("pacman", "--config", str(conf), "-Sp", "aino-player").decode().strip()
-        if not targets.startswith(tree.as_uri()):
-            raise ValueError("pacman candidate does not resolve inside this repository: " + targets)
+        # -Sw 真正下载包并按 SigLevel 校验数据库与包签名，比 -Sp 更接近真实安装路径。
+        subprocess.run(["pacman", "--config", str(conf), "--noconfirm", "-Sw", "aino-player"], check=True)
+        if not list((state / "cache").glob("aino-player-*.pkg.tar.zst")):
+            raise ValueError("pacman did not download the package into the isolated cache")
 
 
 def sign(output, fingerprint):
@@ -121,6 +122,11 @@ def sign(output, fingerprint):
     if not keydir.is_dir():
         raise ValueError("Set GNUPGHOME to a private keyring home with the signing key")
     packages = sorted(output.glob("*.pkg.tar.zst"))
+    # 用户的 SigLevel = Required 要求每个包都有签名：先给包生成 .sig，
+    # repo-add 才能把 %PGPSIG% 写进数据库；数据库随后由 --key 签名。
+    for pkg in packages:
+        subprocess.run(["gpg", "--batch", "--yes", "--pinentry-mode", "loopback", "--passphrase", "",
+                        "--detach-sign", "--output", str(pkg) + ".sig", str(pkg)], check=True)
     database = output / "aino-player.db.tar.gz"
     subprocess.run(["repo-add", "--key", fingerprint, str(database), *(str(p) for p in packages)], check=True)
     key = output.parent / KEY_NAME
