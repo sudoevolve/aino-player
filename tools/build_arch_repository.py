@@ -128,17 +128,10 @@ def sign(output, fingerprint):
         subprocess.run(["gpg", "--batch", "--yes", "--pinentry-mode", "loopback", "--passphrase", "",
                         "--detach-sign", "--output", str(pkg) + ".sig", str(pkg)], check=True)
     database = output / "aino-player.db.tar.gz"
-    # --key 只指定密钥，必须配合 -s 才会真正签名。
+    # -s 才会真正签名；repo-add 会自动创建 <repo>.db / <repo>.db.sig 等规范名符号链接。
     subprocess.run(["repo-add", "--sign", "--key", fingerprint, str(database), *(str(p) for p in packages)], check=True)
-    # repo-add 已自动创建 <repo>.db 符号链接，但 <repo>.db.sig 没有：
-    # pacman 的签名请求不做扩展名回退，补放规范名副本让 SigLevel = Required 能取到签名。
-    database_sig = output / "aino-player.db.tar.gz.sig"
-    if not database_sig.exists():
+    if not (output / "aino-player.db.sig").exists():
         raise ValueError("repo-add did not sign the database")
-    shutil.copy2(database_sig, output / "aino-player.db.sig")
-    files_sig = output / "aino-player.files.tar.gz.sig"
-    if files_sig.exists():
-        shutil.copy2(files_sig, output / "aino-player.files.sig")
     key = output.parent / KEY_NAME
     key.write_bytes(run("gpg", "--armor", "--export", fingerprint))
     return key
