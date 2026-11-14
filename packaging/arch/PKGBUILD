@@ -9,6 +9,8 @@ pkgdesc='aino player - a lightweight desktop music player'
 arch=('x86_64')
 url='https://github.com/sudoevolve/aino-player'
 license=('Apache-2.0')
+# CMake Release 二进制不带调试符号，禁用 makepkg 的调试拆分包。
+options=('!debug')
 depends=(fontconfig freetype2 gdk-pixbuf2 librsvg adwaita-icon-theme dbus alsa-lib libpulse
          curl ca-certificates xdg-utils)
 makedepends=(cmake gcc make python)
