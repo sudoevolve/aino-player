@@ -184,6 +184,7 @@ struct Settings {
     // 两条渠道可以单独关掉：关了音源就只剩自带，反之亦然。
     int lane_pref = 0;
     bool lane_enable[kLaneCount] = {true, true};
+    bool source_smart_switch = true; // 开启按平台路由；关闭固定使用同一个第三方脚本。
     // 下载时把封面 / 歌词写进文件（mp3 走 ID3v2.3，m4a 走 ilst）
     bool embed_cover = false;
     bool embed_lyrics = false;
@@ -1421,7 +1422,7 @@ inline std::string lx_music_info(const Variant& v, const char* key) {
 //  免登录，档位由脚本自己决定（多源聚合脚本通常 320k / 无损都能给）。
 // ============================================================================
 inline bool resolve_via_source(const Variant& v, int quality, ResolveResult& out, std::string* why,
-                               const ResolveAccept& accept = {}) {
+                               const ResolveAccept& accept = {}, bool smart_switch = true) {
     const char* key = lx_platform_key(v.source);
     if (!key) {
         if (why) *why = std::string(source_name(v.source)) + " 不在音源支持的平台内";
@@ -1450,7 +1451,7 @@ inline bool resolve_via_source(const Variant& v, int quality, ResolveResult& out
             timing->verified = bool(accept);
             out = std::move(rr);
             return true;
-        }, timing.get())) {
+        }, timing.get(), smart_switch)) {
         if (why) *why = err.empty() ? "音源没有返回链接" : err;
         return false;
     }
@@ -1531,7 +1532,9 @@ inline ResolveResult resolve(const Variant& v, const Settings& st, const Resolve
         return (parent && parent()) || (cancelled && cancelled());
     });
     std::string why[2];
+    const bool fixed_only = !st.source_smart_switch && st.lane_on(Lane::JsSource) && lx_platform_key(v.source);
     for (Lane lane : st.lane_order()) {
+        if (fixed_only && lane != Lane::JsSource) continue;
         if (net::cancelled()) { ResolveResult fail; fail.reason = "取流已取消"; return fail; }
         if (!st.lane_on(lane)) {
             why[int(lane)] = "已关闭";
@@ -1539,7 +1542,7 @@ inline ResolveResult resolve(const Variant& v, const Settings& st, const Resolve
         }
         ResolveResult rr;
         std::string reason;
-        const bool ok = lane == Lane::JsSource ? resolve_via_source(v, st.quality, rr, &reason, accept)
+        const bool ok = lane == Lane::JsSource ? resolve_via_source(v, st.quality, rr, &reason, accept, st.source_smart_switch)
                                                : resolve_via_builtin(v, st, rr, &reason, accept);
         if (ok) return rr;
         why[int(lane)] = reason;

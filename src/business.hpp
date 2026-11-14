@@ -459,6 +459,8 @@ void lx_fetch_online_sources();
 void lx_reload_sources();
 void lx_check_sources(bool force = false);
 const std::string& source_check_status();
+void set_source_smart_switch(bool enabled);
+std::string source_routing_status();
 void lx_remove_source(const std::string& path);
 void lx_restore_source(const std::string& path);
 void request_frame();
@@ -534,6 +536,8 @@ void load(UiState& state) {
         if (!v.empty()) state.settings.quality = std::atoi(v.c_str());
         v = read_line_value(line, "lane_pref");
         if (!v.empty()) state.settings.lane_pref = std::atoi(v.c_str()) == 1 ? 1 : 0;
+        v = read_line_value(line, "source_smart_switch");
+        if (!v.empty()) state.settings.source_smart_switch = v != "0";
         v = read_line_value(line, "lane_enable");
         if (!v.empty()) {
             const uint32_t m = uint32_t(std::strtoul(v.c_str(), nullptr, 10));
@@ -582,6 +586,7 @@ bool save(UiState& state) {
     std::fprintf(f, "dark=%d\n", state.dark ? 1 : 0);
     std::fprintf(f, "quality=%d\n", state.settings.quality);
     std::fprintf(f, "lane_pref=%d\n", state.settings.lane_pref);
+    std::fprintf(f, "source_smart_switch=%d\n", state.settings.source_smart_switch);
     std::fprintf(f, "lane_enable=%u\n", unsigned(state.settings.lane_enable[0] ? 1 : 0) |
                                         unsigned(state.settings.lane_enable[1] ? 2 : 0));
     std::fprintf(f, "embed_cover=%d\n", state.settings.embed_cover ? 1 : 0);
@@ -971,6 +976,7 @@ static unsigned g_preload_serial = 0;
 static std::string preload_key(const music::Track& track, const music::Settings& st) {
     std::string key = library::encode_track(track) + ":" + std::to_string(st.quality);
     key += ":" + std::to_string(st.lane_pref) + ":" + std::to_string(lx::Engine::instance().revision());
+    key += st.source_smart_switch ? ":smart" : ":fixed";
     for (bool enabled : st.lane_enable) key += enabled ? '1' : '0';
     for (bool enabled : st.enable) key += enabled ? '1' : '0';
     for (const auto* value : {&st.netease_cookie, &st.qq_cookie}) key += library::quote(*value);
@@ -990,7 +996,7 @@ static std::shared_ptr<PreparedMedia> prepare_next(const std::shared_ptr<Preload
     std::vector<int> order;
     if (track.variants.empty() || st.cancelled()) return {};
     order.push_back(std::clamp(track.chosen, 0, int(track.variants.size()) - 1));
-    for (int i = 0; i < int(track.variants.size()); ++i) if (i != order[0]) order.push_back(i);
+    if (st.source_smart_switch) for (int i = 0; i < int(track.variants.size()); ++i) if (i != order[0]) order.push_back(i);
     for (int index : order) {
         if (st.cancelled()) return {};
         auto media = std::make_shared<PreparedMedia>();
@@ -1166,7 +1172,7 @@ static void do_play(HostCallbacks* win, music::Track track, music::Settings st, 
         const int first = std::min<int>(track.chosen, int(track.variants.size()) - 1);
         order.push_back(first);
         for (int i = 0; i < int(track.variants.size()); ++i)
-            if (i != first) order.push_back(i);
+            if (st.source_smart_switch && i != first) order.push_back(i);
     }
 
     std::string reasons;
@@ -1315,7 +1321,7 @@ static void do_play(HostCallbacks* win, music::Track track, music::Settings st, 
     //     歌单里的曲目只有本源那一条 id，本源不可用时只在列表内换源是死路，
     //     必须真的去搜 —— 这就是"自动换源"。
     const bool selected_part = track.current().source == music::Source::Bilibili && !track.current().native_id.empty();
-    if (!track.title.empty() && !selected_part) {
+    if (st.source_smart_switch && !track.title.empty() && !selected_part) {
         for (int si = 0; si < music::kSourceCount; ++si) {
             if (g_shutdown.load()) return;
             if (!st.enable[si]) continue;
@@ -1652,7 +1658,9 @@ void start_download(music::Track track, music::Settings st) {
             return result.ok;
         };
 
-        for (const auto& v : track.variants) {
+        for (size_t i = 0; i < track.variants.size(); ++i) {
+            if (!st.source_smart_switch && i != size_t(std::clamp(track.chosen, 0, int(track.variants.size()) - 1))) continue;
+            const auto& v = track.variants[i];
             if (st.cancelled()) return;
             if (try_one(v, false)) {
                 saved = true;
@@ -1660,7 +1668,7 @@ void start_download(music::Track track, music::Settings st) {
             }
         }
         // 没有网易云变体时，按标题和歌手寻找时长匹配的同曲候选。
-        if (!saved) {
+        if (!saved && st.source_smart_switch) {
             const bool has_netease =
                 std::any_of(track.variants.begin(), track.variants.end(), [](const music::Variant& v) {
                     return v.source == music::Source::Netease;
@@ -2171,94 +2179,97 @@ void disc_open(int idx) {
 static std::atomic<LxTask> g_lx_task{LxTask::None};
 static std::atomic<bool> g_lx_check_running{false};
 static std::atomic<unsigned> g_lx_check_generation{0};
-static uint32_t g_lx_check_force = 0; // UI 线程，按平台消费手动检测请求。
+// 只消费启动恢复、导入/重载和手动检测请求；完成或失败后都不自动重试。
+static bool g_lx_check_requested = false, g_lx_check_reselect = false;
 static std::string g_lx_check_note;
 const std::string& source_check_status() { return g_lx_check_note; }
 void lx_check_sources(bool force) {
     post_ui([force] {
-        if (force) {
-            for (const auto source : music::kPlatforms) if (music::lx_platform_key(source)) g_lx_check_force |= 1u << int(source);
-            ++g_lx_check_generation;
-        }
-        g_lx_check_note = "将自动静默测速，优先当前平台与音质；播放打断后自动继续";
+        g_lx_check_requested = true;
+        g_lx_check_reselect = g_lx_check_reselect || force;
+        ++g_lx_check_generation;
+        g_lx_check_note = "等待本轮静默测速；完成后停止，不会定期重测";
     });
 }
-// 自动检查只提交一个平台任务，不把所有平台检测堆到业务线程池中。
+void set_source_smart_switch(bool enabled) {
+    if (g_ui.settings.source_smart_switch == enabled) return;
+    g_ui.settings.source_smart_switch = enabled;
+    g_ui.config_dirty = true;
+    if (!enabled) lx::Engine::instance().choose_fixed_source(g_ui.settings.quality, true);
+    cancel_preload();
+    request_frame();
+}
+std::string source_routing_status() {
+    if (g_ui.settings.source_smart_switch) return "按歌曲平台选择已验证且加载快的源，失败时尝试后续候选";
+    const auto fixed = lx::Engine::instance().fixed_source();
+    if (fixed.file.empty()) return "固定源将在本轮测速完成或首次播放时选择";
+    return "固定使用：" + fixed.name + " · " + std::to_string(fixed.verified_platforms) +
+        " 个平台样本可用；播放失败不换源";
+}
 static void maintain_source_checks() {
-    static int last_platform = -1, last_quality = -1;
-    static unsigned ticket = 0;
-    static unsigned observed_generation = ~0u;
-    static unsigned long long poll_at = 0;
-    static std::array<unsigned long long, music::kSourceCount> retry_at{};
-    const auto priority = source_order_platform();
-    const int wanted = g_ui.settings.quality;
-    if (last_platform != int(priority) || last_quality != wanted) {
-        last_platform = int(priority); last_quality = wanted; ++g_lx_check_generation;
-    }
     auto& engine = lx::Engine::instance();
-    if (g_shutdown.load() || !g_ui.settings.lane_enable[0] || g_lx_check_running.load() || engine.preflighting() || engine.loading() || g_lx_task.load() != LxTask::None) return;
-    const auto current_generation = g_lx_check_generation.load();
-    if (observed_generation == current_generation && platform::ticks() < poll_at) return;
-    observed_generation = current_generation;
-    poll_at = platform::ticks() + 1000;
-    std::vector<music::Source> platforms{priority};
-    for (const auto source : music::kPlatforms) if (source != priority && music::lx_platform_key(source)) platforms.push_back(source);
-    // 先补齐各平台未知结果，再复测旧失败，避免慢源反复重试占住其它平台的首次测速。
-    for (const bool unmeasured_only : {true, false}) for (const auto source : platforms) {
-        const auto* key = music::lx_platform_key(source);
-        if (!key || !engine.supports(key)) continue;
-        const bool force = (g_lx_check_force & (1u << int(source))) != 0;
-        if (!force && (platform::ticks() < retry_at[size_t(source)] || !engine.needs_check(key, wanted, unmeasured_only))) continue;
-        g_lx_check_force &= ~(1u << int(source));
-        retry_at[size_t(source)] = platform::ticks() + 5000;
-        const auto generation = g_lx_check_generation.load();
-        const auto settings = g_ui.settings;
-        const auto task_ticket = ++ticket;
-        g_lx_check_running.store(true);
-        g_lx_check_note = std::string("正在自动静默测速：") + music::source_name(source) + " · " + music::quality_name(wanted) + "（最多两个并行，不播放声音）";
-        run_task([source, wanted, generation, settings, force] {
-            struct Done { ~Done() { g_lx_check_running.store(false); request_frame(); } } done;
-            const auto cancelled = [generation] { return g_shutdown.load() || generation != g_lx_check_generation.load(); };
-            net::CancelScope cancellation(cancelled);
-            static std::map<music::Source, music::Variant> samples; // 唯一自动检测任务所有。
+    if (!g_lx_check_requested || g_shutdown.load() || !g_ui.settings.lane_enable[0] ||
+        g_lx_check_running.load() || engine.loading() || g_lx_task.load() != LxTask::None) return;
+    g_lx_check_requested = false;
+    const bool reselect = g_lx_check_reselect;
+    g_lx_check_reselect = false;
+    const auto generation = g_lx_check_generation.load();
+    const auto settings = g_ui.settings;
+    const auto priority = source_order_platform();
+    g_lx_check_running.store(true);
+    g_lx_check_note = "正在进行一次静默测速（最多两个并行，不播放声音）";
+    run_task([generation, settings, priority, reselect] {
+        struct Done { ~Done() { g_lx_check_running.store(false); request_frame(); } } done;
+        const auto cancelled = [generation] { return g_shutdown.load() || generation != g_lx_check_generation.load(); };
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(45);
+        net::CancelScope cancellation([&] { return cancelled() || std::chrono::steady_clock::now() >= deadline; });
+        std::vector<music::Source> platforms{priority};
+        for (const auto source : music::kPlatforms)
+            if (source != priority && music::lx_platform_key(source)) platforms.push_back(source);
+        int completed = 0, missing = 0;
+        auto& engine = lx::Engine::instance();
+        for (const auto source : platforms) {
+            if (net::cancelled()) break;
+            const auto* key = music::lx_platform_key(source);
+            if (!key || !engine.supports(key)) continue;
+            post_ui([generation, source] {
+                if (generation == g_lx_check_generation.load()) g_lx_check_note =
+                    std::string("本轮静默测速：") + music::source_name(source) + "（完成后停止）";
+            });
             music::Variant sample;
-            const auto cached = samples.find(source);
-            if (cached != samples.end()) sample = cached->second;
-            else if (source == music::Source::Netease) {
+            if (source == music::Source::Netease) {
                 sample.source = source; sample.id = "347230"; sample.title = "海阔天空"; sample.artist = "Beyond"; sample.duration_ms = 326000;
             } else if (source == music::Source::QQ) {
                 sample.source = source; sample.id = "0039MnYb0qxYhV"; sample.title = "晴天"; sample.artist = "周杰伦"; sample.duration_ms = 269000;
             } else {
-                // 从平台目录取得真实 ID、酷狗各音质 hash、咪咕 copyrightId，禁止编造通用样本 ID。
                 std::string error;
-                const auto songs = music::search_platform(source, "海阔天空 Beyond", 3, 6000, error, settings);
-                if (cancelled()) return;
+                const auto songs = music::search_platform(source, "海阔天空 Beyond", 3, 3000, error, settings);
+                if (net::cancelled()) break;
                 const auto found = std::find_if(songs.begin(), songs.end(), [source](const auto& song) {
-                    return !song.id.empty() && (source != music::Source::Kugou || !song.native_id.empty()) &&
-                        (source != music::Source::Migu || !song.native_id.empty());
+                    return !song.id.empty() && ((source != music::Source::Kugou && source != music::Source::Migu) || !song.native_id.empty());
                 });
-                if (found == songs.end()) {
-                    post_ui([source, error] {
-                        retry_at[size_t(source)] = platform::ticks() + 60000;
-                        g_lx_check_note = std::string(music::source_name(source)) + " 测速样本获取失败，一分钟后自动重试";
-                        toast(g_lx_check_note + (error.empty() ? "" : "：" + error), 6000);
-                    });
-                    return;
-                }
-                sample = *found; samples[source] = sample;
+                if (found == songs.end()) { ++missing; continue; }
+                sample = *found;
             }
-            const auto* key = music::lx_platform_key(source);
-            lx::Engine::instance().check_sources({{key, music::lx_music_info(sample, key)}}, force, cancelled,
-                [] { request_frame(); }, wanted);
-            if (!cancelled()) post_ui([source] { g_lx_check_note = std::string(music::source_name(source)) + " 本轮测速完成；未完成项和过期结果会自动复测"; });
-        }, [source, task_ticket] {
-            if (task_ticket != ticket) return;
-            g_lx_check_running.store(false);
-            retry_at[size_t(source)] = platform::ticks() + 60000;
-            g_lx_check_note = "测速任务失败，一分钟后自动重试；完整原因见通知";
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+            if (remaining <= 0) break;
+            engine.check_sources({{key, music::lx_music_info(sample, key)}},
+                [&] { return cancelled() || std::chrono::steady_clock::now() >= deadline; }, [] { request_frame(); }, settings.quality, int(std::min<long long>(6000, remaining)));
+            ++completed;
+        }
+        if (!cancelled()) post_ui([generation, completed, missing, reselect] {
+            if (generation != g_lx_check_generation.load()) return;
+            lx::Engine::instance().choose_fixed_source(g_ui.settings.quality, reselect);
+            cancel_preload();
+            g_lx_check_note = "本轮测速结束，已检查 " + std::to_string(completed) + " 个平台；不会自动复测";
+            if (missing) g_lx_check_note += "，" + std::to_string(missing) + " 个平台未取得样本";
+            g_lx_check_note += "。未完成项可手动重新检测";
         });
-        return;
-    }
+    }, [generation] {
+        if (generation != g_lx_check_generation.load()) return;
+        g_lx_check_running.store(false);
+        g_lx_check_note = "本轮测速失败，已停止；可手动重新检测";
+    });
 }
 static void lx_source_task(LxTask kind, std::function<void()> action) {
     if (g_shutdown.load()) return;
@@ -2290,11 +2301,13 @@ const std::vector<LxSourceView>& lx_source_status() {
     static std::vector<LxSourceView> cached;
     static unsigned cached_revision = ~0u;
     static int cached_platform = -1, cached_quality = -1;
+    static bool cached_smart = true;
     static unsigned long long cached_until = 0;
     const auto revision = lx::Engine::instance().revision();
     const auto platform = source_order_platform();
     const auto now = platform::ticks();
-    if (revision == cached_revision && cached_platform == int(platform) && cached_quality == g_ui.settings.quality && now < cached_until) return cached;
+    if (revision == cached_revision && cached_platform == int(platform) && cached_quality == g_ui.settings.quality && cached_smart == g_ui.settings.source_smart_switch && now < cached_until) return cached;
+    cached_smart = g_ui.settings.source_smart_switch;
     cached_platform = int(platform); cached_quality = g_ui.settings.quality; cached_until = now + 60000;
     const auto order = lx::Engine::instance().selection_order(music::lx_platform_key(platform), g_ui.settings.quality);
     std::vector<LxSourceView> out;
@@ -2366,12 +2379,21 @@ const std::vector<LxSourceView>& lx_source_status() {
                 checking = check != health->second.end() && check->second.state == 1;
             }
             v.health = std::string(music::source_name(platform)) + " · " + rank->quality + " · " +
-                (rank->availability == 0 ? "样本可用" : rank->availability == 2 ? "失败兜底" : checking ? "静默测速中" : "自动待测") +
+                (rank->availability == 0 ? "样本可用" : rank->availability == 2 ? "失败兜底" : checking ? "静默测速中" : "未检测") +
                 (rank->latency_ms < 300001 ? " · " + std::to_string(rank->latency_ms) + "ms" + (rank->estimated ? "（估算）" : "") : " · 未测速");
         }
         out.push_back(std::move(v));
     }
+    const auto fixed = lx::Engine::instance().fixed_source();
+    if (!g_ui.settings.source_smart_switch) for (auto& item : out) {
+        auto file = platform::fs::u8path(item.file).filename().u8string();
+#ifdef _WIN32
+        file = music::text::lower_ascii(file);
+#endif
+        if (file == fixed.file) { item.selection_position = -1; item.health = "固定使用 · " + item.health; }
+    }
     std::stable_sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+        if ((a.selection_position == -1) != (b.selection_position == -1)) return a.selection_position == -1;
         return std::tie(a.health_rank, a.latency_ms, a.selection_position, a.file) < std::tie(b.health_rank, b.latency_ms, b.selection_position, b.file);
     });
     const auto dir = lx::default_dir();
@@ -4323,7 +4345,7 @@ void start(HostCallbacks host) {
     }
     // 播放/缓冲/检索期间的刷新泵：只在需要时 wake()，其余时间主循环睡着
     background::service([] {
-        unsigned long long toast_seen = 0, timer_seen = 0, memory_seen = platform::ticks(), checks_seen = 0;
+        unsigned long long toast_seen = 0, timer_seen = 0, memory_seen = platform::ticks();
         while (!g_shutdown.load()) {
             bool busy = false;
             {
@@ -4333,7 +4355,6 @@ void start(HostCallbacks host) {
                        g_as.ps == PlayState::Resolving;
             }
             const unsigned long long now = platform::ticks();
-            if (now >= checks_seen + 5000) { if (g_win && !lx::Engine::instance().empty()) g_win->wake(); checks_seen = now; }
             // 暂停且无输入时也维护缓存；先补一帧更新可见封面的访问时间，再回收离屏资源。
             if (now >= memory_seen + 30000) { if (g_win) g_win->wake(); memory_seen = now; }
             if (g_sleep_deadline.load()) {

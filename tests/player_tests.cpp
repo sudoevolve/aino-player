@@ -293,6 +293,14 @@ int main(int argc, char** argv) {
         }
         library::Library lib;
         {
+            check(music::Settings{}.source_smart_switch, "smart routing defaults on");
+            const lx::Engine::FixedSource broad{"broad.js", "Broad", 3, 5, 600};
+            const lx::Engine::FixedSource single{"single.js", "Single", 1, 1, 50};
+            const lx::Engine::FixedSource faster{"fast.js", "Fast", 3, 5, 200};
+            check(lx::Engine::fixed_source_better(broad, single), "fixed source prefers verified platform coverage");
+            check(lx::Engine::fixed_source_better(faster, broad), "equal coverage prefers lower loading latency");
+        }
+        {
             prov::Provider provider;
             std::string error;
             const std::string code = "globalThis.provider={key:'pages',name:'Pages',search(){return []},"
@@ -488,6 +496,14 @@ int main(int argc, char** argv) {
                 check(engine.load_dir(scripts) == 2, "load isolated script fixtures");
                 std::string url, error;
                 int candidates = 0;
+                const auto fixed = engine.choose_fixed_source(1);
+                check(!engine.resolve("wy", "320k", "{}", url, error, nullptr,
+                    [&](const auto&, const auto&, const auto&, auto& reason) {
+                        ++candidates; reason = "fixture rejects fixed source"; return false;
+                    }, nullptr, false) && candidates == 1, "fixed mode never tries another script after failure");
+                check(engine.choose_fixed_source(1).file == fixed.file, "playback failure preserves pinned source");
+                candidates = 0;
+                check(engine.load_dir(scripts) == 2, "reset fixture outcomes before smart routing");
                 check(engine.resolve("wy", "320k", "{}", url, error, nullptr,
                     [&](const auto& candidate, const auto&, const auto& quality, auto& reason) {
                         ++candidates;
