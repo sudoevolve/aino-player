@@ -8,6 +8,7 @@
 #undef None
 #endif
 
+#define AINO_PLAYER_INTERFACE
 #include "business.hpp"
 #include "ui.hpp"
 #include <chrono>
@@ -149,7 +150,11 @@ int main(int argc, char** argv) {
             startup_files.push_back(ec || decoded.empty() ? value : absolute.lexically_normal().u8string());
         }
     }
-    if (!smoke_test && platform::forward_local_files(startup_files)) return 0;
+    const auto forward_startup = [&] {
+        if (!open_mode && !arguments.empty()) return platform::forward_search(arguments.front());
+        return platform::forward_local_files(startup_files);
+    };
+    if (!smoke_test && forward_startup()) return 0;
     platform::InstanceLock instance;
     if (!smoke_test) {
         auto ownership = instance.acquire();
@@ -160,7 +165,7 @@ int main(int argc, char** argv) {
         if (ownership == platform::InstanceLock::Result::Existing) {
             // 另一个进程可能刚取得锁，还没创建 IPC 窗口 / D-Bus 服务。
             for (int attempt = 0; attempt < 40; ++attempt) {
-                if (platform::forward_local_files(startup_files)) return 0;
+                if (forward_startup()) return 0;
                 platform::sleep_ms(100);
             }
             std::fprintf(stderr, "Another player instance owns this library but is not responding\n");
@@ -188,7 +193,7 @@ int main(int argc, char** argv) {
             desktop.hide(); startup_ui.window_hidden = desktop.hidden(); return !desktop.hidden();
         }
         startup_ui.close_dialog = true; startup_ui.close_remember = false;
-        if (g_host.wake) g_host.wake();
+        request_frame();
         return false;
     };
     aino::Window win(cfg);
@@ -271,7 +276,9 @@ int main(int argc, char** argv) {
                 opened_files.insert(opened_files.end(), event.files.begin(), event.files.end());
                 desktop.show(); win.activate();
             }
-            else media_action(event);
+            else if (event.action == platform::MediaAction::Search) {
+                desktop.show(); win.activate(); startup_ui.query = event.track; startup_ui.tab = 0; start_search();
+            } else media_action(event);
         }
         startup_ui.window_hidden = desktop.hidden();
         startup_ui.media_available = desktop.media_available(); startup_ui.tray_available = desktop.tray_available();

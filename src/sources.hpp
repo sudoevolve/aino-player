@@ -879,7 +879,7 @@ inline SearchResult run_search(const std::string& keyword, const Settings& st, i
         if (!is_platform(Source(i)) && Source(i) != Source::Local) {
             job->reports[size_t(i)].pending = false;
             job->reports[size_t(i)].err = "已移除";
-            job->finished[size_t(i)] = 1; ++job->done;
+            job->finished[size_t(i)] = 1;
             continue;
         }
         job->reports[size_t(i)].pending = st.enable[i];

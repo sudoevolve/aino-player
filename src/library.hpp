@@ -190,20 +190,27 @@ inline bool parse_link(const std::string& input, music::Source& source, std::str
     const auto text = music::text::trim(input);
     const std::regex netease(R"(^https?://music\.163\.com/(?:#/)?(?:playlist|m/playlist)(?:\?|/\?)[^\s]*\bid=([0-9]+)(?:[&#][^\s]*)?$)");
     const std::regex qq(R"(^https?://(?:y\.qq\.com|i\.y\.qq\.com)/(?:n/ryqq/playlist/|n2/m/share/details/taoge\.html\?(?:[^\s]*&)?id=|n/yqq/playlist/)([0-9]+)(?:\.html)?(?:[?&#][^\s]*)?$)");
+    const std::regex kuwo(R"(^https?://(?:www\.)?kuwo\.cn/playlist_detail/([0-9]+)(?:[?&#][^\s]*)?$)");
+    const std::regex kugou(R"(^https?://(?:www\.)?kugou\.com/yy/special/single/([0-9]+)(?:\.html)?(?:[?&#][^\s]*)?$)");
+    const std::regex migu(R"(^https?://music\.migu\.cn/v3/music/playlist/([0-9]+)(?:[?&#][^\s]*)?$)");
     std::smatch match;
     if (std::regex_match(text, match, netease)) source = music::Source::Netease;
     else if (std::regex_match(text, match, qq)) source = music::Source::QQ;
+    else if (std::regex_match(text, match, kuwo)) source = music::Source::Kuwo;
+    else if (std::regex_match(text, match, kugou)) source = music::Source::Kugou;
+    else if (std::regex_match(text, match, migu)) source = music::Source::Migu;
     else {
         return false;
     }
     id = match[1].str();
-    return id.size() <= 24 && id.find_first_not_of('0') != std::string::npos;
+    if (id.size() > 24 || id.find_first_not_of('0') == std::string::npos) return false;
+    if (music::script_platform(source)) id = "playlist:" + id;
+    return true;
 }
 inline bool local_audio_file(const platform::fs::path& path) {
     auto ext = path.extension().u8string();
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
-    return ext == ".mp3" || ext == ".flac" || ext == ".wav" || ext == ".wave" || ext == ".m4a" ||
-        ext == ".aac" || ext == ".ogg" || ext == ".oga" || ext == ".opus" || ext == ".webm";
+    return std::any_of(std::begin(platform::audio_extensions), std::end(platform::audio_extensions), [&](const auto* value) { return ext == value; });
 }
 inline std::string local_path_key(const platform::fs::path& path) {
 #ifdef _WIN32
@@ -298,6 +305,7 @@ inline bool m3u_path(const std::string& path) {
 }
 /** @brief 读取本地 UTF-8 M3U；相对路径以歌单文件目录为基准，不获取网络 URL。 */
 inline Playlist read_m3u(const std::string& path, std::string& error, const std::function<bool()>& cancel = {}) {
+    error.clear();
     Playlist playlist;
     if (platform::file_size(path) <= 0 || platform::file_size(path) > 4 * 1024 * 1024) { error = "M3U 文件不存在、为空或超过 4 MiB"; return playlist; }
     std::ifstream file(platform::fs::u8path(path), std::ios::binary);
@@ -336,6 +344,8 @@ inline Playlist read_m3u(const std::string& path, std::string& error, const std:
     return playlist;
 }
 inline bool write_m3u(const Playlist& playlist, const std::string& path, std::string& error) {
+    error.clear();
+    if (playlist.tracks.empty()) { error = "歌单为空，无法导出 M3U"; return false; }
     std::string text = "#EXTM3U\n";
     const auto parent = platform::fs::absolute(platform::fs::u8path(path)).parent_path();
     for (const auto& track : playlist.tracks) {

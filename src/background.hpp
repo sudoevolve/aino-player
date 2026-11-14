@@ -63,6 +63,7 @@ inline void reap() {
     std::vector<std::thread> finished;
     {
         std::lock_guard<std::mutex> lock(mutex);
+        finished.reserve(tasks.size());
         for (auto it = tasks.begin(); it != tasks.end();) {
             if (it->done->load()) { finished.push_back(std::move(it->thread)); it = tasks.erase(it); }
             else ++it;
@@ -73,7 +74,7 @@ inline void reap() {
 template<class F, class... Args> void service(F&& fn, Args&&... args) {
     reap();
     std::lock_guard<std::mutex> lock(mutex);
-    if (!accepting) return;
+    if (!accepting) throw std::runtime_error("Background services stopped");
     auto done = std::make_shared<std::atomic<bool>>(false);
     auto action = std::bind(std::forward<F>(fn), std::forward<Args>(args)...);
     // 先分配容器位置，再创建线程，避免 push_back 失败时销毁仍可连接的临时线程。

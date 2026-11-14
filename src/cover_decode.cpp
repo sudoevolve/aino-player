@@ -1,3 +1,6 @@
+#ifdef AINO_PLAYER_BUSINESS_UNIT
+#include "business.hpp"
+#endif
 #ifndef _WIN32
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_JPEG

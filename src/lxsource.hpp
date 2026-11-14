@@ -64,6 +64,7 @@ struct Decl {                          // 脚本声明的"我支持哪个平台"
 
 struct Info {
     std::string name, version, author, description, homepage, file;
+    std::string fingerprint;
 };
 
 // `/** @name xxx */` 头注释，规则和 lx 自己一致
@@ -966,6 +967,7 @@ inline bool Script::load(const std::string& path, const std::string& script, std
     Operation operation(*this, 12000);
     if (!operation) { err = "脚本加载已取消或超时"; return false; }
     info_.file = path;
+    info_.fingerprint = detail::md5_hex(script);
     const auto head = parse_header(script);
     info_.name = head.count("name") ? head.at("name") : path;
     info_.version = head.count("version") ? head.at("version") : "";
@@ -1233,6 +1235,7 @@ public:
         unsigned long long failed_at = 0;
         unsigned long long verified_revision = 0;
         bool verified = false;
+        bool cached = false;
     };
     // 消费方只报告“已收到有效音频 / 首段可播”，不把整首下载或转码耗时当加载速度。
     struct LoadTiming { int ready_ms = 0; bool verified = false; };
@@ -1256,7 +1259,7 @@ public:
             (fallback && fallback->verified);
         out.availability = recent_failure || failed_check ? 2 : passed ? 0 : 1;
         // 先比较同一口径的样本延迟，不能把一个源的首段解码时间与另一个的 64 KiB 下载直接混排。
-        if (exact && exact->load_ms > 0) out.latency_ms = exact->load_ms;
+        if (exact && exact->load_ms > 0) { out.latency_ms = exact->load_ms; out.estimated = exact->cached; }
         else if (health && health->state == 2 && health->load_ms > 0) {
             out.latency_ms = health->load_ms;
             out.estimated = health->quality != quality;
@@ -1280,6 +1283,77 @@ public:
         return result;
     }
     explicit Engine(std::string preferences_file = {}) : preferences_file_(std::move(preferences_file)) {}
+    void update_network(const std::string& network) {
+        if (network.empty()) return;
+        const auto signature = detail::md5_hex(network);
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!network_hash_.empty() && network_hash_ != signature) { timings_.clear(); health_.clear(); ++revision_; }
+        network_hash_ = signature;
+    }
+    void save_metrics(const std::string& network) {
+        if (network.empty()) return;
+        update_network(network);
+        std::string text = "{\"version\":1,\"network\":" + detail::js_quote(detail::md5_hex(network)) +
+            ",\"time\":" + std::to_string(std::time(nullptr)) + ",\"scripts\":[";
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            bool first = true;
+            for (const auto& script : list_) {
+                if (!first) text += ','; first = false;
+                text += "{\"file\":" + detail::js_quote(file_key(script->path())) + ",\"hash\":" + detail::js_quote(script->info().fingerprint) + ",\"timings\":[";
+                bool first_timing = true;
+                const auto found = timings_.find(file_key(script->path()));
+                if (found != timings_.end()) for (const auto& platform : found->second) for (const auto& quality : platform.second) {
+                    const auto& value = quality.second;
+                    if (!value.verified || value.failures) continue;
+                    if (!first_timing) text += ','; first_timing = false;
+                    text += "{\"platform\":" + detail::js_quote(platform.first) + ",\"quality\":" + detail::js_quote(quality.first) +
+                        ",\"load\":" + std::to_string(value.load_ms) + ",\"ready\":" + std::to_string(value.ready_ms) + ",\"resolve\":" + std::to_string(value.resolve_ms) + "}";
+                }
+                text += "]}";
+            }
+        }
+        text += "]}";
+        if (text.size() > 1024 * 1024) return;
+        const auto path = platform::join(platform::config_dir(), "source-timings.json"), temporary = path + ".tmp";
+        auto* output = platform::fopen(temporary, "wb");
+        if (!output) return;
+        const bool written = std::fwrite(text.data(), 1, text.size(), output) == text.size();
+        const bool closed = std::fclose(output) == 0;
+        if (!written || !closed || !platform::replace_file(temporary, path)) platform::remove(temporary);
+    }
+    void restore_metrics(const std::string& network) {
+        if (network.empty()) return;
+        update_network(network);
+        const auto path = platform::join(platform::config_dir(), "source-timings.json");
+        const auto size = platform::file_size(path);
+        if (size <= 0 || size > 1024 * 1024) return;
+        std::ifstream input(std::filesystem::u8path(path), std::ios::binary);
+        std::string text((std::istreambuf_iterator<char>(input)), {});
+        js::Value root;
+        if (!js::parse(text, root) || root["version"].integer() != 1 || root["network"].str() != detail::md5_hex(network)) return;
+        const auto age = static_cast<long long>(std::time(nullptr)) - root["time"].integer();
+        if (age < 0 || age > 6 * 3600 || root["scripts"].size() > 256) return;
+        std::lock_guard<std::mutex> lock(mu_);
+        for (const auto& row : root["scripts"].array) for (const auto& script : list_) {
+            const auto file = file_key(script->path());
+            if (row["file"].str() != file || row["hash"].str() != script->info().fingerprint || row["timings"].size() > 32) continue;
+            for (const auto& metric : row["timings"].array) {
+                const auto platform = metric["platform"].str(), quality = metric["quality"].str();
+                if (!script->supports(platform, "musicUrl")) continue;
+                if (quality != "128k" && quality != "320k" && quality != "flac" && quality != "flac24bit") continue;
+                auto& timing = timings_[file][platform][quality];
+                if (timing.samples || timing.failures) continue;
+                timing.load_ms = int(std::clamp(metric["load"].integer(), 0LL, 300000LL));
+                timing.ready_ms = int(std::clamp(metric["ready"].integer(), 0LL, 300000LL));
+                timing.resolve_ms = int(std::clamp(metric["resolve"].integer(), 0LL, 300000LL));
+                // 跨启动只作速度估算，不伪造当前网络已通过的音频验证。
+                timing.samples = 1;
+                timing.cached = true;
+            }
+        }
+        ++revision_;
+    }
     static Engine& instance() {
         static Engine e;
         return e;
@@ -1470,6 +1544,7 @@ private:
             if (load_ms > 0 || ready_ms > 0) value.samples = std::min(value.samples + 1, 100000u);
             if (verified || load_ms > 0 || ready_ms > 0) {
                 value.verified = true;
+                value.cached = false;
                 value.verified_revision = ++outcome_revision_;
                 value.failures = 0; value.failed_at = 0;
             }
@@ -1815,6 +1890,7 @@ private:
     std::set<std::string> removed_;
     std::string preferences_error_;
     std::string preferences_file_;
+    std::string network_hash_;
     std::map<std::string, std::map<std::string, std::string>> runtime_errors_;
     std::map<std::string, Checks> health_;
     std::map<std::string, Timings> timings_;

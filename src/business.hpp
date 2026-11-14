@@ -215,6 +215,7 @@ struct UiState {
     std::string local_name;
     std::string local_folder;
     bool scan_recursive = true;
+    bool watch_folders = false;
     std::string playlist_filter, playlist_rename, library_transfer_path;
     int playlist_sort = 0;
     bool playlist_manage = false;
@@ -236,7 +237,11 @@ struct UiState {
     std::string download_dir;    // 空 = 用默认 %USERPROFILE%\Music\aino player
     // 提示条：底栏不再放长错误文本，一次性消息统一走 toast
     std::string toast;
+    bool notifications_open = false;
 };
+struct Notification { std::string text; unsigned long long time = 0; int duration_ms = 3600; };
+const std::deque<Notification>& notifications();
+void clear_notifications();
 
 struct DlItem {
     int percent = 0;
@@ -364,6 +369,7 @@ void playlist_filter_rows();
 void playlist_rename_local();
 void library_export(bool playlist_only);
 void library_restore();
+void library_relocate();
 void queue_move(int from, int to);
 void download_current();
 void request_current_lyrics(bool force = false);
@@ -430,7 +436,50 @@ const cover::Image& brand_icon();
 std::string default_download_dir();
 } // namespace player
 
+namespace player {
+enum class LxTask { None, Import, Fetch, Reload };
+struct LxSourceView {
+    std::string name, version, error, file;   // file 是磁盘上的完整路径，删除时用它
+    bool ok = false;
+    bool removed = false;
+    int health_rank = 1;
+    int latency_ms = 300001;
+    int selection_position = 100000;
+    std::string health;
+};
+LxTask source_task();
+const std::string& source_fetch_progress();
+const std::string& source_fetch_summary();
+const std::vector<LxSourceView>& lx_source_status();
+music::Source source_order_platform();
+bool lx_sources_loading();
+void lx_import_source();
+
+void lx_fetch_online_sources();
+void lx_reload_sources();
+void lx_check_sources(bool force = false);
+void lx_remove_source(const std::string& path);
+void lx_restore_source(const std::string& path);
+void request_frame();
+void play_search_result(int index);
+void playlist_play(int index);
+void open_track_album(const music::Track& track);
+void playlist_home();
+void playlist_choose_source(int index, int variant, bool replay);
+void choose_search_source(int index, int variant, bool replay);
+void library_save_remote(int site, int index);
+void library_import_folder(const std::string& folder, bool recursive);
+void playlist_close();
+void catalog_load_more();
+void catalog_retry();
+void catalog_open_album(int index);
+void catalog_switch_section(int section);
+void playlist_save_view();
+void library_import_link();
+
+}
 namespace player::config { void load(UiState& state); bool save(UiState& state); }
+#ifndef AINO_PLAYER_INTERFACE
 namespace player::config {
 static std::string config_path() {
     const auto dir = platform::config_dir();
@@ -478,6 +527,8 @@ void load(UiState& state) {
         if (!v.empty()) state.ne_uid = v;
         v = read_line_value(line, "dark");
         if (!v.empty()) state.dark = (v != "0");
+        v = read_line_value(line, "watch_folders");
+        if (!v.empty()) state.watch_folders = v != "0";
         v = read_line_value(line, "quality");
         if (!v.empty()) state.settings.quality = std::atoi(v.c_str());
         v = read_line_value(line, "lane_pref");
@@ -517,6 +568,7 @@ bool save(UiState& state) {
     if (!f) return false;
     std::fprintf(f, "# aino player 配置（Cookie 明文放在本机，介意就别填）\n");
     std::fprintf(f, "config_version=2\n");
+    std::fprintf(f, "watch_folders=%d\n", state.watch_folders);
     std::fprintf(f, "volume=%d\n", int(state.volume));
     std::fprintf(f, "sources=%u\n", state.src_mask);
     std::fprintf(f, "netease_cookie=%s\n", state.settings.netease_cookie.c_str());
@@ -649,6 +701,25 @@ static void drain_ui_mail() {
     { std::lock_guard<std::mutex> lk(g_ui_mail_mutex); actions.swap(g_ui_mail); }
     for (auto& action : actions) action();
 }
+static std::deque<Notification> g_notifications, g_notification_pending;
+// 刷新泵跨线程读取提示到期时间。
+static std::atomic<unsigned long long> g_toast_until{0};
+const std::deque<Notification>& notifications() { return g_notifications; }
+void clear_notifications() {
+    g_notifications.clear();
+    g_notification_pending.clear();
+    g_ui.toast.clear();
+    g_toast_until.store(0);
+}
+template<class F> static void run_task(F action, std::function<void()> recover = {}, bool urgent = false) {
+    background::guarded(std::move(action), [recover](const char* detail) {
+        const std::string error(detail);
+        post_ui([recover, error] {
+            if (recover) recover();
+            toast("操作失败，可重试：" + error, 7000);
+        });
+    }, urgent);
+}
 static std::shared_ptr<library::Library> g_library = std::make_shared<library::Library>();
 struct LibraryEdit { std::function<void(library::Library&)> apply; std::function<void()> saved; };
 static std::mutex g_library_write_mutex;
@@ -681,9 +752,6 @@ static std::deque<std::function<void()>> g_download_pending;
 static int g_download_workers = 0;
 static unsigned long long g_download_revision = 0, g_download_snapshot_revision = ~0ULL;
 static std::map<std::string, DlItem> g_dls_snap;   // 主线程快照
-
-// toast 的到期时间放在原子里，后台刷新线程要读它（决定还要不要叫醒主循环）
-static std::atomic<unsigned long long> g_toast_until{0};
 
 // ---- 账号 + 歌单（QQ 音乐 / 网易云音乐 各一套）----
 struct QqState {
@@ -804,7 +872,7 @@ static void dispatch_search(SearchRequest request) {
         if (g_search_worker) return;
         g_search_worker = true;
     }
-    background::start([] {
+    run_task([] {
         for (;;) {
             SearchRequest request;
             {
@@ -814,7 +882,7 @@ static void dispatch_search(SearchRequest request) {
             }
             do_search(g_win, std::move(request));
         }
-    });
+    }, [] { std::lock_guard<std::mutex> lock(g_mu); g_search_worker = false; g_as.searching = false; });
 }
 void start_search() {
     if (music::text::trim(g_ui.query).empty()) { toast("请输入搜索关键词"); return; }
@@ -978,7 +1046,7 @@ static void request_preload(const music::Track& track, const music::Settings& se
         if (g_preload_worker) return;
         g_preload_worker = true;
     }
-    background::start([] {
+    run_task([] {
         for (;;) {
             std::shared_ptr<PreloadRequest> request;
             {
@@ -992,7 +1060,7 @@ static void request_preload(const music::Track& track, const music::Settings& se
                 if (g_preload_request == request && !request->cancelled.load()) g_preload_ready = std::move(ready);
             }
         }
-    });
+    }, [] { std::lock_guard<std::mutex> lock(g_preload_mutex); g_preload_worker = false; g_preload_pending.reset(); });
 }
 static std::shared_ptr<PreparedMedia> take_preloaded(const music::Track& track, const music::Settings& settings) {
     const auto key = preload_key(track, settings);
@@ -1067,7 +1135,10 @@ static void finish_stream(HostCallbacks* win, const music::Variant& variant, con
 static void do_play(HostCallbacks* win, music::Track track, music::Settings st, int gen, bool stream_allowed = true) {
     const auto queue_uid = track_uid(track);
     st.cancelled = [gen] { return g_shutdown.load() || gen != g_play_generation.load(); };
-    net::CancelScope network(st.cancelled);
+    const auto playback_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    net::CancelScope network([cancel = st.cancelled, playback_deadline] {
+        return (cancel && cancel()) || std::chrono::steady_clock::now() >= playback_deadline;
+    });
     std::shared_lock<std::shared_mutex> cache_write(g_play_cache_mutex);
     if (!track.variants.empty() && track.current().source == music::Source::Local) {
         const auto& v = track.current();
@@ -1076,7 +1147,7 @@ static void do_play(HostCallbacks* win, music::Track track, music::Settings st, 
         if (stream_allowed && platform::exists(v.id) && !audio::inspect_mp3(v.id).valid) {
             audio::StreamSpec spec; spec.local_path = v.id; spec.duration_ms = v.duration_ms > 0 ? v.duration_ms : track.duration_ms;
             { std::lock_guard<std::mutex> lock(g_mu); spec.start_ms = g_as.position_ms; }
-            auto stream = audio::Stream::open(spec, st.cancelled, error);
+            auto stream = audio::Stream::open(spec, st.cancelled, error, [] { return net::cancelled(); });
             if (stream) { finish_stream(win, v, spec, std::move(stream), gen); return; }
             if (st.cancelled()) return;
         }
@@ -1179,7 +1250,7 @@ static void do_play(HostCallbacks* win, music::Track track, music::Settings st, 
                 audio::StreamSpec spec; spec.url = rr.url; spec.headers = rr.headers; spec.duration_ms = v.duration_ms > 0 ? v.duration_ms : track.duration_ms;
                 { std::lock_guard<std::mutex> lock(g_mu); spec.start_ms = g_as.position_ms; }
                 std::string error;
-                auto stream = audio::Stream::open(spec, st.cancelled, error);
+                auto stream = audio::Stream::open(spec, st.cancelled, error, [] { return net::cancelled(); });
                 if (stream && !net::cancelled()) {
                     if (rr.load_timing) rr.load_timing->ready_ms = int(std::clamp<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - loading_begin).count(), 1, 300000));
                     finish_stream(win, v, spec, std::move(stream), gen, rr.detail); return true;
@@ -1307,8 +1378,14 @@ static void do_play(HostCallbacks* win, music::Track track, music::Settings st, 
 
 void toast(const std::string& text, int ms) {
     post_ui([text, ms] {
-        g_ui.toast = text;
-        g_toast_until.store(platform::ticks() + static_cast<unsigned long long>(ms));
+        if (text.empty()) return;
+        const auto now = platform::ticks();
+        if (!g_notifications.empty() && g_notifications.front().text == text && now - g_notifications.front().time < 2000) return;
+        Notification message{text, now, std::clamp(ms, 1500, 10000)};
+        if (g_notifications.size() == 64) g_notifications.pop_back();
+        g_notifications.push_front(message);
+        if (g_notification_pending.size() == 16) g_notification_pending.pop_front();
+        g_notification_pending.push_back(std::move(message));
     });
 }
 
@@ -1330,7 +1407,7 @@ static void request_lyrics(const music::Track& track, bool force = false) {
     const auto found = g_library->lyric_preferences.find(uid);
     const std::string local = found == g_library->lyric_preferences.end() ? "" : found->second.path;
     music::Settings st = g_ui.settings;
-    background::start([t, st, uid, local, generation] {
+    run_task([t, st, uid, local, generation] {
         net::CancelScope signal([uid, generation] {
             if (g_shutdown.load()) return true;
             std::lock_guard<std::mutex> lock(g_lyr.m);
@@ -1369,7 +1446,7 @@ static void request_lyrics(const music::Track& track, bool force = false) {
             g_lyr.loading = false;
         }
         if (g_win) g_win->wake();
-    });
+    }, [uid, generation] { std::lock_guard<std::mutex> lock(g_lyr.m); if (g_lyr.for_uid == uid && g_lyr.generation == generation) g_lyr.loading = false; });
 }
 
 // ---------------- 下载 ----------------
@@ -1704,11 +1781,15 @@ void start_download(music::Track track, music::Settings st) {
     int launch = 0;
     {
         std::lock_guard<std::mutex> lock(g_dlm);
-        g_download_pending.push_back(std::move(action));
+        g_download_pending.push_back([action = std::move(action), uid, token]() mutable {
+            try { action(); }
+            catch (const std::exception& error) { dl_set(uid, 0, 2, error.what(), token); }
+            catch (...) { dl_set(uid, 0, 2, "Download failed", token); }
+        });
         launch = std::min(2 - g_download_workers, int(g_download_pending.size()));
         g_download_workers += launch;
     }
-    for (int i = 0; i < launch; ++i) background::start([] {
+    for (int i = 0; i < launch; ++i) run_task([] {
         for (;;) {
             std::function<void()> next;
             {
@@ -1718,7 +1799,7 @@ void start_download(music::Track track, music::Settings st) {
             }
             next();
         }
-    });
+    }, [] { std::lock_guard<std::mutex> lock(g_dlm); if (g_download_workers > 0) --g_download_workers; });
 }
 
 // =============================================================================
@@ -1747,7 +1828,7 @@ void qq_refresh() {
         uin = g_qq.uin;
     }
     if (g_win) g_win->wake();
-    background::start([cookie, uin] {
+    run_task([cookie, uin] {
         qq::Profile p = qq::fetch_profile(cookie, uin);
         if (g_shutdown.load()) return;
         std::lock_guard<std::mutex> lk(g_qq.m);
@@ -1762,7 +1843,7 @@ void qq_refresh() {
             g_qq.err.clear();
         }
         if (g_win) g_win->wake();
-    });
+    }, [] { std::lock_guard<std::mutex> lock(g_qq.m); g_qq.loading = false; });
 }
 
 // 歌单打开只进入详情；用户点播时才建立播放队列。
@@ -1819,7 +1900,7 @@ void playlist_sync_to(int site, int idx) {
     g_sync_index.store(idx);
     toast("正在同步 " + std::to_string(ids.size()) + " 首到「" + name + "」…");
 
-    background::start([site, cookie, uid, pid, ids, name] {
+    run_task([site, cookie, uid, pid, ids, name] {
         std::string err;
         const bool ok = site == 1 ? qq::add_to_playlist(cookie, uid, pid, ids, err)
                                   : ne::add_tracks(cookie, pid, ids, err);
@@ -1831,7 +1912,7 @@ void playlist_sync_to(int site, int idx) {
                   ok ? 5000 : 9000);
             g_win->wake();
         }
-    });
+    }, [] { g_sync_site.store(-1); });
 }
 
 // ---------------- 网易云音乐（和 QQ 那套对称） ----------------
@@ -1859,7 +1940,7 @@ void ne_refresh() {
         uid = g_ne.uid;
     }
     if (g_win) g_win->wake();
-    background::start([cookie, uid] {
+    run_task([cookie, uid] {
         ne::Profile p = ne::fetch_profile(cookie, uid);
         if (g_shutdown.load()) return;
         std::lock_guard<std::mutex> lk(g_ne.m);
@@ -1875,7 +1956,7 @@ void ne_refresh() {
             g_ne.err.clear();
         }
         if (g_win) g_win->wake();
-    });
+    }, [] { std::lock_guard<std::mutex> lock(g_ne.m); g_ne.loading = false; });
 }
 
 void ne_open_playlist(int idx) {
@@ -2004,7 +2085,7 @@ static void request_cards(DiscState& state, int site, std::string query, bool ap
     }
     auto* owner = &state;
     const auto settings = g_ui.settings;
-    background::start([owner, site, query, append, with_heats, request, page, settings] {
+    run_task([owner, site, query, append, with_heats, request, page, settings] {
         prov::Host::instance().set_credentials(settings.netease_cookie, settings.qq_cookie);
         net::CancelScope cancellation([owner, request] {
             if (g_shutdown.load()) return true;
@@ -2037,7 +2118,7 @@ static void request_cards(DiscState& state, int site, std::string query, bool ap
           owner->err = error; owner->loading = false; ++owner->version;
         }
         if (g_win) g_win->wake();
-    });
+    }, [owner, request] { std::lock_guard<std::mutex> lock(owner->m); if (owner->request == request) { owner->loading = false; ++owner->version; } });
 }
 void disc_refresh(int site) { request_cards(g_disc, site, {}, false, true); }
 void disc_more() { request_cards(g_disc, g_ui.disc_site, {}, true, true); }
@@ -2072,10 +2153,9 @@ void disc_open(int idx) {
 }
 
 // ---- 落雪音源（界面用） ----
-enum class LxTask { None, Import, Fetch, Reload };
 static std::atomic<LxTask> g_lx_task{LxTask::None};
-static void lx_check_sources(bool force = false) {
-    background::start([force] {
+void lx_check_sources(bool force) {
+    run_task([force] {
         std::vector<lx::Engine::Check> cases;
         for (const auto source : {music::Source::Netease, music::Source::QQ}) {
             music::Variant v; v.source = source;
@@ -2094,28 +2174,20 @@ static void lx_source_task(LxTask kind, std::function<void()> action) {
     if (g_shutdown.load()) return;
     LxTask expected = LxTask::None;
     if (!g_lx_task.compare_exchange_strong(expected, kind)) { toast("音源任务正在进行，请稍候"); return; }
-    background::start([action = std::move(action)] {
+    run_task([action = std::move(action)] {
         struct Done {
             ~Done() { g_lx_task.store(LxTask::None); if (g_win) g_win->wake(); }
         } done;
         try { action(); lx_check_sources(); }
         catch (const std::exception& error) { const auto message = std::string("音源操作失败：") + error.what(); post_ui([message] { toast(message, 6000); }); }
         catch (...) { post_ui([] { toast("音源操作失败，请重试", 6000); }); }
-    });
+    }, [] { g_lx_task.store(LxTask::None); });
 }
-struct LxSourceView {
-    std::string name, version, error, file;   // file 是磁盘上的完整路径，删除时用它
-    bool ok = false;
-    bool removed = false;
-    int health_rank = 1;
-    int latency_ms = 300001;
-    int selection_position = 100000;
-    std::string health;
-};
+
 
 // 音源引擎是否正在后台加载（界面上显示"加载中"，而不是等锁卡住）
 bool lx_sources_loading() { return lx::Engine::instance().loading(); }
-static music::Source source_order_platform() {
+music::Source source_order_platform() {
     if (g_snapshot.now_source >= 0 && g_snapshot.now_source < music::kSourceCount) {
         const auto source = music::Source(g_snapshot.now_source);
         if (music::lx_platform_key(source)) return source;
@@ -2237,7 +2309,7 @@ void lx_reload_sources() {
 // 从应用中移除；磁盘文件保留，重新导入该文件即可恢复。
 void lx_remove_source(const std::string& file) {
     const std::string name = platform::fs::u8path(file).filename().u8string();
-    background::start([file, name] {
+    run_task([file, name] {
         std::string error;
         const bool removed = lx::Engine::instance().remove_source(file, error);
         post_ui([removed, error, name] { toast(removed ? "已从应用移除 " + name + "，源文件保留，可重新导入" : error, 5000); });
@@ -2252,8 +2324,12 @@ void lx_restore_source(const std::string& file) {
 }
 
 // 下载与脚本初始化分阶段显示；失败不覆盖本地文件，主动获取恢复成功下载的音源。
+LxTask source_task() { return g_lx_task.load(); }
+void request_frame() { if (g_host.wake) g_host.wake(); }
 std::string g_lx_fetch_summary;
 std::string g_lx_fetch_progress; // 仅在 UI 线程读写。
+const std::string& source_fetch_progress() { return g_lx_fetch_progress; }
+const std::string& source_fetch_summary() { return g_lx_fetch_summary; }
 void lx_fetch_online_sources() {
     lx_source_task(LxTask::Fetch, [] {
         post_ui([] { g_lx_fetch_progress = "正在选择下载通路…"; });
@@ -2514,7 +2590,8 @@ static void queue_mark_dirty() {
     g_queue_writer_changed.notify_one();
     if (g_queue_writer_started) return;
     g_queue_writer_started = true;
-    background::start([] {
+    try {
+    background::service([] {
         std::unique_lock<std::mutex> lock(g_queue_writer_mutex);
         while (!g_shutdown.load()) {
             g_queue_writer_changed.wait(lock, [] { return g_shutdown.load() || g_queue_dirty.load(); });
@@ -2533,6 +2610,7 @@ static void queue_mark_dirty() {
         }
         g_queue_writer_started = false;
     });
+    } catch (const std::exception& error) { g_queue_writer_started = false; toast(error.what(), 7000); }
 }
 
 static std::vector<std::string> split_tab(const std::string& line) {
@@ -2700,7 +2778,7 @@ static void start_play_attempt(int index, bool keep_failures) {
         finish_play(g_win, g_current_media->variant, g_current_media->original, gen, false, g_current_media->playable);
         return;
     }
-    background::start(do_play, g_win, track, st, gen, true);
+    run_task([=]() mutable { do_play(g_win, track, st, gen, true); }, [gen] { std::lock_guard<std::mutex> lock(g_mu); if (g_as.gen == gen) { g_as.ps = PlayState::Failed; g_track_failure_gen = gen; } }, true);
 }
 
 void start_play(int index) { start_play_attempt(index, false); }
@@ -2713,7 +2791,7 @@ static void process_local_open() {
     if (g_local_open_requests.empty() || g_shutdown.load()) { g_ui.opening_local = false; return; }
     auto request = std::move(g_local_open_requests.front()); g_local_open_requests.pop_front();
     g_ui.opening_local = true;
-    background::start([request = std::move(request)]() mutable {
+    run_task([request = std::move(request)]() mutable {
         std::vector<music::Track> tracks;
         size_t skipped = 0, repeated = 0;
         bool limited = false;
@@ -2794,7 +2872,7 @@ static void process_local_open() {
             toast(message, 6000);
             process_local_open();
         });
-    });
+    }, [] { g_ui.opening_local = false; process_local_open(); });
 }
 void open_local_files(std::vector<std::string> paths) {
     if (paths.empty() || g_shutdown.load()) return;
@@ -2807,7 +2885,7 @@ void choose_local_audio() {
     if (g_folder_selecting || g_ui.choosing_local || g_shutdown.load()) return;
     g_folder_selecting = true; g_ui.choosing_local = true; g_folder_cancel.store(false);
     void* owner = g_host.native_window ? g_host.native_window() : nullptr;
-    background::start([owner] {
+    run_task([owner] {
         std::string error;
         auto paths = platform::choose_audio_files(owner, g_folder_cancel, error);
         post_ui([paths = std::move(paths), error]() mutable {
@@ -2815,12 +2893,12 @@ void choose_local_audio() {
             if (!error.empty()) toast(error, 6000);
             if (!paths.empty()) open_local_files(std::move(paths));
         });
-    });
+    }, [] { g_ui.choosing_local = false; });
 }
 void configure_default_player() {
     if (g_ui.setting_default_player || g_shutdown.load()) return;
     g_ui.setting_default_player = true;
-    background::start([] {
+    run_task([] {
         std::string error;
         const bool ok = platform::set_default_music_player(error, [] { return g_shutdown.load(); });
         post_ui([ok, error] {
@@ -2831,7 +2909,7 @@ void configure_default_player() {
             toast(ok ? "已将 Aino Player 设为默认音乐播放器" : error, 8000);
 #endif
         });
-    });
+    }, [] { g_ui.setting_default_player = false; });
 }
 
 void toggle_pause() {
@@ -3042,7 +3120,9 @@ static bool library_edit(std::function<void(library::Library&)> edit, std::funct
         if (!g_library_durable) g_library_durable = g_library;
     }
     const auto path = library_path();
-    background::start([path] {
+    try {
+    background::service([path] {
+        struct WriterDone { bool active = true; ~WriterDone() { if (!active) return; std::lock_guard<std::mutex> lock(g_library_write_mutex); g_library_writer = false; } } done;
         for (;;) {
             // 短时间内连续收藏只复制和落盘一批；退出仍会排空已接受的修改。
             platform::sleep_ms(80);
@@ -3050,7 +3130,7 @@ static bool library_edit(std::function<void(library::Library&)> edit, std::funct
             std::shared_ptr<library::Library> base;
             {
                 std::lock_guard<std::mutex> lock(g_library_write_mutex);
-                if (g_library_edits.empty()) { g_library_writer = false; return; }
+                if (g_library_edits.empty()) { g_library_writer = false; done.active = false; return; }
                 edits.swap(g_library_edits); base = g_library_durable;
             }
             std::shared_ptr<library::Library> next;
@@ -3073,6 +3153,10 @@ static bool library_edit(std::function<void(library::Library&)> edit, std::funct
             });
         }
     });
+    } catch (const std::exception& error) {
+        { std::lock_guard<std::mutex> lock(g_library_write_mutex); g_library_writer = false; g_library_edits.clear(); }
+        toast(error.what(), 7000); return false;
+    }
     return true;
 }
 void favorite_toggle(const music::Track& track) {
@@ -3154,12 +3238,12 @@ void reveal_download(const std::string& uid) {
     std::string path;
     { std::lock_guard<std::mutex> lock(g_dlm); auto it = g_dls.find(uid); if (it != g_dls.end()) path = it->second.path; }
     if (path.empty() || !platform::exists(path)) { toast("下载文件已移动或删除"); return; }
-    background::start([path] { platform::open_folder(platform::fs::u8path(path).parent_path().u8string()); });
+    run_task([path] { platform::open_folder(platform::fs::u8path(path).parent_path().u8string()); });
 }
 void reveal_local_track(const music::Track& track) {
     if (track.variants.empty() || track.current().source != music::Source::Local) return;
     const auto path = track.current().id;
-    background::start([path] {
+    run_task([path] {
         if (!platform::exists(path)) { toast("音乐文件已移动或删除：" + path, 6000); return; }
         if (!platform::open_folder(platform::fs::u8path(path).parent_path().u8string())) toast("无法打开音乐文件所在文件夹", 6000);
     });
@@ -3201,7 +3285,7 @@ void choose_local_lyrics() {
     g_lyric_selecting = true; g_lyric_cancel.store(false);
     const auto uid = g_snapshot.now_uid;
     auto* owner = g_host.native_window ? g_host.native_window() : nullptr;
-    background::start([owner, uid] {
+    run_task([owner, uid] {
         std::string error;
         const auto path = platform::choose_music_folder(owner, g_lyric_cancel, error, false);
         post_ui([uid, path, error] {
@@ -3209,7 +3293,7 @@ void choose_local_lyrics() {
             if (!error.empty()) toast(error);
             if (!path.empty() && g_snapshot.now_uid == uid) { g_ui.lyric_file_path = path; use_local_lyrics(false); }
         });
-    });
+    }, [] { g_lyric_selecting = false; });
 }
 void media_action(const platform::MediaEvent& event) {
     PlayState state;
@@ -3254,10 +3338,10 @@ void resolve_window_close(bool to_tray) {
 void refresh_output_devices() {
     if (g_ui.device_loading) return;
     g_ui.device_loading = true;
-    background::start([] {
+    run_task([] {
         std::string error; auto devices = audio::output_devices(error);
         post_ui([devices = std::move(devices), error] { g_ui.output_devices = devices; g_ui.device_error = error; g_ui.device_loading = false; });
-    });
+    }, [] { g_ui.device_loading = false; });
 }
 void select_output_device(const std::string& id) {
     bool paused, active; int index; long long position;
@@ -3316,7 +3400,7 @@ void library_export(bool playlist_only) {
     if (platform::fs::u8path(path).lexically_normal() == platform::fs::u8path(library_path()).lexically_normal() || platform::exists(path)) { toast("请选择一个尚不存在的备份文件，避免覆盖原数据"); return; }
     const auto snapshot = g_library;
     const auto selected = playlist_only ? g_playlist_view.playlist.key : std::string();
-    background::start([snapshot, selected, path] {
+    run_task([snapshot, selected, path] {
         library::Library backup;
         if (selected.empty()) backup = *snapshot;
         else for (const auto& p : snapshot->playlists) if (p.key == selected) {
@@ -3325,7 +3409,18 @@ void library_export(bool playlist_only) {
         std::string error;
         static std::atomic<unsigned long long> serial{0};
         const auto temporary = path + ".aino-" + std::to_string(platform::process_id()) + "-" + std::to_string(++serial) + ".tmp";
-        bool ok = backup.save(temporary, error);
+        bool ok;
+        if (library::m3u_path(path)) {
+            library::Playlist local;
+            if (!selected.empty()) {
+                for (const auto& playlist : backup.playlists) if (playlist.key == selected) local = playlist;
+            } else {
+                std::set<std::string> seen;
+                for (const auto& playlist : backup.playlists) for (const auto& track : playlist.tracks)
+                    if (!track.variants.empty() && seen.insert(track_uid(track)).second) local.tracks.push_back(track);
+            }
+            ok = library::write_m3u(local, temporary, error);
+        } else ok = backup.save(temporary, error);
         if (ok && !platform::move_file_no_replace(temporary, path)) { ok = false; error = "备份目标已存在或无法写入，原文件保留"; }
         platform::remove(temporary);
         post_ui([ok, path, error] { toast(ok ? "已导出：" + path : error, 7000); });
@@ -3335,15 +3430,23 @@ void library_restore() {
     const auto path = music::text::trim(g_ui.library_transfer_path);
     if (path.empty()) { toast("请先填写备份文件路径（JSON）"); return; }
     const auto epoch = g_library_epoch;
-    background::start([path, epoch] {
+    run_task([path, epoch] {
         auto imported = std::make_shared<library::Library>(); std::string error;
-        const bool ok = platform::exists(path) && imported->load(path, error);
+        bool ok = false;
+        if (library::m3u_path(path)) {
+            auto playlist = library::read_m3u(path, error, [] { return g_shutdown.load(); });
+            ok = error.empty();
+            if (ok) imported->upsert(std::move(playlist));
+        } else ok = platform::exists(path) && imported->load(path, error);
         post_ui([imported, ok, error, epoch] {
             if (epoch != g_library_epoch) return;
             if (!ok) { toast(error.empty() ? "备份文件不存在" : error, 7000); return; }
             library_edit([imported](library::Library& next) {
                 for (const auto& p : imported->playlists) {
-                    if (p.key == "favorites") for (const auto& t : p.tracks) { if (!next.contains(t)) next.toggle(t); }
+                    if (p.key == "favorites") {
+                        library::FavoriteIndex index(next.playlists.front().tracks);
+                        for (const auto& t : p.tracks) if (!index.contains(t)) { next.playlists.front().tracks.push_back(t); index.add(t); }
+                    }
                     else next.upsert(p);
                 }
                 for (auto it = imported->recent.rbegin(); it != imported->recent.rend(); ++it) next.remember(*it);
@@ -3420,7 +3523,7 @@ void playlist_open_remote(library::Playlist playlist) {
     g_ui.playlist_manage = false; g_ui.playlist_filter.clear(); g_ui.playlist_sort = 0;
     const auto settings = g_ui.settings;
     const auto uin = g_ui.qq_uin;
-    background::start([playlist = std::move(playlist), settings, uin, generation]() mutable {
+    run_task([playlist = std::move(playlist), settings, uin, generation]() mutable {
         net::CancelScope cancel([generation] { return g_shutdown.load() || generation != g_playlist_generation.load(); });
         std::string error;
         bool more = false;
@@ -3448,7 +3551,7 @@ void playlist_open_remote(library::Playlist playlist) {
             playlist_filter_rows();
             g_ui.scroll_to_top = true;
         });
-    });
+    }, [generation] { if (generation == g_playlist_generation.load()) g_playlist_view.loading = false; });
 }
 
 void playlist_load_more() {
@@ -3459,7 +3562,7 @@ void playlist_load_more() {
     const auto page = view.tracks_offset;
     view.loading_more = true;
     view.more_error.clear();
-    background::start([playlist, generation, page] {
+    run_task([playlist, generation, page] {
         net::CancelScope cancel([generation] { return g_shutdown.load() || generation != g_playlist_generation.load(); });
         bool more = false;
         int total = -1;
@@ -3489,7 +3592,7 @@ void playlist_load_more() {
             }
             playlist_filter_rows();
         });
-    });
+    }, [generation] { if (generation == g_playlist_generation.load()) g_playlist_view.loading_more = false; });
 }
 
 static music::CatalogPage local_catalog(const music::CatalogTarget& target, const library::Library& saved,
@@ -3546,7 +3649,7 @@ static void catalog_request(bool albums, bool append) {
     const auto saved = g_library;
     std::vector<music::Track> queue;
     if (target.source == music::Source::Local) { std::lock_guard<std::mutex> lock(g_mu); queue = g_as.tracks; }
-    background::start([generation, target, seed, artist_index, offset, continuation, settings, saved, queue = std::move(queue), albums, append]() mutable {
+    run_task([generation, target, seed, artist_index, offset, continuation, settings, saved, queue = std::move(queue), albums, append]() mutable {
         net::CancelScope scope(settings.cancelled);
         music::CatalogPage page; page.target = target;
         auto resolved = target;
@@ -3602,7 +3705,7 @@ static void catalog_request(bool albums, bool append) {
             if (!append && g_ui.catalog_section == (albums ? 1 : 0)) g_ui.scroll_to_top = true;
             if (!albums && g_ui.catalog_section == 1 && !view.albums_loaded && view.albums_error.empty()) catalog_request(true, false);
         });
-    });
+    }, [generation] { if (generation == g_playlist_generation.load()) { g_playlist_view.loading = false; g_playlist_view.loading_more = false; } });
 }
 static void open_catalog(music::CatalogTarget target, music::Track seed = {}, int artist_index = 0) {
     detail_begin();
@@ -3739,16 +3842,16 @@ void library_import_folder(const std::string& folder, bool recursive) {
     if (music::text::trim(folder).empty()) { toast("请先选择或输入音乐文件夹路径"); return; }
     g_ui.importing_playlist = true;
     const auto epoch = g_library_epoch;
+    const auto snapshot = g_library;
     toast("正在扫描音乐文件夹…");
-    background::start([folder, recursive, epoch] {
+    run_task([folder, recursive, epoch, snapshot] {
         std::string error;
-        auto playlist = library::scan_folder(folder, recursive, error, [] { return g_shutdown.load(); });
-        if (error.empty()) for (auto& track : playlist.tracks) {
-            if (g_shutdown.load()) return;
-            const auto info = audio::inspect_mp3(track.current().id);
-            if (info.valid && info.duration_ms > 0) track.duration_ms = int(std::min(info.duration_ms, 2147483647LL));
-            track.variants.front().duration_ms = track.duration_ms;
-        }
+        std::error_code ec;
+        const auto canonical = platform::fs::canonical(platform::fs::u8path(folder), ec).u8string();
+        const library::Playlist* previous = nullptr;
+        for (const auto& item : snapshot->playlists) if (item.local_folder == canonical) { previous = &item; break; }
+        auto playlist = library::scan_folder(folder, recursive, error, [] { return g_shutdown.load(); }, previous);
+        if (previous) { playlist.key = previous->key; playlist.name = previous->name; }
         if (g_shutdown.load()) return;
         post_ui([playlist = std::move(playlist), error, epoch]() mutable {
             if (epoch != g_library_epoch) return;
@@ -3758,7 +3861,54 @@ void library_import_folder(const std::string& folder, bool recursive) {
             library_edit([playlist = std::move(playlist)](library::Library& next) { next.upsert(playlist); },
                 [count] { toast("已导入 " + std::to_string(count) + " 首本地歌曲"); });
         });
-    });
+    }, [epoch] { if (epoch == g_library_epoch) g_ui.importing_playlist = false; });
+}
+void library_relocate() {
+    if (!g_playlist_view.saved || g_ui.importing_playlist) return;
+    const auto folder = music::text::trim(g_ui.local_folder);
+    if (folder.empty()) { toast("请先选择新的音乐文件夹"); return; }
+    auto playlist = g_playlist_view.playlist;
+    const auto epoch = g_library_epoch;
+    g_ui.importing_playlist = true;
+    run_task([playlist = std::move(playlist), folder, epoch]() mutable {
+        std::string error;
+        auto scanned = library::scan_folder(folder, true, error, [] { return g_shutdown.load(); });
+        size_t restored = 0, missing = 0;
+        if (error.empty()) {
+            std::map<std::string, std::vector<const music::Track*>> names;
+            std::map<std::string, const music::Track*> paths;
+            for (const auto& track : static_cast<const library::SharedTracks&>(scanned.tracks)) {
+                names[platform::fs::u8path(track.current().id).filename().u8string()].push_back(&track);
+                paths.emplace(library::local_path_key(platform::fs::u8path(track.current().id)), &track);
+            }
+            for (auto& track : playlist.tracks) {
+                if (track.variants.empty() || track.current().source != music::Source::Local || platform::exists(track.current().id)) continue;
+                const music::Track* replacement = nullptr;
+                if (!playlist.local_folder.empty()) {
+                    const auto relative = platform::fs::u8path(track.current().id).lexically_relative(platform::fs::u8path(playlist.local_folder));
+                    if (!relative.empty() && *relative.begin() != "..") {
+                        const auto wanted = platform::fs::u8path(scanned.local_folder) / relative;
+                        const auto found_path = paths.find(library::local_path_key(wanted));
+                        if (found_path != paths.end()) replacement = found_path->second;
+                    }
+                }
+                const auto found = names.find(platform::fs::u8path(track.current().id).filename().u8string());
+                if (!replacement && found != names.end() && found->second.size() == 1) replacement = found->second.front();
+                if (replacement) { track = *replacement; ++restored; } else ++missing;
+            }
+            if (!missing && !playlist.local_folder.empty()) { playlist.local_folder = scanned.local_folder; playlist.files = std::move(scanned.files); }
+        }
+        post_ui([playlist = std::move(playlist), error, epoch, restored, missing]() mutable {
+            if (epoch != g_library_epoch) return;
+            g_ui.importing_playlist = false;
+            if (!error.empty()) { toast(error, 7000); return; }
+            library_edit([playlist = std::move(playlist)](library::Library& next) {
+                if (playlist.key == "favorites") next.playlists.front() = playlist; else next.upsert(playlist);
+            }, [restored, missing] {
+                toast("已重新关联 " + std::to_string(restored) + " 首；仍有 " + std::to_string(missing) + " 首缺失或重名，保留原条目", 7000);
+            });
+        });
+    }, [epoch] { if (epoch == g_library_epoch) g_ui.importing_playlist = false; });
 }
 void library_fetch(library::Playlist playlist) {
     if (g_ui.importing_playlist) { toast("正在保存在线歌单，请稍候"); return; }
@@ -3770,7 +3920,7 @@ void library_fetch(library::Playlist playlist) {
     const auto settings = g_ui.settings;
     const auto uin = g_ui.qq_uin;
     toast("正在保存在线歌单…");
-    background::start([playlist = std::move(playlist), settings, uin, epoch]() mutable {
+    run_task([playlist = std::move(playlist), settings, uin, epoch]() mutable {
         net::CancelScope cancel([] { return g_shutdown.load(); });
         std::string error;
         ne::Playlist ne_metadata;
@@ -3809,12 +3959,12 @@ void library_fetch(library::Playlist playlist) {
                     g_ui.playlist_link.clear(); toast("在线歌单已完整保存到本地");
                 });
         });
-    });
+    }, [epoch] { if (epoch == g_library_epoch) g_ui.importing_playlist = false; });
 }
 void library_import_link() {
     library::Playlist playlist;
     if (!library::parse_link(g_ui.playlist_link, playlist.source, playlist.remote_id)) {
-        toast("请粘贴网易云或 QQ 的完整歌单链接（短链接请先在浏览器打开）", 6500); return;
+        toast("支持网易云、QQ、酷我、酷狗、咪咕的官方完整歌单链接；短链接请先在浏览器展开", 6500); return;
     }
     playlist.key = std::string(music::source_key(playlist.source)) + "#" + playlist.remote_id;
     playlist.name = std::string(music::source_name(playlist.source)) + "歌单 " + playlist.remote_id;
@@ -3901,7 +4051,7 @@ void check_updates(bool notify) {
         g_update_view.status == UpdateStatus::Installing) return;
     g_update_view.status = UpdateStatus::Checking;
     g_update_view.message = "正在检查 GitHub 正式版…";
-    background::start([notify] {
+    run_task([notify] {
         UpdateView result;
         try {
             net::Request request;
@@ -3915,7 +4065,7 @@ void check_updates(bool notify) {
             if (g_update_view.status == UpdateStatus::Available) toast("发现新版本 " + g_update_view.version + "，可在设置 → 版本更新中下载", 7000);
             else if (notify) toast(g_update_view.message, 5000);
         });
-    });
+    }, [] { g_update_view.status = UpdateStatus::Failed; });
 }
 void open_update(bool download) {
 #if defined(_WIN32) || defined(__linux__)
@@ -3934,7 +4084,7 @@ void open_update(bool download) {
         g_update_cancel.store(false);
         g_update_view.status = UpdateStatus::Downloading; g_update_view.progress = 0;
         g_update_view.message = "正在下载安装包并校验 SHA-256…";
-        background::start([release] {
+        run_task([release] {
             const auto tag = release.version.front() == 'v' ? release.version : "v" + release.version;
 #ifdef _WIN32
             const auto path = platform::join(g_temp_dir, "aino-update-" + tag + ".exe");
@@ -3990,7 +4140,7 @@ void open_update(bool download) {
                 toast(g_update_view.message, 8000);
             });
 #endif
-        });
+        }, [] { g_update_view.status = UpdateStatus::Failed; });
         return;
     }
 #endif
@@ -4067,7 +4217,7 @@ void start(HostCallbacks host) {
         ne_refresh();
     }
     // 播放/缓冲/检索期间的刷新泵：只在需要时 wake()，其余时间主循环睡着
-    background::start([] {
+    background::service([] {
         unsigned long long toast_seen = 0, timer_seen = 0, memory_seen = platform::ticks();
         while (!g_shutdown.load()) {
             bool busy = false;
@@ -4079,7 +4229,7 @@ void start(HostCallbacks host) {
             }
             const unsigned long long now = platform::ticks();
             // 暂停且无输入时也维护缓存；先补一帧更新可见封面的访问时间，再回收离屏资源。
-            if (now >= memory_seen + 60000) { if (g_win) g_win->wake(); memory_seen = now; }
+            if (now >= memory_seen + 30000) { if (g_win) g_win->wake(); memory_seen = now; }
             if (g_sleep_deadline.load()) {
                 if (now >= timer_seen + 1000) { if (g_win) g_win->wake(); timer_seen = now; }
             } else timer_seen = 0;
@@ -4105,10 +4255,59 @@ void start(HostCallbacks host) {
     });
 
 }
+static void refresh_watched_folders() {
+    static unsigned long long checked_at = 0;
+    static bool running = false;
+    static std::map<std::string, std::string> last_errors;
+    if (!g_ui.watch_folders || running || g_ui.importing_playlist || platform::ticks() < checked_at + 30000) return;
+    checked_at = platform::ticks(); running = true;
+    const auto snapshot = g_library;
+    const auto epoch = g_library_epoch;
+    run_task([snapshot, epoch] {
+        std::vector<library::Playlist> updates;
+        std::map<std::string, std::string> errors;
+        for (const auto& original : snapshot->playlists) {
+            if (g_shutdown.load()) return;
+            if (original.local_folder.empty()) continue;
+            std::string error;
+            auto scanned = library::scan_folder(original.local_folder, original.recursive, error, [] { return g_shutdown.load(); }, &original);
+            errors[original.key] = error;
+            if (error.empty() && (scanned.files != original.files || scanned.tracks.size() != original.tracks.size())) {
+                scanned.key = original.key; updates.push_back(std::move(scanned));
+            }
+        }
+        post_ui([snapshot, epoch, updates = std::move(updates), errors = std::move(errors)]() mutable {
+            running = false;
+            if (epoch != g_library_epoch || !g_ui.watch_folders) return;
+            for (const auto& error : errors) {
+                if (!error.second.empty() && last_errors[error.first] != error.second) toast("自动刷新：" + error.second, 7000);
+                last_errors[error.first] = error.second;
+            }
+            if (updates.empty()) return;
+            library_edit([updates = std::move(updates), snapshot](library::Library& next) {
+                for (const auto& update : updates) for (auto& current : next.playlists) if (current.key == update.key) {
+                    const auto old = std::find_if(snapshot->playlists.begin(), snapshot->playlists.end(), [&](const auto& p) { return p.key == update.key; });
+                    if (old == snapshot->playlists.end() || current.local_folder != old->local_folder || current.files != old->files) break;
+                    current.tracks = update.tracks; current.files = update.files; current.cover = update.cover;
+                    break;
+                }
+            });
+        });
+    }, [] { running = false; });
+}
 void tick() {
         background::reap();
         for (const auto& error : background::take_errors()) toast("后台任务失败：" + error, 8000);
         drain_ui_mail();
+        refresh_watched_folders();
+        if (platform::ticks() >= g_toast_until.load()) {
+            g_ui.toast.clear();
+            if (!g_notification_pending.empty()) {
+                auto message = std::move(g_notification_pending.front()); g_notification_pending.pop_front();
+                g_ui.toast = std::move(message.text);
+                g_toast_until.store(platform::ticks() + static_cast<unsigned long long>(message.duration_ms));
+            }
+        }
         if (g_ui.sleep_deadline) {
             const auto now = platform::ticks();
             if (now >= g_ui.sleep_deadline) {
@@ -4232,7 +4431,7 @@ void tick() {
             toast(error + "，正在恢复完整文件播放", 6000);
             auto settings = g_ui.settings;
             for (int i = 0; i < music::kSourceCount; ++i) settings.enable[i] = (g_ui.src_mask >> i) & 1u;
-            background::start(do_play, g_win, std::move(track), std::move(settings), gen, false);
+            run_task([=]() mutable { do_play(g_win, std::move(track), std::move(settings), gen, false); }, [gen] { std::lock_guard<std::mutex> lock(g_mu); if (g_as.gen == gen) { g_as.ps = PlayState::Failed; g_track_failure_gen = gen; } }, true);
             snap.ps = PlayState::Buffering;
         }
 
@@ -4335,6 +4534,7 @@ void bootstrap(bool initial_search, bool smoke_test) {
 #endif
             if (g_shutdown.load()) return;
             if (lx::Engine::instance().load_dir(dir) < 0) throw std::runtime_error(lx::Engine::instance().preferences_error());
+            lx::Engine::instance().restore_metrics(platform::network_signature());
             if (!migration_error.empty()) post_ui([migration_error] { toast("部分旧音源未迁移，请重新导入：" + migration_error, 6000); });
         });
     }
@@ -4350,11 +4550,12 @@ void finish_frame(float frame_ms) {
     if (!g_shutdown.load() && now > last_trim + 60000) {
         last_trim = now;
         g_covers.trim_idle(now);
-        if (!lx::Engine::instance().loading() && !collecting.exchange(true)) background::start([] {
+        if (!lx::Engine::instance().loading() && !collecting.exchange(true)) run_task([] {
             struct Done { ~Done() { collecting.store(false); } } done;
             net::CancelScope cancel([] { return g_shutdown.load(); });
             lx::Engine::instance().collect_idle();
-        });
+            lx::Engine::instance().update_network(platform::network_signature());
+        }, [] { collecting.store(false); });
     }
         // Cookie / 音量 / 音源开关变了就落盘，节流到 2 秒一次，别每帧写文件
         if (g_ui.config_dirty) {
@@ -4392,6 +4593,7 @@ void shutdown(bool smoke_test) {
     g_player.shutdown(); // 入口仍持有 UI 线程的 COM apartment，此处先释放音频引擎。
     { std::lock_guard<std::mutex> lock(g_mu); g_pending_stream.reset(); g_active_stream_spec = {}; }
     background::stop();
+    if (!smoke_test) lx::Engine::instance().save_metrics(platform::network_signature());
     g_current_media.reset();
     if (!smoke_test) {
         save_config();
@@ -4422,7 +4624,7 @@ void seek_playback(int milliseconds) {
     g_player.close(); cancel_preload(); g_ui.pos_ms = float(spec.start_ms);
     auto settings = g_ui.settings;
     for (int i = 0; i < music::kSourceCount; ++i) settings.enable[i] = (g_ui.src_mask >> i) & 1u;
-    background::start([spec, track, settings, gen]() mutable {
+    run_task([spec, track, settings, gen]() mutable {
         auto cancelled = [gen] { return g_shutdown.load() || gen != g_play_generation.load(); };
         std::string error; auto stream = audio::Stream::open(spec, cancelled, error);
         if (cancelled()) return;
@@ -4431,7 +4633,7 @@ void seek_playback(int milliseconds) {
             { std::lock_guard<std::mutex> lock(g_mu); if (gen != g_as.gen) return; g_active_stream_spec = {}; }
             do_play(g_win, std::move(track), std::move(settings), gen, false);
         }
-    });
+    }, [gen] { std::lock_guard<std::mutex> lock(g_mu); if (gen == g_as.gen) { g_as.ps = PlayState::Failed; g_track_failure_gen = gen; } } , true);
 }
 
 void choose_source(int index, int variant, bool replay) {
@@ -4460,7 +4662,7 @@ void library_choose_folder() {
     g_folder_cancel.store(false);
     void* owner = g_host.native_window ? g_host.native_window() : nullptr;
     const auto epoch = g_library_epoch;
-    background::start([owner, epoch] {
+    run_task([owner, epoch] {
         std::string error;
         const auto folder = platform::choose_music_folder(owner, g_folder_cancel, error);
         post_ui([folder, error, epoch] {
@@ -4469,7 +4671,7 @@ void library_choose_folder() {
             if (!folder.empty()) g_ui.local_folder = folder;
             if (!error.empty()) toast(error, 6000);
         });
-    });
+    }, [] { g_folder_selecting = false; });
 }
 void download_current() {
     music::Track track;
@@ -4487,3 +4689,5 @@ void open_data_directory(const std::string& path) {
 }
 std::shared_ptr<const cover::Image> cover_image(const std::string& url) { return g_covers.get(url); }
 } // namespace player
+
+#endif // AINO_PLAYER_INTERFACE

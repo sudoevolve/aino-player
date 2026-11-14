@@ -501,6 +501,8 @@ static void sidebar(Ctx& c) {
         }
         c.ui.system_icon(icons[i], {box.x + 11, box.y + 7, 16, 16}, c.model.ui.tab == tabs[i] ? c.th.tint : c.th.label2);
     }
+    if (c.ui.button("通知", {w - 76, 318, 54, 24}, Style().ghost().font(11)))
+        c.model.ui.notifications_open = true;
 
     c.ui.fill_rect({20, 308, w - 40, 1}, c.th.separator);
 
@@ -1180,10 +1182,14 @@ static void playlist_detail(Ctx& c) {
     if (view.saved && state.playlist_manage) {
         c.ui.input(&state.playlist_rename, {mx, 210, mw - 84, 28}, Style().font(11).hint("歌单名称"));
         if (c.ui.button("重命名", {mx + mw - 76, 210, 76, 28}, Style().font(11))) playlist_rename_local();
-        c.ui.input(&state.library_transfer_path, {mx, 246, mw - 94, 28}, Style().font(11).hint("导出 JSON 文件的完整路径"));
+        c.ui.input(&state.library_transfer_path, {mx, 246, mw - 94, 28}, Style().font(11).hint("导出 JSON 或 M3U8 文件的完整路径"));
         if (c.ui.button("导出歌单", {mx + mw - 86, 246, 86, 28}, Style().font(10.5f))) library_export(true);
-        c.ui.muted_text("管理只修改本地歌单，保留原音乐文件", {mx, 280, mw, 18}, Style().font(10.5f));
-        list_top = 308;
+        if (playlist.source == music::Source::Local || !playlist.local_folder.empty() || playlist.key == "favorites") {
+            c.ui.input(&state.local_folder, {mx, 282, mw - 204, 28}, Style().font(11).hint("音乐移动后的新文件夹"));
+            if (c.ui.button("选择目录", {mx + mw - 196, 282, 88, 28}, Style().font(11))) library_choose_folder();
+            if (c.ui.button("重新关联", {mx + mw - 100, 282, 100, 28}, save)) library_relocate();
+            list_top = 346;
+        } else list_top = 310;
     }
     list_top += batch_toolbar(c, "playlist", std::string(music::source_key(playlist.source)) + "/" + playlist.key + "#" + playlist.remote_id + "\x01" + state.playlist_filter + std::to_string(state.playlist_sort), int(view.library_revision) + int(playlist.tracks.size()), playlist.tracks, &view.rows, {mx, list_top, mw, 32}, view.saved, playlist.key);
     const bool paging = view.tracks_more && !view.saved;
@@ -1506,7 +1512,7 @@ static void source_tab_scripts(Ctx& c, const Rect& area) {
 
     const float by = head.y + 14;
     auto source_action = Style().font(11.5f);
-    source_action.disabled = g_lx_task.load() != LxTask::None;
+    source_action.disabled = source_task() != LxTask::None;
     if (c.ui.button("打开目录", {head.right() - 384, by, 84, 26}, Style().ghost().font(11.5f)))
         open_data_directory(lx::default_dir());
     if (c.ui.button("导入音源", {head.right() - 292, by, 84, 26}, source_action)) lx_import_source();
@@ -1514,16 +1520,16 @@ static void source_tab_scripts(Ctx& c, const Rect& area) {
     if (c.ui.button("重新加载", {head.right() - 108, by, 92, 26}, source_action.ghost())) lx_reload_sources();
 
     // 初始化只执行本地脚本；是否请求它自己的接口由脚本决定。
-    const auto source_task = g_lx_task.load();
-    const std::string note = source_task == LxTask::Fetch && !g_lx_fetch_progress.empty()
-        ? g_lx_fetch_progress
+    const auto source_task = player::source_task();
+    const std::string note = source_task == LxTask::Fetch && !source_fetch_progress().empty()
+        ? source_fetch_progress()
         : lx_sources_loading()
         ? std::string("正在初始化音源脚本…（部分脚本会访问自身接口）")
         : source_task == LxTask::Fetch ? std::string("正在下载并加载音源脚本；本次获取的脚本会恢复到应用中")
         : source_task == LxTask::Import ? std::string("正在导入所选脚本，移除的源可通过重新导入恢复")
-        : (g_lx_fetch_summary.empty()
+        : (source_fetch_summary().empty()
             ? std::string("按") + music::source_name(source_order_platform()) + " · " + music::quality_name(c.model.ui.settings.quality) + "的实际选源顺序排列；失败源仅作兜底。"
-            : g_lx_fetch_summary);
+            : source_fetch_summary());
     c.ui.muted_text(ellipsize(c.ui, note, head.w - 240, 10.5f),
                     {head.x + 20, head.y + 46, head.w - 240, 18}, Style().font(10.5f));
 
@@ -1745,9 +1751,11 @@ static void storage_settings(Ctx& c, float x, float w, float y) {
     }
     c.ui.muted_text("清除前会再次确认。已下载的音乐和本地音频文件会保留。", {x + 2, data.bottom() + 12, w - 4, 36}, Style().font(10.5f).wrap_text());
     c.ui.subheading("收藏与歌单备份", {x, data.bottom() + 64, w, 24});
-    c.ui.input(&c.model.ui.library_transfer_path, {x, data.bottom() + 102, w, 30}, Style().font(11).hint("JSON 备份文件完整路径；恢复会合并收藏与歌单"));
+    c.ui.input(&c.model.ui.library_transfer_path, {x, data.bottom() + 102, w, 30}, Style().font(11).hint("JSON 备份或本地 M3U / M3U8 完整路径"));
     if (c.ui.button("导出全部", {x, data.bottom() + 144, 90, 28}, Style().font(11))) library_export(false);
     if (c.ui.button("合并恢复", {x + 104, data.bottom() + 144, 90, 28}, Style().font(11))) library_restore();
+    if (c.ui.toggle(&c.model.ui.watch_folders, {x + w - 42, data.bottom() + 196, 38, 22})) c.model.ui.config_dirty = true;
+    c.ui.muted_text("自动刷新文件夹歌单（每 30 秒检查，未变化的标签不重读）", {x, data.bottom() + 196, w - 58, 36}, Style().font(10.5f).wrap_text());
 }
 
 static void clear_data_dialog(Ctx& c) {
@@ -1901,7 +1909,7 @@ static void tab_settings(Ctx& c) {
     auto& selected = c.model.ui.settings_tab;
     const bool changed = c.ui.segmented({"通用", "账号", "播放", "下载", "数据", "关于"}, &selected, {x, 78, w, 32}, Style().font(11.5f));
     if (changed) c.model.ui.update_settings = false;
-    const float content_height = selected == 4 ? 700.0f : selected == 5 ? 510.0f : selected == 3 ? 350.0f : selected == 2 ? 470.0f : selected == 1 ? 360.0f : c.model.ui.update_settings ? 390.0f + update_notes(c, x, w, 0, false) : 690.0f;
+    const float content_height = selected == 4 ? 744.0f : selected == 5 ? 510.0f : selected == 3 ? 350.0f : selected == 2 ? 470.0f : selected == 1 ? 360.0f : c.model.ui.update_settings ? 390.0f + update_notes(c, x, w, 0, false) : 690.0f;
     const Rect viewport{x, 132, w, c.bar_y - 148};
     if (changed) c.ui.scroll_to_index(viewport, 0, content_height, 1);
     c.ui.scroll(viewport, 1, content_height, [&](int, const Rect& area) {
@@ -2491,10 +2499,28 @@ static void error_details_dialog(Ctx& c) {
     if (c.ui.button("复制全部", {box.x + 20, y, 92, 28}, Style().font(11))) c.ui.set_clipboard(error_details.text);
     if (c.ui.button("关闭", {box.right() - 100, y, 80, 28}, Style().primary().font(11))) error_details.open = false;
 }
+static void notifications_dialog(Ctx& c) {
+    const auto box = Rect::centered(c.W / 2, c.H / 2, std::min(680.0f, c.W - 40), std::min(500.0f, c.H - 48));
+    c.ui.dialog("通知", "最近 64 条，关闭应用后清空；点击一条可查看完整内容", &c.model.ui.notifications_open, box);
+    if (!c.model.ui.notifications_open) return;
+    std::string selected;
+    const auto& history = notifications();
+    c.ui.scroll({box.x + 20, box.y + 88, box.w - 40, box.h - 148}, int(history.size()), 54, [&](int i, const Rect& row) {
+        const auto& message = history[size_t(i)];
+        if (c.ui.item(ellipsize(c.ui, message.text, row.w - 24, 12), "点击查看详情 / 复制", "", row, Style().font(12))) selected = message.text;
+    });
+    if (!selected.empty()) { c.model.ui.notifications_open = false; error_details = {true, "通知详情", std::move(selected)}; }
+    if (c.ui.button("复制全部", {box.x + 20, box.bottom() - 44, 88, 28}, Style().font(11))) {
+        std::string text;
+        for (const auto& message : history) text += message.text + "\n\n";
+        c.ui.set_clipboard(text);
+    }
+    if (c.ui.button("清空", {box.right() - 96, box.bottom() - 44, 76, 28}, Style().ghost().font(11))) clear_notifications();
+}
 
 static void compose(aino::Ui& ui, Ctx& c) {
     row_selection = nullptr;
-    if (ui.pointer_available() && !song_menu.active && !c.model.ui.close_dialog && !artist_chooser.open && !error_details.open &&
+    if (ui.pointer_available() && !song_menu.active && !c.model.ui.close_dialog && !artist_chooser.open && !error_details.open && !c.model.ui.notifications_open &&
         c.model.ui.remove_playlist_key.empty() && c.model.ui.clear_action == ClearAction::None && ui.input().ctrl_of('O')) choose_local_audio();
     if (!c.model.ui.lyrics_open && g_lyr_layout.owner) { g_lyr_layout = {}; g_lyr_scroll = 0; g_lyr_cur = -1; }
     if (c.model.ui.tab == 2) { c.model.ui.tab = 1; c.model.ui.queue_open = true; c.model.ui.lyrics_open = false; }
@@ -2520,6 +2546,7 @@ static void compose(aino::Ui& ui, Ctx& c) {
     else if (artist_chooser.open) artist_chooser_dialog(c);
     else if (!c.model.ui.remove_playlist_key.empty()) remove_playlist_dialog(c);
     else if (error_details.open) error_details_dialog(c);
+    else if (c.model.ui.notifications_open) notifications_dialog(c);
     else clear_data_dialog(c);
 }
 

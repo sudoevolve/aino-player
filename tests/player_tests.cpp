@@ -536,6 +536,31 @@ int main(int argc, char** argv) {
         }
         const auto missing = platform::join(dir, "missing.wav");
         check(!audio::inspect_mp3(missing).valid, "missing audio rejected");
+        {
+            std::atomic<int> completed{0};
+            try {
+                background::ThreadGroup workers;
+                workers.emplace_back([&] { ++completed; });
+                throw std::runtime_error("leave partially constructed group");
+            } catch (const std::runtime_error&) {}
+            check(completed == 1, "worker group joins during exceptional exit");
+            music::Source source; std::string id;
+            check(library::parse_link("https://www.kuwo.cn/playlist_detail/12345", source, id) && source == music::Source::Kuwo && id == "playlist:12345", "kuwo playlist URL identity");
+            check(library::parse_link("https://www.kugou.com/yy/special/single/12345.html", source, id) && source == music::Source::Kugou, "kugou playlist URL identity");
+            check(library::parse_link("https://music.migu.cn/v3/music/playlist/12345", source, id) && source == music::Source::Migu, "migu playlist URL identity");
+            check(!library::parse_link("https://www.kuwo.cn.evil.test/playlist_detail/12345", source, id), "playlist official host boundary");
+            lx::Engine::Timing cached; cached.load_ms = 42; cached.samples = 1; cached.cached = true;
+            const auto score = lx::Engine::selection_score("320k", nullptr, &cached, nullptr, 1000);
+            check(score.availability == 1 && score.estimated && score.latency_ms == 42, "restored metrics estimate without claiming audio verification");
+            const auto m3u = platform::join(dir, "local.m3u8");
+            const auto audio_file = platform::join(dir, "missing track.mp3");
+            library::Playlist local; local.tracks.push_back(library::local_track(platform::fs::u8path(audio_file)));
+            std::string error;
+            check(library::write_m3u(local, m3u, error), "write relative local M3U8");
+            auto restored = library::read_m3u(m3u, error);
+            check(error.empty() && restored.tracks.size() == 1 && library::local_path_key(platform::fs::u8path(restored.tracks.front().current().id)) == library::local_path_key(platform::fs::absolute(platform::fs::u8path(audio_file))), "relative M3U8 roundtrip");
+            platform::remove(m3u);
+        }
         platform::remove(file); platform::remove(dir);
         std::cout << "All player regression checks passed\n";
         login::shutdown(); return 0;

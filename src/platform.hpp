@@ -42,13 +42,25 @@ extern char** environ;
 #endif
 
 namespace platform {
-enum class MediaAction { Toggle, Play, Pause, Stop, Next, Previous, SeekRelative, SeekAbsolute, Volume, Show, Quit, Shuffle, Loop, OpenFiles };
+inline constexpr const char* audio_extensions[]{".mp3", ".flac", ".wav", ".wave", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".webm"};
+inline constexpr const char* audio_mimes[]{"audio/mpeg", "audio/flac", "audio/x-flac", "audio/wav", "audio/x-wav", "audio/mp4", "audio/x-m4a", "audio/aac", "audio/x-aac", "audio/ogg", "audio/x-vorbis+ogg", "application/ogg", "audio/opus", "audio/webm"};
+enum class MediaAction { Toggle, Play, Pause, Stop, Next, Previous, SeekRelative, SeekAbsolute, Volume, Show, Quit, Shuffle, Loop, OpenFiles, Search };
 struct MediaEvent { MediaAction action; long long value = 0; std::string track; std::vector<std::string> files; };
 // 系统打开与拖放只接受本地路径 / file URI，不把外部地址当音乐搜索词或执行命令。
 std::string local_file_path(const std::string& value);
 std::vector<std::string> local_uri_list(const std::string& value);
 bool set_default_music_player(std::string& error, const std::function<bool()>& cancelled = {});
 bool forward_local_files(const std::vector<std::string>& paths);
+bool forward_search(const std::string& query);
+inline std::string config_dir();
+inline std::string instance_scope() {
+    const auto directory = config_dir();
+    uint64_t hash = 14695981039346656037ULL;
+    for (unsigned char byte : directory) { hash ^= byte; hash *= 1099511628211ULL; }
+    return std::to_string(hash);
+}
+/** @brief 本机活动网络接口地址；仅用于本地测速缓存签名，不发送或显示。 */
+std::string network_signature();
 struct MediaState {
     std::string uid, title, artist, album, artwork;
     long long position_ms = 0, duration_ms = 0;

@@ -18,7 +18,7 @@ if(WIN32)
   endif()
   # 新 Windows SDK 的 C++/WinRT 使用标准 coroutine；其余模块仍为 C++17。
   target_compile_features(player_desktop PRIVATE cxx_std_20)
-  target_link_libraries(player_desktop PUBLIC user32 shell32 advapi32 runtimeobject windowsapp)
+  target_link_libraries(player_desktop PUBLIC user32 shell32 advapi32 runtimeobject windowsapp iphlpapi ws2_32)
 else()
   find_package(X11 REQUIRED)
   find_package(PkgConfig REQUIRED)
@@ -107,6 +107,15 @@ if(MSVC)
 endif()
 
 add_executable(aino_player WIN32 src/main.cpp src/cover_decode.cpp)
+target_compile_definitions(aino_player PRIVATE AINO_PLAYER_BUSINESS_UNIT=1)
+option(AINO_PLAYER_PCH "Cache stable framework parsing for incremental player builds" ON)
+if(AINO_PLAYER_PCH)
+  # 框架公开实现全部 inline，沿用原单元和宏，仅缓存稳定的解析结果，不改 ABI / 上游。
+  file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/generated/aino_pch.hpp" CONTENT
+    "#define AINO_IMPLEMENTATION\n#include \"${CMAKE_CURRENT_SOURCE_DIR}/src/aino.hpp\"\n#ifdef AINO_PLATFORM_X11\n#undef Bool\n#undef Status\n#undef None\n#endif\n")
+  target_precompile_headers(aino_player PRIVATE "${CMAKE_BINARY_DIR}/generated/aino_pch.hpp")
+  set_source_files_properties(src/cover_decode.cpp PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+endif()
 # JS 是目录接口的唯一实现。内嵌默认脚本，仍允许 providers/ 同名文件覆盖；
 # 单 EXE 和 Linux 安装均不依赖启动工作目录。
 file(GLOB platform_scripts CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/providers/*.js")

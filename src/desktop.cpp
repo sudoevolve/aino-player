@@ -5,11 +5,17 @@
 #include <fstream>
 #include <sstream>
 #ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
 #include <SystemMediaTransportControlsInterop.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Media.h>
 #include <winrt/Windows.Storage.Streams.h>
 #else
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
 #include <dbus/dbus.h>
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
@@ -19,6 +25,45 @@
 #endif
 
 namespace platform {
+std::string network_signature() {
+    std::vector<std::string> addresses;
+#ifdef _WIN32
+    ULONG size = 16384;
+    std::vector<unsigned char> bytes(size);
+    auto* adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(bytes.data());
+    auto status = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, nullptr, adapters, &size);
+    if (status == ERROR_BUFFER_OVERFLOW && size < 1024 * 1024) {
+        bytes.resize(size); adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(bytes.data());
+        status = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, nullptr, adapters, &size);
+    }
+    if (status != NO_ERROR) return {};
+    for (auto* adapter = adapters; adapter; adapter = adapter->Next) {
+        if (adapter->OperStatus != IfOperStatusUp || adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        for (auto* address = adapter->FirstUnicastAddress; address; address = address->Next) {
+            const auto* socket = address->Address.lpSockaddr;
+            if (!socket) continue;
+            const auto* data = socket->sa_family == AF_INET ? reinterpret_cast<const unsigned char*>(&reinterpret_cast<const sockaddr_in*>(socket)->sin_addr) :
+                socket->sa_family == AF_INET6 ? reinterpret_cast<const unsigned char*>(&reinterpret_cast<const sockaddr_in6*>(socket)->sin6_addr) : nullptr;
+            if (data) addresses.emplace_back(reinterpret_cast<const char*>(data), socket->sa_family == AF_INET ? 4 : 16);
+        }
+    }
+#else
+    ifaddrs* interfaces = nullptr;
+    if (getifaddrs(&interfaces) != 0) return {};
+    for (auto* entry = interfaces; entry; entry = entry->ifa_next) {
+        if (!entry->ifa_addr || !(entry->ifa_flags & IFF_UP) || (entry->ifa_flags & IFF_LOOPBACK)) continue;
+        const auto* socket = entry->ifa_addr;
+        const auto* data = socket->sa_family == AF_INET ? reinterpret_cast<const unsigned char*>(&reinterpret_cast<const sockaddr_in*>(socket)->sin_addr) :
+            socket->sa_family == AF_INET6 ? reinterpret_cast<const unsigned char*>(&reinterpret_cast<const sockaddr_in6*>(socket)->sin6_addr) : nullptr;
+        if (data) addresses.emplace_back(reinterpret_cast<const char*>(data), socket->sa_family == AF_INET ? 4 : 16);
+    }
+    freeifaddrs(interfaces);
+#endif
+    std::sort(addresses.begin(), addresses.end());
+    std::string result;
+    for (const auto& address : addresses) { result += std::to_string(address.size()) + ":"; result += address; }
+    return result;
+}
 std::string local_file_path(const std::string& value) {
     if (value.empty() || value.find('\0') != std::string::npos) return {};
     if (value.rfind("file:", 0) != 0) {
@@ -63,8 +108,6 @@ std::vector<std::string> local_uri_list(const std::string& value) {
 }
 namespace {
 constexpr uintptr_t kOpenFilesMessage = 0x41494e4f;
-const char* const audio_mimes[]{"audio/mpeg", "audio/flac", "audio/x-flac", "audio/wav", "audio/x-wav",
-    "audio/mp4", "audio/x-m4a", "audio/aac", "audio/x-aac", "audio/ogg", "audio/x-vorbis+ogg", "application/ogg", "audio/opus", "audio/webm"};
 #ifndef _WIN32
 // 拖拽源可随时关闭窗口；只忽略独立拖放连接上的 BadWindow，其他连接仍使用原处理器。
 std::atomic<Display*> drop_error_display{nullptr};
@@ -139,6 +182,7 @@ struct Desktop::Impl {
                 begin += length + 1;
             }
             if (paths.empty()) return self->queue->push({MediaAction::Show}) ? TRUE : FALSE;
+            if (paths.size() == 2 && paths[0] == "aino-search:") return self->queue->push({MediaAction::Search, 0, paths[1]}) ? TRUE : FALSE;
             return self->queue->push({MediaAction::OpenFiles, 0, {}, std::move(paths)}) ? TRUE : FALSE;
         }
         if (message == self->taskbar_created) { self->tray.store(false); self->sync_tray(); return 0; }
@@ -487,13 +531,19 @@ struct Desktop::Impl {
             while (arg(values, DBUS_TYPE_STRING) && count++ < 10000) {
                 const auto raw = read_string(values); bytes += raw.size() + 1;
                 if (bytes > 2 * 1024 * 1024) { valid = false; break; }
-                const auto path = local_file_path(raw);
-                if (!path.empty()) paths.push_back(path);
+                paths.push_back(raw);
                 dbus_message_iter_next(&values);
             }
-            if (valid && dbus_message_iter_get_arg_type(&values) == DBUS_TYPE_INVALID)
-                valid = paths.empty() ? queue->push({MediaAction::Show}) : queue->push({MediaAction::OpenFiles, 0, {}, std::move(paths)});
-            else valid = false;
+            if (valid && dbus_message_iter_get_arg_type(&values) == DBUS_TYPE_INVALID) {
+                if (paths.empty()) valid = queue->push({MediaAction::Show});
+                else if (paths.size() == 2 && paths[0] == "aino-search:")
+                    valid = !paths[1].empty() && paths[1].size() <= 8192 && queue->push({MediaAction::Search, 0, paths[1]});
+                else {
+                    std::vector<std::string> local;
+                    for (const auto& raw : paths) { auto file = local_file_path(raw); if (!file.empty()) local.push_back(std::move(file)); }
+                    valid = !local.empty() && queue->push({MediaAction::OpenFiles, 0, {}, std::move(local)});
+                }
+            } else valid = false;
         } else if (iface == player_iface && path == "/org/mpris/MediaPlayer2") {
             if (member == "PlayPause") queue->push({MediaAction::Toggle});
             else if (member == "Play") queue->push({MediaAction::Play});
@@ -627,7 +677,7 @@ struct Desktop::Impl {
         bus = dbus_bus_get_private(DBUS_BUS_SESSION, nullptr);
         if (!bus) { while (!stopping.load()) { poll_drops(); sleep_ms(100); } return; }
         dbus_connection_set_exit_on_disconnect(bus, false);
-        bus_name = "org.mpris.MediaPlayer2.aino.instance" + std::to_string(getpid());
+        bus_name = "org.mpris.MediaPlayer2.aino.instance" + instance_scope() + "_" + std::to_string(getpid());
         if (dbus_bus_request_name(bus, bus_name.c_str(), DBUS_NAME_FLAG_DO_NOT_QUEUE, nullptr) != DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER) { dbus_connection_close(bus); dbus_connection_unref(bus); bus = nullptr; return; }
         media.store(true); unsigned long long checked = 0;
         MediaState prior; bool prior_enabled = !enabled.load();
@@ -775,9 +825,11 @@ bool forward_local_files(const std::vector<std::string>& paths) {
     size_t bytes = 0;
     for (const auto& path : paths) { bytes += path.size() + 1; if (bytes > 2 * 1024 * 1024) return false; }
 #ifdef _WIN32
-    struct Search { HWND target = nullptr; } search;
+    const auto scope_property = widen("AinoPlayerScope" + instance_scope());
+    struct Search { HWND target = nullptr; const wchar_t* scope = nullptr; } search{nullptr, scope_property.c_str()};
     EnumWindows([](HWND window, LPARAM data) -> BOOL {
         if (!GetPropW(window, L"AinoPlayerDesktop")) return TRUE;
+        if (!GetPropW(window, reinterpret_cast<Search*>(data)->scope)) return TRUE;
         reinterpret_cast<Search*>(data)->target = window; return FALSE;
     }, reinterpret_cast<LPARAM>(&search));
     if (!search.target) return false;
@@ -802,7 +854,7 @@ bool forward_local_files(const std::vector<std::string>& paths) {
             dbus_message_iter_recurse(&root, &names);
             while (dbus_message_iter_get_arg_type(&names) == DBUS_TYPE_STRING) {
                 const char* name = nullptr; dbus_message_iter_get_basic(&names, &name);
-                if (name && std::string(name).rfind("org.mpris.MediaPlayer2.aino.instance", 0) == 0) players.emplace_back(name);
+                if (name && std::string(name).rfind("org.mpris.MediaPlayer2.aino.instance" + instance_scope() + "_", 0) == 0) players.emplace_back(name);
                 dbus_message_iter_next(&names);
             }
         }
@@ -823,6 +875,10 @@ bool forward_local_files(const std::vector<std::string>& paths) {
     dbus_connection_close(bus); dbus_connection_unref(bus); return accepted;
 #endif
 }
+bool forward_search(const std::string& query) {
+    if (query.empty() || query.size() > 8192 || query.find('\0') != std::string::npos) return false;
+    return forward_local_files({"aino-search:", query});
+}
 bool set_default_music_player(std::string& error, const std::function<bool()>& cancelled) {
     error.clear();
     if (cancelled && cancelled()) return false;
@@ -842,7 +898,9 @@ bool set_default_music_player(std::string& error, const std::function<bool()>& c
         write(L"Software\\RegisteredApplications", L"AinoPlayer", capabilities) && write(progid, nullptr, L"Aino 音乐文件") &&
         write(progid + L"\\DefaultIcon", nullptr, L"\"" + executable + L"\",0") &&
         write(progid + L"\\shell\\open\\command", nullptr, L"\"" + executable + L"\" --open \"%1\"");
-    for (const auto* extension : {L".mp3", L".flac", L".wav", L".wave", L".m4a", L".aac", L".ogg", L".oga", L".opus", L".webm"}) {
+    for (const auto* extension_utf8 : audio_extensions) {
+        const auto wide_extension = widen(extension_utf8);
+        const auto* extension = wide_extension.c_str();
         ok = write(capabilities + L"\\FileAssociations", extension, L"AinoPlayer.Audio") && ok;
         HKEY handle = nullptr;
         if (RegCreateKeyExW(HKEY_CURRENT_USER, (std::wstring(L"Software\\Classes\\") + extension + L"\\OpenWithProgids").c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr, &handle, nullptr) == ERROR_SUCCESS) {
@@ -909,8 +967,12 @@ void Desktop::start(void* window, void* display, unsigned long xid, std::functio
 #ifdef _WIN32
     impl_->window = static_cast<HWND>(window);
     if (!SetPropW(impl_->window, L"AinoPlayerDesktop", impl_.get())) return;
+    if (!SetPropW(impl_->window, widen("AinoPlayerScope" + instance_scope()).c_str(), reinterpret_cast<HANDLE>(1))) {
+        RemovePropW(impl_->window, L"AinoPlayerDesktop");
+        return;
+    }
     impl_->previous = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(impl_->window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(Impl::procedure)));
-    if (!impl_->previous) { RemovePropW(impl_->window, L"AinoPlayerDesktop"); return; }
+    if (!impl_->previous) { RemovePropW(impl_->window, L"AinoPlayerDesktop"); RemovePropW(impl_->window, widen("AinoPlayerScope" + instance_scope()).c_str()); return; }
     DragAcceptFiles(impl_->window, TRUE);
     impl_->taskbar_created = RegisterWindowMessageW(L"TaskbarCreated"); impl_->sync_tray(); impl_->start_media();
 #else
@@ -927,7 +989,7 @@ void Desktop::stop() {
         impl_->controls = nullptr;
     }
     if (impl_->tray.exchange(false)) Shell_NotifyIconW(NIM_DELETE, &impl_->notify);
-    if (impl_->window && impl_->previous && IsWindow(impl_->window)) { DragAcceptFiles(impl_->window, FALSE); SetWindowLongPtrW(impl_->window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(impl_->previous)); RemovePropW(impl_->window, L"AinoPlayerDesktop"); }
+    if (impl_->window && impl_->previous && IsWindow(impl_->window)) { DragAcceptFiles(impl_->window, FALSE); SetWindowLongPtrW(impl_->window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(impl_->previous)); RemovePropW(impl_->window, L"AinoPlayerDesktop"); RemovePropW(impl_->window, widen("AinoPlayerScope" + instance_scope()).c_str()); }
     impl_->window = nullptr;
 #else
     impl_->stopping.store(true); if (impl_->worker.joinable()) impl_->worker.join();
