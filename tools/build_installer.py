@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import time
 import urllib.request
+from check_file_associations import check as check_file_associations
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPILER_VERSION = "6.7.4"
@@ -52,6 +53,7 @@ if __name__ == "__main__":
     parser.add_argument("--exe", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=ROOT / "build/installer")
     args = parser.parse_args()
+    check_file_associations()
     if os.name != "nt":
         parser.error("Windows installer compilation requires Windows")
     version = re.search(r"project\(aino_player VERSION ([0-9]+\.[0-9]+\.[0-9]+)", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")).group(1)

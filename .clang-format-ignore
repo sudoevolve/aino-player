@@ -1,0 +1,6 @@
+src/aino.hpp
+src/miniaudio.h
+vendor/**
+assets/**
+build/**
+build-lx/**
