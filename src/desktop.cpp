@@ -138,7 +138,7 @@ struct Desktop::Impl {
                 if (length) paths.emplace_back(raw + begin, length);
                 begin += length + 1;
             }
-            if (paths.empty()) return FALSE;
+            if (paths.empty()) return self->queue->push({MediaAction::Show}) ? TRUE : FALSE;
             return self->queue->push({MediaAction::OpenFiles, 0, {}, std::move(paths)}) ? TRUE : FALSE;
         }
         if (message == self->taskbar_created) { self->tray.store(false); self->sync_tray(); return 0; }
@@ -491,8 +491,8 @@ struct Desktop::Impl {
                 if (!path.empty()) paths.push_back(path);
                 dbus_message_iter_next(&values);
             }
-            if (valid && !paths.empty() && dbus_message_iter_get_arg_type(&values) == DBUS_TYPE_INVALID)
-                valid = queue->push({MediaAction::OpenFiles, 0, {}, std::move(paths)});
+            if (valid && dbus_message_iter_get_arg_type(&values) == DBUS_TYPE_INVALID)
+                valid = paths.empty() ? queue->push({MediaAction::Show}) : queue->push({MediaAction::OpenFiles, 0, {}, std::move(paths)});
             else valid = false;
         } else if (iface == player_iface && path == "/org/mpris/MediaPlayer2") {
             if (member == "PlayPause") queue->push({MediaAction::Toggle});
@@ -771,7 +771,7 @@ std::string choose_desktop_file(bool folder, const std::atomic<bool>& cancelled,
 }
 #endif
 bool forward_local_files(const std::vector<std::string>& paths) {
-    if (paths.empty() || paths.size() > 10000) return false;
+    if (paths.size() > 10000) return false;
     size_t bytes = 0;
     for (const auto& path : paths) { bytes += path.size() + 1; if (bytes > 2 * 1024 * 1024) return false; }
 #ifdef _WIN32
@@ -783,6 +783,7 @@ bool forward_local_files(const std::vector<std::string>& paths) {
     if (!search.target) return false;
     std::string payload;
     for (const auto& path : paths) { payload += path; payload += '\0'; }
+    if (payload.empty()) payload += '\0'; // 空请求表示激活已有实例。
     if (payload.size() > 2 * 1024 * 1024) return false;
     COPYDATASTRUCT data{}; data.dwData = kOpenFilesMessage; data.cbData = DWORD(payload.size()); data.lpData = payload.data();
     DWORD_PTR accepted = 0;

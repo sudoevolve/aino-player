@@ -2,15 +2,38 @@
 #pragma once
 #include <atomic>
 #include <functional>
+#include <cstdio>
+#include <deque>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <string>
 #include <vector>
 namespace background {
 struct Task { std::thread thread; std::shared_ptr<std::atomic<bool>> done; };
 inline std::mutex mutex;
 inline std::vector<Task> tasks;
 inline bool accepting = true;
+inline std::mutex error_mutex;
+inline std::deque<std::string> errors;
+inline std::atomic<bool> error_pending{false};
+inline void report_error(const char* message) noexcept {
+    std::fprintf(stderr, "Background task failed: %s\n", message);
+    try {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        if (errors.size() == 16) errors.pop_front();
+        errors.emplace_back(message);
+        error_pending.store(true);
+    } catch (...) {} // 内存不足时至少保留 stderr，不让错误报告再次终止线程。
+}
+inline std::deque<std::string> take_errors() {
+    std::deque<std::string> result;
+    std::lock_guard<std::mutex> lock(error_mutex);
+    result.swap(errors);
+    error_pending.store(false);
+    return result;
+}
 // 及时回收已结束线程的可连接状态；锁外 join，避免阻塞任务注册。
 inline void reap() {
     std::vector<std::thread> finished;
@@ -29,7 +52,16 @@ template<class F, class... Args> void start(F&& fn, Args&&... args) {
     if (!accepting) return;
     auto done = std::make_shared<std::atomic<bool>>(false);
     auto action = std::bind(std::forward<F>(fn), std::forward<Args>(args)...);
-    tasks.push_back({std::thread([action = std::move(action), done]() mutable { action(); done->store(true); }), done});
+    // 先分配容器位置，再创建线程，避免 push_back 失败时销毁仍可连接的临时线程。
+    tasks.push_back({{}, done});
+    try {
+        tasks.back().thread = std::thread([action = std::move(action), done]() mutable {
+            try { action(); }
+            catch (const std::exception& error) { report_error(error.what()); }
+            catch (...) { report_error("Unknown exception"); }
+            done->store(true);
+        });
+    } catch (...) { tasks.pop_back(); throw; }
 }
 inline void stop() {
     std::vector<Task> pending;

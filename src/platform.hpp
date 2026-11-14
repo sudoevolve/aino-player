@@ -34,6 +34,7 @@
 #include <pthread.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <signal.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -186,6 +187,44 @@ inline std::string config_dir() {
 #endif
     return dir;
 }
+/** @brief 持有当前用户资料目录的写入权；进程退出或崩溃后由系统释放。 */
+class InstanceLock {
+public:
+    enum class Result { Primary, Existing, Error };
+    InstanceLock() = default;
+    InstanceLock(const InstanceLock&) = delete;
+    InstanceLock& operator=(const InstanceLock&) = delete;
+    ~InstanceLock() {
+#ifdef _WIN32
+        if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_);
+#else
+        if (handle_ >= 0) ::close(handle_);
+#endif
+    }
+    Result acquire() {
+        const auto dir = config_dir();
+        if (dir.empty()) return Result::Error;
+        const auto path = join(dir, "player.lock");
+#ifdef _WIN32
+        handle_ = CreateFileW(widen(path).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle_ != INVALID_HANDLE_VALUE) return Result::Primary;
+        return GetLastError() == ERROR_SHARING_VIOLATION ? Result::Existing : Result::Error;
+#else
+        // 不删除锁文件：unlink 会让后来进程锁住不同 inode，失去互斥。
+        handle_ = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+        if (handle_ < 0) return Result::Error;
+        if (::flock(handle_, LOCK_EX | LOCK_NB) == 0) return Result::Primary;
+        return errno == EWOULDBLOCK || errno == EAGAIN ? Result::Existing : Result::Error;
+#endif
+    }
+private:
+#ifdef _WIN32
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+    int handle_ = -1;
+#endif
+};
 inline uint32_t process_id() {
 #ifdef _WIN32
     return GetCurrentProcessId();

@@ -20,6 +20,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -2438,22 +2439,28 @@ static bool queue_save() {
     std::lock_guard<std::mutex> file_lock(file_mutex);
     const std::string path = queue_path();
     if (path.empty()) return false;
-    std::string encoded;
+    std::string current;
+    long long position = 0;
+    std::vector<music::Track> tracks;
     {
         std::lock_guard<std::mutex> lk(g_mu);
         if (!g_queue_writable) return false;
-        encoded = "{\"version\":2,\"current\":" + library::quote(g_as.now_uid) +
-            ",\"position_ms\":" + std::to_string(g_as.position_ms) + ",\"tracks\":[";
-        bool first = true;
-        for (const auto& track : g_as.tracks) {
-            if (track.variants.empty() || track.variants.size() > 12) return false;
-            if (!first) encoded += ',';
-            first = false;
-            encoded += library::encode_track(track);
-            if (encoded.size() > kQueueFileLimit - 2) return false;
-        }
-        encoded += "]}";
+        current = g_as.now_uid;
+        position = g_as.position_ms;
+        tracks = g_as.tracks;
     }
+    // JSON 编码和文件 I/O 都在播放锁外，避免长歌单阻挡界面和切歌。
+    std::string encoded = "{\"version\":2,\"current\":" + library::quote(current) +
+        ",\"position_ms\":" + std::to_string(position) + ",\"tracks\":[";
+    bool first = true;
+    for (const auto& track : tracks) {
+        if (track.variants.empty() || track.variants.size() > 12) return false;
+        if (!first) encoded += ',';
+        first = false;
+        encoded += library::encode_track(track);
+        if (encoded.size() > kQueueFileLimit - 2) return false;
+    }
+    encoded += "]}";
     const auto temporary = path + ".tmp";
     std::FILE* f = platform::fopen(temporary, "wb");
     if (!f) return false;
@@ -2468,18 +2475,37 @@ static bool queue_save() {
 // 避免一次批量操作写几十遍文件。
 static std::atomic<bool> g_queue_dirty{false};
 static std::atomic<int> g_queue_gen{0};
-// 改动后延时 1.2 秒落盘：连续删十首只写一次文件。
-// 不能只靠主循环里的判断 —— 界面静止时根本不出帧（0 帧 0% CPU 的代价），
-// 那时候删完一首就再也不保存了。所以这里自己起一个短命线程。
+static std::mutex g_queue_writer_mutex;
+static std::condition_variable g_queue_writer_changed;
+static bool g_queue_writer_started = false; // g_queue_writer_mutex
+// 单写入任务合并连续编辑；静止窗口不依赖新帧，退出时可立即唤醒。
 static void queue_mark_dirty() {
+    if (g_shutdown.load()) return;
     { std::lock_guard<std::mutex> lock(g_mu); g_queue_writable = true; }
-    const int mine = ++g_queue_gen;
+    std::lock_guard<std::mutex> lock(g_queue_writer_mutex);
+    ++g_queue_gen;
     g_queue_dirty.store(true);
-    background::start([mine] {
-        platform::sleep_ms(1200);
-        if (g_queue_gen.load() != mine) return;  // 期间又改了，让最后一次负责写
-        if (!g_queue_dirty.exchange(false)) return;
-        if (!queue_save()) toast("播放队列保存失败，原文件已保留；请检查目录权限或队列是否超过 64 MiB", 7000);
+    g_queue_writer_changed.notify_one();
+    if (g_queue_writer_started) return;
+    g_queue_writer_started = true;
+    background::start([] {
+        std::unique_lock<std::mutex> lock(g_queue_writer_mutex);
+        while (!g_shutdown.load()) {
+            g_queue_writer_changed.wait(lock, [] { return g_shutdown.load() || g_queue_dirty.load(); });
+            if (g_shutdown.load()) break;
+            const int revision = g_queue_gen.load();
+            if (g_queue_writer_changed.wait_for(lock, std::chrono::milliseconds(1200), [revision] {
+                return g_shutdown.load() || revision != g_queue_gen.load();
+            })) continue;
+            if (!g_queue_dirty.exchange(false)) continue;
+            lock.unlock();
+            try {
+                if (!queue_save()) toast("播放队列保存失败，原文件已保留；请检查目录权限或队列是否超过 64 MiB", 7000);
+            } catch (const std::exception& error) { background::report_error(error.what()); }
+            catch (...) { background::report_error("Queue persistence failed"); }
+            lock.lock();
+        }
+        g_queue_writer_started = false;
     });
 }
 
@@ -3947,7 +3973,7 @@ void start(HostCallbacks host) {
             bool busy = false;
             {
                 std::lock_guard<std::mutex> lk(g_mu);
-                busy = g_wait_login_site.load() >= 0 || login::state(login::Site::QQ).return_requested.load() ||
+                busy = background::error_pending.load() || g_wait_login_site.load() >= 0 || login::state(login::Site::QQ).return_requested.load() ||
                        login::state(login::Site::NetEase).return_requested.load() || g_as.searching || g_as.ps == PlayState::Playing || g_as.ps == PlayState::Buffering ||
                        g_as.ps == PlayState::Resolving;
             }
@@ -3981,6 +4007,7 @@ void start(HostCallbacks host) {
 }
 void tick() {
         background::reap();
+        for (const auto& error : background::take_errors()) toast("后台任务失败：" + error, 8000);
         drain_ui_mail();
         if (g_ui.sleep_deadline) {
             const auto now = platform::ticks();
@@ -4254,7 +4281,8 @@ void finish_frame(float frame_ms) {
         g_frame_ms_x10.store(int(g_ui.frame_ms * 10.0f));
 }
 void shutdown(bool smoke_test) {
-    g_shutdown.store(true);
+    { std::lock_guard<std::mutex> lock(g_queue_writer_mutex); g_shutdown.store(true); }
+    g_queue_writer_changed.notify_all();
     g_folder_cancel.store(true); g_lyric_cancel.store(true);
     { std::lock_guard<std::mutex> lock(g_dlm); for (auto& entry : g_download_cancel) entry.second->store(true); g_download_pending.clear(); }
     cancel_preload();

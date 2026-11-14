@@ -148,14 +148,29 @@ int main(int argc, char** argv) {
             const auto absolute = decoded.empty() ? platform::fs::path() : platform::fs::absolute(platform::fs::u8path(decoded), ec);
             startup_files.push_back(ec || decoded.empty() ? value : absolute.lexically_normal().u8string());
         }
-        if (!startup_files.empty() && platform::forward_local_files(startup_files)) return 0;
+    }
+    if (!smoke_test && platform::forward_local_files(startup_files)) return 0;
+    platform::InstanceLock instance;
+    if (!smoke_test) {
+        auto ownership = instance.acquire();
+        if (ownership == platform::InstanceLock::Result::Error) {
+            std::fprintf(stderr, "Cannot lock the player configuration directory\n");
+            return 1;
+        }
+        if (ownership == platform::InstanceLock::Result::Existing) {
+            // 另一个进程可能刚取得锁，还没创建 IPC 窗口 / D-Bus 服务。
+            for (int attempt = 0; attempt < 40; ++attempt) {
+                if (platform::forward_local_files(startup_files)) return 0;
+                platform::sleep_ms(100);
+            }
+            std::fprintf(stderr, "Another player instance owns this library but is not responding\n");
+            return 1; // 不降级为第二个写入实例。
+        }
     }
     const bool initial_search = !open_mode && !smoke_test && !arguments.empty();
     if (initial_search) startup_ui.query = arguments.front();
     if (initial_search) startup_ui.tab = 0;
-    // 文件转交成功即可退出，只有真正启动播放器的进程才创建后台任务。
-    background::start([] { prov::Host::instance().ensure_loaded(); });
-    if (!initialize(smoke_test)) return 1;
+    if (!initialize(smoke_test)) { shutdown(true); return 1; }
 #ifdef _WIN32
     SetCurrentProcessExplicitAppUserModelID(L"sudoevolve.AinoPlayer");
 #endif
@@ -179,8 +194,16 @@ int main(int argc, char** argv) {
     aino::Window win(cfg);
     if (!win.ok()) {
         std::fprintf(stderr, "Cannot create aino player window\n");
+        shutdown(true);
         return 1;
     }
+    // 必须先于窗口析构：后台 wake 回调、音频和桌面事件仍可能访问窗口。
+    struct ApplicationLifetime {
+        platform::Desktop& desktop;
+        bool smoke_test;
+        ~ApplicationLifetime() { desktop.stop(); shutdown(smoke_test); }
+    } lifetime{desktop, smoke_test};
+    background::start([] { prov::Host::instance().ensure_loaded(); });
 #ifdef _WIN32
     const auto window_handle = static_cast<aino::detail::Win32State*>(win.impl->native)->hwnd;
     for (const auto size : {ICON_BIG, ICON_SMALL}) {
@@ -297,7 +320,5 @@ int main(int argc, char** argv) {
         const float elapsed = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - begin).count();
         finish_frame(elapsed);
     });
-    desktop.stop();
-    shutdown(smoke_test);
     return 0;
 }
