@@ -111,8 +111,11 @@ def verify_pacman(tree, key, fingerprint):
         print(info, flush=True)
         if not re.search(r"Version\s*:\s*[0-9]", info):
             raise ValueError("pacman did not find an installable candidate")
-        # -Sw 真正下载包并按 SigLevel 校验数据库与包签名，比 -Sp 更接近真实安装路径。
-        subprocess.run(["pacman", "--config", str(conf), "--noconfirm", "-Sw", "aino-player"], check=True)
+        # -Sw 真正下载包并按 SigLevel 校验数据库与包签名；隔离配置里没有系统仓库，
+        # 用 --assume-installed 声明依赖满足，只下载目标包本身。
+        deps = re.search(r"Depends On\s*:\s*(.*)", info).group(1).split()
+        assume = [flag for dep in deps for flag in ("--assume-installed", dep.split(">=")[0].split("=")[0] + "=1.0")]
+        subprocess.run(["pacman", "--config", str(conf), "--noconfirm", *assume, "-Sw", "aino-player"], check=True)
         if not list((state / "cache").glob("aino-player-*.pkg.tar.zst")):
             raise ValueError("pacman did not download the package into the isolated cache")
 
