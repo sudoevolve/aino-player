@@ -1493,8 +1493,8 @@ static bool lane_toggle(Ctx& c, music::Lane lane, const Rect& box) {
 // ---------- 页签一：第三方音源 ----------
 static void source_tab_scripts(Ctx& c, const Rect& area) {
     const auto& all = lx_source_status();
-    std::vector<LxSourceView> good, bad;
-    for (const auto& item : all) (item.ok ? good : bad).push_back(item);
+    std::vector<const LxSourceView*> good, bad;
+    for (const auto& item : all) (item.ok ? good : bad).push_back(&item);
     const bool show_bad = c.model.ui.sources_show_failed;
 
     const Rect head{area.x, area.y, area.w, 112.0f};
@@ -1548,7 +1548,7 @@ static void source_tab_scripts(Ctx& c, const Rect& area) {
     } else {
         c.ui.scroll(body, rows, 52.0f, [&](int i, const Rect& row) {
             const bool is_good = i < int(good.size());
-            const auto& item = is_good ? good[size_t(i)] : bad[size_t(i - int(good.size()))];
+            const auto& item = *(is_good ? good[size_t(i)] : bad[size_t(i - int(good.size()))]);
             const float act_w = 124.0f;
             const float text_w = std::max(80.0f, row.w - 44.0f - act_w);
             // 圆点只表示当前排序平台的状态，其他平台结果保留在详情中。
