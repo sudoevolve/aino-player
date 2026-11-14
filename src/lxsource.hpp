@@ -34,6 +34,7 @@
 #include <vector>
 #include <tuple>
 
+#include "background.hpp"
 #include "json.hpp"
 #include "net.hpp"
 #include "platform.hpp"
@@ -1448,9 +1449,9 @@ public:
                 }
             }
         };
-        std::vector<std::thread> pool;
+        background::ThreadGroup pool;
         for (size_t i = 0; i < std::min<size_t>(2, scripts.size()); ++i) pool.emplace_back(worker);
-        for (auto& thread : pool) thread.join();
+        pool.join();
     }
 
 private:
@@ -1638,10 +1639,10 @@ private:
             }
         };
         {
-            std::vector<std::thread> pool;
+            background::ThreadGroup pool;
             const int threads = std::min<int>(6, int(files.size()));
             for (int t = 0; t < threads; ++t) pool.emplace_back(worker);
-            for (auto& th : pool) th.join();
+            pool.join();
         }
         {
             std::lock_guard<std::mutex> lock(mu_);
@@ -1764,6 +1765,11 @@ public:
             if (q.empty()) { last = s->info().name + ": 不支持所选音质或更低档位"; continue; }
             bool resolved;
             const auto begin = std::chrono::steady_clock::now();
+            const auto candidate_deadline = std::min(deadline, begin + std::chrono::seconds(score.availability >= 2 ? 5 : 15));
+            const auto owner_cancelled = net::cancel_current;
+            net::CancelScope candidate_budget([parent = owner_cancelled, candidate_deadline] {
+                return (parent && parent()) || std::chrono::steady_clock::now() >= candidate_deadline;
+            });
             if (load_timing) *load_timing = {};
             {
                 const auto source_deadline = std::min(deadline, begin + std::chrono::milliseconds(score.availability >= 2 ? 3000 : 8000));
@@ -1780,7 +1786,9 @@ public:
                 });
                 if (accept && !accept(u, s->info().name, q, e)) {
                     last = s->info().name + ": " + (e.empty() ? "候选音频不可用" : e);
-                    if (!net::cancelled()) report(s, q, last);
+                    // 候选超时记失败；用户切歌 / 退出仍不污染健康统计。
+                    if (!s->retired() && !(owner_cancelled && owner_cancelled()) && std::chrono::steady_clock::now() >= candidate_deadline) report(s, q, last);
+                    else if (!net::cancelled()) report(s, q, last);
                     continue;
                 }
                 if (net::cancelled()) { err = "取流已取消"; return false; }
@@ -1791,7 +1799,7 @@ public:
             }
             if (!resolved && e.empty()) e = "音源未返回有效播放地址";
             if (!e.empty()) {
-                if (!net::cancelled()) report(s, q, e);
+                if (!net::cancelled() || (!(owner_cancelled && owner_cancelled()) && std::chrono::steady_clock::now() >= candidate_deadline)) report(s, q, e);
                 if (!last.empty()) last += "；";
                 last += s->info().name + ": " + e;
             }

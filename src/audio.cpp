@@ -384,7 +384,7 @@ struct Stream::Impl {
     }
     static ma_result cursor(ma_data_source* data, ma_uint64* frame) { *frame = get(data).consumed.load(); return MA_SUCCESS; }
     static ma_result length(ma_data_source*, ma_uint64*) { return MA_NOT_IMPLEMENTED; }
-    bool start(std::string& error) {
+    bool start(std::string& error, const std::function<bool()>& startup_cancelled) {
         const auto helper = ffmpeg_path(error); if (helper.empty()) return false;
         static const ma_data_source_vtable vtable{read, seek, format, cursor, length, nullptr, 0};
         auto config = ma_data_source_config_init(); config.vtable = &vtable; source.owner = this;
@@ -469,9 +469,10 @@ struct Stream::Impl {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
         std::unique_lock<std::mutex> lock(mutex);
         while (written.load() < prebuffer && !decoded.load() && !broken.load() && !stopped()) {
-            if (cv.wait_until(lock,deadline) == std::cv_status::timeout) break;
+            if ((startup_cancelled && startup_cancelled()) || std::chrono::steady_clock::now() >= deadline) break;
+            cv.wait_for(lock, std::chrono::milliseconds(40));
         }
-        if (stopped() || broken.load() || written.load() == 0 || (written.load() < prebuffer && !decoded.load())) {
+        if ((startup_cancelled && startup_cancelled()) || stopped() || broken.load() || written.load() == 0 || (written.load() < prebuffer && !decoded.load())) {
             error = stopped() ? "流式播放已取消" : failure.empty() ? "流式预缓冲失败，尝试完整文件" : failure;
             lock.unlock(); stop.store(true); process.terminate(); cv.notify_all(); return false;
         }
@@ -480,18 +481,19 @@ struct Stream::Impl {
 };
 Stream::Stream() : impl_(std::make_unique<Impl>()) {}
 Stream::~Stream() = default;
-std::shared_ptr<Stream> Stream::open(StreamSpec spec, std::function<bool()> cancelled, std::string& error) {
+std::shared_ptr<Stream> Stream::open(StreamSpec spec, std::function<bool()> cancelled, std::string& error,
+                                     const std::function<bool()>& startup_cancelled) {
     error.clear();
     auto stream = std::shared_ptr<Stream>(new Stream);
     stream->impl_->spec = std::move(spec); stream->impl_->cancelled = std::move(cancelled);
     try {
-        if (!stream->impl_->start(error)) {
+        if (!stream->impl_->start(error, startup_cancelled)) {
             if (stream->impl_->bridge && stream->impl_->spec.range_allowed &&
-                !(stream->impl_->cancelled && stream->impl_->cancelled())) {
+                !(stream->impl_->cancelled && stream->impl_->cancelled()) && !(startup_cancelled && startup_cancelled())) {
                 auto fallback = stream->impl_->spec; fallback.range_allowed = false;
                 auto signal = stream->impl_->cancelled;
                 stream.reset(); // 先回收旧进程、网络请求和端口，再走顺序管道。
-                return open(std::move(fallback), std::move(signal), error);
+                return open(std::move(fallback), std::move(signal), error, startup_cancelled);
             }
             return {};
         }

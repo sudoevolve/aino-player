@@ -35,7 +35,8 @@ std::vector<OutputDevice> output_devices(std::string& error);
  */
 class Stream {
 public:
-    static std::shared_ptr<Stream> open(StreamSpec spec, std::function<bool()> cancelled, std::string& error);
+    static std::shared_ptr<Stream> open(StreamSpec spec, std::function<bool()> cancelled, std::string& error,
+                                      const std::function<bool()>& startup_cancelled = {});
     ~Stream();
     void cancel();
     bool failed() const;

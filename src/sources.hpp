@@ -20,6 +20,7 @@
 #include <thread>
 #include <vector>
 
+#include "background.hpp"
 #include "json.hpp"
 #include "lxsource.hpp"
 #include "provider.hpp"
@@ -870,8 +871,8 @@ inline SearchResult run_search(const std::string& keyword, const Settings& st, i
     auto job = std::make_shared<Job>();
     job->per_source.resize(kSourceCount); job->reports.resize(kSourceCount); job->finished.assign(kSourceCount, 0);
     std::array<std::string, kSourceCount> next;
-    std::vector<std::thread> workers;
     std::atomic<bool> stopped{false};
+    background::ThreadGroup workers;
     for (int i = 0; i < kSourceCount; ++i) {
         job->reports[size_t(i)].source = Source(i);
         // 历史平台编号只留空位，不参与检索
@@ -942,7 +943,7 @@ inline SearchResult run_search(const std::string& keyword, const Settings& st, i
         if (done >= int(workers.size())) break;
         if ((st.cancelled && st.cancelled()) || clock::now() - t_start >= std::chrono::milliseconds(soft_timeout_ms)) { stopped.store(true); break; }
     }
-    for (auto& worker : workers) if (worker.joinable()) worker.join();
+    workers.join();
     return snapshot();
 }
 
