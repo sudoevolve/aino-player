@@ -144,7 +144,8 @@ public:
             s.opacity, s.background, s.font_size, s.width, s.placement, s.x, s.y, s.panel_offset,
             s.topmost, s.karaoke, s.sung_color, s.unsung_color, s.background_color); };
         const bool settings_changed = key(settings) != key(value);
-        bool dirty = settings_changed || first_ != first || second_ != second || std::abs(scale_ - scale) > 0.01f;
+        bool dirty = settings_changed || first_ != first || second_ != second;
+        const float previous_scale = scale_;
         const auto fraction = [](float value) { return value < 0 ? -1 : int(std::clamp(value, 0.0f, 1.0f) * 2048); };
         dirty = dirty || fraction(progress.first) != fraction(progress_.first) || fraction(progress.second) != fraction(progress_.second);
         progress_ = progress;
@@ -153,6 +154,21 @@ public:
         if (!handle_ && ticks() < retry_at_) return moved;
         if (!create()) { retry_at_ = ticks() + 5000; return moved; }
         scale_ = std::clamp(scale, 0.75f, 4.0f);
+#ifdef _WIN32
+        // 歌词可独立于主窗口移动，使用歌词所在显示器的有效 DPI。
+        using MonitorDpi = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
+        static const auto monitor_dpi = [] {
+            const auto library = LoadLibraryW(L"shcore.dll");
+            return library ? reinterpret_cast<MonitorDpi>(GetProcAddress(library, "GetDpiForMonitor")) : nullptr;
+        }();
+        POINT point{settings.x == -32000 ? 0 : settings.x, settings.y == -32000 ? 0 : settings.y};
+        UINT dx = 96, dy = 96;
+        if (monitor_dpi && SUCCEEDED(monitor_dpi(MonitorFromPoint(point, MONITOR_DEFAULTTOPRIMARY), 0, &dx, &dy))) {
+            const auto monitor_scale = std::clamp(dx / 96.0f, 0.75f, 4.0f);
+            scale_ = monitor_scale;
+        }
+#endif
+        dirty = dirty || std::abs(previous_scale - scale_) > 0.01f;
         first_ = first; second_ = second;
         if (dirty || ticks() >= layout_at_ + 1000 || dragging_) {
             dirty = layout() || dirty;
@@ -204,7 +220,9 @@ public:
             XImage* image = XCreateImage(display_, visual_, 32, ZPixmap, 0, reinterpret_cast<char*>(pixels_.data()), width_, height_, 32, width_ * 4);
             if (image) { XPutImage(display_, handle_, gc_, image, 0, 0, 0, 0, width_, height_); image->data = nullptr; XDestroyImage(image); error.clear(); }
             else { exposed_ = true; error = "无法创建悬浮歌词图像"; }
-            if (settings.topmost || settings.placement) XMapRaised(display_, handle_); else XMapWindow(display_, handle_);
+            // 重绘不改变堆叠关系，避免每个歌词填充帧都 raise。
+            XMapWindow(display_, handle_);
+            if (settings_changed && (settings.topmost || settings.placement)) XRaiseWindow(display_, handle_);
             XFlush(display_);
 #endif
         }
@@ -359,10 +377,16 @@ private:
         Bounds out;
 #ifdef _WIN32
         RECT bar{}; HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
-        const bool has_bar = taskbar && GetWindowRect(taskbar, &bar);
         MONITORINFO monitor{sizeof(MONITORINFO)};
         POINT position{settings.x == -32000 ? 0 : settings.x, settings.y == -32000 ? 0 : settings.y};
-        GetMonitorInfoW(has_bar && settings.placement ? MonitorFromWindow(taskbar, MONITOR_DEFAULTTOPRIMARY) : MonitorFromPoint(position, MONITOR_DEFAULTTOPRIMARY), &monitor);
+        const auto target = MonitorFromPoint(position, MONITOR_DEFAULTTOPRIMARY);
+        if (taskbar && MonitorFromWindow(taskbar, MONITOR_DEFAULTTOPRIMARY) != target) {
+            taskbar = nullptr;
+            while ((taskbar = FindWindowExW(nullptr, taskbar, L"Shell_SecondaryTrayWnd", nullptr)))
+                if (MonitorFromWindow(taskbar, MONITOR_DEFAULTTOPRIMARY) == target) break;
+        }
+        const bool has_bar = taskbar && GetWindowRect(taskbar, &bar);
+        GetMonitorInfoW(target, &monitor);
         out.x = monitor.rcMonitor.left; out.y = monitor.rcMonitor.top;
         out.w = monitor.rcMonitor.right - out.x; out.h = monitor.rcMonitor.bottom - out.y;
         if (has_bar) {
@@ -372,6 +396,25 @@ private:
         } else { out.panel_x = out.x; out.panel_y = out.y + out.h - int(40 * scale_); out.panel_w = out.w; out.panel_h = int(40 * scale_); out.anchor = out.x + out.w - int(220 * scale_); }
 #else
         out.w = DisplayWidth(display_, DefaultScreen(display_)); out.h = DisplayHeight(display_, DefaultScreen(display_));
+        // Xinerama 是可选扩展，动态读取各显示器边界，不增加链接依赖。
+        struct ScreenInfo { int number; short x, y, width, height; };
+        using QueryScreens = ScreenInfo* (*)(Display*, int*);
+        static const auto query_screens = [] {
+            auto library = dlopen("libXinerama.so.1", RTLD_LAZY | RTLD_LOCAL);
+            return library ? reinterpret_cast<QueryScreens>(dlsym(library, "XineramaQueryScreens")) : nullptr;
+        }();
+        int screens_count = 0;
+        if (query_screens) if (auto* screens = query_screens(display_, &screens_count)) {
+            const int px = settings.x == -32000 ? 0 : settings.x, py = settings.y == -32000 ? 0 : settings.y;
+            for (int i = 0; i < screens_count; ++i) {
+                const auto& screen = screens[i];
+                if (i == 0 || (px >= screen.x && px < screen.x + screen.width && py >= screen.y && py < screen.y + screen.height)) {
+                    out.x = screen.x; out.y = screen.y; out.w = screen.width; out.h = screen.height;
+                    if (px >= screen.x && px < screen.x + screen.width && py >= screen.y && py < screen.y + screen.height) break;
+                }
+            }
+            XFree(screens);
+        }
         Atom type{}; int format = 0; unsigned long count = 0, extra = 0; unsigned char* data = nullptr;
         unsigned long desktop = 0;
         if (XGetWindowProperty(display_, DefaultRootWindow(display_), XInternAtom(display_, "_NET_CURRENT_DESKTOP", False), 0, 1, False, XA_CARDINAL, &type, &format, &count, &extra, &data) == Success) {
@@ -382,7 +425,8 @@ private:
             if (data && count == 4 && format == 32) { const auto y = reinterpret_cast<unsigned long*>(data)[1]; if (y > 0 && y < 160 * scale_) top = int(y); }
             if (data) XFree(data);
         }
-        out.panel_w = out.w; out.panel_h = top; out.anchor = out.w - int(240 * scale_);
+        out.panel_x = out.x; out.panel_y = out.y;
+        out.panel_w = out.w; out.panel_h = top; out.anchor = out.x + out.w - int(240 * scale_);
 #endif
         bounds_at_ = now; cached_bounds_ = out; return out;
     }
@@ -407,7 +451,7 @@ private:
 #ifdef _WIN32
         stack_changed = bool(GetWindowLongPtrW(handle_, GWL_EXSTYLE) & WS_EX_TOPMOST) != (settings.topmost || settings.placement);
 #endif
-        if (x != x_ || y != y_ || resized || settings.placement || stack_changed) {
+        if (x != x_ || y != y_ || resized || stack_changed) {
             x_ = x; y_ = y; width_ = w; height_ = h;
 #ifdef _WIN32
             SetWindowPos(handle_, (settings.topmost || settings.placement) ? HWND_TOPMOST : HWND_NOTOPMOST, x, y, w, h, SWP_NOACTIVATE);
