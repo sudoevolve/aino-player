@@ -20,10 +20,12 @@
 //   ctx.md5 / ctx.b64encode / ctx.b64decode / ctx.log
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 #include "json.hpp"
@@ -58,6 +60,15 @@ struct Song {  // 和 music::Variant 一一对应，隔离掉上层类型
 
 namespace detail {
 
+struct JsValueOwner {
+    JSContext* ctx;
+    JSValue value;
+    JsValueOwner(JSContext* context, JSValue input) : ctx(context), value(input) {}
+    JsValueOwner(const JsValueOwner&) = delete;
+    JsValueOwner& operator=(const JsValueOwner&) = delete;
+    ~JsValueOwner() { JS_FreeValue(ctx, value); }
+};
+
 inline JSValue to_js_song(JSContext* ctx, const Song& s) {
     JSValue o = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, o, "id", lx::detail::to_js(ctx, s.id));
@@ -73,20 +84,21 @@ inline JSValue to_js_song(JSContext* ctx, const Song& s) {
 
 inline Song song_from_js(JSContext* ctx, JSValueConst v) {
     Song s;
-    JSValue json = JS_JSONStringify(ctx, v, JS_UNDEFINED, JS_UNDEFINED);
-    if (!JS_IsException(json)) js::parse(lx::detail::from_js(ctx, json), s.metadata);
-    JS_FreeValue(ctx, json);
-    auto str = [&](const char* k) {
-        JSValue x = JS_GetPropertyStr(ctx, v, k);
-        std::string r = JS_IsString(x) || JS_IsNumber(x) ? lx::detail::from_js(ctx, x) : std::string();
-        JS_FreeValue(ctx, x);
+    const auto text = [&](JSValueConst object, const char* k) {
+        JsValueOwner x(ctx, JS_GetPropertyStr(ctx, object, k));
+        if (JS_IsException(x.value)) throw std::runtime_error(lx::detail::take_exception(ctx));
+        std::string r = JS_IsString(x.value) || JS_IsNumber(x.value)
+            ? lx::detail::from_js(ctx, x.value) : std::string();
+        if (r.size() > 8192) throw std::runtime_error("平台曲目字段超过 8 KiB");
         return r;
     };
+    auto str = [&](const char* k) { return text(v, k); };
     auto num = [&](const char* k) {
-        JSValue x = JS_GetPropertyStr(ctx, v, k);
+        JsValueOwner x(ctx, JS_GetPropertyStr(ctx, v, k));
+        if (JS_IsException(x.value)) throw std::runtime_error(lx::detail::take_exception(ctx));
         int32_t r = 0;
-        JS_ToInt32(ctx, &r, x);   // pres 不能给 nullptr，QuickJS 会直接写它
-        JS_FreeValue(ctx, x);
+        if ((JS_IsNumber(x.value) || JS_IsString(x.value)) && JS_ToInt32(ctx, &r, x.value) < 0)
+            throw std::runtime_error(lx::detail::take_exception(ctx));
         return int(r);
     };
     s.id = str("id");
@@ -97,6 +109,38 @@ inline Song song_from_js(JSContext* ctx, JSValueConst v) {
     s.cover = str("cover");
     s.duration_ms = num("duration_ms");
     s.bitrate = num("bitrate");
+    // 只保留跨平台模型实际消费的字段，不再把整首原始 JSON 编码、解析后重复保存。
+    const auto string_value = [](std::string text) {
+        js::Value value; value.type = js::Type::String; value.string = std::move(text); return value;
+    };
+    s.metadata.type = js::Type::Object;
+    for (const auto* key : {"album_id", "album_audio_id"}) s.metadata.object.emplace_back(key, string_value(str(key)));
+    JsValueOwner needs_login(ctx, JS_GetPropertyStr(ctx, v, "needs_login"));
+    if (JS_IsException(needs_login.value)) throw std::runtime_error(lx::detail::take_exception(ctx));
+    js::Value flag; flag.type = js::Type::Bool; flag.boolean = JS_ToBool(ctx, needs_login.value) > 0;
+    s.metadata.object.emplace_back("needs_login", std::move(flag));
+    JsValueOwner artists(ctx, JS_GetPropertyStr(ctx, v, "artists"));
+    if (JS_IsException(artists.value)) throw std::runtime_error(lx::detail::take_exception(ctx));
+    js::Value list; list.type = js::Type::Array;
+    if (JS_IsArray(artists.value)) for (uint32_t i = 0; i < 32; ++i) {
+        JsValueOwner item(ctx, JS_GetPropertyUint32(ctx, artists.value, i));
+        if (JS_IsException(item.value)) throw std::runtime_error(lx::detail::take_exception(ctx));
+        if (JS_IsUndefined(item.value)) break;
+        if (!JS_IsObject(item.value)) continue;
+        js::Value artist; artist.type = js::Type::Object;
+        artist.object.emplace_back("id", string_value(text(item.value, "id")));
+        artist.object.emplace_back("name", string_value(text(item.value, "name")));
+        list.array.push_back(std::move(artist));
+    }
+    s.metadata.object.emplace_back("artists", std::move(list));
+    JsValueOwner hashes(ctx, JS_GetPropertyStr(ctx, v, "quality_hashes"));
+    if (JS_IsException(hashes.value)) throw std::runtime_error(lx::detail::take_exception(ctx));
+    js::Value qualities; qualities.type = js::Type::Object;
+    if (JS_IsObject(hashes.value)) for (const auto* quality : {"128k", "320k", "flac", "flac24bit"}) {
+        auto hash = text(hashes.value, quality);
+        if (!hash.empty()) qualities.object.emplace_back(quality, string_value(std::move(hash)));
+    }
+    s.metadata.object.emplace_back("quality_hashes", std::move(qualities));
     return s;
 }
 
@@ -129,14 +173,27 @@ public:
 private:
     struct Operation {
         ExecutionTime time;
+        net::CancelScope priority;
         std::unique_lock<std::timed_mutex> lock;
-        explicit Operation(Provider& p) : lock(p.execution_, std::defer_lock) {
+        explicit Operation(Provider& p, bool background = false)
+            : priority([&p, background, parent = net::cancel_current] {
+                return (parent && parent()) || (background && p.foreground_waiters_.load() != 0);
+            }), lock(p.execution_, std::defer_lock) {
+            struct Waiting {
+                std::atomic<unsigned>& count;
+                bool active;
+                Waiting(std::atomic<unsigned>& value, bool enabled) : count(value), active(enabled) {
+                    if (active) ++count;
+                }
+                ~Waiting() { if (active) --count; }
+            } waiting(p.foreground_waiters_, !background);
             while (!net::cancelled() && !lock.try_lock_for(std::chrono::milliseconds(20))) {}
             if (lock.owns_lock() && p.rt_) JS_UpdateStackTop(p.rt_);
         }
         explicit operator bool() const { return lock.owns_lock() && !net::cancelled(); }
     };
     std::timed_mutex execution_;
+    std::atomic<unsigned> foreground_waiters_{0};
     bool eval(const std::string& code, const char* name, std::string& err);
     bool call(const char* fn, int argc, JSValue* argv, std::vector<Song>& out, std::string& err,
               bool* more = nullptr, int* total = nullptr);
@@ -346,10 +403,17 @@ inline bool Provider::call(const char* fn, int argc, JSValue* argv, std::vector<
     }
     out.clear();
     out.reserve(size_t(n > 0 ? n : 0));
-    for (int i = 0; i < n; ++i) {
-        JSValue item = JS_GetPropertyUint32(ctx_, r, uint32_t(i));
-        if (JS_IsObject(item)) out.push_back(detail::song_from_js(ctx_, item));
-        JS_FreeValue(ctx_, item);
+    try {
+        for (int i = 0; i < n; ++i) {
+            detail::JsValueOwner item(ctx_, JS_GetPropertyUint32(ctx_, r, uint32_t(i)));
+            if (JS_IsException(item.value)) throw std::runtime_error(lx::detail::take_exception(ctx_));
+            if (JS_IsObject(item.value)) out.push_back(detail::song_from_js(ctx_, item.value));
+        }
+    } catch (const std::exception& e) {
+        err = std::string("平台曲目解析失败：") + e.what();
+        out.clear();
+        JS_FreeValue(ctx_, r);
+        return false;
     }
     JS_FreeValue(ctx_, r);
     return true;
@@ -371,7 +435,7 @@ inline bool Provider::search(const std::string& keyword, int page, int limit, st
 
 inline bool Provider::board(const std::string& board_id, int page, int limit, std::vector<Song>& out,
                             std::string& err, bool* more, int* total) {
-    Operation operation(*this);
+    Operation operation(*this, true);
     if (!operation) { err = "平台请求已取消或等待超时"; return false; }
     if (!ctx_) { err = "provider 未加载"; return false; }
     JS_UpdateStackTop(rt_);
@@ -425,7 +489,8 @@ inline bool Provider::resolve(const Song& song, const std::string& quality, std:
 
 // 平台目录接口统一返回 JSON；平台字段解释只保留在相应 JS 中。
 inline bool Provider::request(const char* method, const std::string& args, js::Value& out, std::string& err) {
-    Operation operation(*this);
+    const std::string name(method);
+    Operation operation(*this, name == "lyric" || name == "playlists" || name == "heats");
     if (!operation || !ctx_) { err = "平台未加载、请求已取消或等待超时"; return false; }
     JSValue f = JS_GetPropertyStr(ctx_, provider_, method);
     JSValue arg = JS_ParseJSON(ctx_, args.c_str(), args.size(), "<platform-args>");
