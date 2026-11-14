@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aino Player · RPM 软件源</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { max-width: 780px; margin: 64px auto; padding: 0 24px; line-height: 1.8; }
+  h1 { letter-spacing: -.04em; margin-bottom: 0; }
+  pre { padding: 20px; overflow-x: auto; border: 1px solid #8885; border-radius: 12px; font-size: 13px; }
+  a { color: inherit; } code { overflow-wrap: anywhere; }
+</style>
+<h1>Aino Player</h1>
+<p>项目官方 RPM 源 · Fedora 44+ · x86_64 · 当前版本 @VERSION@</p>
+<p>一键添加软件源并安装：</p>
+<pre>curl -fsSL https://sudoevolve.github.io/aino-player/install-rpm.sh | bash</pre>
+<p>也可手动添加。Fedora（dnf 5）：</p>
+<pre>sudo dnf config-manager addrepo --from-repofile=https://sudoevolve.github.io/aino-player/rpm/aino-player.repo
+sudo rpm --import https://sudoevolve.github.io/aino-player/rpm/aino-player.asc
+sudo dnf install aino-player</pre>
+<p>较旧的 dnf 4 直接放置仓库文件：</p>
+<pre>sudo curl -fsSL https://sudoevolve.github.io/aino-player/rpm/aino-player.repo -o /etc/yum.repos.d/aino-player.repo
+sudo rpm --import https://sudoevolve.github.io/aino-player/rpm/aino-player.asc
+sudo dnf install aino-player</pre>
+<p>后续使用系统更新或 <code>sudo dnf upgrade aino-player</code>。无需先卸载，配置、收藏和歌单会保留。</p>
+<p>缺少下载工具时先运行 <code>sudo dnf install curl ca-certificates gnupg2</code>。</p>
+<p>公钥指纹：<br><code>@FINGERPRINT@</code><br>
+导入前可用 <code>gpg --show-keys --with-fingerprint aino-player.asc</code> 核对，导入后用 <code>rpm -qi gpg-pubkey-ca6020fe-*</code> 查看。仓库元数据与 rpm 均由此密钥签名（repo_gpgcheck 开启）。</p>
+<p>这是开发者提供的软件源，尚未收录于 Fedora 官方仓库。</p>
+<p><a href="https://github.com/sudoevolve/aino-player">项目与截图</a> ·
+<a href="https://github.com/sudoevolve/aino-player/releases/latest">其他下载</a> ·
+<a href="https://github.com/sudoevolve/aino-player/blob/master/docs/RPM.md">维护说明</a></p>
+</html>

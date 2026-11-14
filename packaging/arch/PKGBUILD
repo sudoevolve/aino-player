@@ -1,0 +1,31 @@
+# Arch 打包清单：CI 在 archlinux:base-devel 容器里把仓库检出复制到 $srcdir/aino-player
+# 后运行 makepkg；维护者手动构建时执行
+#   cp -r <仓库检出> /tmp/src/aino-player && cd /tmp/src && makepkg -f
+# pkgver 由发布工作流按 tag 注入，pkgrel 固定为 1。
+pkgname=aino-player
+pkgver=0.0.0
+pkgrel=1
+pkgdesc='aino player - a lightweight desktop music player'
+arch=('x86_64')
+url='https://github.com/sudoevolve/aino-player'
+license=('Apache-2.0')
+# CMake Release 二进制不带调试符号，禁用 makepkg 的调试拆分包。
+options=('!debug')
+depends=(fontconfig freetype2 gdk-pixbuf2 librsvg adwaita-icon-theme dbus alsa-lib libpulse
+         curl ca-certificates xdg-utils)
+makedepends=(cmake gcc make python)
+source=()
+sha256sums=()
+
+prepare() {
+  cmake -S "$srcdir/$pkgname" -B "$srcdir/build" -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr
+}
+
+build() {
+  cmake --build "$srcdir/build" --parallel 2
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install "$srcdir/build"
+}

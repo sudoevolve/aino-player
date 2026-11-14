@@ -112,7 +112,7 @@ def build(output, fingerprint, check):
     if output.exists() and any(output.iterdir()):
         raise ValueError("Output directory must be empty; use a fresh staging directory")
     key = ROOT / "packaging/apt" / KEY_NAME
-    expected = (ROOT / "packaging/apt/signing-key-fingerprint.txt").read_text(encoding="ascii").strip()
+    expected = (ROOT / "packaging/signing-key-fingerprint.txt").read_text(encoding="ascii").strip()
     if fingerprint != expected or not re.fullmatch(r"[A-F0-9]{40}", fingerprint):
         raise ValueError("Signing key does not match the committed repository trust root")
     apt = output / "apt"

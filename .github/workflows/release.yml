@@ -122,8 +122,80 @@ jobs:
             dist/FFmpeg-BUILD-linux.txt
             dist/LICENSE.FFmpeg.txt
           if-no-files-found: error
+  rpm:
+    if: github.event_name != 'workflow_dispatch' || inputs.platform != 'windows'
+    runs-on: ubuntu-latest
+    container: fedora:44
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+      - name: Install build dependencies
+        run: dnf install -y git cmake gcc gcc-c++ make python3 pkgconf-pkg-config libX11-devel dbus-devel libcurl-devel rpm-build xorg-x11-server-Xvfb xdg-utils google-noto-sans-cjk-ttc-fonts adwaita-icon-theme gdk-pixbuf2 librsvg2 dbus-libs alsa-lib curl ca-certificates fontconfig freetype
+      - run: python3 tools/check_file_associations.py
+      - run: python3 tools/build_ffmpeg.py --jobs 2
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DAINO_BUILD_TESTS=ON
+      - run: cmake --build build --parallel 2
+      - run: ctest --test-dir build --output-on-failure --no-tests=error
+      - name: Build and verify RPM package
+        shell: bash
+        run: |
+          test "$(build/aino_player --version)" = "aino player ${RELEASE_TAG#v}"
+          build/aino_player --codec-info | grep -F embedded
+          cpack --config build/CPackConfig.cmake -G RPM -B dist
+          test "$(rpm -qp --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' dist/*.rpm)" = "aino-player-${RELEASE_TAG#v}-1.x86_64"
+          test "$(rpm -qp --qf '%{LICENSE}\n' dist/*.rpm)" = "Apache-2.0"
+          dnf install -y ./dist/*.rpm
+          test -f /usr/share/metainfo/io.github.sudoevolve.AinoPlayer.metainfo.xml
+          test "$(/usr/bin/aino_player --version)" = "aino player ${RELEASE_TAG#v}"
+          xvfb-run -a /usr/bin/aino_player --smoke-test
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: linux-rpm
+          path: dist/*.rpm
+          if-no-files-found: error
+  arch:
+    if: github.event_name != 'workflow_dispatch' || inputs.platform != 'windows'
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+      - name: Install build dependencies
+        run: pacman -Syu --noconfirm --needed sudo git cmake python libx11 dbus curl fontconfig freetype2 gdk-pixbuf2 librsvg adwaita-icon-theme alsa-lib libpulse xorg-server-xvfb noto-fonts-cjk xdg-utils
+      - name: Prepare makepkg workspace
+        shell: bash
+        run: |
+          sed -i "s/^pkgver=.*/pkgver=${RELEASE_TAG#v}/" packaging/arch/PKGBUILD
+          # PKGBUILD 的 $srcdir 是 startdir/src，把检出放到 makepkg 期望的位置。
+          mkdir -p /tmp/pkgbuild/src
+          cp -r . /tmp/pkgbuild/src/aino-player
+          cp packaging/arch/PKGBUILD /tmp/pkgbuild/
+          cd /tmp/pkgbuild/src/aino-player
+          python3 tools/build_ffmpeg.py --jobs 2
+          useradd -m builder
+          chown -R builder: /tmp/pkgbuild
+      - name: Build and verify Arch package
+        shell: bash
+        run: |
+          cd /tmp/pkgbuild
+          sudo -u builder makepkg -f
+          test "$(ls aino-player-*.pkg.tar.zst | wc -l)" -eq 1
+          pacman -U --noconfirm aino-player-*.pkg.tar.zst
+          test "$(/usr/bin/aino_player --version)" = "aino player ${RELEASE_TAG#v}"
+          /usr/bin/aino_player --codec-info | grep -F embedded
+          test -f /usr/share/metainfo/io.github.sudoevolve.AinoPlayer.metainfo.xml
+          xvfb-run -a /usr/bin/aino_player --smoke-test
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp aino-player-*.pkg.tar.zst "$GITHUB_WORKSPACE/dist/"
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: linux-arch
+          path: dist/*.pkg.tar.zst
+          if-no-files-found: error
   publish:
-    needs: [windows, linux]
+    needs: [windows, linux, rpm, arch]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -141,6 +213,6 @@ jobs:
         shell: bash
         run: |
           cd dist
-          sha256sum *.exe *.deb *.tar.xz FFmpeg-BUILD-*.txt LICENSE.FFmpeg.txt > SHA256SUMS.txt
+          sha256sum *.exe *.deb *.rpm *.pkg.tar.zst *.tar.xz FFmpeg-BUILD-*.txt LICENSE.FFmpeg.txt > SHA256SUMS.txt
           cd ..
-          gh release create "$RELEASE_TAG" dist/*.exe dist/*.deb dist/*.tar.xz dist/FFmpeg-BUILD-*.txt dist/LICENSE.FFmpeg.txt dist/SHA256SUMS.txt --verify-tag --title "aino player $RELEASE_TAG" --notes-file docs/RELEASE_NOTES.md --latest
+          gh release create "$RELEASE_TAG" dist/*.exe dist/*.deb dist/*.rpm dist/*.pkg.tar.zst dist/*.tar.xz dist/FFmpeg-BUILD-*.txt dist/LICENSE.FFmpeg.txt dist/SHA256SUMS.txt --verify-tag --title "aino player $RELEASE_TAG" --notes-file docs/RELEASE_NOTES.md --latest

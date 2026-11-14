@@ -53,13 +53,13 @@ sudo apt update
 
 ## 发布维护
 
-工作流 [apt-repository.yml](../.github/workflows/apt-repository.yml) 仅为已有 Release 生成软件源，不编译、安装或运行播放器，不运行 CTest、音频、浏览器或界面回归。
+工作流 [repositories.yml](../.github/workflows/repositories.yml) 仅为已有 Release 生成软件源（APT、RPM、Arch 三棵树共用同一把签名密钥并一次部署），不编译、安装或运行播放器，不运行 CTest、音频、浏览器或界面回归。
 
 - 正式 Release 发布、`release` 工作流成功完成、每周定时或手动触发时刷新。两种 Release 触发用于兼容 GitHub 对工作流令牌事件的限制。
 - 从正式 `vX.Y.Z` Release 选择最高的三个兼容 deb 版本，拒绝草稿、预发行、错误包身份、附件大小或校验不符。新版本必须提供真实 deb 和 `SHA256SUMS.txt`。
 - 同时比对 GitHub 附件 digest 和 `SHA256SUMS.txt`，再以 `dpkg-deb` 检查包名、版本和架构。
 - 通过 `apt-ftparchive` 生成索引，包含按 SHA-256 寻址的索引副本；保留上一代索引，降低部署时客户端读取不一致的概率。
-- 专用 Ed25519 公钥位于 `packaging/apt/`；私钥保存在 GitHub Actions secret `APT_SIGNING_PRIVATE_KEY`、维护者本机受限目录及独立私有仓库的恢复附件中，不能提交到 Git。签名固定到仓库内的完整公钥指纹。
+- 专用 Ed25519 公钥位于 `packaging/apt/`，完整公钥指纹（信任根）固定在 `packaging/signing-key-fingerprint.txt`，与 RPM / Arch 源共享；私钥保存在 GitHub Actions secret `APT_SIGNING_PRIVATE_KEY`、维护者本机受限目录及独立私有仓库的恢复附件中，不能提交到 Git。
 - `InRelease` / `Release.gpg` 使用 SHA-256；索引有效期 30 天，每周重新签发。GitHub 若因仓库长期不活跃而停用定时工作流，需要重新启用并手动运行；签名过期时不应关闭 APT 校验。
 - 部署前用 `gpgv` 验签，并在临时 APT 配置中执行索引读取，确认有安装候选；不改 runner 的软件源，也不安装播放器。
 - GitHub Pages 使用 Actions 部署。根目录主页使用 `packaging/site/index.html`，软件源说明保留在 `/apt/`；发布器注入当前正式版号，并复制项目图标和现有界面截图。不使用前端框架或额外构建依赖。主页更改与已有软件源一起部署，不改播放器版本、已发布标签或 Release 附件。
@@ -68,4 +68,4 @@ sudo apt update
 
 维护者已在独立私有 GitHub 仓库保留私钥、公钥、撤销证书及恢复说明的云端备份，不进入任何 Git 提交。其他电脑日常更新软件源只需登录 GitHub 运行工作流，无需下载私钥；恢复签名环境时再取回备份。GitHub Actions secret 供工作流使用，不能作为可下载的备份。
 
-手动重新部署：GitHub → Actions → **Publish APT repository** → Run workflow，选择 `master`。
+手动重新部署：GitHub → Actions → **Publish package repositories** → Run workflow，选择 `master`。
