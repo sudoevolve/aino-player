@@ -1,4 +1,4 @@
-## aino player v0.4.0
+## aino player v0.4.1
 
 ### 播放体验
 

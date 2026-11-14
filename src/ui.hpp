@@ -324,7 +324,7 @@ static void capture_song_menu(Ctx& c, const music::Track& track, const Rect& row
             const bool queue = row_selection == &batch_selections["queue"];
             const bool search = row_selection == &batch_selections["search"];
             const bool recent = row_selection == &batch_selections["recent"];
-            const auto& tracks = queue ? c.s.tracks : search ? c.s.results : recent ? c.model.library.recent :
+            const auto& tracks = queue ? static_cast<const std::vector<music::Track>&>(c.s.tracks) : search ? c.s.results : recent ? c.model.library.recent :
                 static_cast<const std::vector<music::Track>&>(c.model.playlist.playlist.tracks);
             std::map<std::string, const music::Track*> by_id;
             for (const auto& item : tracks) by_id[track_uid(item)] = &item;
