@@ -491,6 +491,6 @@ Windows 在现有窗口子类中接收 WM_DROPFILES；通过 WM_COPYDATA 优先�
 
 用户要求参考 Everything 的传统软件网站布局，并添加 20 个相关 Topics。GitHub 仓库现已设置 music-player、audio-player、desktop-app、cpp、cross-platform、windows、linux、lightweight、minimal、streaming、lyrics、playlists、netease-cloud-music、qq-music、bilibili、lx-music、quickjs、ffmpeg、open-source、apt，读取 API 确认数量为 20。
 
-Pages 根目录使用独立的 `packaging/site/index.html` 静态模板，白底内容区、左侧导航、下载表格、截图、常见问题及支持项目区域；窄屏自动收起侧栏。APT 详细说明保留在 `/apt/`。现有发布器只增加版本替换和图片复制，不引入前端框架、JavaScript 或新构建依赖；安装脚本、软件源签名与下载校验流程不变。作者尚未提供捐赠链接，明确显示捐赠方式暂未开放，保留反馈和联系入口，不填入未经确认的收款地址。
+Pages 根目录使用独立的 `packaging/site/index.html` 静态模板，白底内容区、左侧导航、下载表格、截图、常见问题及支持项目区域；窄屏自动收起侧栏。APT 详细说明保留在 `/apt/`。现有发布器只增加版本替换和图片复制，不引入前端框架、JavaScript 或新构建依赖；安装脚本、软件源签名与下载校验流程不变。首次上线时捐赠方式尚未提供；作者随后确认使用 `https://ifdian.net/a/sudoevolve`，主页已添加“通过爱发电捐赠”入口并移除未开放提示。
 
 提交 `7eb421d` 经 [Pages 部署 43565655371](https://github.com/sudoevolve/aino-player/actions/runs/43565655371) 上线。静态检查核对了锚点、本地资源、当前 Release 附件链接与 Python 语法；桌面 1280px、手机 390px 截图审查完成。公开页面、两张截图、SVG、安装脚本及 APT 0.3.0 索引均返回成功，页面与源模板、图片及安装脚本与仓库文件一致。此次网站修改未重跑播放器回归，也未更改已发布附件。
