@@ -271,6 +271,24 @@ int main(int argc, char** argv) {
         track.variants.push_back(v);
         auto second = v; second.id = "mid"; second.source = music::Source::QQ;
         track.variants.push_back(second); track.chosen = 1;
+        {
+            lx::Engine::Health health;
+            health.state = 3; health.quality = "320k"; health.checked_revision = 20;
+            lx::Engine::Timing timing;
+            timing.verified = true; timing.verified_revision = 10; timing.load_ms = 80;
+            auto score = lx::Engine::selection_score("320k", &health, &timing, nullptr, 1000);
+            check(score.availability == 2, "failed recheck overrides historical source success");
+            timing.verified_revision = 21;
+            check(lx::Engine::selection_score("320k", &health, &timing, nullptr, 1000).availability == 0,
+                "new audio verification recovers a previously failed source");
+            timing.failures = 1; timing.failed_at = 900;
+            check(lx::Engine::selection_score("320k", nullptr, &timing, nullptr, 1000).availability == 2,
+                "one recent playback failure ranks behind healthy sources regardless of old speed");
+            health.state = 2; health.load_ms = 135;
+            score = lx::Engine::selection_score("flac", &health, nullptr, nullptr, 1000);
+            check(score.availability == 0 && score.latency_ms == 135 && score.estimated,
+                "unmeasured quality uses an explicit platform latency estimate instead of filename order");
+        }
         library::Library lib;
         check(lib.toggle(track), "favorite add");
         check(lib.contains(track), "favorite membership");

@@ -1224,17 +1224,60 @@ public:
         std::string reason;
         int resolve_ms = 0, load_ms = 0;
         std::string quality;
+        unsigned long long checked_revision = 0;
     };
     struct Timing {
         int resolve_ms = 0, load_ms = 0, ready_ms = 0;
         unsigned samples = 0, failures = 0;
         unsigned long long failed_at = 0;
+        unsigned long long verified_revision = 0;
         bool verified = false;
     };
     // 消费方只报告“已收到有效音频 / 首段可播”，不把整首下载或转码耗时当加载速度。
     struct LoadTiming { int ready_ms = 0; bool verified = false; };
     using Timings = std::map<std::string, std::map<std::string, Timing>>; // 平台 → 实际音质 → 测量
     using Checks = std::map<std::string, Health>;
+    struct Selection {
+        std::string file, name, quality;
+        int availability = 1, latency_ms = 300001;
+        bool estimated = false;
+    };
+    // 排序与界面共用。历史成功不能覆盖更新的失败；不同音质的样本只作明确标注的估算。
+    static Selection selection_score(const std::string& quality, const Health* health,
+                                     const Timing* exact, const Timing* fallback, unsigned long long now) {
+        Selection out;
+        out.quality = quality;
+        if (quality.empty()) { out.availability = 3; return out; }
+        const bool recent_failure = exact && exact->failures && now < exact->failed_at + 60000;
+        const bool failed_check = health && (health->state == 3 || health->state == 5) &&
+            (!exact || exact->verified_revision <= health->checked_revision);
+        const bool passed = (exact && exact->verified) || (health && health->state == 2) ||
+            (fallback && fallback->verified);
+        out.availability = recent_failure || failed_check ? 2 : passed ? 0 : 1;
+        // 先比较同一口径的样本延迟，不能把一个源的首段解码时间与另一个的 64 KiB 下载直接混排。
+        if (exact && exact->load_ms > 0) out.latency_ms = exact->load_ms;
+        else if (health && health->state == 2 && health->load_ms > 0) {
+            out.latency_ms = health->load_ms;
+            out.estimated = health->quality != quality;
+        } else if (fallback && fallback->load_ms > 0) {
+            out.latency_ms = fallback->load_ms;
+            out.estimated = true;
+        } else if (exact && exact->ready_ms > 0) {
+            out.latency_ms = exact->ready_ms;
+            out.estimated = true;
+        }
+        return out;
+    }
+    std::vector<Selection> selection_order(const std::string& platform, int wanted) const {
+        std::lock_guard<std::mutex> lock(mu_);
+        std::vector<Selection> result;
+        for (const auto& script : list_) if (!script->retired() && script->supports(platform, "musicUrl"))
+            result.push_back(selection_locked(script, platform, wanted));
+        std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) {
+            return std::tie(a.availability, a.latency_ms, a.file) < std::tie(b.availability, b.latency_ms, b.file);
+        });
+        return result;
+    }
     explicit Engine(std::string preferences_file = {}) : preferences_file_(std::move(preferences_file)) {}
     static Engine& instance() {
         static Engine e;
@@ -1306,7 +1349,6 @@ public:
             failed_.erase(std::remove_if(failed_.begin(), failed_.end(), [&](const auto& f) {
                 return file_key(f.first) == name;
             }), failed_.end());
-            if (file_key(preferred_) == name) preferred_.clear();
         }
         return true;
     }
@@ -1362,7 +1404,9 @@ public:
                           // 检测的中间状态保留上一次已验证结果，避免检测时排序和颜色反复跳变。
                           auto& previous = health_[file][sample.platform];
                           if (state.state < 2 && previous.state == 2) return;
-                          if (state.state == 2) record_timing(file, sample.platform, state.quality, state.resolve_ms, state.load_ms, true);
+                          if (state.state >= 2) state.checked_revision = ++outcome_revision_;
+                          if (state.state == 2 || state.state == 3 || state.state == 5)
+                              record_timing(file, sample.platform, state.quality, state.resolve_ms, state.load_ms, state.state == 2);
                           health_[file][sample.platform] = std::move(state); ++revision_; }
                         if (wake) wake();
                     };
@@ -1415,7 +1459,7 @@ private:
     }
     // mu_ 已持有；平滑波动，取消不调用此入口，单曲失败不覆盖样本状态。
     void record_timing(const std::string& file, const std::string& platform, const std::string& quality,
-                       int resolve_ms, int load_ms, bool success, int ready_ms = 0) {
+                       int resolve_ms, int load_ms, bool success, int ready_ms = 0, bool verified = false) {
         auto& value = timings_[file][platform][quality];
         const auto smooth = [](int previous, int current) { return previous > 0 ? (previous * 3 + current + 2) / 4 : current; };
         if (success) {
@@ -1423,12 +1467,40 @@ private:
             if (load_ms > 0) value.load_ms = smooth(value.load_ms, load_ms);
             if (ready_ms > 0) value.ready_ms = smooth(value.ready_ms, ready_ms);
             if (load_ms > 0 || ready_ms > 0) value.samples = std::min(value.samples + 1, 100000u);
-            if (load_ms > 0 || ready_ms > 0) value.verified = true;
-            value.failures = 0; value.failed_at = 0;
+            if (verified || load_ms > 0 || ready_ms > 0) {
+                value.verified = true;
+                value.verified_revision = ++outcome_revision_;
+                value.failures = 0; value.failed_at = 0;
+            }
         } else {
             if (platform::ticks() >= value.failed_at + 60000) value.failures = 0;
             value.failures = std::min(value.failures + 1, 3u); value.failed_at = platform::ticks();
+            value.verified = false;
         }
+    }
+    Selection selection_locked(const std::shared_ptr<Script>& script, const std::string& platform, int wanted) const {
+        const auto file = file_key(script->path());
+        const auto actual = script->pick_quality(platform, wanted);
+        const Health* health = nullptr;
+        const Timing *exact = nullptr, *fallback = nullptr;
+        const auto checks = health_.find(file);
+        if (checks != health_.end()) {
+            const auto item = checks->second.find(platform);
+            if (item != checks->second.end()) health = &item->second;
+        }
+        const auto timings = timings_.find(file);
+        if (timings != timings_.end()) {
+            const auto data = timings->second.find(platform);
+            if (data != timings->second.end()) for (const auto& item : data->second) {
+                if (item.first == actual) exact = &item.second;
+                if (item.second.verified && item.second.load_ms > 0 &&
+                    (!fallback || item.second.verified_revision > fallback->verified_revision)) fallback = &item.second;
+            }
+        }
+        auto result = selection_score(actual, health, exact, fallback, platform::ticks());
+        result.file = file;
+        result.name = script->info().name;
+        return result;
     }
     static std::string file_key(const std::string& file) {
         auto name = std::filesystem::u8path(file).filename().u8string();
@@ -1652,61 +1724,38 @@ public:
                  std::string& url, std::string& err, std::string* by = nullptr,
                  const std::function<bool(const std::string&, const std::string&, const std::string&, std::string&)>& accept = {},
                  LoadTiming* load_timing = nullptr) {
-        std::vector<std::shared_ptr<Script>> order;
         const int wanted = quality == "128k" ? 0 : quality == "flac" || quality == "flac24bit" ? 2 : 1;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            for (auto& s : list_)
-                if (!s->retired() && s->supports(key, "musicUrl")) order.push_back(s);
-            // 未测或不同音质不能伪装成最快；连续失败暂时降级，60 秒后允许自然重试。
-            const auto now = platform::ticks();
-            const auto rank = [&](const auto& s) {
-                const auto file = file_key(s->path());
-                const auto actual = s->pick_quality(key, wanted);
-                int availability = 1, latency = 300001, penalty = 0;
-                const auto h = health_.find(file);
-                if (h != health_.end()) {
-                    const auto p = h->second.find(key);
-                    if (p != h->second.end()) {
-                        if (p->second.state == 2) availability = 0;
-                        else if (p->second.state == 3 || p->second.state == 5) availability = 2;
-                    }
-                }
-                const auto f = timings_.find(file);
-                if (f != timings_.end()) {
-                    const auto p = f->second.find(key);
-                    if (p != f->second.end()) {
-                        const auto q = p->second.find(actual);
-                        if (q != p->second.end()) {
-                            const auto& value = q->second;
-                            if (value.verified) availability = 0;
-                            if (value.samples) latency = value.ready_ms > 0 ? value.ready_ms : value.load_ms;
-                            if (value.failures && now < value.failed_at + 60000) {
-                                penalty = int(value.failures) * 1500;
-                                if (value.failures >= 2) availability = 2;
-                            }
-                        }
-                    }
-                }
-                if (actual.empty()) availability = 3;
-                return std::make_tuple(availability, latency + penalty, file_key(preferred_) == file ? 0 : 1, file);
-            };
-            std::stable_sort(order.begin(), order.end(), [&](const auto& a, const auto& b) { return rank(a) < rank(b); });
-        }
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
         const auto report = [&](const std::shared_ptr<Script>& script, const std::string& quality, const std::string& error, int resolve_ms = 0, int ready_ms = 0) {
             std::lock_guard<std::mutex> lock(mu_);
             const auto file = file_key(script->path());
             if (!removed_.count(file) && std::find(list_.begin(), list_.end(), script) != list_.end()) {
-                if (error.empty()) runtime_errors_[file].erase(key);
-                else runtime_errors_[file][key] = error;
-                record_timing(file, key, quality, resolve_ms, 0, error.empty(), ready_ms);
-                if (error.empty() && (load_timing ? load_timing->verified : bool(accept))) timings_[file][key][quality].verified = true;
+                const bool verified = error.empty() && (load_timing ? load_timing->verified : bool(accept));
+                if (verified) runtime_errors_[file].erase(key);
+                else if (!error.empty()) runtime_errors_[file][key] = error;
+                record_timing(file, key, quality, resolve_ms, 0, error.empty(), ready_ms, verified);
                 ++revision_;
             }
         };
         std::string last;
-        for (auto& s : order) {
+        std::set<std::string> attempted;
+        for (;;) {
+            std::shared_ptr<Script> s;
+            Selection score;
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                // 每次换源重新排序，不能继续使用检测完成前的旧候选顺序。
+                for (const auto& candidate : list_) {
+                    if (candidate->retired() || !candidate->supports(key, "musicUrl") ||
+                        attempted.count(file_key(candidate->path()))) continue;
+                    const auto rank = selection_locked(candidate, key, wanted);
+                    if (rank.availability == 3) continue;
+                    if (!s || std::tie(rank.availability, rank.latency_ms, rank.file) <
+                        std::tie(score.availability, score.latency_ms, score.file)) { s = candidate; score = rank; }
+                }
+            }
+            if (!s) break;
+            attempted.insert(score.file);
             if (net::cancelled()) { err = "取流已取消"; return false; }
             if (std::chrono::steady_clock::now() >= deadline) { last += "；音源解析已达到 30 秒，尝试其他渠道"; break; }
             if (s->retired()) continue;
@@ -1717,8 +1766,9 @@ public:
             const auto begin = std::chrono::steady_clock::now();
             if (load_timing) *load_timing = {};
             {
-                net::CancelScope time_limit([parent = net::cancel_current, deadline] {
-                    return (parent && parent()) || std::chrono::steady_clock::now() >= deadline;
+                const auto source_deadline = std::min(deadline, begin + std::chrono::milliseconds(score.availability >= 2 ? 3000 : 8000));
+                net::CancelScope time_limit([parent = net::cancel_current, source_deadline] {
+                    return (parent && parent()) || std::chrono::steady_clock::now() >= source_deadline;
                 });
                 resolved = s->music_url(key, q, info_json, u, e);
             }
@@ -1750,13 +1800,8 @@ public:
         return false;
     }
 
-    void set_preferred(const std::string& file) {
-        std::lock_guard<std::mutex> lock(mu_);
-        preferred_ = file;
-    }
-
 private:
-    mutable std::mutex mu_;          // 只保护 list_/failed_/preferred_ 的读写（都应是瞬时操作）
+    mutable std::mutex mu_;          // 只保护集合和测速状态，网络及解码在锁外。
     std::mutex state_io_;
     std::once_flag preferences_once_;
     std::set<std::string> removed_;
@@ -1765,6 +1810,7 @@ private:
     std::map<std::string, std::map<std::string, std::string>> runtime_errors_;
     std::map<std::string, Checks> health_;
     std::map<std::string, Timings> timings_;
+    unsigned long long outcome_revision_ = 0;
     std::mutex check_mu_;
     std::atomic<unsigned> check_epoch_{0};
     bool preferences_valid_ = true;
@@ -1774,7 +1820,6 @@ private:
     std::atomic<bool> restoring_{false};
     std::vector<std::shared_ptr<Script>> list_;   // shared：resolve 锁外持引用时列表可能被整体换掉
     std::vector<std::pair<std::string, std::string>> failed_;
-    std::string preferred_;
 };
 
 }  // namespace lx

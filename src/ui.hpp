@@ -1511,7 +1511,7 @@ static void source_tab_scripts(Ctx& c, const Rect& area) {
         : source_task == LxTask::Fetch ? std::string("正在下载并加载音源脚本；本次获取的脚本会恢复到应用中")
         : source_task == LxTask::Import ? std::string("正在导入所选脚本，移除的源可通过重新导入恢复")
         : (g_lx_fetch_summary.empty()
-            ? std::string("可用优先、加载快优先 · 按平台与音质自动选源，失败继续切换。")
+            ? std::string("按") + music::source_name(source_order_platform()) + " · " + music::quality_name(c.model.ui.settings.quality) + "的实际选源顺序排列；失败源仅作兜底。"
             : g_lx_fetch_summary);
     c.ui.muted_text(ellipsize(c.ui, note, head.w - 240, 10.5f),
                     {head.x + 20, head.y + 46, head.w - 240, 18}, Style().font(10.5f));
@@ -1540,8 +1540,9 @@ static void source_tab_scripts(Ctx& c, const Rect& area) {
             const auto& item = is_good ? good[size_t(i)] : bad[size_t(i - int(good.size()))];
             const float act_w = 124.0f;
             const float text_w = std::max(80.0f, row.w - 44.0f - act_w);
-            // 圆点表示加载及样本状态；单曲取流错误只作详情，不能覆盖另一个平台的成功结果。
-            c.ui.fill_circle(row.x + 10, row.y + row.h * 0.5f, 3.5f, item.removed ? c.th.label3 : !is_good ? c.th.destructive : item.health_rank < 0 ? c.th.tint : c.th.label3);
+            // 圆点只表示当前排序平台的状态，其他平台结果保留在详情中。
+            c.ui.fill_circle(row.x + 10, row.y + row.h * 0.5f, 3.5f, item.removed ? c.th.label3 : !is_good || item.health_rank == 2 ? c.th.destructive : item.health_rank == 0 ? c.th.tint : c.th.label3);
+            c.ui.tooltip({row.x + 24, row.y + 26, text_w, 16}, item.health);
             c.ui.draw_text(ellipsize(c.ui, item.name, text_w, 12.5f, 600),
                            {row.x + 24, row.y + 7, text_w, 18}, is_good ? c.th.label : c.th.label2,
                            Style().font(12.5f).weight(600));
