@@ -543,6 +543,24 @@ int main(int argc, char** argv) {
                 check(!engine.resolve("wy", "320k", "{\"id\":\"during-cooldown\"}", url, error, nullptr,
                     [&](const auto&, const auto&, const auto&, auto&) { ++candidates; return true; }) && candidates == 2,
                     "next song skips temporarily cooling sources without background probes");
+                engine.check_sources({{"tx", "{}"}}, {}, {}, 1, 6000, good);
+                const auto targeted = engine.health();
+                check(targeted.count("02-good.js") && targeted.at("02-good.js").count("tx") &&
+                    !targeted.count("01-bad.js"), "single script check does not publish health for other scripts");
+                const auto after_targeted = engine.selection_order("wy", 1);
+                check(std::all_of(after_targeted.begin(), after_targeted.end(), [](const auto& item) { return item.availability == 4; }),
+                    "checking a different platform preserves existing cooldowns");
+                check(engine.set_manual_order({good, bad}, error), "manual source order saved");
+                check(engine.choose_fixed_source(1, true).file == "02-good.js", "manual order selects first loaded source even during cooldown");
+                {
+                    lx::Engine ordered(preferences);
+                    check(ordered.load_dir(scripts) == 2 && ordered.manual_order().front() == "02-good.js" &&
+                        ordered.choose_fixed_source(1, true).file == "02-good.js", "manual source order survives restart");
+                    check(ordered.set_manual_order({bad, good}, error) && ordered.choose_fixed_source(1, true).file == "01-bad.js",
+                        "manual reorder replaces the pinned source");
+                    ordered.check_sources({{"tx", "{}"}}, {}, {}, 1, 6000, good);
+                    check(!ordered.health().count("01-bad.js"), "targeted check leaves unrelated source untested");
+                }
                 check(engine.remove_source(bad, error) && platform::exists(bad), "app removal preserves source file");
                 check(engine.entries().size() == 1 && engine.load_dir(scripts) == 1, "reload does not restore removed script");
                 check(engine.refresh_files(scripts, {"01-bad.js", "02-good.js"}) == 1 && engine.entries().size() == 1,
@@ -595,7 +613,7 @@ int main(int argc, char** argv) {
                 script.retire();
                 check(!script.music_url("wy", "128k", "{}", url, error), "removed script rejects new requests");
             }
-            for (const auto& path : {bad, good, preferences}) platform::remove(path);
+            for (const auto& path : {bad, good, preferences, preferences + ".order.json"}) platform::remove(path);
             platform::remove(scripts);
         }
         const auto missing = platform::join(dir, "missing.wav");

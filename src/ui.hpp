@@ -1498,6 +1498,8 @@ static bool lane_toggle(Ctx& c, music::Lane lane, const Rect& box) {
 }
 
 // ---------- 页签一：第三方音源 ----------
+struct SourceDrag { std::string file, target; float last_scroll = 0; };
+static SourceDrag source_drag;
 static void source_tab_scripts(Ctx& c, const Rect& area) {
     const auto& all = lx_source_status();
     std::vector<const LxSourceView*> good, bad;
@@ -1529,13 +1531,16 @@ static void source_tab_scripts(Ctx& c, const Rect& area) {
         : source_task == LxTask::Fetch ? std::string("正在下载并加载音源脚本；本次获取的脚本会恢复到应用中")
         : source_task == LxTask::Import ? std::string("正在导入所选脚本，移除的源可通过重新导入恢复")
         : (source_fetch_summary().empty()
-            ? std::string("按") + music::source_name(source_order_platform()) + " · " + music::quality_name(c.model.ui.settings.quality) + "排序；排除样本失败，不跨平台补歌，不自动删除 JS。"
+            ? (c.model.ui.settings.source_smart_switch
+                ? std::string("按") + music::source_name(source_order_platform()) + " · " + music::quality_name(c.model.ui.settings.quality) + "排序；五个平台独立检测，不自动删除 JS。"
+                : std::string("按手动顺序显示；拖动左侧手柄将想使用的源移到最前面。"))
             : source_fetch_summary());
     c.ui.muted_text(ellipsize(c.ui, note, head.w - 240, 10.5f),
                     {head.x + 20, head.y + 46, head.w - 240, 18}, Style().font(10.5f));
     c.ui.tooltip({head.x + 20, head.y + 46, head.w - 240, 18}, source_check_status().empty() ? note : source_check_status());
 
-    auto check_style = Style().ghost().font(10.5f); check_style.disabled = lx_sources_loading();
+    auto check_style = Style().ghost().font(10.5f);
+    check_style.disabled = lx_sources_loading() || lx_source_check_busy() || !c.model.ui.settings.lane_enable[0];
     if (c.ui.button("重新检测", {head.right() - 160, head.y + 74, 76, 26}, check_style)) lx_check_sources(true);
     const bool on = lane_toggle(c, music::Lane::JsSource, {head.right() - 62, head.y + 76, 40, 22});
     const auto check_note = on && !source_check_status().empty() ? source_check_status() : on ? std::string("启动时静默测速一轮；之后仅手动重新检测") : std::string("已停用：取流只走自带接口");
@@ -1547,6 +1552,7 @@ static void source_tab_scripts(Ctx& c, const Rect& area) {
     c.ui.draw_text("音源智能切换", {head.x + 20, head.y + 112, 160, 20}, c.th.label, Style().font(12).weight(600));
     bool smart = c.model.ui.settings.source_smart_switch;
     if (c.ui.toggle(&smart, {head.right() - 62, head.y + 112, 40, 22})) set_source_smart_switch(smart);
+    if (smart) source_drag = {};
     const auto routing = source_routing_status();
     c.ui.muted_text(ellipsize(c.ui, routing, head.w - 40, 10.5f),
                     {head.x + 20, head.y + 143, head.w - 40, 18}, Style().font(10.5f));
@@ -1564,31 +1570,70 @@ static void source_tab_scripts(Ctx& c, const Rect& area) {
                                                      : ("有 " + std::to_string(bad.size()) + " 个未加载或已移除，点「查看原因」可恢复或查看详情"),
                          {body.x, body.y + 16, body.w, 100});
     } else {
-        c.ui.scroll(body, rows, 52.0f, [&](int i, const Rect& row) {
+        constexpr float row_h = 84.0f;
+        const auto& input = c.ui.input();
+        if (!source_drag.file.empty() && c.ui.pointer_available() && input.down[0] && c.ui.time() - source_drag.last_scroll > 0.09f) {
+            const int first = std::max(0, int(c.ui.scroll_offset(body) / row_h));
+            if (input.mouse.y < body.y + 24) c.ui.scroll_to_index(body, std::max(0, first - 1), row_h, rows);
+            else if (input.mouse.y > body.bottom() - 24) c.ui.scroll_to_index(body, first + 1, row_h, rows);
+            source_drag.last_scroll = c.ui.time();
+        }
+        c.ui.scroll(body, rows, row_h, [&](int i, const Rect& row) {
             const bool is_good = i < int(good.size());
             const auto& item = *(is_good ? good[size_t(i)] : bad[size_t(i - int(good.size()))]);
-            const float act_w = 124.0f;
-            const float text_w = std::max(80.0f, row.w - 44.0f - act_w);
-            // 圆点只表示当前排序平台的状态，其他平台结果保留在详情中。
-            c.ui.fill_circle(row.x + 10, row.y + row.h * 0.5f, 3.5f, item.removed ? c.th.label3 : !is_good || item.health_rank == 2 ? c.th.destructive : item.health_rank == 0 ? c.th.tint : c.th.label3);
-            c.ui.tooltip({row.x + 24, row.y + 26, text_w, 16}, item.health);
-            c.ui.draw_text(ellipsize(c.ui, item.name, text_w, 12.5f, 600),
-                           {row.x + 24, row.y + 7, text_w, 18}, is_good ? c.th.label : c.th.label2,
+            const float left = !smart && is_good ? 30.0f : 12.0f;
+            const float text_w = std::max(40.0f, row.w - left - 188.0f);
+            if (!smart && is_good) {
+                const Rect handle{row.x, row.y, 24, row.h};
+                c.ui.item("", "", "", handle, Style().corner(4));
+                c.ui.system_icon(SystemIcon::Menu, {handle.x + 6, row.y + 11, 12, 12}, c.th.label3);
+                c.ui.tooltip(handle, "拖动排序；排在最前面的源将固定使用");
+                if (c.ui.pointer_available() && body.contains(input.mouse.x, input.mouse.y) && handle.contains(input.mouse.x, input.mouse.y) && input.pressed[0]) source_drag = {item.file, item.file};
+                if (!source_drag.file.empty() && c.ui.pointer_available() && body.contains(input.mouse.x, input.mouse.y) && row.contains(input.mouse.x, input.mouse.y)) source_drag.target = item.file;
+                if (!source_drag.file.empty() && source_drag.target == item.file) c.ui.fill_rect({row.x, row.y, row.w, 2}, c.th.tint);
+            }
+            const float name_w = item.fixed ? std::max(24.0f, text_w - 64) : text_w;
+            c.ui.draw_text(ellipsize(c.ui, item.name, name_w, 12.5f, 600),
+                           {row.x + left, row.y + 8, name_w, 18}, is_good ? c.th.label : c.th.label2,
                            Style().font(12.5f).weight(600));
-            const std::string sub = is_good ? item.health : error_summary(item.error);
-            c.ui.muted_text(ellipsize(c.ui, sub, text_w, 10.5f), {row.x + 24, row.y + 26, text_w, 16},
-                            Style().font(10.5f));
-            if (c.ui.button("详情", {row.right() - 116, row.y + 14, 52, 24}, Style().ghost().font(10.5f))) {
+            if (item.fixed) c.ui.draw_text("固定使用", {row.x + left + name_w + 6, row.y + 10, 56, 16}, c.th.tint, Style().font(10));
+            c.ui.tooltip({row.x + left, row.y + 8, text_w, 18}, item.name + (item.fixed ? " · 固定使用" : ""));
+            if (is_good) {
+                const float cell_w = (row.w - left - 10) / 5;
+                for (size_t p = 0; p < item.platforms.size(); ++p) {
+                    const auto& state = item.platforms[p];
+                    const float x = row.x + left + float(p) * cell_w;
+                    const auto color = state.state == 2 ? c.th.tint : state.state == 3 ? c.th.destructive :
+                        state.state == 1 || state.state == 5 || state.state == 6 ? c.th.label2 : c.th.label3;
+                    c.ui.fill_circle(x + 4, row.y + 43, 3, color);
+                    c.ui.draw_text(state.name, {x + 14, row.y + 35, cell_w - 16, 16}, c.th.label2, Style().font(10.5f));
+                    c.ui.draw_text(state.status, {x + 14, row.y + 54, cell_w - 16, 16}, color, Style().font(10));
+                    c.ui.tooltip({x, row.y + 33, cell_w, 40}, state.detail);
+                }
+            } else {
+                c.ui.muted_text(ellipsize(c.ui, error_summary(item.error), row.w - left - 12, 10.5f), {row.x + left, row.y + 42, row.w - left - 12, 18}, Style().font(10.5f));
+                c.ui.tooltip({row.x + left, row.y + 40, row.w - left - 12, 22}, item.error);
+            }
+            auto action_style = Style().ghost().font(10.5f); action_style.disabled = !source_drag.file.empty();
+            auto test_style = action_style; test_style.disabled = test_style.disabled || !is_good || !on || lx_sources_loading() || lx_source_check_busy();
+            if (c.ui.button(lx_source_checking(item.file) && is_good ? "检测中" : "检测", {row.right() - 178, row.y + 7, 56, 24}, test_style)) lx_check_source(item.file);
+            if (c.ui.button("详情", {row.right() - 116, row.y + 7, 52, 24}, action_style)) {
                 std::string detail = item.health;
                 if (!item.error.empty()) detail += (detail.empty() ? "" : "\n\n") + item.error;
                 if (detail.empty()) detail = "脚本已加载，样本尚未检测。";
                 error_details = {true, item.name, detail + "\n\n文件：" + item.file};
             }
-            if (c.ui.button(item.removed ? "恢复" : "移除", {row.right() - 56, row.y + 14, 50, 24},
-                            Style().ghost().font(10.5f))) {
+            if (c.ui.button(item.removed ? "恢复" : "移除", {row.right() - 56, row.y + 7, 50, 24}, action_style)) {
                 if (item.removed) lx_restore_source(item.file); else lx_remove_source(item.file);
             }
         });
+        if (!source_drag.file.empty()) {
+            if (!c.ui.pointer_available() || (!input.down[0] && !input.released[0])) source_drag = {};
+            else if (input.released[0]) {
+                if (body.contains(input.mouse.x, input.mouse.y)) lx_move_source(source_drag.file, source_drag.target);
+                source_drag = {};
+            } else c.ui.request_animation_frame();
+        }
     }
 
     if (!bad.empty()) {

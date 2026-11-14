@@ -1296,6 +1296,40 @@ public:
         return result;
     }
     explicit Engine(std::string preferences_file = {}) : preferences_file_(std::move(preferences_file)) {}
+    std::vector<std::string> manual_order() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto result = manual_order_;
+        if (result.empty() && !fixed_source_.file.empty()) result.push_back(fixed_source_.file);
+        for (const auto& script : list_) {
+            const auto file = file_key(script->path());
+            if (!script->retired() && std::find(result.begin(), result.end(), file) == result.end()) result.push_back(file);
+        }
+        return result;
+    }
+    bool set_manual_order(const std::vector<std::string>& files, std::string& error) {
+        if (!read_preferences()) { error = preferences_error(); return false; }
+        std::lock_guard<std::mutex> state(state_io_);
+        std::vector<std::string> order;
+        for (const auto& file : files) {
+            const auto key = file_key(file);
+            if (!key.empty() && std::find(order.begin(), order.end(), key) == order.end()) order.push_back(key);
+        }
+        std::string text = "[";
+        for (const auto& file : order) { if (text.size() > 1) text += ','; text += detail::js_quote(file); }
+        text += "]\n";
+        const auto path = order_path();
+        std::FILE* output = path.empty() ? nullptr : platform::fopen(path + ".tmp", "wb");
+        bool ok = false;
+        if (output) {
+            const bool written = std::fwrite(text.data(), 1, text.size(), output) == text.size();
+            const bool closed = std::fclose(output) == 0;
+            ok = written && closed && platform::replace_file(path + ".tmp", path);
+        }
+        if (!ok) { if (!path.empty()) platform::remove(path + ".tmp"); error = "保存音源顺序失败，顺序未改变"; return false; }
+        std::lock_guard<std::mutex> lock(mu_);
+        manual_order_ = std::move(order); fixed_source_ = {}; ++revision_;
+        return true;
+    }
     FixedSource fixed_source() const { std::lock_guard<std::mutex> lock(mu_); return fixed_source_; }
     FixedSource choose_fixed_source(int wanted, bool replace = false) {
         std::lock_guard<std::mutex> lock(mu_);
@@ -1311,7 +1345,7 @@ public:
             for (const auto* platform : {"wy", "tx", "kw", "kg", "mg"}) {
                 if (!script->supports(platform, "musicUrl")) continue;
                 const auto score = selection_locked(script, platform, wanted);
-                if (score.availability >= 2) continue;
+                if (score.availability >= 2 && std::find(manual_order_.begin(), manual_order_.end(), choice.file) == manual_order_.end()) continue;
                 ++choice.supported_platforms;
                 if (score.availability == 0) { ++choice.verified_platforms; verified_ms += score.latency_ms; }
                 else if (score.availability == 1 && score.latency_ms < 300001) { ++estimates; estimated_ms += score.latency_ms; }
@@ -1319,7 +1353,9 @@ public:
             if (!choice.supported_platforms) continue;
             if (choice.verified_platforms) choice.latency_ms = int(verified_ms / choice.verified_platforms);
             else if (estimates) choice.latency_ms = int(estimated_ms / estimates);
-            if (best.file.empty() || fixed_source_better(choice, best)) best = std::move(choice);
+            const auto position = [&](const auto& file) { return std::find(manual_order_.begin(), manual_order_.end(), file) - manual_order_.begin(); };
+            if (best.file.empty() || (!manual_order_.empty() && position(choice.file) < position(best.file)) ||
+                (position(choice.file) == position(best.file) && fixed_source_better(choice, best))) best = std::move(choice);
         }
         fixed_source_ = best;
         ++revision_;
@@ -1505,7 +1541,7 @@ public:
     // 由应用后台任务调用；直接检查各脚本，绝不经过会切到其它源的 resolve()。
     void check_sources(const std::vector<Check>& cases,
                        const std::function<bool()>& cancel, const std::function<void()>& wake,
-                       int wanted = 1, int budget_ms = 6000) {
+                       int wanted = 1, int budget_ms = 6000, const std::string& only_file = {}) {
         const auto overall = budget_ms > 0 ? std::chrono::steady_clock::now() + std::chrono::milliseconds(budget_ms) :
             std::chrono::steady_clock::time_point::max();
         const unsigned epoch = ++check_epoch_;
@@ -1514,13 +1550,15 @@ public:
         std::vector<std::shared_ptr<Script>> scripts;
         {
             std::lock_guard<std::mutex> lock(mu_);
-            scripts = list_;
+            for (const auto& script : list_)
+                if (only_file.empty() || file_key(script->path()) == file_key(only_file)) scripts.push_back(script);
             // 手动/启动的一轮检测是显式恢复入口，不沿用这些平台的临时冷却和单曲失败。
             for (const auto& sample : cases) {
                 for (auto it = song_failures_.begin(); it != song_failures_.end();) {
-                    if (it->second.platform == sample.platform) it = song_failures_.erase(it); else ++it;
+                    if (it->second.platform == sample.platform && (only_file.empty() || it->second.file == file_key(only_file))) it = song_failures_.erase(it); else ++it;
                 }
-                for (auto& file : platform_retry_at_) file.second.erase(sample.platform);
+                for (auto& file : platform_retry_at_)
+                    if (only_file.empty() || file.first == file_key(only_file)) file.second.erase(sample.platform);
             }
             if (cases.size() == 1) std::stable_sort(scripts.begin(), scripts.end(), [&](const auto& a, const auto& b) {
                 const auto first = selection_locked(a, cases.front().platform, wanted);
@@ -1686,7 +1724,27 @@ private:
         const auto directory = platform::config_dir();
         return directory.empty() ? std::string() : platform::join(directory, "removed-sources.json");
     }
+    std::string order_path() const {
+        if (!preferences_file_.empty()) return preferences_file_ + ".order.json";
+        const auto directory = platform::config_dir();
+        return directory.empty() ? std::string() : platform::join(directory, "source-order.json");
+    }
     bool read_preferences() {
+        std::call_once(order_once_, [this] {
+            std::ifstream input(std::filesystem::u8path(order_path()), std::ios::binary);
+            if (!input.is_open()) return;
+            std::string text(1024 * 1024 + 1, '\0');
+            input.read(text.data(), std::streamsize(text.size())); text.resize(size_t(input.gcount()));
+            js::Value root;
+            if (text.size() > 1024 * 1024 || !js::parse(text, root) || !root.is_array()) return;
+            std::vector<std::string> order;
+            for (const auto& item : root.array) {
+                if (item.type != js::Type::String || item.string.empty()) return;
+                const auto file = file_key(item.string);
+                if (std::find(order.begin(), order.end(), file) == order.end()) order.push_back(file);
+            }
+            std::lock_guard<std::mutex> lock(mu_); manual_order_ = std::move(order);
+        });
         std::call_once(preferences_once_, [this] {
             const auto path = preferences_path();
             std::error_code ec;
@@ -1888,10 +1946,10 @@ public:
         return failed_;
     }
 
-    bool supports(const std::string& key) const {
+    bool supports(const std::string& key, const std::string& only_file = {}) const {
         std::lock_guard<std::mutex> lock(mu_);
         for (const auto& s : list_)
-            if (!s->retired() && s->supports(key, "musicUrl")) return true;
+            if (!s->retired() && (only_file.empty() || file_key(s->path()) == file_key(only_file)) && s->supports(key, "musicUrl")) return true;
         return false;
     }
 
@@ -2022,6 +2080,8 @@ private:
     mutable std::mutex mu_;          // 只保护集合和测速状态，网络及解码在锁外。
     std::mutex state_io_;
     std::once_flag preferences_once_;
+    std::once_flag order_once_;
+    std::vector<std::string> manual_order_;
     std::set<std::string> removed_;
     std::string preferences_error_;
     std::string preferences_file_;
