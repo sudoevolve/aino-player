@@ -342,7 +342,7 @@ static void draw_song_menu(Ctx& c) {
     const bool downloading = download != c.model.downloads.end() && !download->second.done && !download->second.failed;
     const bool local = song_menu.track.current().source == music::Source::Local;
     std::vector<std::string> items{"下一首播放", "添加到播放列表",
-        c.model.library.contains(song_menu.track) ? "取消收藏" : "收藏歌曲", local ? "打开所在文件夹" : downloading ? "取消下载" : "下载歌曲"};
+        c.model.favorites.contains(song_menu.track) ? "取消收藏" : "收藏歌曲", local ? "打开所在文件夹" : downloading ? "取消下载" : "下载歌曲"};
     const bool group = !song_menu.selected.empty();
     if (group) {
         const auto count = std::to_string(song_menu.selected.size());
@@ -580,7 +580,7 @@ static void result_row(Ctx& c, const music::Track& t, int index, const Rect& box
     const Rect dl{box.right() - dur_w - 6 - dl_w + 2, mid_y - 11.0f, 22.0f, 22.0f};
     const Rect qa{dl.x - q_w, mid_y - 11.0f, 22.0f, 22.0f};
     const Rect favorite{qa.x - fav_w, mid_y - 11.0f, 22.0f, 22.0f};
-    const bool saved = c.model.library.contains(t);
+    const bool saved = c.model.favorites.contains(t);
     const bool favorite_clicked = c.ui.item("", "", "", favorite, Style().corner(6));
     const bool parts_clicked = has_parts && c.ui.button("分 P", {favorite.x - parts_w, mid_y - 12, 42, 24}, Style().font(10.5f));
     int pct = -1;
@@ -953,7 +953,7 @@ static void queue_row(Ctx& c, const music::Track& track, int index, const Rect& 
     const bool hover = c.ui.pointer_available() && box.contains(c.ui.input().mouse.x, c.ui.input().mouse.y);
     const Rect remove{box.right() - 28, box.y + 19, 22, 22};
     const Rect favorite{remove.x - 26, remove.y, 22, 22};
-    const bool saved = c.model.library.contains(track);
+    const bool saved = c.model.favorites.contains(track);
     const bool save_clicked = c.ui.icon_button("", favorite, Style().ghost());
     const bool remove_clicked = hover && c.ui.icon_button("", remove, Style().ghost());
     const Rect play_cover{box.x + 8, box.y + 10, 40, 40};
@@ -2149,7 +2149,7 @@ static void player_bar(Ctx& c) {
         c.ui.draw_text(std::to_string(dl->second.percent), download, c.th.tint, Style().font(9).center());
     else c.ui.system_icon(dl != c.model.downloads.end() && dl->second.done ? SystemIcon::Check : dl != c.model.downloads.end() && dl->second.failed ? SystemIcon::Warning : SystemIcon::Download,
         download.center(15, 15), dl != c.model.downloads.end() && dl->second.failed ? c.th.destructive : c.th.label2);
-    const bool saved = !c.s.now_track.variants.empty() && c.model.library.contains(c.s.now_track);
+    const bool saved = !c.s.now_track.variants.empty() && c.model.favorites.contains(c.s.now_track);
     if (c.ui.icon_button("", favorite, track_action)) favorite_toggle(c.s.now_track);
     if (saved) c.ui.fill_rect(favorite, c.th.tint.scaled_alpha(0.1f), 6);
     c.ui.system_icon(SystemIcon::Star, favorite.center(16, 16), saved ? c.th.tint : c.th.label2);
@@ -2200,6 +2200,7 @@ struct LyricLayout {
     bool translated = true;
     float width = -1.0f;
     std::vector<int> src;          // 显示行 → 原行下标
+    std::vector<int> first_display; // 原行 → 首个显示行，空行记 -1。
     std::vector<std::string> text;
     std::vector<bool> translation;
     std::vector<float> top;        // 相对内容顶部的 y
@@ -2214,6 +2215,7 @@ static void build_lyric_layout(aino::Ui& ui, const std::shared_ptr<const lyr::Do
     g_lyr_layout.owner = doc;
     g_lyr_layout.width = width;
     g_lyr_layout.translated = translated;
+    g_lyr_layout.first_display.assign(doc->lines.size(), -1);
     float y = 0;
     auto append = [&](const std::string& text, int source, bool translation) {
         const float font = translation ? 11.0f : 13.0f;
@@ -2237,6 +2239,7 @@ static void build_lyric_layout(aino::Ui& ui, const std::shared_ptr<const lyr::Do
         const auto& line = doc->lines[size_t(i)];
         if (line.text.empty()) continue;
         if (!g_lyr_layout.text.empty()) y += 9;
+        g_lyr_layout.first_display[size_t(i)] = int(g_lyr_layout.text.size());
         append(line.text, i, false);
         if (translated && !line.translation.empty()) append(line.translation, i, true);
     }
@@ -2303,10 +2306,8 @@ static void lyrics_panel(Ctx& c, const Rect& box) {
 
     const int cur_line = doc->synced ? lyr::current_line(doc->lines, (long long)c.model.ui.pos_ms - offset) : -1;
     int disp_cur = -1;
-    if (cur_line >= 0) {
-        for (int i = 0; i < int(g_lyr_layout.src.size()); ++i)
-            if (g_lyr_layout.src[size_t(i)] == cur_line) { disp_cur = i; break; }
-    }
+    if (cur_line >= 0 && size_t(cur_line) < g_lyr_layout.first_display.size())
+        disp_cur = g_lyr_layout.first_display[size_t(cur_line)];
 
     const float total = g_lyr_layout.total;
     const float max_scroll = std::max(0.0f, total - area.h + 40.0f);
@@ -2342,7 +2343,11 @@ static void lyrics_panel(Ctx& c, const Rect& box) {
     // 点击后 active 常常清不掉，表现为"点十次能中一次"。
     static int press_line = -1;
     if (!c.ui.pointer_available()) press_line = -1;
-    for (int i = 0; i < nline; ++i) {
+    const auto& tops = g_lyr_layout.top;
+    // 留出原有最小行高和向上 3px 的点击边界，保持可见行行为不变。
+    const int first_visible = std::max(0, int(std::lower_bound(tops.begin(), tops.end(), g_lyr_scroll - 30.0f) - tops.begin()) - 1);
+    const int end_visible = std::min(nline, int(std::upper_bound(tops.begin(), tops.end(), g_lyr_scroll + area.h) - tops.begin()));
+    for (int i = first_visible; i < end_visible; ++i) {
         const float ty = base_y + g_lyr_layout.top[size_t(i)];
         // 行高取到下一行的顶部：整段行距都可点，不用瞄准文字那一条
         const float next_top = (i + 1 < nline) ? g_lyr_layout.top[size_t(i + 1)] : g_lyr_layout.total;

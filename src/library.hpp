@@ -10,6 +10,7 @@
 #include <cctype>
 #include <map>
 #include <cmath>
+#include <unordered_set>
 
 namespace library {
 inline std::string quote(const std::string& text) {
@@ -27,6 +28,86 @@ inline bool same_track(const music::Track& a, const music::Track& b) {
         if (music::same_variant(x, y)) return true;
     return false;
 }
+/** @brief 收藏身份索引；遵循 same_variant 的平台、ID 和 B 站分 P 匹配规则。 */
+class FavoriteIndex {
+public:
+    explicit FavoriteIndex(const std::vector<music::Track>& tracks = {}) {
+        for (const auto& track : tracks) add(track);
+    }
+    bool contains(const music::Track& track) const {
+        for (const auto& variant : track.variants)
+            if (!variant.id.empty() && variants_.count(key(variant))) return true;
+        return false;
+    }
+    void add(const music::Track& track) {
+        for (const auto& variant : track.variants)
+            if (!variant.id.empty()) variants_.insert(key(variant));
+    }
+private:
+    static std::string key(const music::Variant& variant) {
+        return std::to_string(int(variant.source)) + ":" + std::to_string(variant.id.size()) + ":" +
+            variant.id + (variant.source == music::Source::Bilibili ? variant.native_id : "");
+    }
+    std::unordered_set<std::string> variants_;
+};
+
+/**
+ * @brief 歌单曲目共享只读存储，只有可写访问才复制。
+ *
+ * 资料库版本、详情页与历史共享曲目；迭代器和可写引用只用于当前同步修改，
+ * 不跨快照保存。UI 使用 const 访问，避免读取时触发复制。
+ */
+class SharedTracks {
+public:
+    using Container = std::vector<music::Track>;
+    using iterator = Container::iterator;
+    using const_iterator = Container::const_iterator;
+    SharedTracks() : data_(std::make_shared<Container>()) {}
+    SharedTracks(const SharedTracks&) = default;
+    SharedTracks& operator=(const SharedTracks&) = default;
+    // 移动后也保留可读取的空 / 旧值，避免已移动详情对象留下空指针。
+    SharedTracks(SharedTracks&& other) noexcept : data_(other.data_) {}
+    SharedTracks& operator=(SharedTracks&& other) noexcept { data_ = other.data_; return *this; }
+    SharedTracks(Container tracks) : data_(std::make_shared<Container>(std::move(tracks))) {}
+    SharedTracks(std::initializer_list<music::Track> tracks) : SharedTracks(Container(tracks)) {}
+    operator const Container&() const { return *data_; }
+    size_t size() const { return data_->size(); }
+    bool empty() const { return data_->empty(); }
+    const music::Track& operator[](size_t i) const { return (*data_)[i]; }
+    music::Track& operator[](size_t i) { return edit()[i]; }
+    const music::Track& front() const { return data_->front(); }
+    music::Track& front() { return edit().front(); }
+    const music::Track& back() const { return data_->back(); }
+    music::Track& back() { return edit().back(); }
+    const music::Track* data() const { return data_->data(); }
+    const_iterator begin() const { return data_->begin(); }
+    const_iterator end() const { return data_->end(); }
+    iterator begin() { return edit().begin(); }
+    iterator end() { return edit().end(); }
+    void reserve(size_t count) { edit().reserve(count); }
+    void clear() { data_ = std::make_shared<Container>(); }
+    void resize(size_t count) { edit().resize(count); }
+    void push_back(const music::Track& track) { edit().push_back(track); }
+    void push_back(music::Track&& track) { edit().push_back(std::move(track)); }
+    template<class... Args> void emplace_back(Args&&... args) { edit().emplace_back(std::forward<Args>(args)...); }
+    iterator erase(const_iterator first, const_iterator last) {
+        const auto a = first - data_->cbegin(), b = last - data_->cbegin();
+        auto& tracks = edit();
+        return tracks.erase(tracks.cbegin() + a, tracks.cbegin() + b);
+    }
+    iterator erase(const_iterator item) { return erase(item, item + 1); }
+    template<class It> iterator insert(const_iterator at, It first, It last) {
+        const auto offset = at - data_->cbegin();
+        auto& tracks = edit();
+        return tracks.insert(tracks.cbegin() + offset, first, last);
+    }
+private:
+    Container& edit() {
+        if (!data_.unique()) data_ = std::make_shared<Container>(*data_);
+        return *data_;
+    }
+    std::shared_ptr<Container> data_;
+};
 inline std::string encode_track(const music::Track& t) {
     std::string out = "{\"title\":" + quote(t.title) + ",\"artist\":" + quote(t.artist) +
         ",\"album\":" + quote(t.album) + ",\"duration_ms\":" + std::to_string(t.duration_ms) +
@@ -93,7 +174,7 @@ inline bool decode_track(const js::Value& value, music::Track& t, bool* dropped 
 struct Playlist {
     std::string key, name, remote_id, cover;
     music::Source source = music::Source::Netease;
-    std::vector<music::Track> tracks;
+    SharedTracks tracks;
     std::string remote_owner; // QQ 自建歌单使用 dirid + uin；公开歌单使用 disstid。
     std::string local_folder;
     bool recursive = true;

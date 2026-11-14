@@ -274,6 +274,20 @@ int main(int argc, char** argv) {
         library::Library lib;
         check(lib.toggle(track), "favorite add");
         check(lib.contains(track), "favorite membership");
+        {
+            library::Library copy = lib;
+            const auto& original_tracks = static_cast<const std::vector<music::Track>&>(lib.playlists.front().tracks);
+            const auto& copied_tracks = static_cast<const std::vector<music::Track>&>(copy.playlists.front().tracks);
+            check(original_tracks.data() == copied_tracks.data(), "unchanged library versions share track storage");
+            copy.playlists.front().tracks.front().title = "Changed";
+            check(lib.playlists.front().tracks.front().title == track.title &&
+                copy.playlists.front().tracks.front().title != track.title, "editing a library copy preserves the published version");
+            library::FavoriteIndex index(original_tracks);
+            music::Track alternative; alternative.variants.push_back(second);
+            check(index.contains(alternative), "favorite index matches any platform variant");
+            alternative.variants.front().source = music::Source::Bilibili;
+            check(!index.contains(alternative), "favorite index preserves platform identity");
+        }
         const auto dir = platform::join(platform::temp_dir(), "test-" + std::to_string(platform::ticks()));
         check(platform::make_dirs(dir), "test directory");
         const auto file = platform::join(dir, "资料库.json");

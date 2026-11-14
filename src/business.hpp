@@ -313,6 +313,7 @@ struct ViewModel {
     unsigned long long toast_until;
     std::shared_ptr<const library::Library> library_storage;
     unsigned library_revision = 0;
+    const library::FavoriteIndex& favorites;
 };
 inline std::string track_uid(const music::Track& track) {
     const auto& variant = track.current();
@@ -3060,7 +3061,11 @@ void batch_tracks(std::vector<music::Track> tracks, BatchAction action, std::str
     if (action == BatchAction::Favorite || action == BatchAction::RemovePlaylist) {
         library_edit([tracks = std::move(tracks), action, playlist_key](library::Library& next) {
             if (action == BatchAction::Favorite) {
-                for (const auto& track : tracks) if (!next.contains(track)) next.toggle(track);
+                library::FavoriteIndex index(next.playlists.front().tracks);
+                for (const auto& track : tracks) if (!track.variants.empty() && !index.contains(track)) {
+                    next.playlists.front().tracks.push_back(track);
+                    index.add(track);
+                }
             } else {
                 std::set<std::string> ids;
                 for (const auto& track : tracks) ids.insert(track_uid(track));
@@ -3927,8 +3932,16 @@ static std::array<LoginView, 3> g_login_view;
 static LyricView g_lyric_view;
 static StoragePaths g_paths;
 ViewModel view_model() {
+    static std::shared_ptr<const library::Library> indexed;
+    static library::FavoriteIndex favorites;
+    static unsigned indexed_revision = ~0u;
+    if (indexed != g_library || indexed_revision != g_library_revision) {
+        favorites = library::FavoriteIndex(g_library->playlists.front().tracks);
+        indexed = g_library;
+        indexed_revision = g_library_revision;
+    }
     return {g_ui, g_snapshot, *g_library, g_qq_snap, g_ne_snap, g_disc_snap, g_playlist_search_snap, g_dls_snap,
-        g_login_view, g_lyric_view, g_paths, g_update_view, g_playlist_view, g_sync_site.load(), g_sync_index.load(), g_toast_until.load(), g_library, g_library_revision};
+        g_login_view, g_lyric_view, g_paths, g_update_view, g_playlist_view, g_sync_site.load(), g_sync_index.load(), g_toast_until.load(), g_library, g_library_revision, favorites};
 }
 bool initialize(bool smoke_test) {
     net::shutdown_signal = &g_shutdown;
@@ -3936,6 +3949,7 @@ bool initialize(bool smoke_test) {
     g_player.set_device(g_ui.output_device);
     std::string library_error;
     if (!smoke_test) g_library_writable = g_library->load(library_path(), library_error);
+    ++g_library_revision;
     if (!library_error.empty()) toast(library_error, 10000);
     g_temp_dir = platform::temp_dir();
     if (g_temp_dir.empty()) { std::fprintf(stderr, "Cannot create cache directory\n"); return false; }
