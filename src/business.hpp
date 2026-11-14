@@ -195,6 +195,9 @@ struct UiState {
     int close_behavior = 0; // 0 询问，1 到托盘，2 退出；旧版 bool 仅保留配置兼容。
     bool close_dialog = false, close_remember = false;
     bool media_available = false, tray_available = false;
+    platform::LyricOverlaySettings lyric_overlay;
+    std::string lyric_overlay_error;
+    bool overlay_settings = false;
     std::string output_device, lyric_file_path;
     int download_filter = 0;
     bool lyric_tools = false, device_loading = false;
@@ -373,6 +376,9 @@ void library_relocate();
 void queue_move(int from, int to);
 void download_current();
 void request_current_lyrics(bool force = false);
+std::pair<std::string, std::string> floating_lyric_text();
+platform::LyricOverlayProgress floating_lyric_progress();
+void set_floating_lyrics_enabled(bool enabled);
 void open_data_directory(const std::string& path);
 std::shared_ptr<const cover::Image> cover_image(const std::string& url);
 void start_search();
@@ -537,6 +543,26 @@ void load(UiState& state) {
         if (!v.empty()) state.ne_uid = v;
         v = read_line_value(line, "dark");
         if (!v.empty()) state.dark = (v != "0");
+        auto& overlay = state.lyric_overlay;
+        const std::pair<const char*, bool*> overlay_flags[]{{"overlay_enabled", &overlay.enabled}, {"overlay_double_line", &overlay.double_line},
+            {"overlay_locked", &overlay.locked}, {"overlay_translation", &overlay.translation}, {"overlay_topmost", &overlay.topmost}, {"overlay_karaoke", &overlay.karaoke}};
+        for (const auto& flag : overlay_flags) { v = read_line_value(line, flag.first); if (!v.empty()) *flag.second = v != "0"; }
+        const auto integer = [&](const char* key, int& field, int low, int high) {
+            const auto value = read_line_value(line, key);
+            if (!value.empty()) field = int(std::clamp(std::strtol(value.c_str(), nullptr, 10), long(low), long(high)));
+        };
+        integer("overlay_opacity", overlay.opacity, 10, 100); integer("overlay_background", overlay.background, 0, 90);
+        integer("overlay_font", overlay.font_size, 12, 64); integer("overlay_width", overlay.width, 220, 1200);
+        integer("overlay_placement", overlay.placement, 0, 1); integer("overlay_offset", overlay.panel_offset, -500, 500);
+        integer("overlay_x", overlay.x, -32000, 32000); integer("overlay_y", overlay.y, -32000, 32000);
+        for (const auto& color : {std::make_pair("overlay_sung_color", &overlay.sung_color), std::make_pair("overlay_unsung_color", &overlay.unsung_color), std::make_pair("overlay_background_color", &overlay.background_color)}) {
+            const auto value = read_line_value(line, color.first);
+            char* end = nullptr;
+            if (value.size() == 6 && value.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos) {
+                const auto rgb = std::strtoul(value.c_str(), &end, 16);
+                if (end == value.c_str() + value.size() && rgb <= 0xffffff) *color.second = uint32_t(rgb);
+            }
+        }
         v = read_line_value(line, "watch_folders");
         if (!v.empty()) state.watch_folders = v != "0";
         v = read_line_value(line, "quality");
@@ -591,6 +617,15 @@ bool save(UiState& state) {
     std::fprintf(f, "close_to_tray=%d\ntray_enabled=%d\noutput_device=%s\n", state.close_behavior == 1, state.tray_enabled, state.output_device.c_str());
     std::fprintf(f, "close_behavior=%d\n", state.close_behavior);
     std::fprintf(f, "dark=%d\n", state.dark ? 1 : 0);
+    const auto& overlay = state.lyric_overlay;
+    std::fprintf(f, "overlay_enabled=%d\noverlay_double_line=%d\noverlay_locked=%d\noverlay_translation=%d\n",
+        overlay.enabled, overlay.double_line, overlay.locked, overlay.translation);
+    std::fprintf(f, "overlay_opacity=%d\noverlay_background=%d\noverlay_font=%d\noverlay_width=%d\n",
+        overlay.opacity, overlay.background, overlay.font_size, overlay.width);
+    std::fprintf(f, "overlay_placement=%d\noverlay_offset=%d\noverlay_x=%d\noverlay_y=%d\n",
+        overlay.placement, overlay.panel_offset, overlay.x, overlay.y);
+    std::fprintf(f, "overlay_topmost=%d\noverlay_karaoke=%d\noverlay_sung_color=%06x\noverlay_unsung_color=%06x\noverlay_background_color=%06x\n",
+        overlay.topmost, overlay.karaoke, unsigned(overlay.sung_color), unsigned(overlay.unsung_color), unsigned(overlay.background_color));
     std::fprintf(f, "quality=%d\n", state.settings.quality);
     std::fprintf(f, "lane_pref=%d\n", state.settings.lane_pref);
     std::fprintf(f, "source_smart_switch=%d\n", state.settings.source_smart_switch);
@@ -2872,7 +2907,7 @@ static void start_play_attempt(int index, bool keep_failures) {
     g_player.close();  // 播放设备只由主线程操作。
     g_current_media = take_preloaded(track, st);
     cleanup_temp(gen);
-    if (g_ui.lyrics_open) request_lyrics(track);
+    if (g_ui.lyrics_open || g_ui.lyric_overlay.enabled) request_lyrics(track);
     if (g_current_media) {
         {
             std::lock_guard<std::mutex> lock(g_mu);
@@ -4691,7 +4726,7 @@ void finish_frame(float frame_ms) {
             } else if (snap.ps == PlayState::Buffering || snap.ps == PlayState::Resolving) {
                 fps = 30;
             }
-            if (g_ui.window_hidden) fps = 1;
+            if (g_ui.window_hidden && !(g_ui.lyric_overlay.enabled && snap.ps == PlayState::Playing)) fps = 1;
             g_fps_hint.store(fps);
         }
 
@@ -4800,6 +4835,52 @@ void request_current_lyrics(bool force) {
     music::Track track;
     { std::lock_guard<std::mutex> lock(g_mu); track = g_as.now_track; }
     if (!track.variants.empty()) request_lyrics(track, force);
+}
+void set_floating_lyrics_enabled(bool enabled) {
+    if (g_ui.lyric_overlay.enabled == enabled) return;
+    g_ui.lyric_overlay.enabled = enabled; g_ui.config_dirty = true;
+    if (enabled) request_current_lyrics();
+    request_frame();
+}
+platform::LyricOverlayProgress floating_lyric_progress() {
+    platform::LyricOverlayProgress result;
+    const auto& view = g_lyric_view;
+    if (!g_ui.lyric_overlay.enabled || !g_ui.lyric_overlay.karaoke || view.uid != g_snapshot.now_uid ||
+        !view.doc || !view.doc->synced || view.doc->empty()) return result;
+    const auto& lines = view.doc->lines;
+    const auto position = static_cast<long long>(g_ui.pos_ms) - lyric_offset();
+    const int index = lyr::current_line(lines, position);
+    if (index < 0 || size_t(index) >= lines.size() || lines[size_t(index)].text.empty()) return result;
+    const auto start = lines[size_t(index)].ms;
+    const auto next = std::upper_bound(lines.begin() + index + 1, lines.end(), start,
+        [](long long time, const auto& line) { return time < line.ms; });
+    const auto end = next == lines.end() ? static_cast<long long>(g_ui.dur_ms) : next->ms;
+    if (end > start) result.first = std::clamp(float(double(position - start) / double(end - start)), 0.0f, 1.0f);
+    if (g_ui.lyric_overlay.double_line && g_ui.lyric_overlay.translation && !lines[size_t(index)].translation.empty()) result.second = result.first;
+    return result;
+}
+std::pair<std::string, std::string> floating_lyric_text() {
+    if (!g_ui.lyric_overlay.enabled) return {};
+    if (g_snapshot.now_uid.empty()) return {"Aino Player", g_ui.lyric_overlay.double_line ? "播放音乐后显示歌词" : ""};
+    const auto& view = g_lyric_view;
+    std::pair<std::string, std::string> result{g_snapshot.now_title, g_snapshot.now_artist};
+    if (view.uid == g_snapshot.now_uid && view.doc && !view.doc->empty()) {
+        const auto& lines = view.doc->lines;
+        const int index = view.doc->synced ? lyr::current_line(lines, static_cast<long long>(g_ui.pos_ms) - lyric_offset()) : 0;
+        if (index >= 0 && size_t(index) < lines.size()) {
+            const auto& line = lines[size_t(index)];
+            if (!line.text.empty()) result.first = line.text;
+            result.second = g_ui.lyric_overlay.translation && !line.translation.empty() ? line.translation :
+                size_t(index + 1) < lines.size() ? lines[size_t(index + 1)].text : "";
+        }
+    } else if (view.loading && view.uid == g_snapshot.now_uid) result.second = "正在加载歌词…";
+    // 脚本歌词可包含极长行；限制浮层测量成本，并保持 UTF-8 边界完整。
+    for (auto* text : {&result.first, &result.second}) if (text->size() > 2048) {
+        size_t end = 2048; while (end && (static_cast<unsigned char>((*text)[end]) & 0xc0) == 0x80) --end;
+        text->resize(end);
+    }
+    if (!g_ui.lyric_overlay.double_line) result.second.clear();
+    return result;
 }
 void open_data_directory(const std::string& path) {
     if (!platform::open_folder(path)) toast("无法打开目录，请检查目录是否可用");

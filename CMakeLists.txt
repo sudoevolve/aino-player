@@ -24,7 +24,7 @@ else()
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(DBUS REQUIRED IMPORTED_TARGET dbus-1)
   target_include_directories(player_desktop PRIVATE ${X11_INCLUDE_DIR})
-  target_link_libraries(player_desktop PUBLIC PkgConfig::DBUS ${X11_LIBRARIES})
+  target_link_libraries(player_desktop PUBLIC PkgConfig::DBUS ${X11_LIBRARIES} ${CMAKE_DL_LIBS})
 endif()
 
 add_library(player_audio STATIC src/audio.cpp)

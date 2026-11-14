@@ -1570,7 +1570,8 @@ static void source_tab_scripts(Ctx& c, const Rect& area) {
                                                      : ("有 " + std::to_string(bad.size()) + " 个未加载或已移除，点「查看原因」可恢复或查看详情"),
                          {body.x, body.y + 16, body.w, 100});
     } else {
-        constexpr float row_h = 84.0f;
+        const bool compact = body.w < 640;
+        const float row_h = compact ? 120.0f : 84.0f;
         const auto& input = c.ui.input();
         if (!source_drag.file.empty() && c.ui.pointer_available() && input.down[0] && c.ui.time() - source_drag.last_scroll > 0.09f) {
             const int first = std::max(0, int(c.ui.scroll_offset(body) / row_h));
@@ -1582,7 +1583,11 @@ static void source_tab_scripts(Ctx& c, const Rect& area) {
             const bool is_good = i < int(good.size());
             const auto& item = *(is_good ? good[size_t(i)] : bad[size_t(i - int(good.size()))]);
             const float left = !smart && is_good ? 30.0f : 12.0f;
-            const float text_w = std::max(40.0f, row.w - left - 188.0f);
+            const float actions_x = row.right() - 190;
+            const float action_y = row.y + (compact ? 88 : 30);
+            const float text_w = std::max(40.0f, compact ? row.w - left - 12 : actions_x - row.x - left - 20);
+            if (compact) c.ui.fill_rect({row.x + left, row.y + 80, text_w, 1}, c.th.separator);
+            else c.ui.fill_rect({actions_x, row.y + 12, 1, row.h - 24}, c.th.separator);
             if (!smart && is_good) {
                 const Rect handle{row.x, row.y, 24, row.h};
                 c.ui.item("", "", "", handle, Style().corner(4));
@@ -1599,7 +1604,7 @@ static void source_tab_scripts(Ctx& c, const Rect& area) {
             if (item.fixed) c.ui.draw_text("固定使用", {row.x + left + name_w + 6, row.y + 10, 56, 16}, c.th.tint, Style().font(10));
             c.ui.tooltip({row.x + left, row.y + 8, text_w, 18}, item.name + (item.fixed ? " · 固定使用" : ""));
             if (is_good) {
-                const float cell_w = (row.w - left - 10) / 5;
+                const float cell_w = text_w / 5;
                 for (size_t p = 0; p < item.platforms.size(); ++p) {
                     const auto& state = item.platforms[p];
                     const float x = row.x + left + float(p) * cell_w;
@@ -1611,19 +1616,19 @@ static void source_tab_scripts(Ctx& c, const Rect& area) {
                     c.ui.tooltip({x, row.y + 33, cell_w, 40}, state.detail);
                 }
             } else {
-                c.ui.muted_text(ellipsize(c.ui, error_summary(item.error), row.w - left - 12, 10.5f), {row.x + left, row.y + 42, row.w - left - 12, 18}, Style().font(10.5f));
-                c.ui.tooltip({row.x + left, row.y + 40, row.w - left - 12, 22}, item.error);
+                c.ui.muted_text(ellipsize(c.ui, error_summary(item.error), text_w, 10.5f), {row.x + left, row.y + 42, text_w, 18}, Style().font(10.5f));
+                c.ui.tooltip({row.x + left, row.y + 40, text_w, 22}, item.error);
             }
             auto action_style = Style().ghost().font(10.5f); action_style.disabled = !source_drag.file.empty();
             auto test_style = action_style; test_style.disabled = test_style.disabled || !is_good || !on || lx_sources_loading() || lx_source_check_busy();
-            if (c.ui.button(lx_source_checking(item.file) && is_good ? "检测中" : "检测", {row.right() - 178, row.y + 7, 56, 24}, test_style)) lx_check_source(item.file);
-            if (c.ui.button("详情", {row.right() - 116, row.y + 7, 52, 24}, action_style)) {
+            if (c.ui.button(lx_source_checking(item.file) && is_good ? "检测中" : "检测", {actions_x + 12, action_y, 56, 24}, test_style)) lx_check_source(item.file);
+            if (c.ui.button("详情", {actions_x + 74, action_y, 52, 24}, action_style)) {
                 std::string detail = item.health;
                 if (!item.error.empty()) detail += (detail.empty() ? "" : "\n\n") + item.error;
                 if (detail.empty()) detail = "脚本已加载，样本尚未检测。";
                 error_details = {true, item.name, detail + "\n\n文件：" + item.file};
             }
-            if (c.ui.button(item.removed ? "恢复" : "移除", {row.right() - 56, row.y + 7, 50, 24}, action_style)) {
+            if (c.ui.button(item.removed ? "恢复" : "移除", {actions_x + 132, action_y, 50, 24}, action_style)) {
                 if (item.removed) lx_restore_source(item.file); else lx_remove_source(item.file);
             }
         });
@@ -1958,6 +1963,168 @@ static void tab_recent(Ctx& c) {
         else if (clicked) select_song(c, track_uid(track));
     });
 }
+static void floating_lyrics_settings(Ctx& c, float x, float w, float y) {
+    if (c.ui.button("返回通用设置", {x, y, 120, 28}, Style().ghost().font(11))) c.model.ui.overlay_settings = false;
+    const Rect group{x, y + 62, w, 928};
+    settings_group(c, "悬浮歌词", group);
+    auto& settings = c.model.ui.lyric_overlay;
+    const auto row = [&](int i) { return Rect{x, group.y + i * 58, w, 58}; };
+    const auto label = [&](int i, const char* text) { settings_label(c, text, row(i)); if (i) settings_rule(c, group, row(i).y); };
+    const auto toggle = [&](int i, const char* text, bool& field) {
+        label(i, text); if (c.ui.toggle(&field, {x + w - 54, row(i).y + 18, 38, 22})) c.model.ui.config_dirty = true;
+    };
+    const auto slider = [&](int i, const char* text, int& field, float low, float high, const char* suffix) {
+        label(i, text);
+        const float length = std::min(230.0f, w * 0.42f);
+        float value = float(field);
+        if (c.ui.slider(&value, low, high, {x + w - length - 70, row(i).y + 20, length, 20})) {
+            field = int(std::round(value)); c.model.ui.config_dirty = true;
+        }
+        c.ui.draw_text(std::to_string(field) + suffix, {x + w - 62, row(i).y + 19, 46, 22}, c.th.label2, Style().font(10.5f).right());
+    };
+    label(0, "显示悬浮歌词"); bool enabled = settings.enabled;
+    if (c.ui.toggle(&enabled, {x + w - 54, row(0).y + 18, 38, 22})) set_floating_lyrics_enabled(enabled);
+    label(1, "显示行数"); int lines = settings.double_line ? 1 : 0;
+    if (c.ui.select({"单行", "双行"}, &lines, {x + w - 146, row(1).y + 15, 130, 28}, Style().font(11))) { settings.double_line = lines == 1; c.model.ui.config_dirty = true; }
+    toggle(2, "第二行优先显示译文", settings.translation);
+    slider(3, "字号", settings.font_size, 12, 64, "");
+    slider(4, "窗口宽度", settings.width, 220, 1200, "");
+    slider(5, "整体不透明度", settings.opacity, 10, 100, "%");
+    slider(6, "背景不透明度", settings.background, 0, 90, "%");
+    label(7, "停靠位置");
+#ifdef _WIN32
+    const char* dock = "任务栏（可拖入）";
+#else
+    const char* dock = "顶栏（可拖入）";
+#endif
+    if (c.ui.select({"自由悬浮", dock}, &settings.placement, {x + w - 178, row(7).y + 15, 162, 28}, Style().font(11))) c.model.ui.config_dirty = true;
+    slider(8, "停靠水平偏移", settings.panel_offset, -500, 500, "");
+    toggle(9, "锁定位置并穿透鼠标", settings.locked);
+    label(10, "找回悬浮歌词");
+    if (c.ui.button("重置位置", {x + w - 104, row(10).y + 15, 88, 28}, Style().font(11))) {
+        settings.x = settings.y = -32000; settings.placement = 0; settings.locked = false; c.model.ui.config_dirty = true;
+    }
+    toggle(11, "始终置顶", settings.topmost);
+    toggle(12, "随播放进度填色", settings.karaoke);
+    const auto color_row = [&](int index, const char* title, uint32_t& rgb) {
+        label(index, title);
+        constexpr uint32_t palette[]{0x31b6ff, 0x52d78b, 0xffcf4a, 0xff7894, 0xc49bff, 0xf5f5f5, 0x121212};
+        const float swatch = std::min(24.0f, std::max(17.0f, (w - 260) / 7));
+        const float start = x + w - 120 - swatch * 7;
+        for (size_t i = 0; i < 7; ++i) {
+            const Rect box{start + i * swatch, row(index).y + 20, swatch - 4, 18};
+            if (c.ui.color_well(Color::hex(palette[i]), box)) { rgb = palette[i]; c.model.ui.config_dirty = true; }
+            if (rgb == palette[i]) c.ui.stroke_rect(box.expand(2), c.th.tint, 4, 1.5f);
+        }
+        static std::array<std::string, 3> hex;
+        static std::array<uint32_t, 3> synced{~0u, ~0u, ~0u};
+        const size_t slot = size_t(index - 13);
+        if (synced[slot] != rgb) { char value[8]; std::snprintf(value, sizeof value, "%06X", unsigned(rgb)); hex[slot] = value; synced[slot] = rgb; }
+        const Rect input{x + w - 108, row(index).y + 15, 92, 28};
+        if (c.ui.input(&hex[slot], input, Style().font(11))) {
+            const auto& value = hex[slot]; char* end = nullptr;
+            const size_t prefix = !value.empty() && value.front() == '#' ? 1 : 0;
+            const auto parsed = std::strtoul(value.c_str() + prefix, &end, 16);
+            if (value.size() == 6 + prefix && value.find_first_not_of("0123456789abcdefABCDEF", prefix) == std::string::npos &&
+                end == value.c_str() + value.size() && parsed <= 0xffffff) {
+                rgb = uint32_t(parsed); synced[slot] = rgb; c.model.ui.config_dirty = true;
+            }
+        }
+        c.ui.tooltip(input, "输入六位十六进制颜色，例如 31B6FF；支持 # 前缀");
+    };
+    color_row(13, "已唱颜色", settings.sung_color);
+    color_row(14, "未唱颜色", settings.unsung_color);
+    color_row(15, "背景颜色", settings.background_color);
+    const std::string hint = "解锁后拖到任务栏／顶栏，松手固定；向外拖可恢复悬浮。停靠时保持置顶。填色按当前行与下一行的时间推进；普通 LRC 不含逐字时间，属于行内估算。";
+    c.ui.muted_text(c.model.ui.lyric_overlay_error.empty() ? hint : c.model.ui.lyric_overlay_error,
+        {x + 2, group.bottom() + 14, w - 4, 66}, Style().font(10.5f).wrap_text().top());
+}
+
+struct FloatingLyricRaster {
+    std::pair<std::string, std::string> lines;
+    int width = 0, height = 0, font = 0, placement = 0;
+    float scale = 0;
+    bool double_line = false;
+    std::array<float, 2> left{}, text_width{};
+    std::vector<uint8_t> mask, shadow;
+};
+static FloatingLyricRaster floating_raster;
+static void clear_floating_lyric_cache() { if (!floating_raster.mask.empty()) floating_raster = {}; }
+// 字形和描边遮罩只在文字 / 布局变化时生成，播放推进仅给既有遮罩着色。
+static void paint_floating_lyrics(aino::detail::TextRenderer& text, const platform::LyricOverlaySettings& settings,
+    const std::pair<std::string, std::string>& lines, const platform::LyricOverlayProgress& progress,
+    uint8_t* pixels, int width, int height, float scale, void* dc) {
+    auto& raster = floating_raster;
+    const bool rebuild = raster.mask.empty() || raster.lines != lines || raster.width != width || raster.height != height ||
+        raster.font != settings.font_size || raster.placement != settings.placement || raster.double_line != settings.double_line || std::abs(raster.scale - scale) > 0.01f;
+    aino::detail::Canvas canvas; canvas.px = pixels; canvas.w = width; canvas.h = height; canvas.stride = width * 4; canvas.platform_dc = dc;
+    const int rows = settings.double_line ? 2 : 1;
+    const float pad = settings.placement ? 1.0f : 6 * scale;
+    const float row_h = (height - pad * 2) / rows;
+    if (rebuild) {
+        std::memset(pixels, 0, size_t(width) * height * 4);
+        for (int i = 0; i < rows; ++i) {
+            std::string value = i == 0 ? lines.first : lines.second;
+            float size = std::min(settings.font_size * scale * (i ? 0.85f : 1.0f), row_h * 0.78f);
+            float line_h = text.line_height(size, 600);
+            if (line_h > row_h) { size *= row_h / line_h; line_h = text.line_height(size, 600); }
+            const float available = std::max(1.0f, width - 20 * scale);
+            if (text.measure(value, size, 600) > available) {
+                size_t lo = 0, hi = value.size();
+                while (lo < hi) {
+                    const size_t mid = (lo + hi + 1) / 2;
+                    size_t end = mid; while (end && end < value.size() && (static_cast<unsigned char>(value[end]) & 0xc0) == 0x80) --end;
+                    if (text.measure(value.substr(0, end) + "…", size, 600) <= available) lo = mid; else hi = mid - 1;
+                }
+                while (lo && lo < value.size() && (static_cast<unsigned char>(value[lo]) & 0xc0) == 0x80) --lo;
+                value = value.substr(0, lo) + "…";
+            }
+            const float measured = text.measure(value, size, 600);
+            const float y = pad + i * row_h + (row_h - line_h) * 0.5f;
+            raster.left[size_t(i)] = (width - measured) * 0.5f;
+            raster.text_width[size_t(i)] = measured;
+            text.draw(canvas, value, raster.left[size_t(i)], y, size, 600,
+                Color::white(), {0, pad + i * row_h, float(width), row_h});
+        }
+#ifdef _WIN32
+        GdiFlush(); // GDI 完成文字写入后才读取覆盖率。
+#endif
+        raster.mask.resize(size_t(width) * height); raster.shadow.resize(raster.mask.size());
+        for (size_t i = 0; i < raster.mask.size(); ++i) raster.mask[i] = std::max({pixels[i * 4], pixels[i * 4 + 1], pixels[i * 4 + 2]});
+        for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x) {
+            int shadow = 0;
+            for (int dy = -1; dy <= 1; ++dy) for (int dx = -1; dx <= 1; ++dx)
+                if (x + dx >= 0 && x + dx < width && y + dy >= 0 && y + dy < height) shadow = std::max(shadow, int(raster.mask[size_t(y + dy) * width + x + dx]));
+            raster.shadow[size_t(y) * width + x] = uint8_t(shadow / 2);
+        }
+        raster.lines = lines; raster.width = width; raster.height = height; raster.font = settings.font_size;
+        raster.placement = settings.placement; raster.double_line = settings.double_line; raster.scale = scale;
+    }
+    const int background = std::max(settings.locked ? 0 : 2, settings.background * 255 / 100);
+    const int radius = std::min(int(7 * scale), height / 2);
+    for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x) {
+        const size_t i = size_t(y) * width + x;
+        const int cx = x < radius ? radius - x : x >= width - radius ? x - (width - radius - 1) : 0;
+        const int cy = y < radius ? radius - y : y >= height - radius ? y - (height - radius - 1) : 0;
+        const int bg = cx * cx + cy * cy > radius * radius ? 0 : background;
+        const int coverage = raster.mask[i];
+        const int under = std::max(bg, int(raster.shadow[i]));
+        const int alpha = coverage + under * (255 - coverage) / 255;
+        const size_t line = rows == 2 && y >= height / 2 ? 1 : 0;
+        const float fraction = line ? progress.second : progress.first;
+        const bool sung = settings.karaoke && fraction >= 0 && x < raster.left[line] + raster.text_width[line] * fraction;
+        const auto color = sung ? settings.sung_color : settings.unsung_color;
+        // 色彩保持预乘 alpha；覆盖率与 RGB 分开，黑色文字同样具有完整字形。
+        for (int channel = 0; channel < 3; ++channel) {
+            const int shift = channel * 8;
+            const int text_value = int(color >> shift & 255);
+            const int bg_value = int(settings.background_color >> shift & 255);
+            pixels[i * 4 + size_t(channel)] = uint8_t((text_value * coverage + bg_value * bg * (255 - coverage) / 255) / 255);
+        }
+        pixels[i * 4 + 3] = uint8_t(alpha);
+    }
+}
+
 static void tab_settings(Ctx& c) {
     const float available = c.W - kSidebar - right_panel_width(c);
     const float w = std::min(680.0f, available - 48);
@@ -1966,7 +2133,7 @@ static void tab_settings(Ctx& c) {
     auto& selected = c.model.ui.settings_tab;
     const bool changed = c.ui.segmented({"通用", "账号", "播放", "下载", "数据", "关于"}, &selected, {x, 78, w, 32}, Style().font(11.5f));
     if (changed) c.model.ui.update_settings = false;
-    const float content_height = selected == 4 ? 744.0f : selected == 5 ? 510.0f : selected == 3 ? 350.0f : selected == 2 ? 470.0f : selected == 1 ? 360.0f : c.model.ui.update_settings ? 390.0f + update_notes(c, x, w, 0, false) : 690.0f;
+    const float content_height = selected == 4 ? 744.0f : selected == 5 ? 510.0f : selected == 3 ? 350.0f : selected == 2 ? 470.0f : selected == 1 ? 360.0f : c.model.ui.overlay_settings ? 1090.0f : c.model.ui.update_settings ? 390.0f + update_notes(c, x, w, 0, false) : 752.0f;
     const Rect viewport{x, 132, w, c.bar_y - 148};
     if (changed) c.ui.scroll_to_index(viewport, 0, content_height, 1);
     c.ui.scroll(viewport, 1, content_height, [&](int, const Rect& area) {
@@ -2031,12 +2198,18 @@ static void tab_settings(Ctx& c) {
             c.ui.muted_text(audio::decoder_info(), {x + 2, dy + 152, w - 4, 36}, Style().font(10.5f).wrap_text().top());
             return;
         }
+        if (c.model.ui.overlay_settings) { floating_lyrics_settings(c, x, w, y); return; }
         if (c.model.ui.update_settings) { update_settings(c, x, w, y); return; }
-        const Rect appearance{x, y + 28, w, 62};
+        const Rect appearance{x, y + 28, w, 124};
         settings_group(c, "外观", appearance);
-        settings_label(c, "深色外观", appearance);
+        settings_label(c, "深色外观", {x, appearance.y, w, 62});
         if (c.ui.toggle(&c.model.ui.dark, {x + w - 54, appearance.y + 20, 38, 22})) c.model.ui.config_dirty = true;
-        const Rect version{x, y + 138, w, 72};
+        settings_rule(c, appearance, appearance.y + 62);
+        settings_label(c, "悬浮歌词", {x, appearance.y + 62, w, 62});
+        if (c.ui.button("配置", {x + w - 124, appearance.y + 79, 54, 28}, Style().ghost().font(11))) { c.model.ui.overlay_settings = true; c.ui.scroll_to_index(viewport, 0, 1090, 1); }
+        bool overlay = c.model.ui.lyric_overlay.enabled;
+        if (c.ui.toggle(&overlay, {x + w - 54, appearance.y + 82, 38, 22})) set_floating_lyrics_enabled(overlay);
+        const Rect version{x, y + 200, w, 72};
         settings_group(c, "软件更新", version);
         c.ui.draw_text("Aino Player", {x + 16, version.y + 13, w - 140, 20}, c.th.label, Style().font(12));
         c.ui.muted_text(std::string("版本 ") + kVersion, {x + 16, version.y + 38, w - 140, 18}, Style().font(11));

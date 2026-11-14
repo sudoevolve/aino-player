@@ -4,6 +4,7 @@
 #include <cmath>
 #include <fstream>
 #include <sstream>
+#include <tuple>
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -19,6 +20,9 @@
 #include <dbus/dbus.h>
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
+#include <X11/Xutil.h>
+#include <dlfcn.h>
+#include <poll.h>
 #undef None
 #undef Status
 #undef Bool
@@ -108,6 +112,333 @@ std::vector<std::string> local_uri_list(const std::string& value) {
 }
 namespace {
 constexpr uintptr_t kOpenFilesMessage = 0x41494e4f;
+// 原生浮层只负责窗口、吸附与位图提交；字体由主窗口共享，避免第二套字体缓存或渲染循环。
+class LyricWindow {
+public:
+    LyricOverlaySettings settings;
+    std::function<void()> wake;
+    std::string error;
+    ~LyricWindow() { close(true); }
+    bool update(LyricOverlaySettings& value, const std::string& first, const std::string& second,
+                const LyricOverlayProgress& progress, float scale, const LyricPainter& paint) {
+        poll_events();
+        const bool moved = moved_;
+        if (moved_) {
+            value.x = settings.x; value.y = settings.y; value.placement = settings.placement;
+            moved_ = false;
+        }
+        const auto key = [](const auto& s) { return std::tie(s.enabled, s.double_line, s.locked, s.translation,
+            s.opacity, s.background, s.font_size, s.width, s.placement, s.x, s.y, s.panel_offset,
+            s.topmost, s.karaoke, s.sung_color, s.unsung_color, s.background_color); };
+        const bool settings_changed = key(settings) != key(value);
+        bool dirty = settings_changed || first_ != first || second_ != second || std::abs(scale_ - scale) > 0.01f;
+        const auto fraction = [](float value) { return value < 0 ? -1 : int(std::clamp(value, 0.0f, 1.0f) * 2048); };
+        dirty = dirty || fraction(progress.first) != fraction(progress_.first) || fraction(progress.second) != fraction(progress_.second);
+        progress_ = progress;
+        settings = value;
+        if (!settings.enabled) { close(); first_.clear(); second_.clear(); return moved; }
+        if (!handle_ && ticks() < retry_at_) return moved;
+        if (!create()) { retry_at_ = ticks() + 5000; return moved; }
+        scale_ = std::clamp(scale, 0.75f, 4.0f);
+        first_ = first; second_ = second;
+        if (dirty || ticks() >= layout_at_ + 1000 || dragging_) {
+            dirty = layout() || dirty;
+            layout_at_ = ticks();
+        }
+#ifdef _WIN32
+        if (settings_changed || exposed_) {
+            const auto style = GetWindowLongPtrW(handle_, GWL_EXSTYLE);
+            SetWindowLongPtrW(handle_, GWL_EXSTYLE, (style & ~LONG_PTR(WS_EX_TRANSPARENT)) | (settings.locked ? WS_EX_TRANSPARENT : 0));
+        }
+#else
+        if (settings_changed || exposed_) {
+            const bool above = settings.topmost || settings.placement;
+            XSetWindowAttributes attributes{}; attributes.override_redirect = above;
+            if (above != override_) { XUnmapWindow(display_, handle_); XChangeWindowAttributes(display_, handle_, CWOverrideRedirect, &attributes); override_ = above; }
+            const Atom states[]{XInternAtom(display_, "_NET_WM_STATE_ABOVE", False), XInternAtom(display_, "_NET_WM_STATE_SKIP_TASKBAR", False), XInternAtom(display_, "_NET_WM_STATE_SKIP_PAGER", False)};
+            XChangeProperty(display_, handle_, XInternAtom(display_, "_NET_WM_STATE", False), XA_ATOM, 32, PropModeReplace,
+                reinterpret_cast<const unsigned char*>(states + (above ? 0 : 1)), above ? 3 : 2);
+        }
+        if (shape_ && (shape_locked_ != settings.locked || settings_changed || exposed_)) {
+            XRectangle rectangle{0, 0, static_cast<unsigned short>(width_), static_cast<unsigned short>(height_)};
+            shape_(display_, handle_, 2, 0, 0, settings.locked ? nullptr : &rectangle, settings.locked ? 0 : 1, 0, 0);
+            shape_locked_ = settings.locked;
+        }
+#endif
+        if (dirty || exposed_) {
+            exposed_ = false;
+#ifdef _WIN32
+            if (!bitmap_ || buffer_w_ != width_ || buffer_h_ != height_) {
+                if (bitmap_) { SelectObject(dc_, original_); DeleteObject(bitmap_); bitmap_ = nullptr; }
+                BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                info.bmiHeader.biWidth = width_; info.bmiHeader.biHeight = -height_;
+                info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32; info.bmiHeader.biCompression = BI_RGB;
+                bitmap_ = CreateDIBSection(dc_, &info, DIB_RGB_COLORS, reinterpret_cast<void**>(&pixels_), nullptr, 0);
+                if (!bitmap_) { exposed_ = true; error = "无法分配悬浮歌词位图"; return moved; }
+                SelectObject(dc_, bitmap_); buffer_w_ = width_; buffer_h_ = height_;
+            }
+            paint(pixels_, width_, height_, scale_, dc_);
+            GdiFlush();
+            POINT destination{x_, y_}, origin{}; SIZE size{width_, height_};
+            BLENDFUNCTION blend{AC_SRC_OVER, 0, BYTE(std::clamp(settings.opacity, 10, 100) * 255 / 100), AC_SRC_ALPHA};
+            if (!UpdateLayeredWindow(handle_, nullptr, &destination, &size, dc_, &origin, 0, &blend, ULW_ALPHA)) error = "提交悬浮歌词图像失败";
+            else error.clear();
+            ShowWindow(handle_, SW_SHOWNOACTIVATE);
+#else
+            pixels_.resize(size_t(width_) * height_ * 4);
+            paint(pixels_.data(), width_, height_, scale_, nullptr);
+            for (auto& channel : pixels_) channel = uint8_t(unsigned(channel) * std::clamp(settings.opacity, 10, 100) / 100);
+            XImage* image = XCreateImage(display_, visual_, 32, ZPixmap, 0, reinterpret_cast<char*>(pixels_.data()), width_, height_, 32, width_ * 4);
+            if (image) { XPutImage(display_, handle_, gc_, image, 0, 0, 0, 0, width_, height_); image->data = nullptr; XDestroyImage(image); error.clear(); }
+            else { exposed_ = true; error = "无法创建悬浮歌词图像"; }
+            if (settings.topmost || settings.placement) XMapRaised(display_, handle_); else XMapWindow(display_, handle_);
+            XFlush(display_);
+#endif
+        }
+#ifndef _WIN32
+        if (settings.placement && (!env("WAYLAND_DISPLAY").empty() || env("XDG_SESSION_TYPE") == "wayland"))
+            error = "Wayland 不允许普通应用覆盖 GNOME 顶栏；可使用自由悬浮，或在 Ubuntu on Xorg 会话中停靠顶栏。";
+#endif
+        return moved;
+    }
+    void close(bool final = false) {
+#ifdef _WIN32
+        if (handle_) DestroyWindow(handle_); handle_ = nullptr;
+        if (bitmap_) { SelectObject(dc_, original_); DeleteObject(bitmap_); bitmap_ = nullptr; }
+        // 共享 GDI 字体渲染器会缓存 HDC 状态；保留小型 DC，防止句柄复用后误用已缓存字体。
+        if (final && dc_) { DeleteDC(dc_); dc_ = nullptr; }
+        pixels_ = nullptr;
+#else
+        fd_.store(-1);
+        if (display_) {
+            if (gc_) XFreeGC(display_, gc_);
+            if (handle_) XDestroyWindow(display_, handle_);
+            if (colormap_) XFreeColormap(display_, colormap_);
+            XCloseDisplay(display_);
+        }
+        display_ = nullptr; handle_ = 0; gc_ = nullptr; colormap_ = 0;
+        std::vector<uint8_t>().swap(pixels_);
+        if (extension_) dlclose(extension_); extension_ = nullptr; shape_ = nullptr;
+#endif
+        dragging_ = false; exposed_ = true;
+    }
+    bool event_ready() const {
+#ifndef _WIN32
+        const int descriptor = fd_.load();
+        pollfd item{descriptor, POLLIN, 0};
+        return descriptor >= 0 && ::poll(&item, 1, 0) > 0 && (item.revents & POLLIN);
+#else
+        return false;
+#endif
+    }
+    int event_wait_ms() const { return dragging_.load() ? 16 : 100; }
+private:
+    int x_ = 0, y_ = 0, width_ = 0, height_ = 0;
+    int grab_x_ = 0, grab_y_ = 0;
+    float scale_ = 1;
+    bool moved_ = false, exposed_ = true;
+    std::atomic<bool> dragging_{false};
+    unsigned long long layout_at_ = 0, retry_at_ = 0;
+    std::string first_, second_;
+    LyricOverlayProgress progress_;
+#ifdef _WIN32
+    HWND handle_ = nullptr;
+    HDC dc_ = nullptr;
+    HBITMAP bitmap_ = nullptr;
+    HGDIOBJ original_ = nullptr;
+    uint8_t* pixels_ = nullptr;
+    int buffer_w_ = 0, buffer_h_ = 0;
+    static LRESULT CALLBACK procedure(HWND window, UINT message, WPARAM w, LPARAM l) {
+        auto* self = reinterpret_cast<LyricWindow*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+        if (message == WM_NCCREATE) {
+            self = static_cast<LyricWindow*>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams);
+            SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        }
+        if (!self) return DefWindowProcW(window, message, w, l);
+        if (message == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
+        if (message == WM_NCHITTEST && self->settings.locked) return HTTRANSPARENT;
+        if (message == WM_ERASEBKGND) return 1;
+        if (message == WM_LBUTTONDOWN && !self->settings.locked) {
+            POINT point{}; GetCursorPos(&point);
+            self->begin_drag(point.x, point.y); SetCapture(window); return 0;
+        }
+        if (message == WM_MOUSEMOVE && self->dragging_) {
+            POINT point{}; GetCursorPos(&point); self->drag(point.x, point.y); return 0;
+        }
+        if (message == WM_LBUTTONUP && self->dragging_) {
+            POINT point{}; GetCursorPos(&point); self->end_drag(point.x, point.y); ReleaseCapture(); return 0;
+        }
+        if (message == WM_CAPTURECHANGED) self->dragging_ = false;
+        return DefWindowProcW(window, message, w, l);
+    }
+#else
+    Display* display_ = nullptr;
+    ::Window handle_ = 0;
+    GC gc_ = nullptr;
+    Colormap colormap_ = 0;
+    Visual* visual_ = nullptr;
+    std::vector<uint8_t> pixels_;
+    std::atomic<int> fd_{-1};
+    void* extension_ = nullptr;
+    using Shape = void (*)(Display*, ::Window, int, int, int, XRectangle*, int, int, int);
+    Shape shape_ = nullptr;
+    bool shape_locked_ = false;
+    bool override_ = true;
+#endif
+    bool create() {
+        if (handle_) return true;
+#ifdef _WIN32
+        WNDCLASSW type{}; type.lpfnWndProc = procedure; type.hInstance = GetModuleHandleW(nullptr);
+        type.lpszClassName = L"AinoFloatingLyrics"; type.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32646));
+        if (!RegisterClassW(&type) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) { error = "无法注册悬浮歌词窗口"; return false; }
+        handle_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | ((settings.topmost || settings.placement) ? WS_EX_TOPMOST : 0), type.lpszClassName,
+            L"Aino 悬浮歌词", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, type.hInstance, this);
+        if (!handle_) { error = "无法创建悬浮歌词窗口"; return false; }
+        if (!dc_) {
+            dc_ = CreateCompatibleDC(nullptr); if (!dc_) { close(); error = "无法创建歌词绘图表面"; return false; }
+            original_ = GetCurrentObject(dc_, OBJ_BITMAP);
+        }
+#else
+        display_ = XOpenDisplay(nullptr);
+        if (!display_) { error = "无法连接 X11 / XWayland 显示服务"; return false; }
+        XVisualInfo visual{};
+        const int screen = DefaultScreen(display_);
+        if (!XMatchVisualInfo(display_, screen, 32, TrueColor, &visual)) {
+            close(); error = "透明悬浮歌词需要 32 位 X11 / XWayland 窗口支持"; return false;
+        }
+        visual_ = visual.visual;
+        colormap_ = XCreateColormap(display_, RootWindow(display_, screen), visual_, AllocNone);
+        XSetWindowAttributes attributes{}; attributes.colormap = colormap_; attributes.override_redirect = True;
+        attributes.background_pixel = 0; attributes.border_pixel = 0;
+        attributes.event_mask = ExposureMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask;
+        handle_ = XCreateWindow(display_, RootWindow(display_, screen), 0, 0, 1, 1, 0, 32, InputOutput, visual_,
+            CWColormap | CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWEventMask, &attributes);
+        gc_ = XCreateGC(display_, handle_, 0, nullptr);
+        XStoreName(display_, handle_, "Aino floating lyrics");
+        const unsigned long decorations[]{2, 0, 0, 0, 0};
+        const auto motif = XInternAtom(display_, "_MOTIF_WM_HINTS", False);
+        XChangeProperty(display_, handle_, motif, motif, 32, PropModeReplace, reinterpret_cast<const unsigned char*>(decorations), 5);
+        XWMHints hints{}; hints.flags = InputHint; hints.input = False; XSetWMHints(display_, handle_, &hints);
+        override_ = true;
+        const Atom above = XInternAtom(display_, "_NET_WM_STATE_ABOVE", False);
+        XChangeProperty(display_, handle_, XInternAtom(display_, "_NET_WM_STATE", False), XA_ATOM, 32, PropModeReplace,
+            reinterpret_cast<const unsigned char*>(&above), 1);
+        extension_ = dlopen("libXext.so.6", RTLD_LAZY | RTLD_LOCAL);
+        if (extension_) shape_ = reinterpret_cast<Shape>(dlsym(extension_, "XShapeCombineRectangles"));
+        using ShapeVersion = int (*)(Display*, int*, int*);
+        const auto version = extension_ ? reinterpret_cast<ShapeVersion>(dlsym(extension_, "XShapeQueryVersion")) : nullptr;
+        int major = 0, minor = 0;
+        if (!shape_ || !version || !version(display_, &major, &minor) || (major == 1 && minor < 1) || major < 1) {
+            close(); error = "需要 XShape 1.1，才能保证锁定歌词时鼠标穿透"; return false;
+        }
+        fd_.store(ConnectionNumber(display_));
+#endif
+        error.clear(); exposed_ = true; layout_at_ = 0; width_ = height_ = 0; return true;
+    }
+    struct Bounds { int x = 0, y = 0, w = 0, h = 0, panel_x = 0, panel_y = 0, panel_w = 0, panel_h = 0, anchor = 0; };
+    Bounds cached_bounds_;
+    unsigned long long bounds_at_ = 0;
+    Bounds bounds() {
+        const auto now = ticks();
+        if (now < bounds_at_ + 1000 && cached_bounds_.w > 0 && (settings.placement || settings.x == -32000 ||
+            (settings.x >= cached_bounds_.x && settings.x < cached_bounds_.x + cached_bounds_.w &&
+             settings.y >= cached_bounds_.y && settings.y < cached_bounds_.y + cached_bounds_.h))) return cached_bounds_;
+        Bounds out;
+#ifdef _WIN32
+        RECT bar{}; HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+        const bool has_bar = taskbar && GetWindowRect(taskbar, &bar);
+        MONITORINFO monitor{sizeof(MONITORINFO)};
+        POINT position{settings.x == -32000 ? 0 : settings.x, settings.y == -32000 ? 0 : settings.y};
+        GetMonitorInfoW(has_bar && settings.placement ? MonitorFromWindow(taskbar, MONITOR_DEFAULTTOPRIMARY) : MonitorFromPoint(position, MONITOR_DEFAULTTOPRIMARY), &monitor);
+        out.x = monitor.rcMonitor.left; out.y = monitor.rcMonitor.top;
+        out.w = monitor.rcMonitor.right - out.x; out.h = monitor.rcMonitor.bottom - out.y;
+        if (has_bar) {
+            out.panel_x = bar.left; out.panel_y = bar.top; out.panel_w = bar.right - bar.left; out.panel_h = bar.bottom - bar.top;
+            RECT tray{}; const auto notify = FindWindowExW(taskbar, nullptr, L"TrayNotifyWnd", nullptr);
+            out.anchor = notify && GetWindowRect(notify, &tray) ? tray.left : bar.right - int(220 * scale_);
+        } else { out.panel_x = out.x; out.panel_y = out.y + out.h - int(40 * scale_); out.panel_w = out.w; out.panel_h = int(40 * scale_); out.anchor = out.x + out.w - int(220 * scale_); }
+#else
+        out.w = DisplayWidth(display_, DefaultScreen(display_)); out.h = DisplayHeight(display_, DefaultScreen(display_));
+        Atom type{}; int format = 0; unsigned long count = 0, extra = 0; unsigned char* data = nullptr;
+        unsigned long desktop = 0;
+        if (XGetWindowProperty(display_, DefaultRootWindow(display_), XInternAtom(display_, "_NET_CURRENT_DESKTOP", False), 0, 1, False, XA_CARDINAL, &type, &format, &count, &extra, &data) == Success) {
+            if (data && count == 1 && format == 32) desktop = *reinterpret_cast<unsigned long*>(data); if (data) XFree(data); data = nullptr;
+        }
+        int top = int(28 * scale_);
+        if (desktop < 256 && XGetWindowProperty(display_, DefaultRootWindow(display_), XInternAtom(display_, "_NET_WORKAREA", False), desktop * 4, 4, False, XA_CARDINAL, &type, &format, &count, &extra, &data) == Success) {
+            if (data && count == 4 && format == 32) { const auto y = reinterpret_cast<unsigned long*>(data)[1]; if (y > 0 && y < 160 * scale_) top = int(y); }
+            if (data) XFree(data);
+        }
+        out.panel_w = out.w; out.panel_h = top; out.anchor = out.w - int(240 * scale_);
+#endif
+        bounds_at_ = now; cached_bounds_ = out; return out;
+    }
+    bool layout() {
+        const auto area = bounds();
+        int w = std::clamp(int(settings.width * scale_), 160, std::max(160, area.w));
+        int h = int((std::clamp(settings.font_size, 12, 64) * 1.5f * (settings.double_line ? 2 : 1) + 16) * scale_);
+        int x = settings.x, y = settings.y;
+        if (settings.placement) {
+            w = std::min(w, int(520 * scale_)); h = std::max(20, area.panel_h - 4);
+            if (area.panel_w < area.panel_h) { h = int(72 * scale_); x = area.panel_x < area.x + area.w / 2 ? area.panel_x + area.panel_w : area.panel_x - w; y = area.panel_y + area.panel_h - h; }
+            else { x = area.anchor - w - int(8 * scale_) + int(settings.panel_offset * scale_); y = area.panel_y + 2; }
+#ifndef _WIN32
+            if (!env("WAYLAND_DISPLAY").empty() || env("XDG_SESSION_TYPE") == "wayland") y = area.panel_h + 2;
+#endif
+        } else if (x == -32000 || y == -32000) { x = area.x + (area.w - w) / 2; y = area.y + area.h - h - int(110 * scale_); }
+        x = std::clamp(x, area.x, area.x + std::max(0, area.w - w));
+        y = std::clamp(y, area.y, area.y + std::max(0, area.h - h));
+        const bool resized = w != width_ || h != height_;
+        if (resized) exposed_ = true;
+        bool stack_changed = false;
+#ifdef _WIN32
+        stack_changed = bool(GetWindowLongPtrW(handle_, GWL_EXSTYLE) & WS_EX_TOPMOST) != (settings.topmost || settings.placement);
+#endif
+        if (x != x_ || y != y_ || resized || settings.placement || stack_changed) {
+            x_ = x; y_ = y; width_ = w; height_ = h;
+#ifdef _WIN32
+            SetWindowPos(handle_, (settings.topmost || settings.placement) ? HWND_TOPMOST : HWND_NOTOPMOST, x, y, w, h, SWP_NOACTIVATE);
+#else
+            XMoveResizeWindow(display_, handle_, x, y, w, h);
+            if (settings.topmost || settings.placement) XRaiseWindow(display_, handle_);
+            XFlush(display_);
+#endif
+        }
+        return resized;
+    }
+    void begin_drag(int x, int y) {
+        dragging_ = true; grab_x_ = x - x_; grab_y_ = y - y_;
+        settings.x = x_; settings.y = y_; settings.placement = 0; moved_ = true;
+        if (wake) wake();
+    }
+    void drag(int x, int y) {
+        settings.x = x - grab_x_; settings.y = y - grab_y_; moved_ = true;
+        layout(); if (wake) wake();
+    }
+    void end_drag(int x, int y) {
+        drag(x, y); dragging_ = false;
+        const auto area = bounds(); const int margin = int(12 * scale_);
+        if (x >= area.panel_x - margin && x <= area.panel_x + area.panel_w + margin && y >= area.panel_y - margin && y <= area.panel_y + area.panel_h + margin) settings.placement = 1;
+        moved_ = true; exposed_ = true; layout(); if (wake) wake();
+    }
+    void poll_events() {
+#ifndef _WIN32
+        if (!display_) return;
+        int motion_x = 0, motion_y = 0; bool motion_pending = false;
+        while (XPending(display_)) {
+            XEvent event{}; XNextEvent(display_, &event);
+            if (event.type == Expose) exposed_ = true;
+            else if (event.type == ButtonPress && event.xbutton.button == Button1 && !settings.locked) {
+                begin_drag(event.xbutton.x_root, event.xbutton.y_root);
+                if (XGrabPointer(display_, handle_, False, PointerMotionMask | ButtonReleaseMask, GrabModeAsync, GrabModeAsync, 0, 0, CurrentTime) != GrabSuccess)
+                    dragging_ = false;
+            } else if (event.type == MotionNotify && dragging_) { motion_x = event.xmotion.x_root; motion_y = event.xmotion.y_root; motion_pending = true; }
+            else if (event.type == ButtonRelease && event.xbutton.button == Button1 && dragging_) { motion_pending = false; end_drag(event.xbutton.x_root, event.xbutton.y_root); XUngrabPointer(display_, CurrentTime); }
+        }
+        if (motion_pending && dragging_) drag(motion_x, motion_y);
+#endif
+    }
+};
 #ifndef _WIN32
 // 拖拽源可随时关闭窗口；只忽略独立拖放连接上的 BadWindow，其他连接仍使用原处理器。
 std::atomic<Display*> drop_error_display{nullptr};
@@ -125,6 +456,7 @@ struct EventQueue {
     bool closed = false;
     unsigned long long last = 0;
     MediaAction last_action = MediaAction::Show;
+    void notify() { std::lock_guard<std::mutex> lock(mutex); if (!closed && wake) wake(); }
     bool push(MediaEvent event) {
         std::lock_guard<std::mutex> lock(mutex);
         if (closed) return false;
@@ -138,6 +470,7 @@ struct EventQueue {
 };
 }
 struct Desktop::Impl {
+    LyricWindow lyrics;
     std::shared_ptr<EventQueue> queue = std::make_shared<EventQueue>();
     std::mutex mutex;
     MediaState state;
@@ -675,14 +1008,19 @@ struct Desktop::Impl {
         struct Cleanup { Impl* self; ~Cleanup() { self->stop_drops(); } } cleanup{this};
         dbus_threads_init_default();
         bus = dbus_bus_get_private(DBUS_BUS_SESSION, nullptr);
-        if (!bus) { while (!stopping.load()) { poll_drops(); sleep_ms(100); } return; }
+        if (!bus) { while (!stopping.load()) { poll_drops(); if (lyrics.event_ready()) queue->notify(); sleep_ms(lyrics.event_wait_ms()); } return; }
         dbus_connection_set_exit_on_disconnect(bus, false);
         bus_name = "org.mpris.MediaPlayer2.aino.instance" + instance_scope() + "_" + std::to_string(getpid());
-        if (dbus_bus_request_name(bus, bus_name.c_str(), DBUS_NAME_FLAG_DO_NOT_QUEUE, nullptr) != DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER) { dbus_connection_close(bus); dbus_connection_unref(bus); bus = nullptr; return; }
+        if (dbus_bus_request_name(bus, bus_name.c_str(), DBUS_NAME_FLAG_DO_NOT_QUEUE, nullptr) != DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER) {
+            dbus_connection_close(bus); dbus_connection_unref(bus); bus = nullptr;
+            while (!stopping.load()) { poll_drops(); if (lyrics.event_ready()) queue->notify(); sleep_ms(lyrics.event_wait_ms()); }
+            return;
+        }
         media.store(true); unsigned long long checked = 0;
         MediaState prior; bool prior_enabled = !enabled.load();
         while (!stopping.load() && dbus_connection_get_is_connected(bus)) {
             poll_drops();
+            if (lyrics.event_ready()) queue->notify();
             const auto now = ticks();
             if (now > checked + 2000) { sync_watcher(); checked = now; }
             std::unique_lock<std::mutex> lock(mutex);
@@ -701,12 +1039,13 @@ struct Desktop::Impl {
                 prior_enabled = enabled.load();
             }
             prior = state; lock.unlock();
-            dbus_connection_read_write(bus, 100);
+            dbus_connection_read_write(bus, lyrics.event_wait_ms());
             while (auto* request = dbus_connection_pop_message(bus)) { std::lock_guard<std::mutex> held(mutex); dispatch(request); dbus_message_unref(request); }
         }
         media.store(false); tray.store(false);
         if (hidden.load()) queue->push({MediaAction::Show});
         dbus_connection_close(bus); dbus_connection_unref(bus); bus = nullptr;
+        while (!stopping.load()) { poll_drops(); if (lyrics.event_ready()) queue->notify(); sleep_ms(lyrics.event_wait_ms()); }
     }
 #endif
 };
@@ -964,6 +1303,7 @@ Desktop::Desktop() : impl_(std::make_unique<Impl>()) {}
 Desktop::~Desktop() { stop(); }
 void Desktop::start(void* window, void* display, unsigned long xid, std::function<void()> wake) {
     impl_->queue->wake = std::move(wake);
+    impl_->lyrics.wake = [events = impl_->queue] { events->notify(); };
 #ifdef _WIN32
     impl_->window = static_cast<HWND>(window);
     if (!SetPropW(impl_->window, L"AinoPlayerDesktop", impl_.get())) return;
@@ -994,7 +1334,13 @@ void Desktop::stop() {
 #else
     impl_->stopping.store(true); if (impl_->worker.joinable()) impl_->worker.join();
 #endif
+    impl_->lyrics.close(true);
 }
+bool Desktop::update_lyrics(LyricOverlaySettings& settings, const std::string& first, const std::string& second,
+                           const LyricOverlayProgress& progress, float scale, const LyricPainter& paint) {
+    return impl_->lyrics.update(settings, first, second, progress, scale, paint);
+}
+std::string Desktop::lyrics_error() const { return impl_->lyrics.error; }
 void Desktop::update(const MediaState& state, bool tray_enabled) {
 #ifdef _WIN32
     impl_->state = state; impl_->enabled.store(tray_enabled); impl_->sync_tray(); impl_->publish(state);

@@ -304,6 +304,15 @@ int main(int argc, char** argv) {
             state.loop = model.ui.play_mode == PlayMode::RepeatOne ? 2 : model.ui.play_mode == PlayMode::RepeatAll ? 1 : 0;
             state.can_seek = !state.uid.empty() && state.duration_ms > 0;
             desktop.update(state, model.ui.tray_enabled);
+            const auto lyric_text = floating_lyric_text();
+            const auto lyric_progress = floating_lyric_progress();
+            auto& overlay = model.ui.lyric_overlay;
+            if (desktop.update_lyrics(overlay, lyric_text.first, lyric_text.second, lyric_progress, win.dpi_scale(),
+                [&](uint8_t* pixels, int width, int height, float scale, void* dc) {
+                    ui::paint_floating_lyrics(*win.impl->text, overlay, lyric_text, lyric_progress, pixels, width, height, scale, dc);
+                })) model.ui.config_dirty = true;
+            model.ui.lyric_overlay_error = desktop.lyrics_error();
+            if (!overlay.enabled) ui::clear_floating_lyric_cache();
         }
         if (!desktop.hidden()) ui::draw(ui, model);
 #ifdef AINO_PLATFORM_X11

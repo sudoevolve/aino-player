@@ -17,6 +17,7 @@
 #include <mutex>
 #include <algorithm>
 #include <memory>
+#include <utility>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -67,6 +68,16 @@ struct MediaState {
     int volume = 70, loop = 0;
     bool playing = false, paused = false, shuffle = false, can_seek = false;
 };
+/** @brief 悬浮歌词设置；坐标为物理像素，尺寸与字号为逻辑像素。 */
+struct LyricOverlaySettings {
+    bool enabled = false, double_line = true, locked = false, translation = true;
+    int opacity = 100, background = 20, font_size = 26, width = 640;
+    int placement = 0, x = -32000, y = -32000, panel_offset = 0; // 0 自由悬浮，1 拖到任务栏 / 顶栏停靠。
+    bool topmost = true, karaoke = true;
+    uint32_t sung_color = 0x31b6ff, unsung_color = 0xf5f5f5, background_color = 0x121212;
+};
+struct LyricOverlayProgress { float first = -1, second = -1; }; // -1 无时间轴，不显示进度填充。
+using LyricPainter = std::function<void(uint8_t*, int, int, float, void*)>;
 /** @brief 桌面媒体与托盘边界；只向 UI 线程排事件，不从系统回调直接操作播放器。 */
 class Desktop {
 public:
@@ -84,6 +95,10 @@ public:
     void hide();
     void show();
     void set_icon(int width, int height, const std::vector<uint8_t>& rgba);
+    /** @brief UI 线程调用；复用现有字体绘制，仅内容 / 设置变化时重绘；返回拖动造成的设置变化。 */
+    bool update_lyrics(LyricOverlaySettings& settings, const std::string& first, const std::string& second,
+                       const LyricOverlayProgress& progress, float scale, const LyricPainter& paint);
+    std::string lyrics_error() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -294,7 +294,40 @@ int main(int argc, char** argv) {
             check(g_fps_hint.load() == 10, "ordinary playback uses lower refresh cadence");
             model.ui.lyrics_open = true; finish_frame(1);
             check(g_fps_hint.load() == 10, "visible lyrics use low playback cadence; scrolling requests its own animation frames");
+            model.ui.window_hidden = true; model.ui.lyric_overlay.enabled = true; finish_frame(1);
+            check(g_fps_hint.load() == 10, "floating lyrics retain playback synchronization with the main window hidden");
+            model.ui.lyric_overlay.enabled = false; finish_frame(1);
+            check(g_fps_hint.load() == 1, "hidden player without floating lyrics returns to low refresh cadence");
+            model.ui.window_hidden = false;
             model.ui.lyrics_open = false; g_snapshot.ps = PlayState::Idle; finish_frame(1);
+        }
+        {
+            const auto saved_snapshot = g_snapshot;
+            const auto saved_view = g_lyric_view;
+            const auto saved_settings = model.ui.lyric_overlay;
+            const auto saved_position = model.ui.pos_ms;
+            auto doc = std::make_shared<lyr::Doc>(lyr::from_lrc("[00:01]First\n[00:03]Next", "fixture"));
+            doc->lines[0].translation = "译文";
+            g_snapshot.now_uid = "floating-fixture"; g_snapshot.now_title = "Title"; g_snapshot.now_artist = "Artist";
+            g_lyric_view = {doc, "floating-fixture", false}; model.ui.pos_ms = 1500;
+            model.ui.lyric_overlay.enabled = true; model.ui.lyric_overlay.double_line = true; model.ui.lyric_overlay.translation = true;
+            check(floating_lyric_text() == std::make_pair(std::string("First"), std::string("译文")), "floating second line prefers translation");
+            auto fill = floating_lyric_progress();
+            check(std::abs(fill.first - 0.25f) < 0.001f && fill.second == fill.first, "floating lyrics and translation share line progress");
+            model.ui.lyric_overlay.translation = false;
+            check(floating_lyric_text().second == "Next", "floating second line can preview next lyric");
+            check(floating_lyric_progress().second < 0, "next lyric preview is not marked as already sung");
+            model.ui.lyric_overlay.karaoke = false;
+            check(floating_lyric_progress().first < 0, "disabled karaoke does not request progress redraws");
+            model.ui.lyric_overlay.karaoke = true;
+            model.ui.lyric_overlay.double_line = false;
+            check(floating_lyric_text().second.empty(), "single-line floating mode omits second lyric");
+            g_lyric_view.uid = "previous-song";
+            check(floating_lyric_text().first == "Title", "floating window never shows lyrics belonging to the previous track");
+            check(floating_lyric_progress().first < 0, "old-song timing cannot color the current title");
+            model.ui.lyric_overlay.enabled = false;
+            check(floating_lyric_text().first.empty(), "disabled floating lyrics do not prepare text");
+            g_snapshot = saved_snapshot; g_lyric_view = saved_view; model.ui.lyric_overlay = saved_settings; model.ui.pos_ms = saved_position;
         }
         music::Track nav_a, nav_b, nav_c;
         auto navigation_track = [](const char* name) {
@@ -620,6 +653,9 @@ int main(int argc, char** argv) {
         model.ui.settings.netease_cookie = "MUSIC_U=fixture";
         model.ui.settings.qq_cookie = "uin=123; qm_keyst=fixture";
         model.ui.qq_uin = "123"; model.ui.ne_uid = "456";
+        model.ui.lyric_overlay = {true, false, true, false, 78, 12, 32, 780, 1, -240, 860, -16};
+        model.ui.lyric_overlay.topmost = false; model.ui.lyric_overlay.karaoke = false;
+        model.ui.lyric_overlay.sung_color = 0xff7894; model.ui.lyric_overlay.unsung_color = 0x102030; model.ui.lyric_overlay.background_color = 0x314159;
         check(config::save(model.ui), "persist fake credentials");
         auto& login_state = login::state(login::Site::NetEase);
         { std::lock_guard<std::mutex> lock(login_state.m); login_state.cookie = "MUSIC_U=fixture"; }
@@ -629,6 +665,14 @@ int main(int argc, char** argv) {
         clear_data(ClearAction::Cookies);
         UiState restored;
         config::load(restored);
+        check(restored.lyric_overlay.enabled && !restored.lyric_overlay.double_line && restored.lyric_overlay.locked &&
+            !restored.lyric_overlay.translation && restored.lyric_overlay.opacity == 78 && restored.lyric_overlay.background == 12 &&
+            restored.lyric_overlay.font_size == 32 && restored.lyric_overlay.width == 780 && restored.lyric_overlay.placement == 1 &&
+            restored.lyric_overlay.x == -240 && restored.lyric_overlay.y == 860 && restored.lyric_overlay.panel_offset == -16,
+            "floating lyric appearance and dock position survive configuration reload");
+        check(!restored.lyric_overlay.topmost && !restored.lyric_overlay.karaoke && restored.lyric_overlay.sung_color == 0xff7894 &&
+            restored.lyric_overlay.unsung_color == 0x102030 && restored.lyric_overlay.background_color == 0x314159,
+            "floating lyric colors, stacking and karaoke settings survive configuration reload");
         check(restored.settings.netease_cookie.empty() && restored.settings.qq_cookie.empty() && restored.qq_uin.empty() && restored.ne_uid.empty(), "logout persists cleared credentials");
         check(restored.volume == 43 && restored.dark && restored.download_dir == model.ui.download_dir, "logout preserves unrelated settings");
         check(restored.play_mode == PlayMode::Shuffle && !restored.sleep_deadline && !restored.sleep_after_track, "play mode persists without restoring a timer");
