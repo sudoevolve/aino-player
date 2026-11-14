@@ -178,6 +178,11 @@ struct Playlist {
     std::string remote_owner; // QQ 自建歌单使用 dirid + uin；公开歌单使用 disstid。
     std::string local_folder;
     bool recursive = true;
+    struct FileStamp {
+        uintmax_t size = 0; std::string modified;
+        bool operator==(const FileStamp& other) const { return size == other.size && modified == other.modified; }
+    };
+    std::map<std::string, FileStamp> files;
     bool online() const { return !remote_id.empty(); }
 };
 inline bool parse_link(const std::string& input, music::Source& source, std::string& id) {
@@ -231,7 +236,7 @@ inline music::Track local_track(const platform::fs::path& file) {
 }
 // 扫描路径与有界标签；不跟随目录链接、不修改原音乐，失败时调用方保留旧歌单。
 inline Playlist scan_folder(const std::string& input, bool recursive, std::string& error,
-                            const std::function<bool()>& cancelled = {}) {
+                            const std::function<bool()>& cancelled = {}, const Playlist* previous = nullptr) {
     error.clear();
     Playlist out;
     std::error_code ec;
@@ -245,30 +250,111 @@ inline Playlist scan_folder(const std::string& input, bool recursive, std::strin
     auto add = [&](const platform::fs::directory_entry& entry) {
         if (entry.is_symlink(ec) || !entry.is_regular_file(ec) || ec) return;
         if (local_audio_file(entry.path())) files.push_back(entry.path().u8string());
+        if (files.size() > 10000) error = "文件夹超过 10000 首，原歌单保留";
     };
     if (recursive) {
         for (platform::fs::recursive_directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec)) {
             if (cancelled && cancelled()) { error = "扫描已取消"; return out; }
             add(*it);
-            if (ec) break;
+            if (ec || !error.empty()) break;
         }
     } else {
         for (platform::fs::directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec)) {
             if (cancelled && cancelled()) { error = "扫描已取消"; return out; }
             add(*it);
-            if (ec) break;
+            if (ec || !error.empty()) break;
         }
     }
     if (ec) { error = "部分目录无法读取，原歌单已保留：" + ec.message(); return out; }
+    if (!error.empty()) return out;
+    std::map<std::string, const music::Track*> old;
+    if (previous) for (const auto& track : previous->tracks)
+        if (!track.variants.empty() && track.current().source == music::Source::Local) old.emplace(track.current().id, &track);
     std::sort(files.begin(), files.end());
     files.erase(std::unique(files.begin(), files.end()), files.end());
     for (const auto& path : files) {
         if (cancelled && cancelled()) { error = "扫描已取消"; return out; }
-        out.tracks.push_back(local_track(platform::fs::u8path(path)));
+        const auto file = platform::fs::u8path(path);
+        const auto size = platform::fs::file_size(file, ec);
+        if (ec) { error = "无法读取文件大小，原歌单保留：" + path; return out; }
+        const auto time = platform::fs::last_write_time(file, ec);
+        if (ec) { error = "无法读取文件时间，原歌单保留：" + path; return out; }
+        Playlist::FileStamp stamp{size, std::to_string(time.time_since_epoch().count())};
+        const auto found = old.find(path);
+        const auto cached = previous ? previous->files.find(path) : out.files.end();
+        if (previous && found != old.end() && cached != previous->files.end() &&
+            cached->second.size == stamp.size && cached->second.modified == stamp.modified)
+            out.tracks.push_back(*found->second);
+        else out.tracks.push_back(local_track(file));
+        out.files.emplace(path, std::move(stamp));
     }
     if (!out.tracks.empty()) out.cover = out.tracks.front().cover_url;
     if (out.tracks.empty()) error = "文件夹内没有支持的音频文件，原歌单已保留";
     return out;
+}
+inline bool m3u_path(const std::string& path) {
+    const auto extension = music::text::lower_ascii(platform::fs::u8path(path).extension().u8string());
+    return extension == ".m3u" || extension == ".m3u8";
+}
+/** @brief 读取本地 UTF-8 M3U；相对路径以歌单文件目录为基准，不获取网络 URL。 */
+inline Playlist read_m3u(const std::string& path, std::string& error, const std::function<bool()>& cancel = {}) {
+    Playlist playlist;
+    if (platform::file_size(path) <= 0 || platform::file_size(path) > 4 * 1024 * 1024) { error = "M3U 文件不存在、为空或超过 4 MiB"; return playlist; }
+    std::ifstream file(platform::fs::u8path(path), std::ios::binary);
+    std::string line, title;
+    std::set<std::string> seen;
+    playlist.key = "m3u#" + path; playlist.source = music::Source::Local;
+    playlist.name = platform::fs::u8path(path).stem().u8string();
+    const auto parent = platform::fs::absolute(platform::fs::u8path(path)).parent_path();
+    bool first = true;
+    while (std::getline(file, line)) {
+        if (cancel && cancel()) { error = "导入已取消"; return {}; }
+        if (first && line.rfind("\xef\xbb\xbf", 0) == 0) line.erase(0, 3);
+        first = false;
+        line = music::text::trim(line);
+        if (line.empty()) continue;
+        if (line.rfind("#EXTINF:", 0) == 0) { const auto comma = line.find(','); title = comma == std::string::npos ? "" : line.substr(comma + 1); continue; }
+        if (line[0] == '#') continue;
+        if (line.size() > 8192 || line.find('\0') != std::string::npos || line.find("://") != std::string::npos || line.rfind("file:", 0) == 0) {
+            error = "仅导入本地文件路径，不支持 M3U 网络地址"; return {};
+        }
+#ifndef _WIN32
+        std::replace(line.begin(), line.end(), '\\', '/');
+#endif
+        auto audio = platform::fs::u8path(line);
+        if (audio.is_relative()) audio = parent / audio;
+        audio = audio.lexically_normal();
+        if (!local_audio_file(audio)) { error = "M3U 含不支持的文件格式：" + line; return {}; }
+        if (!seen.insert(local_path_key(audio)).second) { title.clear(); continue; }
+        if (playlist.tracks.size() >= 10000) { error = "M3U 超过 10000 首，未导入"; return {}; }
+        auto track = local_track(audio);
+        if (!title.empty()) { track.title = title; track.variants.front().title = title; }
+        playlist.tracks.push_back(std::move(track)); title.clear();
+    }
+    if (file.bad()) error = "M3U 读取失败";
+    else if (playlist.tracks.empty()) error = "M3U 中没有本地歌曲";
+    return playlist;
+}
+inline bool write_m3u(const Playlist& playlist, const std::string& path, std::string& error) {
+    std::string text = "#EXTM3U\n";
+    const auto parent = platform::fs::absolute(platform::fs::u8path(path)).parent_path();
+    for (const auto& track : playlist.tracks) {
+        if (track.variants.empty() || track.current().source != music::Source::Local) { error = "M3U 只导出本地歌曲；含在线歌曲请使用 JSON 备份"; return false; }
+        auto file = platform::fs::u8path(track.current().id);
+        auto relative = file.lexically_relative(parent);
+        auto location = (relative.empty() ? file : relative).generic_u8string();
+        if (location.find_first_of("\r\n") != std::string::npos || location.empty() || location[0] == '#') { error = "文件名无法写入 M3U，请使用 JSON"; return false; }
+        auto title = track.title;
+        std::replace(title.begin(), title.end(), '\r', ' '); std::replace(title.begin(), title.end(), '\n', ' ');
+        text += "#EXTINF:" + std::to_string(track.duration_ms > 0 ? track.duration_ms / 1000 : -1) + "," + title + "\n" + location + "\n";
+        if (text.size() > 4 * 1024 * 1024) { error = "M3U 超过 4 MiB"; return false; }
+    }
+    auto* file = platform::fopen(path, "wb");
+    if (!file) { error = "无法创建 M3U"; return false; }
+    const auto count = std::fwrite(text.data(), 1, text.size(), file);
+    const bool closed = std::fclose(file) == 0;
+    if (count != text.size() || !closed) { error = "M3U 写入失败"; return false; }
+    return true;
 }
 class Library {
 public:
@@ -314,7 +400,13 @@ public:
                 if (!first_track) out += ',';
                 first_track = false; out += encode_track(t);
             }
-            out += "]}";
+            out += "],\"files\":{";
+            bool first_file = true;
+            for (const auto& file : p.files) {
+                if (!first_file) out += ','; first_file = false;
+                out += quote(file.first) + ":[" + quote(std::to_string(file.second.size)) + "," + quote(file.second.modified) + "]";
+            }
+            out += "}}";
         }
         out += "],\"recent\":[";
         first = true;
@@ -359,6 +451,13 @@ public:
                 err = "本地资料库条目损坏，原文件保留"; return false;
             }
             p.source = music::Source(source);
+            if (row["files"].size() > 10000) { err = "扫描索引超过容量限制"; return false; }
+            try {
+                for (const auto& file : row["files"].object) {
+                    if (file.first.size() > 8192 || file.second.array.size() != 2) { err = "扫描索引损坏"; return false; }
+                    p.files.emplace(file.first, Playlist::FileStamp{std::stoull(file.second.array[0].str()), file.second.array[1].str()});
+                }
+            } catch (...) { err = "扫描索引损坏"; return false; }
             for (const auto& track : row["tracks"].array) {
                 music::Track t;
                 bool dropped = false;
