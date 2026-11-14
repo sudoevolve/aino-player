@@ -290,6 +290,20 @@ int main(int argc, char** argv) {
                 "unmeasured quality uses an explicit platform latency estimate instead of filename order");
         }
         library::Library lib;
+        {
+            prov::Provider provider;
+            std::string error;
+            const std::string code = "globalThis.provider={key:'pages',name:'Pages',search(){return []},"
+                "board(id,page,limit){return {items:[{id:String(page),title:'Song'}],more:page===0,total:2}}}";
+            check(provider.load("pages.js", code, error), "paged provider fixture loads");
+            std::vector<prov::Song> songs;
+            bool more = false; int total = -1;
+            check(provider.board("playlist:1", 0, 100, songs, error, &more, &total) && more && total == 2 && songs.size() == 1,
+                "provider preserves explicit pagination metadata on a short page");
+            check(provider.board("playlist:1", 1, 100, songs, error, &more, &total) && !more && songs.front().id == "1",
+                "provider passes subsequent page and explicit end to the caller");
+            check(provider.board("playlist:1", 1, 100, songs, error), "legacy board callers accept paged objects");
+        }
         check(lib.toggle(track), "favorite add");
         check(lib.contains(track), "favorite membership");
         {

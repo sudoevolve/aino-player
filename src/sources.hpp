@@ -1307,11 +1307,11 @@ inline bool search_via_provider(Source src, const std::string& keyword, int limi
 }
 
 inline bool board_via_provider(Source src, const std::string& board_id, int page, int limit,
-                               std::vector<Variant>& out, std::string& err) {
+                               std::vector<Variant>& out, std::string& err, bool* more = nullptr, int* total = nullptr) {
     const char* key = provider_key_of(src);
     if (!key) { err = "平台不支持此目录接口"; return false; }
     std::vector<prov::Song> songs;
-    if (!prov::Host::instance().board(key, board_id, page, limit, songs, err)) return false;
+    if (!prov::Host::instance().board(key, board_id, page, limit, songs, err, more, total)) return false;
     out.clear();
     for (const auto& song : songs) {
         if (song.id.empty() || song.title.empty()) continue;
@@ -1324,10 +1324,11 @@ inline bool board_via_provider(Source src, const std::string& board_id, int page
 }
 
 // 榜单：provider 给的 Variant 直接包成 Track（榜单内不需要跨源合并）
-inline std::vector<Track> board_tracks(Source src, const std::string& board_id, int limit, std::string& err) {
+inline std::vector<Track> board_track_page(Source src, const std::string& board_id, int page, int limit,
+                                          bool& more, int& total, std::string& err) {
     std::vector<Variant> variants;
     std::vector<Track> out;
-    if (!board_via_provider(src, board_id, 0, limit, variants, err)) return out;
+    if (!board_via_provider(src, board_id, page, limit, variants, err, &more, &total)) return out;
     out.reserve(variants.size());
     for (auto& v : variants) {
         Track t;
@@ -1341,6 +1342,34 @@ inline std::vector<Track> board_tracks(Source src, const std::string& board_id, 
         out.push_back(std::move(t));
     }
     return out;
+}
+
+// 保存远端快照必须完整成功；分页失败、重复页或达到保护上限均不覆盖旧歌单。
+inline std::vector<Track> board_tracks(Source src, const std::string& board_id, int limit, std::string& err) {
+    std::vector<Track> out;
+    std::set<std::string> ids;
+    const int page_size = src == Source::Migu ? 50 : 100;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
+    net::CancelScope budget([parent = net::cancel_current, deadline] {
+        return (parent && parent()) || std::chrono::steady_clock::now() >= deadline;
+    });
+    for (int page = 0; page < 201; ++page) {
+        if (net::cancelled()) { err = "歌单读取已取消或超时，原快照保留"; return {}; }
+        bool more = false;
+        int total = -1;
+        auto tracks = board_track_page(src, board_id, page, page_size, more, total, err);
+        if (!err.empty()) return {};
+        const auto before = out.size();
+        for (auto& track : tracks) if (ids.insert(variant_uid(track.current())).second) out.push_back(std::move(track));
+        if (out.size() > size_t(limit)) { err = "歌单超过安全上限，原快照保留"; return {}; }
+        if (!more) {
+            if (total >= 0 && out.size() < size_t(total)) { err = "平台未返回完整歌单，原快照保留"; return {}; }
+            return out;
+        }
+        if (out.size() == before) { err = "平台返回重复或空白分页，原快照保留"; return {}; }
+    }
+    err = "歌单分页数量超限，原快照保留";
+    return {};
 }
 
 // ---------------------------------------------------------------- 落雪音源取流

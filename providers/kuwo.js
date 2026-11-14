@@ -65,22 +65,22 @@
     },
     board(id, page, limit) {
       if (/^playlist:\d+$/.test(String(id))) {
-        const pid = String(id).slice(9), rows = [], size = Math.min(100, limit);
-        for (let n = 0; n * size < limit; n++) {
-          const r = api('https://nplserver.kuwo.cn/pl.svc?op=getlistinfo&pid=' + pid + '&pn=' + (page * Math.ceil(limit / size) + n) +
-            '&rn=' + size + '&encode=utf8&keyset=pl2012&identity=kuwo&pcmp4=1&vipver=MUSIC_9.0.5.0_W1&newver=1');
-          if (!Array.isArray(r.musiclist)) throw new Error('酷我未返回歌单曲目');
-          rows.push(...r.musiclist.map(song));
-          if (r.musiclist.length < size || rows.length >= Number(r.total)) break;
-        }
-        return rows.slice(0, limit);
+        const pid = String(id).slice(9), size = Math.max(1, Math.min(100, limit));
+        const r = api('https://nplserver.kuwo.cn/pl.svc?op=getlistinfo&pid=' + pid + '&pn=' + page +
+          '&rn=' + size + '&encode=utf8&keyset=pl2012&identity=kuwo&pcmp4=1&vipver=MUSIC_9.0.5.0_W1&newver=1');
+        if (!Array.isArray(r.musiclist)) throw new Error('酷我未返回歌单曲目');
+        const total = Number(r.total) || 0;
+        return {items: r.musiclist.map(song), total: total || undefined,
+          more: total ? (page + 1) * size < total : r.musiclist.length >= size};
       }
       id = String(id).replace(/^rank:/, '');
       if (!/^\d+$/.test(id)) throw new Error('无效酷我榜单 ID');
       const r = api('https://kbangserver.kuwo.cn/ksong.s?from=pc&fmt=json&type=bang&data=content&id=' +
         id + '&pn=' + page + '&rn=' + limit + '&show_copyright_off=0&pcmp4=1&isbang=1');
       if (!Array.isArray(r.musiclist)) throw new Error('酷我未返回榜单曲目');
-      return r.musiclist.map(song);
+      const total = Number(r.total || r.num) || 0;
+      return {items: r.musiclist.map(song), total: total || undefined,
+        more: total ? (page + 1) * limit < total : r.musiclist.length >= limit};
     }
   };
 })();

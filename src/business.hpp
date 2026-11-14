@@ -293,6 +293,8 @@ struct PlaylistView {
     bool tracks_more = false, albums_more = false;
     bool tracks_retry_append = false, albums_retry_append = false;
     int tracks_offset = 0, albums_offset = 0;
+    int remote_total = -1;
+    std::string more_error;
     std::string tracks_continuation, albums_continuation;
 };
 struct ViewModel {
@@ -415,6 +417,8 @@ void batch_tracks(std::vector<music::Track> tracks, BatchAction action, std::str
 void library_open(size_t index);
 void library_save_current();
 void playlist_open_remote(library::Playlist playlist);
+void playlist_load_more();
+void library_fetch(library::Playlist playlist);
 void bilibili_open_parts(const music::Track& track);
 void open_track_artist(const music::Track& track, int artist_index = 0);
 void begin_login(int site);
@@ -3419,22 +3423,71 @@ void playlist_open_remote(library::Playlist playlist) {
     background::start([playlist = std::move(playlist), settings, uin, generation]() mutable {
         net::CancelScope cancel([generation] { return g_shutdown.load() || generation != g_playlist_generation.load(); });
         std::string error;
+        bool more = false;
+        int total = -1;
         if (playlist.source == music::Source::Bilibili) {
             auto parts = music::bilibili_parts(playlist.remote_id, error);
             playlist.tracks = std::move(parts.tracks);
             if (!parts.title.empty()) playlist.name = parts.title;
             if (!parts.cover.empty()) playlist.cover = parts.cover;
         } else if (music::script_platform(playlist.source)) {
-            playlist.tracks = music::board_tracks(playlist.source, playlist.remote_id, 200, error);
+            const int size = playlist.source == music::Source::Migu ? 50 : 100;
+            playlist.tracks = music::board_track_page(playlist.source, playlist.remote_id, 0, size, more, total, error);
         } else playlist.tracks = playlist.source == music::Source::Netease ?
             ne::fetch_playlist(settings.netease_cookie, playlist.remote_id, error) :
             qq::fetch_playlist(settings.qq_cookie, playlist.remote_id, uin, error, 15000, playlist.remote_owner.empty());
-        post_ui([playlist = std::move(playlist), error, generation]() mutable {
+        post_ui([playlist = std::move(playlist), error, generation, more, total]() mutable {
             if (generation != g_playlist_generation) return;
             g_playlist_view.loading = false; g_playlist_view.error = error;
             g_playlist_view.playlist = std::move(playlist);
+            g_playlist_view.tracks_more = more;
+            g_playlist_view.tracks_offset = 1;
+            g_playlist_view.remote_total = total;
+            if (!more && total >= 0 && g_playlist_view.playlist.tracks.size() < size_t(total))
+                g_playlist_view.more_error = "平台返回曲目不足，保存时会重新读取完整歌单";
             playlist_filter_rows();
             g_ui.scroll_to_top = true;
+        });
+    });
+}
+
+void playlist_load_more() {
+    auto& view = g_playlist_view;
+    if (!view.open || view.saved || view.catalog_open || view.loading || view.loading_more || !view.tracks_more) return;
+    const auto generation = g_playlist_generation.load();
+    const auto playlist = view.playlist;
+    const auto page = view.tracks_offset;
+    view.loading_more = true;
+    view.more_error.clear();
+    background::start([playlist, generation, page] {
+        net::CancelScope cancel([generation] { return g_shutdown.load() || generation != g_playlist_generation.load(); });
+        bool more = false;
+        int total = -1;
+        std::string error;
+        const int size = playlist.source == music::Source::Migu ? 50 : 100;
+        auto tracks = music::board_track_page(playlist.source, playlist.remote_id, page, size, more, total, error);
+        post_ui([generation, page, more, total, error, tracks = std::move(tracks)]() mutable {
+            if (generation != g_playlist_generation) return;
+            auto& view = g_playlist_view;
+            view.loading_more = false;
+            if (!error.empty()) { view.more_error = error; toast(error, 7000); return; }
+            std::set<std::string> ids;
+            for (const auto& track : static_cast<const std::vector<music::Track>&>(view.playlist.tracks)) ids.insert(track_uid(track));
+            std::vector<music::Track> added;
+            for (auto& track : tracks) if (ids.insert(track_uid(track)).second) added.push_back(std::move(track));
+            if ((more && added.empty()) || view.playlist.tracks.size() + added.size() > 10000) {
+                view.more_error = more && added.empty() ? "平台返回重复或空白分页，已保留现有歌曲" : "歌单超过 10000 首安全上限";
+                toast(view.more_error, 7000); return;
+            }
+            for (auto& track : added) view.playlist.tracks.push_back(std::move(track));
+            view.tracks_offset = page + 1;
+            view.tracks_more = more;
+            if (total >= 0) view.remote_total = total;
+            if (!more && view.remote_total >= 0 && view.playlist.tracks.size() < size_t(view.remote_total)) {
+                view.more_error = "平台返回曲目不足，保存时会重新读取完整歌单";
+                toast(view.more_error, 7000);
+            }
+            playlist_filter_rows();
         });
     });
 }
@@ -3656,7 +3709,12 @@ void playlist_choose_source(int index, int variant, bool replay) {
     if (replay) playlist_play(index);
 }
 void playlist_save_view() {
-    if (!g_playlist_view.open || g_playlist_view.loading || !g_playlist_view.error.empty()) return;
+    if (!g_playlist_view.open || g_playlist_view.loading || g_playlist_view.loading_more || !g_playlist_view.error.empty()) return;
+    if (music::script_platform(g_playlist_view.playlist.source) &&
+        (g_playlist_view.tracks_more || !g_playlist_view.more_error.empty())) {
+        library_fetch(g_playlist_view.playlist);
+        return;
+    }
     const auto generation = g_playlist_generation.load();
     library_edit([playlist = g_playlist_view.playlist](library::Library& next) { next.upsert(playlist); }, [generation] {
         if (generation == g_playlist_generation && !g_playlist_view.catalog_open) {
@@ -3724,7 +3782,7 @@ void library_fetch(library::Playlist playlist) {
             if (!parts.title.empty()) playlist.name = parts.title;
             if (!parts.cover.empty()) playlist.cover = parts.cover;
         } else if (music::script_platform(playlist.source)) {
-            tracks = music::board_tracks(playlist.source, playlist.remote_id, 200, error);
+            tracks = music::board_tracks(playlist.source, playlist.remote_id, 10000, error);
         } else tracks = playlist.source == music::Source::Netease ?
             ne::fetch_playlist(settings.netease_cookie, playlist.remote_id, error, 15000, &ne_metadata) :
             qq::fetch_playlist(settings.qq_cookie, playlist.remote_id, uin, error, 15000, playlist.remote_owner.empty(), &qq_metadata);
@@ -3741,8 +3799,15 @@ void library_fetch(library::Playlist playlist) {
             if (epoch != g_library_epoch) return;
             g_ui.importing_playlist = false;
             if (!error.empty()) { toast("保存歌单失败：" + error, 7000); return; }
+            const auto key = playlist.key;
             library_edit([playlist = std::move(playlist)](library::Library& next) { next.upsert(playlist); },
-                [] { g_ui.playlist_link.clear(); toast("在线歌单已保存到本地，曲目快照可随时打开"); });
+                [key] {
+                    if (g_playlist_view.open && g_playlist_view.playlist.key == key && !g_playlist_view.catalog_open) {
+                        g_playlist_view.saved = true; g_playlist_view.tracks_more = false;
+                        g_playlist_view.more_error.clear(); g_playlist_view.library_revision = ~0u;
+                    }
+                    g_ui.playlist_link.clear(); toast("在线歌单已完整保存到本地");
+                });
         });
     });
 }

@@ -1158,7 +1158,8 @@ static void playlist_detail(Ctx& c) {
     c.ui.heading(ellipsize(c.ui, playlist.name, mw, 22, 600), {mx, 60, mw, 32});
     const auto origin = !playlist.local_folder.empty() ? "本地文件夹" : playlist.online() ?
         std::string(music::source_name(playlist.source)) + (view.saved ? " · 已保存快照" : playlist.source == music::Source::Bilibili ? " · 视频分 P" : " · 在线歌单") : "本地歌单";
-    c.ui.muted_text(origin + " · " + std::to_string(playlist.tracks.size()) + " 首", {mx, 98, mw, 18}, Style().font(11));
+    c.ui.muted_text(origin + " · " + (view.tracks_more ? "已加载 " : "") + std::to_string(playlist.tracks.size()) +
+        (view.remote_total >= 0 ? " / " + std::to_string(view.remote_total) : "") + " 首", {mx, 98, mw, 18}, Style().font(11));
     if (view.loading) { c.ui.spinner({mx + mw / 2 - 11, 174, 22, 22}); return; }
     if (!view.error.empty()) {
         c.ui.empty_state("歌单加载失败", view.error, {mx, 158, mw, 140});
@@ -1167,8 +1168,9 @@ static void playlist_detail(Ctx& c) {
     }
     auto& state = c.model.ui;
     Style play = Style().primary().font(11.5f); play.disabled = view.rows.empty();
-    if (c.ui.button(state.playlist_filter.empty() ? "播放全部" : "播放筛选结果", {mx, 130, 112, 30}, play)) playlist_play(-1);
-    if (!view.saved && c.ui.button("保存到本地", {mx + 124, 130, 100, 30}, Style().font(11.5f))) playlist_save_view();
+    if (c.ui.button(state.playlist_filter.empty() ? (view.tracks_more ? "播放已加载" : "播放全部") : "播放筛选结果", {mx, 130, 112, 30}, play)) playlist_play(-1);
+    auto save = Style().font(11.5f); save.disabled = state.importing_playlist || view.loading_more;
+    if (!view.saved && c.ui.button(state.importing_playlist ? "完整读取中…" : "保存到本地", {mx + 124, 130, 100, 30}, save)) playlist_save_view();
     if (view.saved && c.ui.button(state.playlist_manage ? "完成管理" : "管理歌单", {mx + mw - 88, 130, 88, 30}, Style().font(11)))
         state.playlist_manage = !state.playlist_manage;
     bool changed = c.ui.search_field(&state.playlist_filter, {mx, 172, mw - 126, 28}, Style().font(11).hint("歌单内搜索"));
@@ -1184,9 +1186,18 @@ static void playlist_detail(Ctx& c) {
         list_top = 308;
     }
     list_top += batch_toolbar(c, "playlist", std::string(music::source_key(playlist.source)) + "/" + playlist.key + "#" + playlist.remote_id + "\x01" + state.playlist_filter + std::to_string(state.playlist_sort), int(view.library_revision) + int(playlist.tracks.size()), playlist.tracks, &view.rows, {mx, list_top, mw, 32}, view.saved, playlist.key);
+    const bool paging = view.tracks_more && !view.saved;
+    if (paging) {
+        auto more = Style().font(11); more.disabled = view.loading_more;
+        if (c.ui.button(view.loading_more ? "加载中…" : view.more_error.empty() ? "加载更多" : "重试下一页",
+            {mx + mw - 120, c.bar_y - 46, 120, 30}, more)) playlist_load_more();
+        const std::string message = view.more_error.empty() ? "保存到本地会读取完整歌单" : view.more_error;
+        c.ui.muted_text(ellipsize(c.ui, message, mw - 132, 10.5f), {mx, c.bar_y - 42, mw - 132, 22}, Style().font(10.5f));
+        c.ui.tooltip({mx, c.bar_y - 42, mw - 132, 22}, message);
+    }
     if (playlist.tracks.empty()) { c.ui.empty_state("歌单是空的", "收藏歌曲或导入音乐文件夹后会显示在这里", {mx, list_top + 12, mw, 120}); return; }
     if (view.rows.empty()) { c.ui.empty_state("没有匹配的歌曲", "试试其他关键词，或清空歌单内搜索", {mx, list_top + 12, mw, 120}); return; }
-    const Rect list{mx, list_top, mw, c.bar_y - list_top - 12};
+    const Rect list{mx, list_top, mw, c.bar_y - list_top - 12 - (paging ? 44.0f : 0.0f)};
     if (list.h < kRowHeight) return;
     if (state.scroll_to_top) { c.ui.scroll_to_index(list, 0, kRowHeight, int(view.rows.size())); state.scroll_to_top = false; }
     c.ui.scroll(list, int(view.rows.size()), kRowHeight, [&](int visible, const Rect& row) {

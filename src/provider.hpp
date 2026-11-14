@@ -119,7 +119,8 @@ public:
 
     bool load(const std::string& path, const std::string& code, std::string& err);
     bool search(const std::string& keyword, int page, int limit, std::vector<Song>& out, std::string& err);
-    bool board(const std::string& board_id, int page, int limit, std::vector<Song>& out, std::string& err);
+    bool board(const std::string& board_id, int page, int limit, std::vector<Song>& out, std::string& err,
+               bool* more = nullptr, int* total = nullptr);
     bool resolve(const Song& song, const std::string& quality, std::string& url, std::string& err);
     bool request(const char* method, const std::string& args, js::Value& out, std::string& err);
 
@@ -137,7 +138,8 @@ private:
     };
     std::timed_mutex execution_;
     bool eval(const std::string& code, const char* name, std::string& err);
-    bool call(const char* fn, int argc, JSValue* argv, std::vector<Song>& out, std::string& err);
+    bool call(const char* fn, int argc, JSValue* argv, std::vector<Song>& out, std::string& err,
+              bool* more = nullptr, int* total = nullptr);
 
     JSRuntime* rt_ = nullptr;
     JSContext* ctx_ = nullptr;
@@ -268,7 +270,8 @@ inline void Provider::close() {
 }
 
 // 调用返回"歌曲数组"的函数
-inline bool Provider::call(const char* fn, int argc, JSValue* argv, std::vector<Song>& out, std::string& err) {
+inline bool Provider::call(const char* fn, int argc, JSValue* argv, std::vector<Song>& out, std::string& err,
+                           bool* more, int* total) {
     ExecutionTime time_limit;
     if (net::cancelled()) { err = "provider 请求已取消"; return false; }
     if (!ctx_) { err = "provider 未加载"; return false; }
@@ -310,6 +313,22 @@ inline bool Provider::call(const char* fn, int argc, JSValue* argv, std::vector<
         JS_FreeValue(ctx_, r);
         r = v;
     }
+    bool explicit_more = false;
+    if (more) *more = false;
+    if (total) *total = -1;
+    if (more && JS_IsObject(r) && !JS_IsArray(r)) {
+        const auto value = JS_GetPropertyStr(ctx_, r, "more");
+        explicit_more = !JS_IsUndefined(value);
+        *more = JS_ToBool(ctx_, value) > 0;
+        JS_FreeValue(ctx_, value);
+        const auto count = JS_GetPropertyStr(ctx_, r, "total");
+        int32_t parsed = -1;
+        if (total && !JS_IsUndefined(count) && JS_ToInt32(ctx_, &parsed, count) == 0 && parsed >= 0) *total = parsed;
+        JS_FreeValue(ctx_, count);
+        const auto items = JS_GetPropertyStr(ctx_, r, "items");
+        JS_FreeValue(ctx_, r);
+        r = items;
+    }
     if (!JS_IsArray(r)) {
         err = std::string(fn) + " 没有返回数组";
         JS_FreeValue(ctx_, r);
@@ -320,6 +339,11 @@ inline bool Provider::call(const char* fn, int argc, JSValue* argv, std::vector<
     JS_ToInt32(ctx_, &n, lenv);
     JS_FreeValue(ctx_, lenv);
     if (n < 0 || n > 10000) { err = "平台返回曲目数量超限"; JS_FreeValue(ctx_, r); return false; }
+    if (more && !explicit_more) {
+        int32_t limit = 0;
+        if (argc == 3) JS_ToInt32(ctx_, &limit, argv[2]);
+        *more = limit > 0 && n >= limit;
+    }
     out.clear();
     out.reserve(size_t(n > 0 ? n : 0));
     for (int i = 0; i < n; ++i) {
@@ -346,13 +370,15 @@ inline bool Provider::search(const std::string& keyword, int page, int limit, st
 }
 
 inline bool Provider::board(const std::string& board_id, int page, int limit, std::vector<Song>& out,
-                            std::string& err) {
+                            std::string& err, bool* more, int* total) {
     Operation operation(*this);
     if (!operation) { err = "平台请求已取消或等待超时"; return false; }
     if (!ctx_) { err = "provider 未加载"; return false; }
     JS_UpdateStackTop(rt_);
     JSValue args[3] = {mk_str(ctx_, board_id), JS_NewInt32(ctx_, page), JS_NewInt32(ctx_, limit)};
-    const bool ok = call("board", 3, args, out, err);
+    bool ignored_more = false;
+    int ignored_total = -1;
+    const bool ok = call("board", 3, args, out, err, more ? more : &ignored_more, total ? total : &ignored_total);
     for (auto& a : args) JS_FreeValue(ctx_, a);
     return ok;
 }
@@ -502,8 +528,8 @@ public:
     }
 
     bool board(const std::string& key, const std::string& board_id, int page, int limit, std::vector<Song>& out,
-               std::string& err) {
-        if (auto p = get(key)) return p->board(board_id, page, limit, out, err);
+               std::string& err, bool* more = nullptr, int* total = nullptr) {
+        if (auto p = get(key)) return p->board(board_id, page, limit, out, err, more, total);
         err = "没有 " + key + " 的 provider";
         return false;
     }

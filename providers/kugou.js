@@ -86,16 +86,13 @@
     },
     board(id, page, limit) {
       if (/^playlist:\d+$/.test(String(id))) {
-        const pid = String(id).slice(9), rows = [], size = Math.max(1, Math.min(100, limit));
-        for (let n = 0; n * size < limit; n++) {
-          const r = api('https://gateway.kugou.com/api/v3/special/song?specialid=' + pid + '&page=' +
-            (page * Math.ceil(limit / size) + n + 1) + '&pagesize=' + size + '&version=9108&plat=0',
-            {'x-router': 'mobilecdnbj.kugou.com'});
-          if (!r.data || !Array.isArray(r.data.info)) throw new Error('酷狗未返回歌单曲目');
-          rows.push(...r.data.info.map(song));
-          if (r.data.info.length < size || rows.length >= Number(r.data.total)) break;
-        }
-        return rows.slice(0, limit);
+        const pid = String(id).slice(9), size = Math.max(1, Math.min(100, limit));
+        const r = api('https://gateway.kugou.com/api/v3/special/song?specialid=' + pid + '&page=' +
+          (page + 1) + '&pagesize=' + size + '&version=9108&plat=0', {'x-router': 'mobilecdnbj.kugou.com'});
+        if (!r.data || !Array.isArray(r.data.info)) throw new Error('酷狗未返回歌单曲目');
+        const total = Number(r.data.total) || 0;
+        return {items: r.data.info.map(song), total: total || undefined,
+          more: total ? (page + 1) * size < total : r.data.info.length >= size};
       }
       id = String(id).replace(/^rank:/, '');
       if (!/^\d+$/.test(id)) throw new Error('无效酷狗榜单 ID');
@@ -104,7 +101,9 @@
         '&with_res_tag=0&show_portrait_mv=1&rankid=' + id + '&page=' + (page + 1) + '&pagesize=' + limit,
         {'x-router': 'mobilecdnbj.kugou.com'});
       if (!r.data || !Array.isArray(r.data.info)) throw new Error('酷狗未返回榜单曲目');
-      return r.data.info.map(song);
+      const total = Number(r.data.total) || 0;
+      return {items: r.data.info.map(song), total: total || undefined,
+        more: total ? (page + 1) * limit < total : r.data.info.length >= limit};
     }
   };
 })();

@@ -151,21 +151,21 @@
     },
     board(id, page, limit) {
       if (/^playlist:\d+$/.test(String(id))) {
-        const pid = String(id).slice(9), rows = [], size = Math.min(50, limit);
-        for (let n = 0; n * size < limit; n++) {
-          const r = api('https://app.c.nf.migu.cn/MIGUM3.0/resource/playlist/song/v2.0?pageNo=' +
-            (page * Math.ceil(limit / size) + n + 1) + '&pageSize=' + size + '&playlistId=' + pid);
-          if (!r.data || !Array.isArray(r.data.songList)) throw new Error('咪咕未返回歌单曲目');
-          rows.push(...r.data.songList.map(song));
-          if (r.data.songList.length < size || rows.length >= Number(r.data.totalCount)) break;
-        }
-        return rows.slice(0, limit);
+        const pid = String(id).slice(9), size = Math.max(1, Math.min(50, limit));
+        const r = api('https://app.c.nf.migu.cn/MIGUM3.0/resource/playlist/song/v2.0?pageNo=' +
+          (page + 1) + '&pageSize=' + size + '&playlistId=' + pid);
+        if (!r.data || !Array.isArray(r.data.songList)) throw new Error('咪咕未返回歌单曲目');
+        const total = Number(r.data.totalCount) || 0;
+        return {items: r.data.songList.map(song), total: total || undefined,
+          more: total ? (page + 1) * size < total : r.data.songList.length >= size};
       }
       id = String(id).replace(/^rank:/, '');
       if (!/^\d+$/.test(id)) throw new Error('无效咪咕榜单 ID');
       const r = api('https://app.c.nf.migu.cn/MIGUM2.0/v1.0/content/querycontentbyId.do?columnId=' + id + '&needAll=0');
       if (!r.columnInfo || !Array.isArray(r.columnInfo.contents)) throw new Error('咪咕未返回榜单曲目');
-      return r.columnInfo.contents.slice(page * limit, (page + 1) * limit).map(s => song(s.objectInfo || s));
+      const rows = r.columnInfo.contents;
+      return {items: rows.slice(page * limit, (page + 1) * limit).map(s => song(s.objectInfo || s)),
+        total: rows.length, more: (page + 1) * limit < rows.length};
     }
   };
 })();
