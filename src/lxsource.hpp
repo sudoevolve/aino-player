@@ -1476,7 +1476,15 @@ public:
         std::lock_guard<std::mutex> checking(check_mu_);
         if (epoch != check_epoch_.load() || (cancel && cancel())) return;
         std::vector<std::shared_ptr<Script>> scripts;
-        { std::lock_guard<std::mutex> lock(mu_); scripts = list_; }
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            scripts = list_;
+            if (cases.size() == 1) std::stable_sort(scripts.begin(), scripts.end(), [&](const auto& a, const auto& b) {
+                const auto first = selection_locked(a, cases.front().platform, wanted);
+                const auto second = selection_locked(b, cases.front().platform, wanted);
+                return std::tie(first.availability, first.latency_ms, first.file) < std::tie(second.availability, second.latency_ms, second.file);
+            });
+        }
         std::atomic<size_t> next{0};
         std::atomic<bool> ready{false};
         auto worker = [&] {
@@ -1504,6 +1512,7 @@ public:
                         if (wake) wake();
                     };
                     if (!s->supports(sample.platform, "musicUrl")) { publish({4, "未声明支持"}); continue; }
+                    if (quality.empty()) { publish({4, "不支持所选音质或更低档位"}); continue; }
                     { std::lock_guard<std::mutex> lock(mu_);
                       if (!force && !check_needed_locked(file, sample.platform, quality)) continue; }
                     // 点播优先。检测被打断后保留“待检测”，不会把抢占记成失败。
@@ -1563,8 +1572,9 @@ private:
         return found == checks->second.end() || check_due(found->second, quality);
     }
     static bool check_due(const Health& health, const std::string& quality) {
+        if (health.quality != quality) return true;
         if (health.state == 4) return false;
-        if (health.quality != quality || !health.checked_at) return true;
+        if (!health.checked_at) return true;
         const auto interval = health.state == 2 ? 600000ULL : health.state <= 1 ? 5000ULL : 60000ULL;
         return platform::ticks() >= health.checked_at + interval;
     }
