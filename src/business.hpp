@@ -2203,11 +2203,12 @@ static void maintain_source_checks() {
     poll_at = platform::ticks() + 1000;
     std::vector<music::Source> platforms{priority};
     for (const auto source : music::kPlatforms) if (source != priority && music::lx_platform_key(source)) platforms.push_back(source);
-    for (const auto source : platforms) {
+    // 先补齐各平台未知结果，再复测旧失败，避免慢源反复重试占住其它平台的首次测速。
+    for (const bool unmeasured_only : {true, false}) for (const auto source : platforms) {
         const auto* key = music::lx_platform_key(source);
         if (!key || !engine.supports(key)) continue;
         const bool force = (g_lx_check_force & (1u << int(source))) != 0;
-        if (!force && (platform::ticks() < retry_at[size_t(source)] || !engine.needs_check(key, wanted))) continue;
+        if (!force && (platform::ticks() < retry_at[size_t(source)] || !engine.needs_check(key, wanted, unmeasured_only))) continue;
         g_lx_check_force &= ~(1u << int(source));
         retry_at[size_t(source)] = platform::ticks() + 5000;
         const auto generation = g_lx_check_generation.load();

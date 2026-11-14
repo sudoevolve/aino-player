@@ -1453,10 +1453,11 @@ public:
     std::map<std::string, Timings> timings() const {
         std::lock_guard<std::mutex> lock(mu_); return timings_;
     }
-    bool needs_check(const std::string& platform, int wanted) const {
+    bool needs_check(const std::string& platform, int wanted, bool unmeasured_only = false) const {
         std::lock_guard<std::mutex> lock(mu_);
         for (const auto& script : list_) {
             if (script->retired() || !script->supports(platform, "musicUrl")) continue;
+            if (unmeasured_only && selection_locked(script, platform, wanted).availability != 1) continue;
             if (check_needed_locked(file_key(script->path()), platform, script->pick_quality(platform, wanted))) return true;
         }
         return false;
