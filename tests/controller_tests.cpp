@@ -184,6 +184,15 @@ int main(int argc, char** argv) {
         }
 
         std::array<unsigned, 3> version{};
+        check(retry_stream(1) && retry_stream(2) && !retry_stream(3), "stream recovery is bounded before complete-file fallback");
+        {
+            music::Track track; track.title = "shared queue";
+            library::SharedTracks queue{track};
+            auto snapshot = queue;
+            check(std::as_const(queue).data() == std::as_const(snapshot).data(), "queue snapshot shares storage without copying");
+            queue.insert(queue.cbegin(), track);
+            check(snapshot.size() == 1 && queue.size() == 2 && std::as_const(queue).data() != std::as_const(snapshot).data(), "queue edits preserve an older save snapshot");
+        }
         check(updates::version_parts("v1.2.10", version) && version[2] == 10, "numeric release version parsing");
         for (const auto* bad : {"1.2", "1.2.3.4", "v1.2.3-rc1", "1.2.3;evil", "01.2.3", "1.9999999.0"})
             check(!updates::version_parts(bad, version), "invalid and prerelease versions rejected");
@@ -254,9 +263,19 @@ int main(int argc, char** argv) {
         const auto asset_start = portable_json.find("[{\"") + 1;
         installers.body.insert(installers.body.rfind(']'), "," + portable_json.substr(asset_start, portable_json.rfind(']') - asset_start));
         check(updates::parse_release(installers, "1.0.0", "windows-x64.exe").installer, "installer choice independent of API ordering");
+        for (const auto* suffix : {".x86_64.rpm", "-x86_64.pkg.tar.zst"}) {
+            const auto package = updates::parse_release(response("v2.0.0", suffix), "1.0.0", suffix);
+            check(package.status == UpdateStatus::Available && package.asset_url.find(suffix) != std::string::npos,
+                "Linux update selects the requested distro package");
+        }
+#ifdef __linux__
+        check(std::string(platform::package_update_command(platform::PackageChannel::Pacman)) == "sudo pacman -Syu",
+            "Arch update performs a full upgrade instead of a partial upgrade");
+#endif
 
         {
-            const auto old_tracks = g_as.tracks, old_results = g_as.results;
+            const auto old_tracks = g_as.tracks;
+            const auto old_results = g_as.results;
             const int old_tracks_version = g_as.tracks_version, old_results_version = g_as.results_version;
             music::Track item; item.title = "unchanged";
             g_as.tracks = {item}; g_as.results = {item};
@@ -562,23 +581,23 @@ int main(int argc, char** argv) {
         music::Settings offline_search;
         for (auto& enabled : offline_search.enable) enabled = false;
         {
-            std::lock_guard<std::mutex> lock(g_mu); g_search_worker = true; g_as.searching = true;
+            std::lock_guard<std::mutex> lock(g_mu); g_search.worker = true; g_as.searching = true;
         }
         const auto saved_mask = model.ui.src_mask; model.ui.src_mask = 0;
-        const int disabled_search = g_search_gen.load();
+        const int disabled_search = g_search.generation.load();
         model.ui.query = "disabled"; start_search();
-        check(g_search_gen.load() == disabled_search, "search with no enabled source is rejected");
+        check(g_search.generation.load() == disabled_search, "search with no enabled source is rejected");
         auto dispatch_offline = [&](const char* keyword) {
             SearchRequest request; request.keyword = keyword; request.settings = offline_search;
             dispatch_search(std::move(request));
         };
-        dispatch_offline("older"); const int obsolete_search = g_search_gen.load();
+        dispatch_offline("older"); const int obsolete_search = g_search.generation.load();
         dispatch_offline("latest");
         {
             std::lock_guard<std::mutex> lock(g_mu);
-            check(g_pending_search.keyword == "latest" && g_pending_search.generation > obsolete_search,
+            check(g_search.pending.keyword == "latest" && g_search.pending.generation > obsolete_search,
                   "busy search retains only the latest new request");
-            g_search_worker = false; g_pending_search = {};
+            g_search.worker = false; g_search.pending = {};
         }
         { SearchRequest request; request.keyword = "older"; request.settings = offline_search; request.generation = obsolete_search; do_search(g_win, std::move(request)); }
         check(g_as.searching, "obsolete search cannot clear latest request status");
@@ -586,12 +605,12 @@ int main(int argc, char** argv) {
         const auto search_deadline = platform::ticks() + 3000;
         bool searching = true;
         while (searching && platform::ticks() < search_deadline) {
-            { std::lock_guard<std::mutex> lock(g_mu); searching = g_search_worker; }
+            { std::lock_guard<std::mutex> lock(g_mu); searching = g_search.worker; }
             if (searching) platform::sleep_ms(5);
         }
         check(!searching, "latest offline search completes on the bounded worker");
         model.ui.src_mask = saved_mask;
-        const int search_generation = ++g_search_gen;
+        const int search_generation = ++g_search.generation;
         { SearchRequest request; request.keyword = "fixture"; request.settings = offline_search; request.generation = search_generation; do_search(g_win, std::move(request)); } tick();
         check(model.playback.tracks.size() == 1 && model.playback.results.empty() && model.playlist.playlist.tracks.size() == 2,
             "online search does not overwrite the playing queue or playlist detail");
@@ -643,6 +662,9 @@ int main(int argc, char** argv) {
         { std::lock_guard<std::mutex> lock(g_mu); g_as.results = {track}; ++g_as.results_version; }
 
         model.ui.volume = 43;
+        model.ui.gapless = false; model.ui.normalize_volume = true;
+        model.ui.equalizer.enabled = true; model.ui.equalizer.gains_db[5] = -4; model.ui.equalizer.preamp_db = -2;
+        model.ui.output_device = "fixture-device"; model.ui.close_behavior = 2; model.ui.tray_enabled = false;
         model.ui.dark = true;
         set_play_mode(PlayMode::Shuffle);
         model.ui.download_dir = platform::join(model.paths.config, "downloads");
@@ -675,6 +697,13 @@ int main(int argc, char** argv) {
             "floating lyric colors, stacking and karaoke settings survive configuration reload");
         check(restored.settings.netease_cookie.empty() && restored.settings.qq_cookie.empty() && restored.qq_uin.empty() && restored.ne_uid.empty(), "logout persists cleared credentials");
         check(restored.volume == 43 && restored.dark && restored.download_dir == model.ui.download_dir, "logout preserves unrelated settings");
+        check(!restored.gapless && restored.normalize_volume && restored.output_device == "fixture-device" && restored.close_behavior == 2 && !restored.tray_enabled,
+            "playback enhancements and desktop choices survive reload");
+        check(restored.equalizer.enabled && restored.equalizer.gains_db[5] == -4 && restored.equalizer.preamp_db == -2, "equalizer gains survive reload");
+        const auto diagnosis = playback_diagnostics();
+        check(diagnosis.find("MUSIC_U") == std::string::npos && diagnosis.find("qm_keyst") == std::string::npos &&
+            diagnosis.find(original) == std::string::npos && diagnosis.find("http://") == std::string::npos,
+            "playback diagnostics exclude credentials, paths and links");
         check(restored.play_mode == PlayMode::Shuffle && !restored.sleep_deadline && !restored.sleep_after_track, "play mode persists without restoring a timer");
         check(view_model().library.contains(track), "logout preserves local library");
         clear_data(ClearAction::Queue);

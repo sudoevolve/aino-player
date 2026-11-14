@@ -10,6 +10,7 @@
 #include <cstring>
 #include <mutex>
 #include <random>
+#include <cmath>
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -331,6 +332,7 @@ struct Stream::Impl {
     std::unique_ptr<RangeBridge> bridge;
     std::vector<int16_t> pcm = std::vector<int16_t>(capacity * 2);
     std::atomic<uint64_t> written{0}, consumed{0};
+    std::atomic<uint64_t> resume_buffer{prebuffer};
     std::atomic<bool> stop{false}, decoded{false}, broken{false}, waiting{true};
     std::atomic<bool> input_complete{false}, input_abort{false};
     std::thread input, output, monitor;
@@ -358,15 +360,17 @@ struct Stream::Impl {
         const bool ended = self.decoded.load(std::memory_order_acquire);
         const auto available = self.written.load(std::memory_order_acquire) - begin;
         // 暂时断流输出静音且不推进曲目位置，不能把网络空隙误报为自然结束。
-        if (!ended && (available < count || (self.waiting.load() && available < prebuffer))) {
-            if (frames) std::memset(frames, 0, size_t(count) * 4);
-            self.waiting.store(true); *read_count = count; return MA_SUCCESS;
+        if (!ended && (available < count || (self.waiting.load() && available < self.resume_buffer.load()))) {
+            if (frames) std::memset(frames, 0, size_t(count) * 2 * sizeof(float));
+            if (!self.waiting.exchange(true)) self.resume_buffer.store(std::min<uint64_t>(rate, self.resume_buffer.load() + prebuffer));
+            *read_count = count; return MA_SUCCESS;
         }
         const auto n = std::min<uint64_t>(count, available);
         const auto first = std::min<uint64_t>(n, capacity - begin % capacity);
         if (frames && n) {
-            std::memcpy(frames, self.pcm.data() + (begin % capacity) * 2, size_t(first) * 4);
-            if (n > first) std::memcpy(static_cast<char*>(frames) + first * 4, self.pcm.data(), size_t(n - first) * 4);
+            auto* output = static_cast<float*>(frames);
+            for (uint64_t i = 0; i < first * 2; ++i) output[i] = self.pcm[(begin % capacity) * 2 + i] / 32768.0f;
+            for (uint64_t i = 0; i < (n - first) * 2; ++i) output[first * 2 + i] = self.pcm[i] / 32768.0f;
         }
         self.consumed.store(begin + n, std::memory_order_release);
         self.waiting.store(false); *read_count = n;
@@ -376,7 +380,7 @@ struct Stream::Impl {
         return frame == 0 && get(data).consumed.load() == 0 ? MA_SUCCESS : MA_NOT_IMPLEMENTED;
     }
     static ma_result format(ma_data_source*, ma_format* format, ma_uint32* channels, ma_uint32* sample_rate, ma_channel* map, size_t cap) {
-        if (format) *format = ma_format_s16;
+        if (format) *format = ma_format_f32;
         if (channels) *channels = 2;
         if (sample_rate) *sample_rate = ma_uint32(rate);
         if (map) ma_channel_map_init_standard(ma_standard_channel_map_default, map, cap, 2);
@@ -412,7 +416,7 @@ struct Stream::Impl {
                 const auto read = consumed.load();
                 const auto now = std::chrono::steady_clock::now();
                 // 只检测缺少 PCM 时的停滞；暂停造成的正常背压不会触发。
-                if (produced != previous_written || !waiting.load() || produced >= read + prebuffer)
+                if (produced != previous_written || !waiting.load() || produced >= read + resume_buffer.load())
                     last_progress = now;
                 previous_written = produced;
                 if (waiting.load() && now - last_progress >= std::chrono::seconds(15)) {
@@ -504,6 +508,11 @@ std::shared_ptr<Stream> Stream::open(StreamSpec spec, std::function<bool()> canc
 void Stream::cancel() { impl_->stop.store(true); impl_->process.terminate(); impl_->cv.notify_all(); }
 bool Stream::failed() const { return impl_->broken.load(); }
 bool Stream::buffering() const { return impl_->waiting.load() && !impl_->decoded.load(); }
+long long Stream::buffered_ms() const {
+    const auto consumed = impl_->consumed.load(std::memory_order_acquire);
+    const auto written = impl_->written.load(std::memory_order_acquire);
+    return static_cast<long long>((written - std::min(written, consumed)) * 1000 / Impl::rate);
+}
 std::string Stream::error() const { std::lock_guard<std::mutex> lock(impl_->mutex); return impl_->failure; }
 
 static std::string device_key(ma_backend backend, const ma_device_id& id) {
@@ -539,76 +548,280 @@ std::vector<OutputDevice> output_devices(std::string& error) {
     ma_context_uninit(&context); return out;
 }
 struct Player::Impl {
+    // 所有权由 UI 线程持有；回调只读已发布的 Segment，退出读取后才回收旧段。
+    struct Segment {
+        ma_resource_manager_data_source file{};
+        bool file_ready = false;
+        std::shared_ptr<Stream> stream;
+        ma_data_source* source() { return stream ? reinterpret_cast<ma_data_source*>(&stream->impl_->source.base) : reinterpret_cast<ma_data_source*>(&file); }
+        ~Segment() { if (file_ready) ma_resource_manager_data_source_uninit(&file); if (stream) stream->cancel(); }
+    };
+    struct Sequence { ma_data_source_base base{}; Impl* owner = nullptr; } sequence;
     ma_context context{};
-    bool context_ready = false, device_fallback = false;
+    ma_resource_manager resources{};
     ma_engine engine{};
     ma_sound sound{};
-    bool engine_ready = false;
-    std::string selected_device;
-    bool sound_ready = false;
-    int volume = 100;
-    std::string error;
-    std::shared_ptr<Stream> stream;
+    bool context_ready = false, resources_ready = false, engine_ready = false, sound_ready = false, sequence_ready = false;
+    bool device_fallback = false, offline = false;
+    std::string selected_device, error;
+    std::vector<std::unique_ptr<Segment>> segments;
+    std::atomic<Segment*> current{nullptr}, next{nullptr};
+    std::atomic<unsigned> readers{0};
+    std::atomic<bool> transitioned{false}, normalization{false};
+    std::atomic<int> read_failure{MA_SUCCESS};
+    std::atomic<int> volume{100};
+    std::atomic<unsigned> eq_revision{0};
+    std::array<std::atomic<int>, 10> eq_values{};
+    std::atomic<int> eq_preamp{0};
+    std::atomic<bool> eq_enabled{false};
+    struct Band {
+        double b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
+        double z1[2]{}, z2[2]{};
+        float process(float sample, int channel) {
+            const double result = b0 * sample + z1[channel];
+            z1[channel] = b1 * sample - a1 * result + z2[channel];
+            z2[channel] = b2 * sample - a2 * result;
+            // 防止静音尾部进入极小浮点数运算。
+            if (std::abs(z1[channel]) < 1e-24) z1[channel] = 0;
+            if (std::abs(z2[channel]) < 1e-24) z2[channel] = 0;
+            return float(result);
+        }
+    };
+    std::array<Band, 10> bands{};
+    std::array<bool, 10> band_active{};
+    unsigned applied_eq_revision = ~0u;
+    bool apply_eq = false;
+    float eq_mix = 0, eq_level = 1;
+    // 下面仅由音频线程访问，避免回调分配内存、取锁或执行网络任务。
+    double mean_power = 0.0;
+    float gain = 1.0f, output_volume = 1.0f;
+    Segment* normalized_segment = nullptr;
+
+    static Impl& get(ma_data_source* source) { return *reinterpret_cast<Sequence*>(source)->owner; }
+    static ma_result read(ma_data_source* source, void* output, ma_uint64 count, ma_uint64* read_count) {
+        auto& self = get(source);
+        struct Reading { std::atomic<unsigned>& count; Reading(std::atomic<unsigned>& c) : count(c) { count.fetch_add(1, std::memory_order_seq_cst); } ~Reading() { count.fetch_sub(1, std::memory_order_seq_cst); } } reading(self.readers);
+        *read_count = 0;
+        while (*read_count < count) {
+            auto* segment = self.current.load(std::memory_order_seq_cst);
+            if (!segment) return *read_count ? MA_SUCCESS : MA_AT_END;
+            ma_uint64 got = 0;
+            const auto result = ma_data_source_read_pcm_frames(segment->source(), output ? static_cast<float*>(output) + *read_count * 2 : nullptr, count - *read_count, &got);
+            *read_count += got;
+            if (segment->stream && segment->stream->failed()) {
+                self.read_failure.store(MA_ERROR); return MA_ERROR;
+            }
+            if (*read_count == count) return MA_SUCCESS;
+            if (result == MA_AT_END || (result == MA_SUCCESS && !got)) {
+                // 在本次读取内部换段，剩余帧直接接下一曲，无 UI 调度间隙。
+                if (auto* queued = self.next.exchange(nullptr, std::memory_order_seq_cst)) {
+                    self.current.store(queued, std::memory_order_seq_cst);
+                    self.transitioned.store(true, std::memory_order_release);
+                    continue;
+                }
+                return *read_count ? MA_SUCCESS : MA_AT_END;
+            }
+            if (result == MA_BUSY) {
+                if (output) std::memset(static_cast<float*>(output) + *read_count * 2, 0, size_t(count - *read_count) * 2 * sizeof(float));
+                *read_count = count; return MA_SUCCESS;
+            }
+            if (result != MA_SUCCESS) { self.read_failure.store(result); return result; }
+        }
+        return MA_SUCCESS;
+    }
+    static ma_result seek(ma_data_source* source, ma_uint64 frame) {
+        auto* current = get(source).current.load();
+        return current ? ma_data_source_seek_to_pcm_frame(current->source(), frame) : MA_INVALID_OPERATION;
+    }
+    static ma_result format(ma_data_source*, ma_format* f, ma_uint32* channels, ma_uint32* rate, ma_channel* map, size_t cap) {
+        if (f) *f = ma_format_f32;
+        if (channels) *channels = 2;
+        if (rate) *rate = 48000;
+        if (map) ma_channel_map_init_standard(ma_standard_channel_map_default, map, cap, 2);
+        return MA_SUCCESS;
+    }
+    static ma_result cursor(ma_data_source* source, ma_uint64* frame) {
+        auto* current = get(source).current.load();
+        return current ? ma_data_source_get_cursor_in_pcm_frames(current->source(), frame) : MA_INVALID_OPERATION;
+    }
+    static ma_result length(ma_data_source* source, ma_uint64* frames) {
+        auto* current = get(source).current.load();
+        return current ? ma_data_source_get_length_in_pcm_frames(current->source(), frames) : MA_INVALID_OPERATION;
+    }
+    static void process(void* owner, float* samples, ma_uint64 frames) {
+        auto& self = *static_cast<Impl*>(owner);
+        if (!frames) return;
+        const auto revision = self.eq_revision.load(std::memory_order_acquire);
+        if (!(revision & 1) && revision != self.applied_eq_revision) {
+            std::array<int, 10> values{};
+            for (size_t i = 0; i < values.size(); ++i) values[i] = self.eq_values[i].load(std::memory_order_relaxed);
+            const int preamp = self.eq_preamp.load(std::memory_order_relaxed);
+            const bool enabled = self.eq_enabled.load(std::memory_order_relaxed);
+            if (revision == self.eq_revision.load(std::memory_order_acquire)) {
+                constexpr double frequencies[]{31, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000};
+                for (size_t i = 0; i < values.size(); ++i) {
+                    auto& band = self.bands[i];
+                    const double a = std::pow(10.0, values[i] / 40.0), w = 6.283185307179586 * frequencies[i] / 48000.0;
+                    const double alpha = std::sin(w) / (2 * 1.4), a0 = 1 + alpha / a;
+                    band.b0 = (1 + alpha * a) / a0; band.b1 = -2 * std::cos(w) / a0; band.b2 = (1 - alpha * a) / a0;
+                    band.a1 = band.b1; band.a2 = (1 - alpha / a) / a0;
+                    if (values[i] == 0 || !self.apply_eq) { band.z1[0] = band.z1[1] = band.z2[0] = band.z2[1] = 0; }
+                    self.band_active[i] = values[i] != 0;
+                }
+                const auto headroom = std::max(0, *std::max_element(values.begin(), values.end()));
+                self.eq_level = float(std::pow(10.0, (preamp - headroom) / 20.0));
+                self.apply_eq = enabled; self.applied_eq_revision = revision;
+            }
+        }
+        if (self.apply_eq || self.eq_mix > 0) for (ma_uint64 f = 0; f < frames; ++f) {
+            self.eq_mix = std::clamp(self.eq_mix + (self.apply_eq ? 1.0f : -1.0f) / 480.0f, 0.0f, 1.0f);
+            for (int channel = 0; channel < 2; ++channel) {
+                auto& sample = samples[size_t(f) * 2 + channel];
+                float filtered = sample;
+                for (size_t i = 0; i < self.bands.size(); ++i) if (self.band_active[i]) filtered = self.bands[i].process(filtered, channel);
+                sample += self.eq_mix * (filtered * self.eq_level - sample);
+            }
+        }
+        const auto* segment = self.current.load(std::memory_order_seq_cst);
+        if (self.normalized_segment != segment) { self.normalized_segment = const_cast<Segment*>(segment); self.mean_power = 0; self.gain = 1; }
+        const bool enabled = self.normalization.load(std::memory_order_relaxed);
+        float target = 1.0f;
+        if (enabled) {
+            double power = 0; float peak = 0;
+            for (size_t i = 0; i < size_t(frames) * 2; ++i) { power += double(samples[i]) * samples[i]; peak = std::max(peak, std::abs(samples[i])); }
+            power /= double(frames * 2);
+            const double coefficient = 1.0 - std::exp(-double(frames) / (48000.0 * 0.4));
+            if (power > 1e-8) self.mean_power = self.mean_power > 0 ? self.mean_power + coefficient * (power - self.mean_power) : power;
+            if (self.mean_power > 1e-8 && power > 1e-8) target = float(std::clamp(0.126 / std::sqrt(self.mean_power), 0.25, 2.0));
+            else target = self.gain; // 静音不抬增益，避免噪声和重新入声时的抽吸。
+            if (peak > 0) target = std::min(target, 0.98f / peak);
+        }
+        const auto smoothing = float(1.0 - std::exp(-double(frames) / (48000.0 * (target < self.gain ? 0.08 : 2.0))));
+        const float final_gain = enabled ? self.gain + smoothing * (target - self.gain) : 1.0f;
+        const float volume_target = self.volume.load(std::memory_order_relaxed) / 100.0f;
+        for (ma_uint64 f = 0; f < frames; ++f) {
+            const float progress = float(f + 1) / float(frames);
+            const float level = (self.gain + (final_gain - self.gain) * progress) * (self.output_volume + (volume_target - self.output_volume) * progress);
+            for (int channel = 0; channel < 2; ++channel) {
+                auto& sample = samples[size_t(f) * 2 + channel];
+                sample *= level;
+                if (enabled || self.apply_eq || self.eq_mix > 0) sample = std::clamp(sample, -0.98f, 0.98f);
+            }
+        }
+        self.gain = final_gain; self.output_volume = volume_target;
+    }
     bool ensure_engine() {
         if (engine_ready) return true;
-        auto& p = *this;
         auto config = ma_engine_config_init();
-        if (!context_ready) {
+        config.channels = 2; config.sampleRate = 48000; config.noDevice = offline;
+        config.onProcess = process; config.pProcessUserData = this;
+        if (!offline && !context_ready) {
             const auto rc = ma_context_init(nullptr, 0, nullptr, &context);
             if (rc != MA_SUCCESS) { error = std::string("音频后端初始化失败：") + ma_result_description(rc); return false; }
             context_ready = true;
         }
-        config.pContext = &context;
+        if (!resources_ready) {
+            auto resource_config = ma_resource_manager_config_init();
+            resource_config.decodedFormat = ma_format_f32; resource_config.decodedChannels = 2; resource_config.decodedSampleRate = 48000;
+            if (ma_resource_manager_init(&resource_config, &resources) != MA_SUCCESS) { error = "无法初始化音频预读器"; return false; }
+            resources_ready = true;
+        }
+        config.pResourceManager = &resources;
+        if (!offline) config.pContext = &context;
         ma_device_id selected{};
-        if (!selected_device.empty()) {
+        if (!offline && !selected_device.empty()) {
             ma_device_info* devices = nullptr; ma_uint32 count = 0;
             if (ma_context_get_devices(&context, &devices, &count, nullptr, nullptr) == MA_SUCCESS)
                 for (ma_uint32 i = 0; i < count; ++i)
                     if (device_key(context.backend, devices[i].id) == selected_device) { selected = devices[i].id; config.pPlaybackDeviceID = &selected; break; }
             if (!config.pPlaybackDeviceID) device_fallback = true;
         }
-        auto rc = ma_engine_init(&config, &p.engine);
-        if (rc != MA_SUCCESS && config.pPlaybackDeviceID) { device_fallback = true; config.pPlaybackDeviceID = nullptr; rc = ma_engine_init(&config, &p.engine); }
-        if (rc != MA_SUCCESS) { p.error = std::string("音频设备初始化失败：") + ma_result_description(rc); return false; }
-        p.engine_ready = true;
+        auto rc = ma_engine_init(&config, &engine);
+        if (rc != MA_SUCCESS && config.pPlaybackDeviceID) { device_fallback = true; config.pPlaybackDeviceID = nullptr; rc = ma_engine_init(&config, &engine); }
+        if (rc != MA_SUCCESS) { error = std::string("音频后端初始化失败：") + ma_result_description(rc); return false; }
+        engine_ready = true;
+        static const ma_data_source_vtable vtable{read, seek, format, cursor, length, nullptr, 0};
+        auto source_config = ma_data_source_config_init(); source_config.vtable = &vtable; sequence.owner = this;
+        if (ma_data_source_init(&source_config, &sequence.base) != MA_SUCCESS) { error = "无法创建连续播放数据源"; return false; }
+        sequence_ready = true;
         return true;
     }
-    ~Impl() { if (sound_ready) ma_sound_uninit(&sound); if (engine_ready) ma_engine_uninit(&engine); if (context_ready) ma_context_uninit(&context); }
+    std::unique_ptr<Segment> file_segment(const std::string& path) {
+        auto segment = std::make_unique<Segment>();
+        auto config = ma_resource_manager_data_source_config_init();
+        config.flags = MA_RESOURCE_MANAGER_DATA_SOURCE_FLAG_STREAM;
+#ifdef _WIN32
+        const auto native = platform::widen(path); config.pFilePathW = native.c_str();
+#else
+        config.pFilePath = path.c_str();
+#endif
+        const auto rc = ma_resource_manager_data_source_init_ex(&resources, &config, &segment->file);
+        if (rc != MA_SUCCESS) { error = std::string("音频解码失败：") + ma_result_description(rc); return {}; }
+        segment->file_ready = true;
+        return segment;
+    }
+    bool attach(std::unique_ptr<Segment> segment) {
+        current.store(segment.get()); segments.push_back(std::move(segment));
+        // 所有段已统一到引擎格式；关闭多余的变速重采样，避免引入一帧前导延迟。
+        const auto rc = ma_sound_init_from_data_source(&engine, &sequence.base, MA_SOUND_FLAG_NO_SPATIALIZATION | MA_SOUND_FLAG_NO_PITCH, nullptr, &sound);
+        if (rc != MA_SUCCESS) { error = std::string("音频解码失败：") + ma_result_description(rc); current.store(nullptr); segments.clear(); return false; }
+        sound_ready = true; return true;
+    }
+    void collect_segments() {
+        // next 为 null 后，新回调无法开始换段；已有换段由 readers 保护。
+        if (next.load(std::memory_order_seq_cst)) return;
+        if (readers.load(std::memory_order_seq_cst)) return;
+        const auto* active = current.load(std::memory_order_seq_cst);
+        const auto* queued = next.load(std::memory_order_seq_cst);
+        segments.erase(std::remove_if(segments.begin(), segments.end(), [&](const auto& segment) { return segment.get() != active && segment.get() != queued; }), segments.end());
+    }
+    ~Impl() {
+        if (sound_ready) ma_sound_uninit(&sound);
+        if (engine_ready) ma_engine_uninit(&engine);
+        segments.clear();
+        if (sequence_ready) ma_data_source_uninit(&sequence.base);
+        if (resources_ready) ma_resource_manager_uninit(&resources);
+        if (context_ready) ma_context_uninit(&context);
+    }
 };
-Player::Player() : impl_(std::make_unique<Impl>()) {}
+Player::Player(bool offline) : impl_(std::make_unique<Impl>()) { impl_->offline = offline; }
 Player::~Player() = default;
 bool Player::open(const std::string& path) {
-    close();
-    auto& p = *impl_;
-    p.error.clear();
+    close(); auto& p = *impl_; p.error.clear();
     if (!p.ensure_engine()) return false;
-#ifdef _WIN32
-    const auto rc = ma_sound_init_from_file_w(&p.engine, platform::widen(path).c_str(), MA_SOUND_FLAG_STREAM, nullptr, nullptr, &p.sound);
-#else
-    const auto rc = ma_sound_init_from_file(&p.engine, path.c_str(), MA_SOUND_FLAG_STREAM, nullptr, nullptr, &p.sound);
-#endif
-    if (rc != MA_SUCCESS) { p.error = std::string("音频解码失败：") + ma_result_description(rc); return false; }
-    p.sound_ready = true;
-    ma_sound_set_volume(&p.sound, float(p.volume) / 100);
-    return true;
+    auto segment = p.file_segment(path);
+    return segment && p.attach(std::move(segment));
 }
 bool Player::open_stream(std::shared_ptr<Stream> stream) {
     close(); auto& p = *impl_; p.error.clear();
     if (!stream) { p.error = "流式音频为空"; return false; }
     if (!p.ensure_engine()) return false;
-    const auto rc = ma_sound_init_from_data_source(&p.engine, &stream->impl_->source.base, 0, nullptr, &p.sound);
-    if (rc != MA_SUCCESS) { p.error = std::string("流式播放初始化失败：") + ma_result_description(rc); return false; }
-    p.stream = std::move(stream); p.sound_ready = true;
-    ma_sound_set_volume(&p.sound,float(p.volume)/100); return true;
+    auto segment = std::make_unique<Impl::Segment>(); segment->stream = std::move(stream);
+    return p.attach(std::move(segment));
 }
+bool Player::queue_next(const std::string& path) {
+    auto& p = *impl_;
+    if (!p.sound_ready || p.transitioned.load()) return false;
+    cancel_next();
+    auto segment = p.file_segment(path);
+    if (!segment) return false;
+    auto* pointer = segment.get(); p.segments.push_back(std::move(segment));
+    p.next.store(pointer, std::memory_order_seq_cst); return true;
+}
+void Player::cancel_next() { impl_->next.store(nullptr, std::memory_order_seq_cst); impl_->collect_segments(); }
+bool Player::take_transition() { const bool changed = impl_->transitioned.exchange(false, std::memory_order_acq_rel); impl_->collect_segments(); return changed; }
 void Player::close() {
-    if (impl_->sound_ready) { ma_sound_uninit(&impl_->sound); impl_->sound_ready = false; }
-    if (impl_->stream) { impl_->stream->cancel(); impl_->stream.reset(); }
+    auto& p = *impl_;
+    if (p.sound_ready) { ma_sound_uninit(&p.sound); p.sound_ready = false; }
+    p.next.store(nullptr); p.current.store(nullptr); p.transitioned.store(false); p.segments.clear();
+    p.read_failure.store(MA_SUCCESS);
 }
 void Player::shutdown() {
-    close();
-    if (impl_->engine_ready) { ma_engine_uninit(&impl_->engine); impl_->engine_ready = false; }
-    if (impl_->context_ready) { ma_context_uninit(&impl_->context); impl_->context_ready = false; }
+    close(); auto& p = *impl_;
+    if (p.engine_ready) { ma_engine_uninit(&p.engine); p.engine_ready = false; }
+    if (p.sequence_ready) { ma_data_source_uninit(&p.sequence.base); p.sequence_ready = false; }
+    if (p.resources_ready) { ma_resource_manager_uninit(&p.resources); p.resources_ready = false; }
+    if (p.context_ready) { ma_context_uninit(&p.context); p.context_ready = false; }
 }
 bool Player::play() {
     if (!impl_->sound_ready) return false;
@@ -620,42 +833,48 @@ void Player::pause() { if (impl_->sound_ready) ma_sound_stop(&impl_->sound); }
 void Player::resume() { play(); }
 bool Player::is_playing() const { return impl_->sound_ready && ma_sound_is_playing(&impl_->sound); }
 bool Player::is_ended() const { return impl_->sound_ready && !stream_failed() && ma_sound_at_end(&impl_->sound); }
-bool Player::stream_failed() const { return impl_->stream && impl_->stream->failed(); }
-bool Player::buffering() const { return impl_->stream && impl_->stream->buffering(); }
+bool Player::stream_failed() const { auto* current = impl_->current.load(); return impl_->read_failure.load() != MA_SUCCESS || (current && current->stream && current->stream->failed()); }
+bool Player::buffering() const { auto* current = impl_->current.load(); return current && current->stream && current->stream->buffering(); }
+long long Player::buffered_ms() const { auto* current = impl_->current.load(); return current && current->stream ? current->stream->buffered_ms() : 0; }
 long long Player::position_ms() const {
-    if (impl_->stream) { const auto& stream = *impl_->stream->impl_; return stream.spec.start_ms + static_cast<long long>(stream.consumed.load() * 1000 / Stream::Impl::rate); }
-    float seconds = 0;
-    if (impl_->sound_ready) ma_sound_get_cursor_in_seconds(&impl_->sound, &seconds);
-    return static_cast<long long>(seconds * 1000.0f);
+    auto* current = impl_->current.load();
+    if (!current) return 0;
+    if (current->stream) { const auto& stream = *current->stream->impl_; return stream.spec.start_ms + static_cast<long long>(stream.consumed.load() * 1000 / Stream::Impl::rate); }
+    ma_uint64 frames = 0; ma_data_source_get_cursor_in_pcm_frames(current->source(), &frames);
+    return static_cast<long long>(frames * 1000 / 48000);
 }
 long long Player::duration_ms() const {
-    if (impl_->stream) return impl_->stream->impl_->spec.duration_ms;
-    float seconds = 0;
-    if (impl_->sound_ready) ma_sound_get_length_in_seconds(&impl_->sound, &seconds);
-    return static_cast<long long>(seconds * 1000.0f);
+    auto* current = impl_->current.load();
+    if (!current) return 0;
+    if (current->stream) return current->stream->impl_->spec.duration_ms;
+    ma_uint64 frames = 0; ma_data_source_get_length_in_pcm_frames(current->source(), &frames);
+    return static_cast<long long>(frames * 1000 / 48000);
 }
 void Player::seek_ms(long long ms) {
-    if (!impl_->sound_ready || impl_->stream) return;
-    ma_uint32 rate = 0;
-    if (ma_sound_get_data_format(&impl_->sound, nullptr, nullptr, &rate, nullptr, 0) != MA_SUCCESS) return;
-    const auto end = duration_ms();
+    if (!impl_->sound_ready || (impl_->current.load() && impl_->current.load()->stream)) return;
+    cancel_next(); const auto end = duration_ms();
     ms = std::max(0LL, end > 0 ? std::min(ms, end) : ms);
-    ma_sound_seek_to_pcm_frame(&impl_->sound, ma_uint64(ms) * rate / 1000);
+    ma_sound_seek_to_pcm_frame(&impl_->sound, ma_uint64(ms) * 48000 / 1000);
 }
-void Player::set_volume(int volume) {
-    impl_->volume = std::clamp(volume, 0, 100);
-    if (impl_->sound_ready) ma_sound_set_volume(&impl_->sound, float(impl_->volume) / 100);
+void Player::set_volume(int volume) { impl_->volume.store(std::clamp(volume, 0, 100)); }
+void Player::set_normalization(bool enabled) { impl_->normalization.store(enabled); }
+void Player::set_equalizer(const EqualizerSettings& settings) {
+    auto& p = *impl_; p.eq_revision.fetch_add(1, std::memory_order_acq_rel);
+    for (size_t i = 0; i < settings.gains_db.size(); ++i) p.eq_values[i].store(std::clamp(settings.gains_db[i], -12, 12), std::memory_order_relaxed);
+    p.eq_preamp.store(std::clamp(settings.preamp_db, -12, 12), std::memory_order_relaxed); p.eq_enabled.store(settings.enabled, std::memory_order_relaxed);
+    p.eq_revision.fetch_add(1, std::memory_order_release);
 }
-void Player::set_device(const std::string& id) {
-    shutdown(); impl_->selected_device = id; impl_->device_fallback = false;
-}
+bool Player::render(float* samples, size_t frames) { return impl_->offline && impl_->engine_ready && ma_engine_read_pcm_frames(&impl_->engine, samples, frames, nullptr) == MA_SUCCESS; }
+void Player::set_device(const std::string& id) { shutdown(); impl_->selected_device = id; impl_->device_fallback = false; }
 bool Player::take_device_change() {
-    // 默认设备切换由 miniaudio 后端处理；失效设备交给 UI 线程重建，回调不执行销毁。
-    return impl_->engine_ready && ma_device_get_state(ma_engine_get_device(&impl_->engine)) == ma_device_state_stopped && impl_->sound_ready;
+    const auto* device = impl_->engine_ready && !impl_->offline ? ma_engine_get_device(&impl_->engine) : nullptr;
+    return device && ma_device_get_state(device) == ma_device_state_stopped && impl_->sound_ready;
 }
 bool Player::take_device_fallback() { const bool value = impl_->device_fallback; impl_->device_fallback = false; return value; }
 const std::string& Player::error() const {
-    if (impl_->stream && impl_->stream->failed()) impl_->error = impl_->stream->error();
+    auto* current = impl_->current.load();
+    if (current && current->stream && current->stream->failed()) impl_->error = current->stream->error();
+    else if (impl_->read_failure.load() != MA_SUCCESS) impl_->error = std::string("音频读取失败：") + ma_result_description(ma_result(impl_->read_failure.load()));
     return impl_->error;
 }
 } // namespace audio

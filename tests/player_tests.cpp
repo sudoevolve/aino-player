@@ -241,6 +241,15 @@ int main(int argc, char** argv) {
                 spec.start_ms = offset;
                 auto stream = audio::Stream::open(spec, [&] { return cancelled.load(); }, error);
                 check(stream && !stream->failed(), error.c_str());
+                audio::Player player(true);
+                check(player.open_stream(stream) && player.play(), "decoded stream attaches to offline engine");
+                std::array<float, 960> pcm{};
+                const auto playback_deadline = platform::ticks() + 5000;
+                while (!player.is_ended() && !player.stream_failed() && platform::ticks() < playback_deadline) {
+                    check(player.render(pcm.data(), 480), "decoded stream produces PCM frames"); platform::sleep_ms(1);
+                }
+                check(player.is_ended() && !player.stream_failed() && player.position_ms() >= 900, "stream consumes complete decoded audio including offset");
+                player.close();
                 const auto began = platform::ticks(); stream->cancel(); stream.reset();
                 check(platform::ticks() - began < 2500, "cancel reaps stream with a full or partially full ring");
             }
@@ -361,6 +370,67 @@ int main(int argc, char** argv) {
         }
         const auto dir = platform::join(platform::temp_dir(), "test-" + std::to_string(platform::ticks()));
         check(platform::make_dirs(dir), "test directory");
+        {
+            auto wave = [&](const char* name, int16_t value, unsigned frames, double frequency = 0) {
+                const auto path = platform::join(dir, name);
+                std::string bytes = "RIFF";
+                auto u16 = [&](unsigned n) { bytes += char(n); bytes += char(n >> 8); };
+                auto u32 = [&](unsigned n) { u16(n); u16(n >> 16); };
+                u32(36 + frames * 4); bytes += "WAVEfmt "; u32(16); u16(1); u16(2); u32(48000); u32(192000); u16(4); u16(16);
+                bytes += "data"; u32(frames * 4);
+                for (unsigned i = 0; i < frames * 2; ++i)
+                    u16(uint16_t(frequency ? int16_t(value * std::sin(6.283185307179586 * frequency * (i / 2) / 48000)) : value));
+                auto* output = platform::fopen(path, "wb"); check(output != nullptr, "gapless wave fixture");
+                check(std::fwrite(bytes.data(), 1, bytes.size(), output) == bytes.size(), "gapless wave contents"); std::fclose(output);
+                return path;
+            };
+            const auto first = wave("first.wav", 8192, 4800), second = wave("second.wav", -8192, 4800);
+            audio::Player player(true);
+            check(player.open(first) && player.queue_next(second) && player.play(), player.error().c_str());
+            std::vector<float> samples(9600 * 2);
+            for (size_t at = 0; at < 9600;) {
+                const size_t count = std::min<size_t>(137, 9600 - at);
+                check(player.render(samples.data() + at * 2, count), "offline gapless rendering"); at += count;
+            }
+            for (size_t i = 0; i < 9600; ++i) if (samples[i * 2] < -0.20f) { std::cout << "Gapless boundary frame: " << i << '\n'; break; }
+            for (size_t i = 100; i < 9500; ++i) {
+                check(std::abs(samples[i * 2]) > 0.20f, "no silent frames between preloaded tracks");
+                check((i < 4800 ? samples[i * 2] > 0 : samples[i * 2] < 0), "transition stays on exact PCM boundary");
+            }
+            check(player.take_transition() && !player.take_transition(), "one transition event per audio boundary");
+            check(player.position_ms() == 100, "position belongs to next track without UI polling");
+            check(player.open(first) && player.queue_next(second), "queue cancellation fixture");
+            player.cancel_next(); check(player.play() && player.render(samples.data(), 9600), "cancelled queue renders current only");
+            check(!player.take_transition() && std::none_of(samples.begin(), samples.end(), [](float v) { return v < -0.01f; }), "cancelled next track never plays");
+            const auto loud = wave("loud.wav", 30000, 96000);
+            player.set_normalization(true);
+            check(player.open(loud) && player.play(), "normalization fixture");
+            for (int i = 0; i < 10; ++i) check(player.render(samples.data(), 4800), "normalized blocks render");
+            const auto full = std::abs(samples[4700 * 2]);
+            check(std::abs(full - 0.25f * 30000 / 32768) < 0.01f && std::all_of(samples.begin(), samples.begin() + 9600, [](float v) { return std::abs(v) <= 0.981f; }), "normalization respects maximum attenuation and bounded peaks");
+            player.set_volume(25);
+            check(player.render(samples.data(), 4800), "normalized volume render");
+            check(std::abs(samples[4700 * 2]) < full * 0.30f, "normalization cannot compensate user volume reduction");
+            player.pause(); const auto paused = player.position_ms();
+            check(player.render(samples.data(), 137) && player.position_ms() == paused, "offline pause preserves position");
+            player.shutdown();
+            const auto tone = wave("tone.wav", 4000, 48000, 1000);
+            audio::Player flat(true), equalized(true);
+            audio::EqualizerSettings eq; eq.enabled = true; eq.gains_db[5] = -12;
+            equalized.set_equalizer(eq);
+            check(flat.open(tone) && equalized.open(tone) && flat.play() && equalized.play(), "equalizer tone fixture");
+            std::vector<float> reference(9600);
+            double reference_power = 0, equalized_power = 0;
+            for (int block = 0; block < 4; ++block) {
+                check(flat.render(reference.data(), 4800) && equalized.render(samples.data(), 4800), "equalizer tone renders");
+                if (block == 3) for (size_t i = 0; i < reference.size(); ++i) { reference_power += reference[i] * reference[i]; equalized_power += samples[i] * samples[i]; }
+            }
+            const auto ratio = std::sqrt(equalized_power / reference_power);
+            check(ratio > 0.23 && ratio < 0.28, "1 kHz band applies twelve decibel cut at its center frequency");
+            eq.gains_db.fill(0); equalized.set_equalizer(eq);
+            check(flat.render(reference.data(), 4800) && equalized.render(samples.data(), 4800), "flat reset renders");
+            check(std::abs(samples[8000] - reference[8000]) < 0.001f, "reset equalizer is transparent after transition");
+        }
         const auto file = platform::join(dir, "资料库.json");
         std::string err;
         lib.remember(track); lib.remember(track);
@@ -534,6 +604,8 @@ int main(int argc, char** argv) {
                 check(engine.choose_fixed_source(1).file == fixed.file, "playback failure preserves pinned source");
                 candidates = 0;
                 check(engine.load_dir(scripts) == 2, "reset fixture outcomes before smart routing");
+                const auto routing_revision = engine.routing_revision();
+                const auto view_revision = engine.revision();
                 check(engine.resolve("wy", "320k", "{}", url, error, nullptr,
                     [&](const auto& candidate, const auto&, const auto& quality, auto& reason) {
                         ++candidates;
@@ -541,7 +613,10 @@ int main(int argc, char** argv) {
                         if (candidate.find("/bad") != std::string::npos) { reason = "fixture rejects media"; return false; }
                         return true;
                     }) && candidates == 2 && url == "https://example.invalid/good", "rejected media advances to next script");
+                check(engine.routing_revision() == routing_revision && engine.revision() != view_revision,
+                    "playback timing updates refresh source UI without invalidating next-song preload");
                 check(engine.load_dir(scripts) == 2, "reset fixture outcomes before per-song checks");
+                check(engine.routing_revision() != routing_revision, "source reload invalidates prepared routing");
                 candidates = 0;
                 check(!engine.resolve("wy", "320k", "{\"id\":\"missing\"}", url, error, nullptr,
                     [&](const auto&, const auto&, const auto&, auto& reason) {
@@ -578,7 +653,9 @@ int main(int argc, char** argv) {
                 const auto after_targeted = engine.selection_order("wy", 1);
                 check(std::all_of(after_targeted.begin(), after_targeted.end(), [](const auto& item) { return item.availability == 4; }),
                     "checking a different platform preserves existing cooldowns");
+                const auto before_order = engine.routing_revision();
                 check(engine.set_manual_order({good, bad}, error), "manual source order saved");
+                check(engine.routing_revision() != before_order, "manual source order invalidates prepared routing");
                 check(engine.choose_fixed_source(1, true).file == "02-good.js", "manual order selects first loaded source even during cooldown");
                 {
                     lx::Engine ordered(preferences);
@@ -607,6 +684,12 @@ int main(int argc, char** argv) {
                     check(!script.music_url("wy", "128k", "{}", url, error), "cancelled script request returns promptly");
                 }
                 check(script.music_url("wy", "128k", "{}", url, error), "cancelled request does not poison later calls");
+                const auto memory_before = script.runtime_bytes();
+                check(memory_before > 0 && script.resident(), "loaded source runtime is measurable");
+                script.collect_idle(true, 0);
+                check(!script.resident() && script.runtime_bytes() == 0 && script.supports("wy", "musicUrl"), "idle release retains published source capabilities");
+                check(script.music_url("wy", "128k", "{}", url, error) && script.resident() && url == "https://example.invalid/good", "dormant source reinitializes and resolves normally");
+                std::cout << "Idle source runtime: " << memory_before << " -> 0 live JS bytes; wake passed\n";
                 {
                     lx::Script deferred;
                     const std::string startup = "const lx = globalThis.lx;"

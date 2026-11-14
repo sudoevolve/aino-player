@@ -1879,9 +1879,14 @@ static void update_settings(Ctx& c, float x, float w, float y) {
         update.status == UpdateStatus::Installing || update.status == UpdateStatus::Installed;
     if (c.ui.button(update.status == UpdateStatus::Checking ? "正在检查…" : "检查更新", {x + 20, card.y + 154, 88, 28}, check)) check_updates();
     if (c.ui.button("发布页", {x + 118, card.y + 154, 72, 28}, Style().ghost().font(11))) open_update(false);
-    if (update.status == UpdateStatus::Available && c.ui.button(update.installer ? "下载并安装" : "下载新版", {x + w - 116, card.y + 154, 96, 28}, Style().primary().font(11))) open_update(true);
+    if (update.status == UpdateStatus::Available && c.ui.button(!update.package_command.empty() ? "复制更新命令" : update.installer ? "下载并安装" : "下载新版", {x + w - 128, card.y + 154, 108, 28}, Style().primary().font(11))) {
+        if (!update.package_command.empty()) { c.ui.set_clipboard(update.package_command); toast("已复制更新命令，请在终端执行"); }
+        else open_update(true);
+    }
     if (update.status == UpdateStatus::Downloading) c.ui.muted_text("下载 " + std::to_string(update.progress) + "%", {x + 20, card.bottom() + 14, w - 40, 20}, Style().font(11));
-    c.ui.muted_text("Windows 使用安装器覆盖升级；Linux 完成系统授权后覆盖安装 deb，无需卸载旧版。更新保留配置、收藏和歌单。", {x + 2, card.bottom() + 44, w - 4, 52}, Style().font(11).wrap_text().top());
+    c.ui.muted_text(update.package_command.empty() ? "更新保留配置、收藏和歌单。Linux 便携版下载当前系统对应的软件包。" :
+        "通过系统包管理器升级，保留配置、收藏和歌单。软件源可能稍晚于 GitHub 同步。\n" + update.package_command,
+        {x + 2, card.bottom() + 44, w - 4, 64}, Style().font(11).wrap_text().top());
     update_notes(c, x, w, card.bottom() + 116, true);
 }
 static void about_settings(Ctx& c, float x, float w, float y) {
@@ -2125,6 +2130,35 @@ static void paint_floating_lyrics(aino::detail::TextRenderer& text, const platfo
     }
 }
 
+static void audio_effects_settings(Ctx& c, float x, float w, float y) {
+    if (c.ui.button("返回播放设置", {x, y, 110, 28}, Style().ghost().font(11))) c.model.ui.audio_effects_open = false;
+    auto settings = c.model.ui.equalizer;
+    c.ui.draw_text("均衡器", {x, y + 52, w - 70, 26}, c.th.label, Style().font(17).weight(600));
+    bool changed = c.ui.toggle(&settings.enabled, {x + w - 42, y + 54, 38, 22});
+    static int preset = 0;
+    if (c.ui.select({"自定义", "平直", "低音增强", "人声", "柔和"}, &preset, {x, y + 98, 150, 30}, Style().font(11))) {
+        const std::array<std::array<int, 10>, 5> presets{{{}, {}, {5, 4, 3, 1, 0, 0, 0, 0, 0, 0}, {-2, -1, 0, 2, 3, 3, 2, 0, -1, -2}, {0, 0, 0, 0, -1, -1, -2, -3, -4, -4}}};
+        if (preset) { settings.gains_db = presets[size_t(preset)]; settings.preamp_db = 0; changed = true; }
+    }
+    if (c.ui.button("重置", {x + w - 70, y + 98, 70, 30}, Style().font(11))) {
+        settings.gains_db.fill(0); settings.preamp_db = 0; preset = 1; changed = true;
+    }
+    constexpr const char* labels[]{"31 Hz", "63 Hz", "125 Hz", "250 Hz", "500 Hz", "1 kHz", "2 kHz", "4 kHz", "8 kHz", "16 kHz", "前级"};
+    static std::array<SeekBar, 11> sliders;
+    for (size_t i = 0; i < sliders.size(); ++i) {
+        int& gain = i < 10 ? settings.gains_db[i] : settings.preamp_db;
+        const float row_y = y + 150 + float(i) * 43;
+        c.ui.draw_text(labels[i], {x + 2, row_y, 66, 28}, c.th.label2, Style().font(11));
+        float value = 0;
+        if (seek_bar(c, float(gain + 12), 24, {x + 80, row_y + 4, w - 152, 20}, &sliders[i], &value)) {
+            gain = std::clamp(int(std::round(value)) - 12, -12, 12); changed = true; preset = 0;
+        }
+        const auto label = (gain > 0 ? "+" : "") + std::to_string(gain) + " dB";
+        c.ui.draw_text(label, {x + w - 68, row_y, 66, 28}, c.th.label2, Style().font(11).right());
+    }
+    if (changed) set_equalizer(settings);
+    c.ui.muted_text("自动预留提升频段所需的音量余量，减少失真。均衡器默认关闭，设置保存在本机。", {x + 2, y + 638, w - 4, 48}, Style().font(11).wrap_text().top());
+}
 static void tab_settings(Ctx& c) {
     const float available = c.W - kSidebar - right_panel_width(c);
     const float w = std::min(680.0f, available - 48);
@@ -2133,7 +2167,7 @@ static void tab_settings(Ctx& c) {
     auto& selected = c.model.ui.settings_tab;
     const bool changed = c.ui.segmented({"通用", "账号", "播放", "下载", "数据", "关于"}, &selected, {x, 78, w, 32}, Style().font(11.5f));
     if (changed) c.model.ui.update_settings = false;
-    const float content_height = selected == 4 ? 744.0f : selected == 5 ? 510.0f : selected == 3 ? 350.0f : selected == 2 ? 470.0f : selected == 1 ? 360.0f : c.model.ui.overlay_settings ? 1090.0f : c.model.ui.update_settings ? 390.0f + update_notes(c, x, w, 0, false) : 752.0f;
+    const float content_height = selected == 4 ? 744.0f : selected == 5 ? 510.0f : selected == 3 ? 350.0f : selected == 2 ? (c.model.ui.audio_effects_open ? 720.0f : 760.0f) : selected == 1 ? 360.0f : c.model.ui.overlay_settings ? 1090.0f : c.model.ui.update_settings ? 410.0f + update_notes(c, x, w, 0, false) : 752.0f;
     const Rect viewport{x, 132, w, c.bar_y - 148};
     if (changed) c.ui.scroll_to_index(viewport, 0, content_height, 1);
     c.ui.scroll(viewport, 1, content_height, [&](int, const Rect& area) {
@@ -2167,7 +2201,8 @@ static void tab_settings(Ctx& c) {
             return;
         }
         if (selected == 2) {
-            const Rect group{x, y + 28, w, 192};
+            if (c.model.ui.audio_effects_open) { audio_effects_settings(c, x, w, y); return; }
+            const Rect group{x, y + 28, w, 320};
             settings_group(c, "播放", group);
             const bool compact = w < 450;
             settings_label(c, "音质", {x, group.y, w, 64});
@@ -2185,7 +2220,18 @@ static void tab_settings(Ctx& c) {
             settings_label(c, "播放模式", {x, group.y + 128, w, 64});
             int mode = int(c.model.ui.play_mode);
             if (c.ui.select({"顺序播放", "随机播放", "列表循环", "单曲循环"}, &mode, {x + w - 130, group.y + 146, 114, 28}, Style().font(11))) set_play_mode(PlayMode(mode));
-            const float dy = group.bottom() + 24;
+            settings_rule(c, group, group.y + 192);
+            settings_label(c, "无缝播放", {x, group.y + 192, w, 64});
+            bool gapless = c.model.ui.gapless;
+            if (c.ui.toggle(&gapless, {x + w - 54, group.y + 213, 38, 22})) set_gapless(gapless);
+            c.ui.tooltip({x, group.y + 192, w - 64, 64}, "下一曲准备好后连续衔接；预加载未完成时正常切歌。");
+            settings_rule(c, group, group.y + 256);
+            settings_label(c, "响度均衡", {x, group.y + 256, w, 64});
+            bool normalize = c.model.ui.normalize_volume;
+            if (c.ui.toggle(&normalize, {x + w - 54, group.y + 277, 38, 22})) set_normalization(normalize);
+            c.ui.tooltip({x, group.y + 256, w - 64, 64}, "实时平滑音量差异并限制峰值，最多提升 6 dB。默认关闭，不修改音乐文件。");
+            if (c.ui.button("均衡器", {x, group.bottom() + 18, 130, 30}, Style().font(11))) { c.model.ui.audio_effects_open = true; c.ui.scroll_to_index(viewport, 0, content_height, 1); }
+            const float dy = group.bottom() + 70;
             c.ui.draw_text("输出设备", {x + 2, dy, w - 110, 24}, c.th.label2, Style().font(12).weight(600));
             Style refresh_style = Style().font(11); refresh_style.disabled = c.model.ui.device_loading;
             if (c.ui.button(c.model.ui.device_loading ? "读取中…" : "刷新设备", {x + w - 100, dy, 98, 26}, refresh_style)) refresh_output_devices();
@@ -2196,6 +2242,8 @@ static void tab_settings(Ctx& c) {
             c.ui.muted_text(c.model.ui.device_error.empty() ? "切换时保留播放位置与暂停状态；设备不可用时回退默认输出。" : c.model.ui.device_error, {x, dy + 80, w, 36}, Style().font(10.5f).wrap_text().top());
             c.ui.draw_text("音频解码", {x + 2, dy + 126, w - 4, 20}, c.th.label2, Style().font(11.5f).weight(600));
             c.ui.muted_text(audio::decoder_info(), {x + 2, dy + 152, w - 4, 36}, Style().font(10.5f).wrap_text().top());
+            if (c.ui.button("播放诊断", {x, dy + 210, 94, 30}, Style().font(11))) error_details = {true, "播放诊断", playback_diagnostics()};
+            c.ui.muted_text("查看播放阶段和缓冲情况，可复制用于反馈。报告不含链接、Cookie 或本地路径。", {x + 110, dy + 210, w - 110, 40}, Style().font(10.5f).wrap_text().top());
             return;
         }
         if (c.model.ui.overlay_settings) { floating_lyrics_settings(c, x, w, y); return; }
@@ -2337,8 +2385,7 @@ static void player_bar(Ctx& c) {
     const float title_w = tw - (state_badge ? 78.0f : 0.0f) - lane_w;
     c.ui.draw_text(ellipsize(c.ui, title, title_w, 12.5f, 600), {tx, y + 14, title_w, 19}, c.s.now_title.empty() ? c.th.label2 : c.th.label, Style().font(12.5f).weight(600));
     if (state_badge) {
-        const std::string state = c.s.ps == PlayState::Failed ? "播放失败" : c.s.pending_paused ? "已暂停" : c.s.ps == PlayState::Buffering ?
-            "缓冲 " + std::to_string(int(c.s.buffer * 100)) + "%" : "解析中…";
+        const std::string state = c.s.ps == PlayState::Failed ? "播放失败" : c.s.pending_paused ? "已暂停" : playback_stage_name(c.s.stage);
         c.ui.draw_text(state, {tx + tw - lane_w - 72, y + 14, 72, 19}, c.s.ps == PlayState::Failed ? c.th.destructive : c.th.tint, Style().font(9.5f).right());
     }
     if (has_lane) {
@@ -2369,7 +2416,9 @@ static void player_bar(Ctx& c) {
     }
     if (!has_artist && !has_album) c.ui.muted_text("选择一首歌曲开始播放", {tx, y + 35, tw, 16}, Style().font(10.5f));
     std::string status = c.s.now_quality;
-    if (busy) status = c.s.pending_paused ? "已暂停，准备完成后等待播放" : c.s.ps == PlayState::Buffering ? "缓冲 " + std::to_string(int(c.s.buffer * 100)) + "%" : "正在解析…";
+    if (busy) status = c.s.pending_paused ? "已暂停，准备完成后等待播放" : std::string(playback_stage_name(c.s.stage)) +
+        (c.s.stage == PlaybackStage::Downloading ? " " + std::to_string(int(c.s.buffer * 100)) + "%" : "…");
+    else if (c.s.ps == PlayState::Playing && c.s.stage == PlaybackStage::Buffering) status = "正在缓冲 · 已缓冲 " + std::to_string(c.s.buffered_ms) + " ms";
     else if (c.s.ps == PlayState::Failed) status = "播放失败 · 点击播放重试：" + c.s.error;
     c.ui.tooltip(cover, status);
     auto* selection = row_selection; row_selection = nullptr;
@@ -2500,6 +2549,9 @@ static void lyrics_panel(Ctx& c, const Rect& box) {
     const auto& doc = c.model.lyrics.doc;
     const auto& uid = c.model.lyrics.uid;
     const bool loading = c.model.lyrics.loading;
+    c.ui.draw_text("桌面歌词", {box.x + 16, box.y + 2, box.w - 90, 28}, c.th.label2, Style().font(11));
+    bool floating = c.model.ui.lyric_overlay.enabled;
+    if (c.ui.toggle(&floating, {box.right() - 54, box.y + 5, 38, 22})) set_floating_lyrics_enabled(floating);
 
     static bool show_translation = true;
     bool has_translation = doc && std::any_of(doc->lines.begin(), doc->lines.end(), [](const auto& line) { return !line.translation.empty(); });
@@ -2507,7 +2559,7 @@ static void lyrics_panel(Ctx& c, const Rect& box) {
     const Rect tools_button{box.right() - 64, box.bottom() - 28, 54, 24};
     if (c.ui.button(c.model.ui.lyric_tools ? "收起" : "校准", tools_button, Style().ghost().font(10))) c.model.ui.lyric_tools = !c.model.ui.lyric_tools;
     const float extra = c.model.ui.lyric_tools ? 126.0f : 0.0f;
-    const Rect area{box.x + 8, box.y + 4, box.w - 16, std::max(20.0f, box.h - 36 - extra)};
+    const Rect area{box.x + 8, box.y + 38, box.w - 16, std::max(20.0f, box.h - 70 - extra)};
     const int offset = lyric_offset();
     if (c.model.ui.lyric_tools) {
         const float x = box.x + 16, y = box.bottom() - 150, w = box.w - 32;

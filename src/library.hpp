@@ -82,6 +82,8 @@ public:
     const music::Track* data() const { return data_->data(); }
     const_iterator begin() const { return data_->begin(); }
     const_iterator end() const { return data_->end(); }
+    const_iterator cbegin() const { return data_->cbegin(); }
+    const_iterator cend() const { return data_->cend(); }
     iterator begin() { return edit().begin(); }
     iterator end() { return edit().end(); }
     void reserve(size_t count) { edit().reserve(count); }
@@ -96,6 +98,11 @@ public:
         return tracks.erase(tracks.cbegin() + a, tracks.cbegin() + b);
     }
     iterator erase(const_iterator item) { return erase(item, item + 1); }
+    iterator insert(const_iterator at, music::Track track) {
+        const auto offset = at - data_->cbegin();
+        auto& tracks = edit();
+        return tracks.insert(tracks.cbegin() + offset, std::move(track));
+    }
     template<class It> iterator insert(const_iterator at, It first, It last) {
         const auto offset = at - data_->cbegin();
         auto& tracks = edit();

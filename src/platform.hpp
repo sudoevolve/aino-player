@@ -15,6 +15,7 @@
 #include <codecvt>
 #include <locale>
 #include <mutex>
+#include <condition_variable>
 #include <algorithm>
 #include <memory>
 #include <utility>
@@ -741,6 +742,62 @@ inline std::string sha256_file(const std::string& path) {
 }
 inline bool deb_installer_available() {
     return ::access("/usr/bin/pkexec", X_OK) == 0 && ::access("/usr/bin/apt-get", X_OK) == 0;
+}
+enum class PackageChannel { Portable, Apt, Dnf, Pacman };
+// 查询实际可执行文件的归属，不能只凭发行版名称把便携版当成系统安装。
+inline PackageChannel package_channel() {
+    std::error_code ec;
+    const auto executable = fs::canonical("/proc/self/exe", ec).u8string();
+    if (ec) return PackageChannel::Portable;
+    const auto owned = [&](std::vector<std::string> args, const std::string& expected) {
+        PipeProcess process;
+        if (!process.start(args)) return false;
+        process.finish_input();
+        struct Deadline {
+            PipeProcess& process;
+            std::mutex mutex;
+            std::condition_variable cv;
+            bool done = false;
+            std::thread thread;
+            explicit Deadline(PipeProcess& child) : process(child), thread([this] {
+                std::unique_lock<std::mutex> lock(mutex);
+                if (!cv.wait_for(lock, std::chrono::seconds(2), [this] { return done; })) process.terminate();
+            }) {}
+            ~Deadline() {
+                { std::lock_guard<std::mutex> lock(mutex); done = true; }
+                cv.notify_one(); thread.join();
+            }
+        } deadline(process);
+        std::string result;
+        std::array<char, 256> bytes{};
+        while (const auto n = process.read(bytes.data(), bytes.size())) {
+            if (result.size() + n > 4096) { process.terminate(); return false; }
+            result.append(bytes.data(), n);
+        }
+        if (process.wait() != 0) return false;
+        return result == expected || result == expected + "\n" || result == expected + "\r\n";
+    };
+    if (::access("/usr/bin/dpkg-query", X_OK) == 0 &&
+        owned({"/usr/bin/dpkg-query", "-S", executable}, "aino-player: " + executable)) return PackageChannel::Apt;
+    if (::access("/usr/bin/rpm", X_OK) == 0 &&
+        owned({"/usr/bin/rpm", "-qf", "--qf", "%{NAME}", executable}, "aino-player")) return PackageChannel::Dnf;
+    if (::access("/usr/bin/pacman", X_OK) == 0 &&
+        owned({"/usr/bin/pacman", "-Qqo", executable}, "aino-player")) return PackageChannel::Pacman;
+    return PackageChannel::Portable;
+}
+inline const char* package_suffix() {
+    if (::access("/usr/bin/pacman", X_OK) == 0) return "-x86_64.pkg.tar.zst";
+    if (::access("/usr/bin/dnf", X_OK) == 0) return ".x86_64.rpm";
+    if (::access("/usr/bin/apt-get", X_OK) == 0) return "_amd64.deb";
+    return "";
+}
+inline const char* package_update_command(PackageChannel channel) {
+    switch (channel) {
+        case PackageChannel::Apt: return "sudo apt update && sudo apt install --only-upgrade aino-player";
+        case PackageChannel::Dnf: return "sudo dnf upgrade --refresh aino-player";
+        case PackageChannel::Pacman: return "sudo pacman -Syu";
+        default: return "";
+    }
 }
 // 系统授权窗口负责提权；按 argv 覆盖安装，禁止移除其他包。开始安装后不强杀 dpkg。
 inline int install_deb(const std::string& path, const std::string& log_path) {

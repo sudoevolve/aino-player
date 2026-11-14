@@ -4,7 +4,14 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include <cstddef>
+#include <array>
 namespace audio {
+struct EqualizerSettings {
+    bool enabled = false;
+    std::array<int, 10> gains_db{};
+    int preamp_db = 0;
+};
 struct MediaInfo {
     bool valid = false;
     int bitrate_kbps = 0;
@@ -41,6 +48,7 @@ public:
     void cancel();
     bool failed() const;
     bool buffering() const;
+    long long buffered_ms() const;
     std::string error() const;
 private:
     Stream();
@@ -50,12 +58,16 @@ private:
 };
 class Player {
 public:
-    Player();
+    explicit Player(bool offline = false);
     ~Player();
     Player(const Player&) = delete;
     Player& operator=(const Player&) = delete;
     bool open(const std::string& path);
     bool open_stream(std::shared_ptr<Stream> stream);
+    /** @brief 为当前音频预备本地下一曲，在音频回调内跨越边界，无需等待 UI 帧。 */
+    bool queue_next(const std::string& path);
+    void cancel_next();
+    bool take_transition();
     void close();
     /** @brief 在所属线程退出 COM 前释放声音及音频引擎；普通切歌仍使用 close。 */
     void shutdown();
@@ -66,10 +78,15 @@ public:
     bool is_ended() const;
     bool stream_failed() const;
     bool buffering() const;
+    long long buffered_ms() const;
     long long position_ms() const;
     long long duration_ms() const;
     void seek_ms(long long ms);
     void set_volume(int volume);
+    void set_normalization(bool enabled);
+    void set_equalizer(const EqualizerSettings& settings);
+    /** @brief 离线引擎按 48 kHz 双声道 float 输出；普通设备模式不能调用。 */
+    bool render(float* samples, size_t frames);
     /** @brief 关闭当前引擎并选择设备；空 ID 跟随系统默认，下次 open 时初始化。 */
     void set_device(const std::string& id);
     /** @brief 读取设备通知，UI 线程据此恢复播放，音频回调不接触业务状态。 */

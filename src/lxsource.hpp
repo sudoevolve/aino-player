@@ -307,6 +307,8 @@ public:
     void retire() { retired_.store(true); }
     bool retired() const { return retired_.load(); }
     bool playback_waiting() const { return foreground_.load() != 0; }
+    unsigned long long last_used() const { return last_used_.load(); }
+    bool resident() const { return resident_.load(); }
 
     const Decl* find(const std::string& key) const {
         for (const auto& d : sources_)
@@ -373,7 +375,7 @@ public:
     void close();
 
     // 只由后台维护调用，忙碌的脚本直接跳过，避免 GC 阻塞点播或 UI。
-    void collect_idle() {
+    void collect_idle(bool release_runtime = false, unsigned long long idle_ms = 60000) {
         if (foreground_.load() || retired()) return;
         std::unique_lock<std::timed_mutex> lock(execution_, std::try_to_lock);
         if (!lock || !rt_ || foreground_.load() || retired()) return;
@@ -384,6 +386,16 @@ public:
             else ++it;
         }
         JS_RunGC(rt_);
+        if (release_runtime && !foreground_.load() && platform::ticks() >= last_used_.load() + idle_ms) {
+            // 只释放执行环境，声明、排序、测速和健康状态仍有效；下次请求重新初始化令牌。
+            close_locked();
+        }
+    }
+    size_t runtime_bytes() {
+        std::unique_lock<std::timed_mutex> lock(execution_, std::try_to_lock);
+        if (!lock || !rt_) return 0;
+        JS_UpdateStackTop(rt_); JSMemoryUsage usage{}; JS_ComputeMemoryUsage(rt_, &usage);
+        return size_t(usage.memory_used_size);
     }
 
     // 调试用：在脚本上下文里跑一段代码，把结果当字符串返回（失败返回错误文本）
@@ -427,6 +439,8 @@ private:
         ~Operation() { detail::current = previous; }
     };
     bool eval(const std::string& code, const char* name, std::string& err);
+    void close_locked();
+    bool wake_runtime(std::string& error);
     int pump(std::string& err);
     void clear_tasks() {
         // 仅结束当前取流作用域，保留脚本初始化创建的令牌和更新任务。
@@ -444,6 +458,8 @@ private:
     std::timed_mutex execution_;
     std::atomic<bool> retired_{false};
     std::atomic<unsigned> foreground_{0};
+    std::atomic<unsigned long long> last_used_{0};
+    std::atomic<bool> resident_{false};
     JSRuntime* rt_ = nullptr;
     JSContext* ctx_ = nullptr;
     JSValue handlers_ = JS_UNDEFINED;
@@ -951,6 +967,9 @@ inline void Script::on_send(const std::string& event, const std::string& json) {
 
 inline void Script::close() {
     std::lock_guard<std::timed_mutex> lock(execution_);
+    close_locked();
+}
+inline void Script::close_locked() {
     for (auto& task : http_) task.second.cancel->store(true);
     http_.clear(); // 网络线程只持有自身请求，退出后再释放运行时。
     if (ctx_) {
@@ -965,6 +984,34 @@ inline void Script::close() {
         JS_FreeRuntime(rt_);
         rt_ = nullptr;
     }
+    resident_.store(false);
+}
+
+inline bool Script::wake_runtime(std::string& error) {
+    if (ctx_) return true;
+    std::ifstream file(std::filesystem::u8path(info_.file), std::ios::binary);
+    if (!file) { error = "音源文件已移动，请重新导入"; return false; }
+    std::string code;
+    std::array<char, 8192> bytes{};
+    while (file && !net::cancelled()) {
+        file.read(bytes.data(), bytes.size()); code.append(bytes.data(), size_t(file.gcount()));
+        if (code.size() > 8u * 1024u * 1024u) break;
+    }
+    if (net::cancelled()) { error = "音源唤醒已取消"; return false; }
+    if (file.bad() || detail::md5_hex(code) != info_.fingerprint) {
+        error = "音源文件已变化，请重新加载音源"; return false;
+    }
+    Script loaded;
+    if (!loaded.load(info_.file, code, error) || !loaded.init(error)) return false;
+    // 声明发布后不可改写；动态初始化若改变能力，要求显式重载，避免 UI 并发读取悬空数据。
+    if (loaded.sources_.size() != sources_.size()) { error = "音源能力已变化，请重新加载"; return false; }
+    for (size_t i = 0; i < sources_.size(); ++i)
+        if (loaded.sources_[i].key != sources_[i].key || loaded.sources_[i].qualitys != sources_[i].qualitys ||
+            loaded.sources_[i].actions != sources_[i].actions) { error = "音源能力已变化，请重新加载"; return false; }
+    std::swap(rt_, loaded.rt_); std::swap(ctx_, loaded.ctx_); std::swap(handlers_, loaded.handlers_);
+    http_.swap(loaded.http_); std::swap(next_http_, loaded.next_http_);
+    resident_.store(true);
+    return true;
 }
 
 inline bool Script::eval(const std::string& code, const char* name, std::string& err) {
@@ -992,6 +1039,7 @@ inline bool Script::load(const std::string& path, const std::string& script, std
 
     rt_ = JS_NewRuntime();
     if (!rt_) { err = "创建 JS 运行时失败"; return false; }
+    resident_.store(true); last_used_.store(platform::ticks());
     JS_SetMemoryLimit(rt_, 512u * 1024u * 1024u);
     JS_SetInterruptHandler(rt_, detail::interrupt_cb, nullptr);
 
@@ -1188,7 +1236,9 @@ inline bool Script::music_url(const std::string& platform, const std::string& qu
     } priority(foreground_, !background);
     Operation operation(*this, background ? 6500 : 12000);
     if (!operation) { err = "脚本繁忙、已移除或取流超时"; return false; }
-    if (!ctx_ || !inited_) { err = "脚本未就绪"; return false; }
+    last_used_.store(platform::ticks());
+    if (!inited_ || !wake_runtime(err)) { if (err.empty()) err = "脚本未就绪"; return false; }
+    detail::current = this;
     JS_UpdateStackTop(rt_);   // 同上：解析常常发生在别的线程
     if (!eval("__lxBeginRequest()", "<begin-request>", err)) return false;
     struct Tasks { Script& script; ~Tasks() { script.clear_tasks(); } } tasks{*this};
@@ -1345,7 +1395,7 @@ public:
         }
         if (!ok) { if (!path.empty()) platform::remove(path + ".tmp"); error = "保存音源顺序失败，顺序未改变"; return false; }
         std::lock_guard<std::mutex> lock(mu_);
-        manual_order_ = std::move(order); fixed_source_ = {}; ++revision_;
+        manual_order_ = std::move(order); fixed_source_ = {}; ++revision_; ++routing_revision_;
         return true;
     }
     FixedSource fixed_source() const { std::lock_guard<std::mutex> lock(mu_); return fixed_source_; }
@@ -1375,6 +1425,7 @@ public:
             if (best.file.empty() || (!manual_order_.empty() && position(choice.file) < position(best.file)) ||
                 (position(choice.file) == position(best.file) && fixed_source_better(choice, best))) best = std::move(choice);
         }
+        if (replace && fixed_source_.file != best.file) ++routing_revision_;
         fixed_source_ = best;
         ++revision_;
         return fixed_source_;
@@ -1384,7 +1435,7 @@ public:
         const auto signature = detail::md5_hex(network);
         std::lock_guard<std::mutex> lock(mu_);
         if (!network_hash_.empty() && network_hash_ != signature) {
-            timings_.clear(); health_.clear(); song_failures_.clear(); platform_retry_at_.clear(); ++revision_;
+            timings_.clear(); health_.clear(); song_failures_.clear(); platform_retry_at_.clear(); ++revision_; ++routing_revision_;
         }
         network_hash_ = signature;
     }
@@ -1510,7 +1561,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(mu_);
             removed_ = std::move(next);
-            ++revision_;
+            ++revision_; ++routing_revision_;
             runtime_errors_.erase(name);
             health_.erase(name);
             timings_.erase(name);
@@ -1535,12 +1586,20 @@ public:
         return preferences_error_;
     }
     unsigned revision() const { return revision_.load(); }
+    // 预加载仅随路由配置失效；自身测速和健康状态更新不得取消已准备的下一曲。
+    unsigned routing_revision() const { return routing_revision_.load(); }
     void set_restoring(bool value) { restoring_.store(value); }
     bool restoring() const { return restoring_.load(); }
-    void collect_idle() {
+    void collect_idle(const std::string& active_name = {}) {
         std::vector<std::shared_ptr<Script>> scripts;
         { std::lock_guard<std::mutex> lock(mu_); scripts = list_; }
-        for (const auto& script : scripts) { if (net::cancelled()) break; script->collect_idle(); }
+        std::stable_sort(scripts.begin(), scripts.end(), [](const auto& a, const auto& b) { return a->last_used() > b->last_used(); });
+        size_t kept = 0;
+        for (const auto& script : scripts) {
+            if (net::cancelled()) break;
+            const bool keep = script->info().name == active_name || (script->resident() && kept++ < 2);
+            script->collect_idle(!keep);
+        }
     }
     std::map<std::string, std::map<std::string, std::string>> runtime_errors() const {
         std::lock_guard<std::mutex> lock(mu_);
@@ -1887,7 +1946,7 @@ private:
         };
         {
             background::ThreadGroup pool;
-            const int threads = std::min<int>(6, int(files.size()));
+            const int threads = std::min<int>(3, int(files.size()));
             for (int t = 0; t < threads; ++t) pool.emplace_back(worker);
             pool.join();
         }
@@ -1920,7 +1979,7 @@ private:
             list_.swap(new_list);
             for (const auto& old : new_list)
                 if (std::find(list_.begin(), list_.end(), old) == list_.end()) old->retire();
-            ++revision_;
+            ++revision_; ++routing_revision_;
             failed_.swap(new_failed);
             for (const auto& file : files) { runtime_errors_.erase(file_key(file)); health_.erase(file_key(file)); timings_.erase(file_key(file)); }
             for (const auto& file : files) {
@@ -2115,6 +2174,7 @@ private:
     FixedSource fixed_source_; // mu_；仅启动选择、手动重选或移除后重选，不随播放失败改变。
     bool preferences_valid_ = true;
     std::atomic<unsigned> revision_{0};
+    std::atomic<unsigned> routing_revision_{0};
     std::mutex load_mu_;             // 串行化 load_dir（网络在锁外，见 load_dir 注释）
     std::atomic<bool> busy_{false};  // 正在后台加载
     std::atomic<bool> restoring_{false};
