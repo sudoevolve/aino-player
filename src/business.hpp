@@ -191,7 +191,7 @@ struct UiState {
 
     // 外观
     bool dark = false;
-    bool close_to_tray = false, tray_enabled = true, window_hidden = false;
+    bool tray_enabled = true, window_hidden = false;
     int close_behavior = 0; // 0 询问，1 到托盘，2 退出；旧版 bool 仅保留配置兼容。
     bool close_dialog = false, close_remember = false;
     bool media_available = false, tray_available = false;
@@ -599,7 +599,7 @@ static std::array<int, music::kSourceCount> g_search_pages{};
 static std::array<std::string, music::kSourceCount> g_search_continuation, g_search_page_input;
 static SearchRequest g_pending_search; // g_mu；只保留最新的待执行搜索。
 static bool g_search_worker = false;
-// 界面希望的刷新节奏（帧/秒）：0 = 不用动，30 = 有进度要跟，60 = 歌词在滚动
+// 基础刷新节奏由 tick 设置；歌词滚动另按需请求动画帧。
 static std::atomic<int> g_fps_hint{0};
 static std::atomic<int> g_frame_ms_x10{100};
 static std::atomic<unsigned long long> g_sleep_deadline{0};
@@ -3026,7 +3026,7 @@ static void refresh_snapshot(Snapshot& snap) {
 }
 
 // =============================================================================
-//  五、界面
+//  资料库写入与操作
 // =============================================================================
 
 // 已发布的资料库只读；所有修改由一个写入任务合并、原子保存后发布。

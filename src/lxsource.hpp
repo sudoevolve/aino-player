@@ -99,7 +99,7 @@ inline const char* quality_key(int q) {
 
 namespace detail {
 
-inline thread_local Script* current = nullptr;  // 供 C 回调取回当前脚本  // 供 C 回调取回当前脚本
+inline thread_local Script* current = nullptr;  // 供 C 回调取回当前脚本
 
 inline std::string from_js(JSContext* ctx, JSValueConst v);
 
