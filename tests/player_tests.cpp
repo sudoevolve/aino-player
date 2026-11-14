@@ -431,6 +431,20 @@ int main(int argc, char** argv) {
             const auto metadata = tag::read_metadata(id3_path);
             check(metadata.title == "中文标题" && metadata.artist == "Artist" && metadata.cover == "PNG-data", "ID3 text encoding and embedded front cover");
             check(tag::read_metadata(id3_path,false).cover.empty(), "cover extraction can be disabled");
+            {
+                std::string error;
+                auto scanned = library::scan_folder(dir, false, error);
+                check(error.empty() && scanned.files.count(id3_path), "incremental scan records file stamp");
+                for (auto& track : scanned.tracks) if (track.current().id == id3_path) track.title = "cached metadata";
+                auto unchanged = library::scan_folder(dir, false, error, {}, &scanned);
+                auto found = std::find_if(unchanged.tracks.begin(), unchanged.tracks.end(), [&](const auto& track) { return track.current().id == id3_path; });
+                check(error.empty() && found != unchanged.tracks.end() && found->title == "cached metadata", "unchanged scan reuses metadata");
+                write_metadata("tagged.mp3", id3 + "changed-size");
+                auto changed = library::scan_folder(dir, false, error, {}, &scanned);
+                auto updated = std::find_if(changed.tracks.begin(), changed.tracks.end(), [&](const auto& track) { return track.current().id == id3_path; });
+                check(error.empty() && updated != changed.tracks.end() && updated->title == metadata.title, "changed file invalidates cached metadata");
+                check(found->title == "cached metadata", "rescan preserves previous snapshot");
+            }
             std::string comments;
             auto le = [](std::string& bytes,uint32_t n) { for (int i=0;i<4;++i) bytes += char(n >> (i*8)); };
             le(comments,0); le(comments,2);
@@ -559,6 +573,9 @@ int main(int argc, char** argv) {
             check(library::write_m3u(local, m3u, error), "write relative local M3U8");
             auto restored = library::read_m3u(m3u, error);
             check(error.empty() && restored.tracks.size() == 1 && library::local_path_key(platform::fs::u8path(restored.tracks.front().current().id)) == library::local_path_key(platform::fs::absolute(platform::fs::u8path(audio_file))), "relative M3U8 roundtrip");
+            auto* unsafe = platform::fopen(m3u, "wb");
+            check(unsafe != nullptr, "M3U URL fixture"); std::fputs("#EXTM3U\nhttps://example.test/music.mp3\n", unsafe); std::fclose(unsafe);
+            check(library::read_m3u(m3u, error).tracks.empty() && !error.empty(), "M3U import rejects remote audio");
             platform::remove(m3u);
         }
         platform::remove(file); platform::remove(dir);
