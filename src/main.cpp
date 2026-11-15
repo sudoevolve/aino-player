@@ -247,6 +247,7 @@ int main(int argc, char** argv) {
     }
 #endif
     if (!smoke_test) {
+        desktop.set_shortcuts(startup_ui.shortcuts);
 #ifdef _WIN32
         desktop.start(window_handle, nullptr, 0, [&win] { win.wake(); });
 #else
@@ -303,6 +304,7 @@ int main(int argc, char** argv) {
             state.volume = int(model.ui.volume); state.shuffle = model.ui.play_mode == PlayMode::Shuffle;
             state.loop = model.ui.play_mode == PlayMode::RepeatOne ? 2 : model.ui.play_mode == PlayMode::RepeatAll ? 1 : 0;
             state.can_seek = !state.uid.empty() && state.duration_ms > 0;
+            desktop.set_shortcuts(startup_ui.shortcuts);
             desktop.update(state, model.ui.tray_enabled);
             const auto lyric_text = floating_lyric_text();
             const auto lyric_progress = floating_lyric_progress();

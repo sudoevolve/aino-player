@@ -82,6 +82,14 @@ struct LyricOverlaySettings {
 struct LyricOverlayProgress { float first = -1, second = -1; }; // -1 无时间轴，不显示进度填充。
 using LyricPainter = std::function<void(uint8_t*, int, int, float, void*)>;
 /** @brief 桌面媒体与托盘边界；只向 UI 线程排事件，不从系统回调直接操作播放器。 */
+struct ShortcutSettings {
+    bool enabled = true;
+    std::array<int, 4> keys{{0, 1, 2, 3}}, modifiers{{0, 0, 0, 0}};
+    bool operator==(const ShortcutSettings& s) const { return enabled == s.enabled && keys == s.keys && modifiers == s.modifiers; }
+};
+inline const std::vector<std::string>& shortcut_keys() { static const std::vector<std::string> names{"Space", "Left", "Right", "L", "P", "B", "N", "D", "F7", "F8", "F9", "F10", "F11", "F12", "停用"}; return names; }
+inline const std::vector<std::string>& shortcut_modifiers() { static const std::vector<std::string> names{"Ctrl+Alt", "Ctrl+Shift", "Alt+Shift", "Ctrl+Alt+Shift"}; return names; }
+inline std::string shortcut_label(const ShortcutSettings& s, int i) { return s.keys[size_t(i)] == 14 ? "停用" : shortcut_modifiers()[size_t(std::clamp(s.modifiers[size_t(i)], 0, 3))] + "+" + shortcut_keys()[size_t(std::clamp(s.keys[size_t(i)], 0, 14))]; }
 class Desktop {
 public:
     Desktop();
@@ -91,6 +99,7 @@ public:
     void start(void* window, void* display, unsigned long xid, std::function<void()> wake);
     void stop();
     void update(const MediaState& state, bool tray_enabled);
+    void set_shortcuts(const ShortcutSettings& settings);
     std::vector<MediaEvent> events();
     bool tray_available() const;
     bool media_available() const;
@@ -569,7 +578,7 @@ private:
 };
 // 由专用 STA 工作线程调用；取消计时器也在该 apartment 关闭对话框。
 #ifdef _WIN32
-struct FolderPickerCancel { IFileOpenDialog* dialog; const std::atomic<bool>* cancelled; };
+struct FolderPickerCancel { IFileDialog* dialog; const std::atomic<bool>* cancelled; };
 inline void CALLBACK cancel_folder_picker(HWND window, UINT, UINT_PTR, DWORD) {
     const auto* state = reinterpret_cast<const FolderPickerCancel*>(GetWindowLongPtrW(window, GWLP_USERDATA));
     if (state && state->cancelled->load()) state->dialog->Close(HRESULT_FROM_WIN32(ERROR_CANCELLED));
@@ -588,18 +597,22 @@ inline std::string choose_music_folder(void* owner, const std::atomic<bool>& can
 #ifdef _WIN32
     const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(initialized)) { error = "无法初始化文件夹选择器"; return {}; }
-    IFileOpenDialog* dialog = nullptr;
-    HRESULT result = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
+    IFileDialog* dialog = nullptr;
+    HRESULT result = CoCreateInstance(kind == 4 ? CLSID_FileSaveDialog : CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
     if (FAILED(result)) { CoUninitialize(); error = "无法创建文件夹选择器"; return {}; }
     DWORD options = 0;
     result = dialog->GetOptions(&options);
-    if (SUCCEEDED(result)) result = dialog->SetOptions(options | (folder ? FOS_PICKFOLDERS : FOS_FILEMUSTEXIST)
+    if (SUCCEEDED(result)) result = dialog->SetOptions(options | (folder ? FOS_PICKFOLDERS : kind == 4 ? FOS_OVERWRITEPROMPT : FOS_FILEMUSTEXIST)
         | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR
         | (multi && !folder ? FOS_ALLOWMULTISELECT : 0));
     if (SUCCEEDED(result)) result = dialog->SetTitle(folder ? L"选择音乐文件夹"
-                                                    : (kind == 2 ? L"选择音源脚本（.js）" : kind == 1 ? L"打开本地音乐" : L"选择本地歌词"));
+                                                    : (kind == 2 ? L"选择音源脚本（.js）" : kind == 1 ? L"打开本地音乐" : kind == 3 ? L"恢复歌单备份" : kind == 4 ? L"导出歌单备份" : L"选择本地歌词"));
     if (!folder && SUCCEEDED(result)) {
-        if (kind == 2) {
+        if (kind == 3 || kind == 4) {
+            const COMDLG_FILTERSPEC filters[]{{L"歌单备份", L"*.json;*.m3u;*.m3u8"}, {L"所有文件", L"*.*"}};
+            result = dialog->SetFileTypes(2, filters);
+            if (kind == 4) { dialog->SetDefaultExtension(L"json"); dialog->SetFileName(L"aino-backup.json"); }
+        } else if (kind == 2) {
             const COMDLG_FILTERSPEC filters[]{{L"音源脚本 (*.js)", L"*.js"}, {L"所有文件", L"*.*"}};
             result = dialog->SetFileTypes(2, filters);
         } else if (kind == 1) {
@@ -620,7 +633,7 @@ inline std::string choose_music_folder(void* owner, const std::atomic<bool>& can
     if (SUCCEEDED(result) && !cancelled.load()) {
         if (multi && !folder) {
             IShellItemArray* items = nullptr;
-            result = dialog->GetResults(&items);
+            result = static_cast<IFileOpenDialog*>(dialog)->GetResults(&items);
             if (SUCCEEDED(result)) {
                 DWORD count = 0;
                 if (SUCCEEDED(items->GetCount(&count))) {

@@ -457,7 +457,20 @@ int main(int argc, char** argv) {
         check(queue_save(), "multipart queue save"); queue_load(); tick();
         check(model.playback.tracks.size() == 2 && model.playback.tracks[1].current().native_id == "202" &&
             track_uid(model.playback.tracks[0]) != track_uid(model.playback.tracks[1]), "queue reload retains part identity and current-song highlighting");
-        g_undo.clear(); queue_remove(1); undo_last_action(); tick();
+        { std::lock_guard<std::mutex> lock(g_mu);
+          g_play_next = {track_uid(part2)}; g_shuffle_remaining = {track_uid(part2), track_uid(part1)};
+          g_shuffle_history = {track_uid(part1)}; g_shuffle_cursor = 0; }
+        g_undo.clear(); queue_remove(1);
+        const auto first_undo_id = g_undo.back().id;
+        tick();
+        check(!undo_action_label(first_undo_id).empty(), "toast undo ID identifies its own queue operation");
+        toast("unrelated operation"); tick();
+        check(notifications().front().undo_id == 0, "unrelated toast cannot advertise an older undo");
+        undo_last_action(); tick();
+        { std::lock_guard<std::mutex> lock(g_mu);
+          check(g_play_next == std::deque<std::string>{track_uid(part2)} && g_shuffle_remaining.size() == 2 && g_shuffle_history.size() == 1 && g_shuffle_cursor == 0,
+            "queue undo restores explicit-next and shuffle history atomically"); }
+        check(undo_action_label(first_undo_id).empty(), "consumed operation cannot be undone through an old toast");
         check(model.playback.tracks.size() == 2 && model.playback.tracks[1].current().native_id == "202", "queue removal undo retains part identity and order");
         queue_move(0, 1); undo_last_action(); tick();
         check(model.playback.tracks[0].current().native_id == "101", "queue reorder can be undone");
@@ -584,6 +597,10 @@ int main(int argc, char** argv) {
         while (!model.ui.restore_preview_open && platform::ticks() < restore_deadline) { tick(); platform::sleep_ms(5); }
         check(model.ui.restore_preview_open && view_model().library.playlists[1].name == "预览期间的名称", "restore preview cannot write before confirmation");
         model.ui.restore_favorites = false; model.ui.restore_playlists = true;
+        for (auto& row : model.ui.restore_rows) row.selected = false;
+        confirm_library_restore(); wait_library();
+        check(model.ui.restore_preview_open && view_model().library.playlists[1].name == "预览期间的名称", "unselected playlists cannot be restored by category alone");
+        for (auto& row : model.ui.restore_rows) row.selected = true;
         confirm_library_restore(); wait_library();
         check(view_model().library.playlists[1].name == "重命名歌单" && view_model().library.contains(track), "selective restore replaces playlists and preserves unselected favorites");
         model.ui.pause_on_disconnect = false; model.ui.resume_after_suspend = true;
@@ -726,6 +743,94 @@ int main(int argc, char** argv) {
             "playback diagnostics exclude credentials, paths and links");
         check(restored.play_mode == PlayMode::Shuffle && !restored.sleep_deadline && !restored.sleep_after_track, "play mode persists without restoring a timer");
         check(view_model().library.contains(track), "logout preserves local library");
+        // 十二项体验审查：离线夹具，不请求音乐平台或真实音频设备。
+        check(cover::Store::retry_allowed(0, 0, 0) && !cover::Store::retry_allowed(1, 5000, 4999) &&
+            cover::Store::retry_allowed(2, 30000, 30000) && !cover::Store::retry_allowed(3, 0, 999999), "cover retries have backoff and a hard attempt limit");
+        check(music::catalog_supported(music::Source::Netease) && music::catalog_supported(music::Source::QQ) &&
+            !music::catalog_supported(music::Source::Migu), "catalog capabilities match implemented platform directories");
+        {
+            auto removed = scanned.tracks[0]; removed.variants[0].id += ".not-in-queue";
+            { std::lock_guard<std::mutex> lock(g_mu); g_as.now_track = removed; g_as.now_uid = track_uid(removed);
+              g_as.playing = -1; g_as.ps = PlayState::Resolving; g_as.position_ms = 12345; g_play_ready_paused = true; }
+            select_output_device("");
+            { std::lock_guard<std::mutex> lock(g_mu);
+              check(g_as.now_uid == track_uid(removed) && g_as.playing == -1 && g_as.position_ms == 12345 && g_play_ready_paused,
+                "device change restores removed current track by identity, position and pending pause state");
+              ++g_as.gen; g_play_generation.store(g_as.gen); g_as.ps = PlayState::Idle; }
+            const int generation = g_as.gen; select_output_device("");
+            check(g_as.gen == generation, "device change does not autoplay an inactive saved track");
+        }
+        {
+            auto token = std::make_shared<std::atomic<bool>>(false); const auto uid = track_uid(track);
+            { std::lock_guard<std::mutex> lock(g_dlm); DlItem item; item.track = track; item.created_at = 111;
+              item.path = platform::join(model.paths.config, "moved-file.mp3"); g_dls[uid] = item; g_download_cancel[uid] = token; }
+            const auto disk_revision = g_download_persist_revision, ui_revision = g_download_revision;
+            dl_set(uid, 12, 0, {}, token);
+            check(g_download_revision > ui_revision && g_download_persist_revision == disk_revision, "progress-only updates cannot trigger downloads.json rewrites");
+            dl_set(uid, 0, 2, "fixture failure", token);
+            check(g_download_persist_revision > disk_revision && g_dls.at(uid).finished_at > 0, "terminal download states persist completion time");
+            { std::lock_guard<std::mutex> lock(g_dlm); auto& item = g_dls[uid]; item.done = true; item.failed = false; item.bytes = 123; item.finished_at = 222; g_download_cancel.erase(uid); download_changed(); }
+            downloads_save(true);
+            { std::lock_guard<std::mutex> lock(g_dlm); g_dls.clear(); } downloads_load();
+            check(g_dls.at(uid).missing && !g_dls.at(uid).done && g_dls.at(uid).bytes == 123 && g_dls.at(uid).created_at == 111 && g_dls.at(uid).finished_at == 222,
+                "moved completed downloads retain identity, timestamps and expected size");
+            downloads_save(true); { std::lock_guard<std::mutex> lock(g_dlm); g_dls.clear(); } downloads_load();
+            check(g_dls.at(uid).missing, "missing completed download remains relocatable after repeated restarts");
+        }
+        {
+            begin_playlist_add({track, track}); model.ui.playlist_add_name = "审查歌单"; confirm_playlist_add(); wait_library();
+            const auto key = g_library->playlists.back().key;
+            check(g_library->playlists.back().tracks.size() == 1, "new playlist batch creation deduplicates songs");
+            begin_playlist_add({track}); model.ui.playlist_add_key = key; confirm_playlist_add(); wait_library();
+            check(g_library->playlists.back().tracks.size() == 1, "adding to an existing playlist skips duplicates");
+            const auto count = g_library->playlists[1].tracks.size();
+            begin_playlist_add({track}); model.ui.playlist_add_key = g_library->playlists[1].key; confirm_playlist_add(); wait_library();
+            check(g_library->playlists[1].tracks.size() == count, "watched folder playlist cannot accept unrelated song insertion");
+        }
+        {
+            const auto uid = track_uid(track);
+            library_edit([uid](auto& lib) { lib.lyric_preferences[uid].offset_ms = 123; }); wait_library();
+            g_undo.clear(); g_restore_library = std::make_shared<library::Library>(*g_library);
+            g_restore_library->lyric_preferences[uid].offset_ms = 789; g_restore_epoch = g_library_epoch;
+            model.ui.restore_favorites = true; model.ui.restore_playlists = model.ui.restore_settings = model.ui.restore_equalizer = model.ui.restore_sources = false;
+            confirm_library_restore(); wait_library();
+            check(g_library->lyric_preferences.at(uid).offset_ms == 789 && !g_undo.empty(), "restore of lyrics alone creates an undo record");
+            const auto undo_id = g_undo.back().id;
+            const auto original_path = library_path(), displaced_path = original_path + ".audit-held";
+            check(platform::replace_file(original_path, displaced_path) && platform::make_dirs(original_path), "save failure fixture protects original library");
+            undo_last_action(); wait_library();
+            check(!g_undo_busy && !undo_action_label(undo_id).empty() && g_library->lyric_preferences.at(uid).offset_ms == 789,
+                "failed undo save retains both durable data and retryable undo");
+            platform::remove(original_path); check(platform::replace_file(displaced_path, original_path), "restore protected library fixture");
+            undo_last_action(); wait_library();
+            check(g_library->lyric_preferences.at(uid).offset_ms == 123 && undo_action_label(undo_id).empty(), "retry commits lyric preference undo transactionally");
+            // 此后发生的歌词修改不能被旧撤销覆盖。
+            g_restore_library = std::make_shared<library::Library>(*g_library); g_restore_library->lyric_preferences[uid].offset_ms = 456;
+            g_restore_epoch = g_library_epoch; confirm_library_restore(); wait_library();
+            library_edit([uid](auto& lib) { lib.lyric_preferences[uid].offset_ms = 999; }); wait_library();
+            undo_last_action(); wait_library();
+            check(g_library->lyric_preferences.at(uid).offset_ms == 999, "undo conflict preserves newer lyric preference");
+        }
+        {
+            library_edit([&](auto& lib) {
+                for (int i = 0; i < 30; ++i) {
+                    library::Playlist p; p.key = "quota-" + std::to_string(i); p.name = "Quota " + std::to_string(i); lib.upsert(p);
+                    auto t = track; t.title = i == 29 ? "Quota" : "Quota song " + std::to_string(i); t.artist = "Quota artist " + std::to_string(i);
+                    for (auto& v : t.variants) v.id += "-quota-" + std::to_string(i);
+                    lib.playlists.front().tracks.push_back(std::move(t));
+                }
+            }); wait_library();
+            const auto await_quick = [&] { const auto limit = platform::ticks() + 3000; do { tick(); platform::sleep_ms(2); } while (model.ui.quick_loading && platform::ticks() < limit); check(!model.ui.quick_loading, "background quick search completes"); };
+            model.ui.quick_open = true; model.ui.quick_query = "Quota"; refresh_quick_search(); await_quick();
+            std::array<int, 3> counts{}; for (const auto& r : model.ui.quick_results) ++counts[size_t(r.kind)];
+            check(counts[0] == 20 && counts[1] == 20 && counts[2] == 20 && model.ui.quick_results.front().title == "Quota", "quick search ranks exact titles and reserves each category quota");
+            model.ui.quick_query = "Quota song"; refresh_quick_search(); model.ui.quick_query = "does-not-exist"; refresh_quick_search(); await_quick();
+            check(model.ui.quick_results.empty(), "superseded quick query cannot publish stale results");
+            model.ui.quick_open = false; refresh_quick_search(); check(!g_quick_index && model.ui.quick_results.empty(), "closing quick search releases its index");
+        }
+        model.ui.shortcuts.enabled = false; model.ui.shortcuts.keys = {{8, 9, 10, 14}}; model.ui.shortcuts.modifiers = {{1, 2, 3, 0}};
+        check(config::save(model.ui), "custom global shortcuts save"); UiState shortcut_reload; config::load(shortcut_reload);
+        check(shortcut_reload.shortcuts == model.ui.shortcuts && platform::shortcut_label(shortcut_reload.shortcuts, 0) == "Ctrl+Shift+F7", "global shortcut configuration roundtrips");
         clear_data(ClearAction::Queue);
         tick();
         check(model.playback.tracks.empty() && model.playback.results.size() == 1, "clear queue preserves independent search results");

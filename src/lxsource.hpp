@@ -1312,7 +1312,17 @@ public:
         std::set<std::string> failed_songs;
     };
     // 消费方只报告“已收到有效音频 / 首段可播”，不把整首下载或转码耗时当加载速度。
-    struct LoadTiming { int ready_ms = 0; bool verified = false; };
+    struct LoadTiming {
+        int ready_ms = 0; bool verified = false;
+        std::vector<std::string> route;
+        void add(std::string text) { if (route.size() == 24) route.erase(route.begin() + 20); route.push_back(std::move(text)); }
+    };
+    static std::string route_file(const std::string& file) {
+        const auto name = std::filesystem::u8path(file).filename().u8string();
+        std::string safe;
+        for (unsigned char c : name) if (c >= 128 || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') safe += char(c);
+        return safe.empty() ? "未命名脚本" : safe.substr(0, 160);
+    }
     using Timings = std::map<std::string, std::map<std::string, Timing>>; // 平台 → 实际音质 → 测量
     using Checks = std::map<std::string, Health>;
     struct Selection {
@@ -2087,6 +2097,11 @@ public:
         const int wanted = quality == "128k" ? 0 : quality == "flac" || quality == "flac24bit" ? 2 : 1;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
         const auto fixed = smart_switch ? FixedSource{} : choose_fixed_source(wanted);
+        if (load_timing) load_timing->add(smart_switch ? "智能路由：优先已验证，再按样本加载延迟排序；测速未知排后" : "固定音源：本次不自动切换其他脚本");
+        std::set<std::string> explained;
+        const auto trace = [&](const Selection& rank, const std::string& status) {
+            if (load_timing && explained.insert(rank.file).second) load_timing->add(route_file(rank.file) + " · " + rank.quality + " · " + status);
+        };
         const auto report = [&](const std::shared_ptr<Script>& script, const std::string& quality, const std::string& error, int resolve_ms = 0, int ready_ms = 0) {
             std::lock_guard<std::mutex> lock(mu_);
             const auto file = file_key(script->path());
@@ -2128,11 +2143,11 @@ public:
                     if (candidate->retired() || !candidate->supports(key, "musicUrl") ||
                         attempted.count(file_key(candidate->path()))) continue;
                     const auto rank = selection_locked(candidate, key, wanted);
-                    if (rank.availability == 2) { excluded_failed = true; continue; }
-                    if (rank.availability == 4) { cooling_down = true; continue; }
-                    if (rank.availability == 3) continue;
+                    if (rank.availability == 2) { excluded_failed = true; trace(rank, "跳过：双样本失败，冷却中"); continue; }
+                    if (rank.availability == 4) { cooling_down = true; trace(rank, "跳过：临时网络冷却"); continue; }
+                    if (rank.availability == 3) { trace(rank, "跳过：不支持当前音质"); continue; }
                     const auto failure = song_failures_.find(song_failure_key(rank.file, key, rank.quality, info_json));
-                    if (failure != song_failures_.end() && platform::ticks() < failure->second.until) { skipped_song = true; continue; }
+                    if (failure != song_failures_.end() && platform::ticks() < failure->second.until) { skipped_song = true; trace(rank, "跳过：近期此歌曲失败，不影响其他歌曲"); continue; }
                     if (!s || std::tie(rank.availability, rank.latency_ms, rank.file) <
                         std::tie(score.availability, score.latency_ms, score.file)) { s = candidate; score = rank; }
                 }
@@ -2140,6 +2155,8 @@ public:
             if (!s) break;
             if (!smart_switch) last.clear();
             attempted.insert(score.file);
+            if (load_timing) load_timing->add("尝试 " + route_file(score.file) + " · " + (score.availability == 0 ? "已验证" : "未验证") + " · " +
+                (score.latency_ms < 300001 ? std::to_string(score.latency_ms) + " ms" + (score.estimated ? "（历史 / 估算）" : "（样本）") : "未测速"));
             if (net::cancelled()) { err = "取流已取消"; return false; }
             if (std::chrono::steady_clock::now() >= deadline) { last += smart_switch ? "；音源解析已达到 30 秒，尝试其他渠道" : "；固定音源解析超时"; break; }
             if (s->retired()) continue;
@@ -2153,7 +2170,7 @@ public:
             net::CancelScope candidate_budget([parent = owner_cancelled, candidate_deadline] {
                 return (parent && parent()) || std::chrono::steady_clock::now() >= candidate_deadline;
             });
-            if (load_timing) *load_timing = {};
+            if (load_timing) { load_timing->ready_ms = 0; load_timing->verified = false; }
             {
                 const auto source_deadline = std::min(deadline, begin + std::chrono::seconds(8));
                 net::CancelScope time_limit([parent = net::cancel_current, source_deadline] {
@@ -2170,6 +2187,7 @@ public:
                     return s->retired() || (parent && parent());
                 });
                 if (accept && !accept(u, s->info().name, q, e)) {
+                    if (load_timing) load_timing->add("候选加载或解码失败，继续同平台候选");
                     last = s->info().name + ": " + (e.empty() ? "候选音频不可用" : e);
                     // 候选预算到期属于临时超时，不能当成该曲长期不可用。
                     if (!s->retired() && !(owner_cancelled && owner_cancelled()) && std::chrono::steady_clock::now() >= candidate_deadline) report(s, q, "音源启动超时：" + last);
@@ -2178,10 +2196,12 @@ public:
                 }
                 if (net::cancelled()) { err = "取流已取消"; return false; }
                 report(s, q, "", resolve_ms, load_timing && load_timing->ready_ms > 0 ? resolve_ms + load_timing->ready_ms : 0);
+                if (load_timing) load_timing->add("采用 " + route_file(score.file) + " · 取址 " + std::to_string(resolve_ms) + " ms" + (load_timing->ready_ms > 0 ? " · 首段加载 " + std::to_string(load_timing->ready_ms) + " ms" : " · 未记录首段耗时"));
                 url = u;
                 if (by) *by = s->info().name;
                 return true;
             }
+            if (!resolved && load_timing) load_timing->add("取址失败，继续同平台候选");
             if (!resolved && e.empty()) e = "音源未返回有效播放地址";
             if (!e.empty()) {
                 if (!net::cancelled() || (!(owner_cancelled && owner_cancelled()) && std::chrono::steady_clock::now() >= candidate_deadline)) report(s, q, e);

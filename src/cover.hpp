@@ -137,23 +137,28 @@ public:
         }
     }
 
+    static bool retry_allowed(unsigned attempts, unsigned long long retry_at, unsigned long long now) { return attempts < 3 && now >= retry_at; }
+    bool retry_due(unsigned long long now) {
+        std::lock_guard<std::mutex> lock(m_); bool due = false;
+        for (auto& pair : map_) { auto& e = pair.second; if (e.state == 3 && e.retry_at && retry_allowed(e.attempts, e.retry_at, now)) { e.retry_at = 0; due = true; } }
+        return due;
+    }
+    void retry_failed() {
+        std::lock_guard<std::mutex> lock(m_);
+        for (auto& pair : map_) if (pair.second.state == 3) { pair.second.attempts = 0; pair.second.retry_at = 0; }
+    }
     // 就绪返回图；没就绪返回空（并确保后台已经在取）。UI 线程每帧调它。
     std::shared_ptr<const Image> get(const std::string& url) {
         if (url.empty()) return nullptr;
         bool launch = false;
         {
             std::lock_guard<std::mutex> lk(m_);
-            auto it = map_.find(url);
-            if (it != map_.end()) {
-                it->second.touched = ++clock_;
-                it->second.last_used = platform::ticks();
-                if (it->second.state == 2) return it->second.img;
-                return nullptr;
-            }
-            if (pending_.size() >= 32) return nullptr;
-            map_[url].state = 1;
-            map_[url].touched = ++clock_;
-            map_[url].last_used = platform::ticks();
+            auto& entry = map_[url];
+            entry.touched = ++clock_; entry.last_used = platform::ticks();
+            if (entry.state == 2) return entry.img;
+            if (entry.state == 1 || (entry.state == 3 && !retry_allowed(entry.attempts, entry.retry_at, platform::ticks()))) return nullptr;
+            if (pending_.size() >= 32) { if (!entry.state) map_.erase(url); return nullptr; }
+            entry.state = 1;
             pending_.push_back({url, generation_});
             if (workers_ < 2) { ++workers_; launch = true; }
         }
@@ -178,7 +183,8 @@ private:
         int state = 0;  // 0 未知 / 1 下载中 / 2 就绪 / 3 失败
         std::shared_ptr<const Image> img;
         uint64_t touched = 0;
-        unsigned long long last_used = 0;
+        unsigned long long last_used = 0, retry_at = 0;
+        unsigned attempts = 0;
     };
 
     void load(const std::string& url, unsigned generation) {
@@ -222,6 +228,7 @@ private:
             if (generation != generation_) return;
             Entry& e = map_[url];
             e.state = ok ? 2 : 3;
+            if (!ok) { ++e.attempts; e.retry_at = platform::ticks() + (e.attempts == 1 ? 5000 : 30000); } else e.attempts = 0;
             if (ok) { e.img = img; pixel_bytes_ += img->rgba.size(); }
             // 按实际像素字节和访问时间回收，而不是按 URL 字典序保留最多 160 张完整封面。
             while (map_.size() > 160 || pixel_bytes_ > pixel_budget) {

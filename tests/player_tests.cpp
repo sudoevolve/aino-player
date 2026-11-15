@@ -673,13 +673,19 @@ int main(int argc, char** argv) {
                 check(engine.load_dir(scripts) == 2, "reset fixture outcomes before smart routing");
                 const auto routing_revision = engine.routing_revision();
                 const auto view_revision = engine.revision();
+                lx::Engine::LoadTiming route;
                 check(engine.resolve("wy", "320k", "{}", url, error, nullptr,
                     [&](const auto& candidate, const auto&, const auto& quality, auto& reason) {
                         ++candidates;
                         check(quality == "128k", "script advertised quality fallback");
-                        if (candidate.find("/bad") != std::string::npos) { reason = "fixture rejects media"; return false; }
+                        if (candidate.find("/bad") != std::string::npos) { reason = "fixture rejects https://secret.invalid/?cookie=PRIVATE"; return false; }
                         return true;
-                    }) && candidates == 2 && url == "https://example.invalid/good", "rejected media advances to next script");
+                    }, &route) && candidates == 2 && url == "https://example.invalid/good", "rejected media advances to next script");
+                std::string route_text; for (const auto& line : route.route) route_text += line;
+                check(route_text.find("采用 02-good.js") != std::string::npos && route_text.find("PRIVATE") == std::string::npos && route_text.find("https://") == std::string::npos && route_text.find(scripts) == std::string::npos,
+                    "actual routing trace records accepted source without raw errors, URLs, credentials or full paths");
+                for (int i = 0; i < 100; ++i) route.add("bounded " + std::to_string(i));
+                check(route.route.size() == 24 && route.route.back() == "bounded 99", "routing trace is bounded and preserves final outcomes");
                 check(engine.routing_revision() == routing_revision && engine.revision() != view_revision,
                     "playback timing updates refresh source UI without invalidating next-song preload");
                 check(engine.load_dir(scripts) == 2, "reset fixture outcomes before per-song checks");

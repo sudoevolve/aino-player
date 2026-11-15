@@ -1471,6 +1471,7 @@ inline bool resolve_via_source(const Variant& v, int quality, ResolveResult& out
     const std::string info = lx_music_info(v, key);
     std::string url, err, by;
     auto timing = std::make_shared<lx::Engine::LoadTiming>();
+    out.load_timing = timing;
     if (!engine.resolve(key, q, info, url, err, &by,
         [&](const std::string& candidate, const std::string& name, const std::string& actual_quality, std::string& error) {
             ResolveResult rr;
@@ -1563,11 +1564,13 @@ inline ResolveResult resolve(const Variant& v, const Settings& st, const Resolve
         return (parent && parent()) || (cancelled && cancelled());
     });
     std::string why[2];
+    auto trace = std::make_shared<lx::Engine::LoadTiming>();
     const bool fixed_only = !st.source_smart_switch && st.lane_on(Lane::JsSource) && lx_platform_key(v.source);
     for (Lane lane : st.lane_order()) {
         if (fixed_only && lane != Lane::JsSource) continue;
         if (net::cancelled()) { ResolveResult fail; fail.reason = "取流已取消"; return fail; }
         if (!st.lane_on(lane)) {
+            trace->add(lane == Lane::JsSource ? "第三方音源渠道已关闭" : "自带接口渠道已关闭");
             why[int(lane)] = "已关闭";
             continue;
         }
@@ -1575,12 +1578,14 @@ inline ResolveResult resolve(const Variant& v, const Settings& st, const Resolve
         std::string reason;
         const bool ok = lane == Lane::JsSource ? resolve_via_source(v, st.quality, rr, &reason, accept, st.source_smart_switch)
                                                : resolve_via_builtin(v, st, rr, &reason, accept);
-        if (ok) return rr;
+        if (rr.load_timing) for (const auto& line : rr.load_timing->route) trace->add(line);
+        trace->add(std::string(lane == Lane::JsSource ? "第三方音源" : "自带接口") + (ok ? (accept ? "：候选已通过播放加载" : "：已取得候选地址，尚未验证播放") : "：本次未取得可播放音频"));
+        if (ok) { rr.load_timing = trace; return rr; }
         why[int(lane)] = reason;
     }
 
     ResolveResult fail;
-    fail.ok = false;
+    fail.ok = false; fail.load_timing = trace;
     if (st.lane_on(Lane::JsSource) && st.lane_on(Lane::Builtin) && !why[0].empty() && !why[1].empty()) {
         fail.reason = "音源：" + why[0] + "；自带：" + why[1];
     } else {
@@ -1675,6 +1680,7 @@ inline bool hydrate_catalog_variant(Variant& variant, const Settings& st, std::s
     }
     return true;
 }
+inline bool catalog_supported(Source source) { return source == Source::Netease || source == Source::QQ || source == Source::Bilibili || source == Source::Local; }
 inline bool catalog_target_from_track(const Track& track, CatalogKind kind, int artist_index, const Settings& st,
                                       CatalogTarget& target, std::string& error) {
     if (track.variants.empty()) { error = "没有曲目资料"; return false; }

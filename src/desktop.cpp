@@ -573,9 +573,56 @@ struct Desktop::Impl {
     std::shared_ptr<EventQueue> queue = std::make_shared<EventQueue>();
     std::mutex mutex;
     MediaState state;
+    ShortcutSettings shortcut_settings, active_shortcuts;
+    bool shortcuts_dirty = true;
     std::atomic<bool> tray{false}, media{false}, hidden{false}, enabled{true}, stopping{false};
     int icon_w = 0, icon_h = 0;
     std::vector<uint8_t> icon;
+    void sync_shortcuts() {
+#ifdef _WIN32
+        if (!window) return;
+#else
+        if (!drops || env("XDG_SESSION_TYPE") == "wayland") return;
+#endif
+        ShortcutSettings settings;
+        { std::lock_guard<std::mutex> lock(mutex); if (!shortcuts_dirty) return; settings = shortcut_settings; shortcuts_dirty = false; }
+#ifdef _WIN32
+        for (int i = 0; i < 4; ++i) UnregisterHotKey(window, 0xA100 + i);
+        const UINT keys[]{VK_SPACE, VK_LEFT, VK_RIGHT, 'L', 'P', 'B', 'N', 'D', VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12};
+        const UINT modifiers[]{MOD_CONTROL | MOD_ALT, MOD_CONTROL | MOD_SHIFT, MOD_ALT | MOD_SHIFT, MOD_CONTROL | MOD_ALT | MOD_SHIFT};
+#else
+        XUngrabKey(drops, AnyKey, AnyModifier, DefaultRootWindow(drops)); held_shortcuts.clear();
+        const KeySym keys[]{XK_space, XK_Left, XK_Right, XK_l, XK_p, XK_b, XK_n, XK_d, XK_F7, XK_F8, XK_F9, XK_F10, XK_F11, XK_F12};
+        const unsigned int modifiers[]{ControlMask | Mod1Mask, ControlMask | ShiftMask, Mod1Mask | ShiftMask, ControlMask | Mod1Mask | ShiftMask};
+#endif
+        active_shortcuts = settings;
+        if (!settings.enabled) return;
+        const char* actions[]{"播放 / 暂停", "上一首", "下一首", "悬浮歌词"};
+        for (int i = 0; i < 4; ++i) {
+            const int key = settings.keys[size_t(i)], modifier = settings.modifiers[size_t(i)];
+            if (key < 0 || key >= 14 || modifier < 0 || modifier > 3) continue;
+            bool failed = false;
+            for (int j = 0; j < i; ++j) if (settings.keys[size_t(j)] == key && settings.modifiers[size_t(j)] == modifier) failed = true;
+#ifdef _WIN32
+            if (!failed) failed = !RegisterHotKey(window, 0xA100 + i, modifiers[modifier] | MOD_NOREPEAT, keys[key]);
+#else
+            const auto code = XKeysymToKeycode(drops, keys[key]);
+            if (!code) failed = true;
+            if (!failed) {
+                for (unsigned int extra : {0u, unsigned(LockMask), unsigned(Mod2Mask), unsigned(LockMask | Mod2Mask)}) {
+                    shortcut_conflict.store(false);
+                    XGrabKey(drops, code, modifiers[modifier] | extra, DefaultRootWindow(drops), False, GrabModeAsync, GrabModeAsync); XSync(drops, False);
+                    failed = shortcut_conflict.exchange(false) || failed;
+                }
+                if (failed) for (unsigned int extra : {0u, unsigned(LockMask), unsigned(Mod2Mask), unsigned(LockMask | Mod2Mask)}) XUngrabKey(drops, code, modifiers[modifier] | extra, DefaultRootWindow(drops));
+            }
+#endif
+            if (failed) { active_shortcuts.keys[size_t(i)] = 14; queue->push({MediaAction::ShortcutError, 0, std::string(actions[i]) + "：" + shortcut_label(settings, i) + " 被占用或重复，请在快捷键设置中修改"}); }
+        }
+#ifndef _WIN32
+        XFlush(drops);
+#endif
+    }
 #ifdef _WIN32
     HWND window = nullptr;
     WNDPROC previous = nullptr;
@@ -770,18 +817,11 @@ struct Desktop::Impl {
         XChangeProperty(drops, window, proxy, XA_WINDOW, 32, PropModeReplace, reinterpret_cast<const unsigned char*>(&drop_proxy), 1);
         XChangeProperty(drops, window, aware, XA_ATOM, 32, PropModeReplace, reinterpret_cast<const unsigned char*>(&version), 1);
         XChangeProperty(drops, drop_proxy, aware, XA_ATOM, 32, PropModeReplace, reinterpret_cast<const unsigned char*>(&version), 1);
-        if (env("XDG_SESSION_TYPE") != "wayland") {
-            const KeySym keys[]{XK_space, XK_Left, XK_Right, XK_l};
-            const unsigned int modifiers[]{0, LockMask, Mod2Mask, LockMask | Mod2Mask};
-            for (auto key : keys) for (unsigned int extra : modifiers)
-                XGrabKey(drops, XKeysymToKeycode(drops, key), ControlMask | Mod1Mask | extra, DefaultRootWindow(drops), False, GrabModeAsync, GrabModeAsync);
-            XSync(drops, False);
-            if (shortcut_conflict.exchange(false)) queue->push({MediaAction::ShortcutError, 0, "部分全局快捷键被其他程序占用，可使用系统媒体键"});
-        }
+        sync_shortcuts();
         XFlush(drops);
     }
     void poll_drops() {
-        poll_power();
+        poll_power(); sync_shortcuts();
         while (drops && XPending(drops)) {
             XEvent event{}; XNextEvent(drops, &event);
             if (event.type == KeyRelease) {
@@ -790,12 +830,13 @@ struct Desktop::Impl {
                 held_shortcuts.erase(event.xkey.keycode);
             } else if (event.type == KeyPress) {
                 if (!held_shortcuts.insert(event.xkey.keycode).second) continue;
-                const auto key = XLookupKeysym(&event.xkey, 0);
-                if ((event.xkey.state & (ControlMask | Mod1Mask | ShiftMask | Mod4Mask)) == (ControlMask | Mod1Mask)) {
-                    if (key == XK_space) queue->push({MediaAction::Toggle});
-                    else if (key == XK_Left) queue->push({MediaAction::Previous});
-                    else if (key == XK_Right) queue->push({MediaAction::Next});
-                    else if (key == XK_l || key == XK_L) queue->push({MediaAction::ToggleLyrics});
+                const KeySym keys[]{XK_space, XK_Left, XK_Right, XK_l, XK_p, XK_b, XK_n, XK_d, XK_F7, XK_F8, XK_F9, XK_F10, XK_F11, XK_F12};
+                const unsigned int modifiers[]{ControlMask | Mod1Mask, ControlMask | ShiftMask, Mod1Mask | ShiftMask, ControlMask | Mod1Mask | ShiftMask};
+                const MediaAction actions[]{MediaAction::Toggle, MediaAction::Previous, MediaAction::Next, MediaAction::ToggleLyrics};
+                for (int i = 0; i < 4 && active_shortcuts.enabled; ++i) {
+                    const int key = active_shortcuts.keys[size_t(i)], modifier = active_shortcuts.modifiers[size_t(i)];
+                    if (key >= 0 && key < 14 && modifier >= 0 && modifier < 4 && event.xkey.keycode == XKeysymToKeycode(drops, keys[key]) &&
+                        (event.xkey.state & (ControlMask | Mod1Mask | ShiftMask | Mod4Mask)) == modifiers[modifier]) queue->push({actions[i]});
                 }
             } else if (event.type == ClientMessage) {
                 const auto& data = event.xclient.data.l;
@@ -1206,11 +1247,11 @@ std::string choose_desktop_file(bool folder, const std::atomic<bool>& cancelled,
     dbus_connection_set_exit_on_disconnect(bus, false);
     const auto cleanup = [&] { dbus_connection_close(bus); dbus_connection_unref(bus); };
     dbus_bus_add_match(bus, "type='signal',interface='org.freedesktop.portal.Request',member='Response'", nullptr);
-    auto* request = dbus_message_new_method_call("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop", "org.freedesktop.portal.FileChooser", "OpenFile");
+    auto* request = dbus_message_new_method_call("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop", "org.freedesktop.portal.FileChooser", kind == 4 ? "SaveFile" : "OpenFile");
     if (!request) { cleanup(); error = "无法创建文件选择请求"; return {}; }
     DBusMessageIter args, options;
     dbus_message_iter_init_append(request, &args);
-    const char* parent = ""; const char* title = folder ? "选择音乐文件夹" : kind == 1 ? "打开本地音乐" : kind == 2 ? "选择音源脚本" : "选择本地歌词";
+    const char* parent = ""; const char* title = folder ? "选择音乐文件夹" : kind == 1 ? "打开本地音乐" : kind == 2 ? "选择音源脚本" : kind == 3 ? "选择歌单备份" : kind == 4 ? "保存歌单备份" : "选择本地歌词";
     dbus_message_iter_append_basic(&args, DBUS_TYPE_STRING, &parent); dbus_message_iter_append_basic(&args, DBUS_TYPE_STRING, &title);
     dbus_message_iter_open_container(&args, DBUS_TYPE_ARRAY, "{sv}", &options);
     const auto option = [&](const char* key, const char* signature, int type, const void* value) {
@@ -1224,6 +1265,7 @@ std::string choose_desktop_file(bool folder, const std::atomic<bool>& cancelled,
     const auto token_text = "aino" + std::to_string(getpid()) + "_" + std::to_string(ticks());
     const char* token = token_text.c_str(); dbus_bool_t directory = folder, multiple = multi && !folder;
     option("handle_token", "s", DBUS_TYPE_STRING, &token); option("directory", "b", DBUS_TYPE_BOOLEAN, &directory); option("multiple", "b", DBUS_TYPE_BOOLEAN, &multiple);
+    if (kind == 4) { const char* filename = "aino-backup.json"; option("current_name", "s", DBUS_TYPE_STRING, &filename); }
     if (!folder) {
         DBusMessageIter row, variant, filters;
         const char* key = "filters";
@@ -1243,10 +1285,11 @@ std::string choose_desktop_file(bool folder, const std::atomic<bool>& cancelled,
             };
             if (all) pattern(0, "*");
             else if (kind == 1) for (const auto* mime : audio_mimes) pattern(1, mime);
+            else if (kind == 3 || kind == 4) { pattern(0, "*.json"); pattern(0, "*.m3u"); pattern(0, "*.m3u8"); }
             else pattern(0, kind == 2 ? "*.[jJ][sS]" : "*.[lL][rR][cC]");
             dbus_message_iter_close_container(&group, &patterns); dbus_message_iter_close_container(&filters, &group);
         };
-        filter(kind == 1 ? "音乐文件" : kind == 2 ? "音源脚本" : "LRC 歌词", false); filter("所有文件", true);
+        filter(kind == 1 ? "音乐文件" : kind == 2 ? "音源脚本" : kind >= 3 ? "歌单备份" : "LRC 歌词", false); filter("所有文件", true);
         dbus_message_iter_close_container(&variant, &filters); dbus_message_iter_close_container(&row, &variant);
         dbus_message_iter_close_container(&options, &row);
     }
@@ -1461,10 +1504,7 @@ void Desktop::start(void* window, void* display, unsigned long xid, std::functio
     impl_->previous = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(impl_->window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(Impl::procedure)));
     if (!impl_->previous) { RemovePropW(impl_->window, L"AinoPlayerDesktop"); RemovePropW(impl_->window, widen("AinoPlayerScope" + instance_scope()).c_str()); return; }
     DragAcceptFiles(impl_->window, TRUE);
-    const UINT shortcut_keys[]{VK_SPACE, VK_LEFT, VK_RIGHT, 'L'};
-    bool conflict = false;
-    for (int i = 0; i < 4; ++i) if (!RegisterHotKey(impl_->window, 0xA100 + i, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, shortcut_keys[i])) conflict = true;
-    if (conflict) impl_->queue->push({MediaAction::ShortcutError, 0, "部分全局快捷键被其他程序占用，可使用系统媒体键"});
+    impl_->sync_shortcuts();
     impl_->taskbar_created = RegisterWindowMessageW(L"TaskbarCreated"); impl_->sync_tray(); impl_->start_media();
 #else
     impl_->display = static_cast<Display*>(display); impl_->window = xid;
@@ -1493,6 +1533,13 @@ bool Desktop::update_lyrics(LyricOverlaySettings& settings, const std::string& f
     return impl_->lyrics.update(settings, first, second, progress, scale, paint);
 }
 std::string Desktop::lyrics_error() const { return impl_->lyrics.error; }
+void Desktop::set_shortcuts(const ShortcutSettings& settings) {
+    if (!impl_) return;
+    { std::lock_guard<std::mutex> lock(impl_->mutex); if (!(impl_->shortcut_settings == settings)) { impl_->shortcut_settings = settings; impl_->shortcuts_dirty = true; } }
+#ifdef _WIN32
+    impl_->sync_shortcuts();
+#endif
+}
 void Desktop::update(const MediaState& state, bool tray_enabled) {
 #ifdef _WIN32
     impl_->state = state; impl_->enabled.store(tray_enabled); impl_->sync_tray(); impl_->publish(state);

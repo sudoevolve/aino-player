@@ -396,7 +396,10 @@ inline bool write_m3u(const Playlist& playlist, const std::string& path, std::st
 class Library {
 public:
     std::vector<Playlist> playlists;
-    struct LyricPreference { int offset_ms = 0; std::string path, netease_id; };
+    struct LyricPreference {
+        int offset_ms = 0; std::string path, netease_id;
+        bool operator==(const LyricPreference& p) const { return offset_ms == p.offset_ms && path == p.path && netease_id == p.netease_id; }
+    };
     std::vector<music::Track> recent;
     std::map<std::string, LyricPreference> lyric_preferences;
     Library() { reset(); }
