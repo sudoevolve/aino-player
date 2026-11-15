@@ -1424,9 +1424,28 @@ static void tab_search(Ctx& c) {
                            c.th.label2, es);
         } else {
             const bool searched = !c.s.reports.empty();
+            std::vector<const music::SourceReport*> failed;
+            for (const auto& report : c.s.reports) {
+                if (report.pending || report.ok || report.err.empty() || report.err == "已关闭") continue;
+                if ((c.model.ui.src_mask >> int(report.source)) & 1u) failed.push_back(&report);
+            }
+            float empty_y = list.y + list.h * 0.26f;
+            if (!failed.empty()) {
+                float error_y = list.y + 6;
+                for (const auto* report : failed) {
+                    error_notice(c, std::string(music::source_name(report->source)) + "搜索失败", report->err,
+                        {list.x, error_y, std::max(1.0f, list.w - 98), 28});
+                    auto retry = Style().font(10.5f); retry.disabled = c.s.searching;
+                    if (c.ui.button("重试", {list.right() - 88, error_y, 82, 28}, retry))
+                        retry_search_source(int(report->source));
+                    error_y += 34;
+                }
+                empty_y = error_y + 8;
+            }
             c.ui.empty_state(mask == 0 ? "请选择音源" : searched ? "没有找到歌曲" : "搜索你想听的音乐",
-                mask == 0 ? "开启上方音源后再搜索" : searched ? "换个关键词，或在音源页面查看失败原因" : "输入歌曲、歌手或专辑名称",
-                {list.x, list.y + list.h * 0.26f, list.w, 120});
+                mask == 0 ? "开启上方音源后再搜索" : !failed.empty() ? "接口暂时没有返回结果；可查看详情或重试" :
+                    searched ? "换个关键词，或在音源页面查看失败原因" : "输入歌曲、歌手或专辑名称",
+                {list.x, empty_y, list.w, 120});
         }
         return;
     }
