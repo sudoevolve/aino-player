@@ -4165,13 +4165,22 @@ void library_import_folder(const std::string& folder, bool recursive) {
         auto playlist = library::scan_folder(folder, recursive, error, [] { return g_shutdown.load(); }, previous);
         if (previous) { playlist.key = previous->key; playlist.name = previous->name; }
         if (g_shutdown.load()) return;
-        post_ui([playlist = std::move(playlist), error, epoch]() mutable {
+        post_ui([playlist = std::move(playlist), error, epoch, snapshot, previous]() mutable {
             if (epoch != g_library_epoch) return;
             g_ui.importing_playlist = false;
             if (!error.empty()) { toast(error, 7000); return; }
             const auto count = playlist.tracks.size();
-            library_edit([playlist = std::move(playlist)](library::Library& next) { next.upsert(playlist); },
-                [count] { toast("已导入 " + std::to_string(count) + " 首本地歌曲"); });
+            auto applied = std::make_shared<bool>(false);
+            library_edit([playlist = std::move(playlist), snapshot, previous, applied](library::Library& next) {
+                if (!previous) { next.upsert(playlist); *applied = true; return; }
+                for (auto& current : next.playlists) if (current.key == previous->key) {
+                    if (current.local_folder != previous->local_folder || current.recursive != previous->recursive ||
+                        current.files != previous->files || !current.tracks.shares_storage_with(previous->tracks)) return;
+                    current.tracks = playlist.tracks; current.files = playlist.files;
+                    current.cover = playlist.cover; current.recursive = playlist.recursive;
+                    *applied = true; return;
+                }
+            }, [count, applied] { toast(*applied ? "已导入 " + std::to_string(count) + " 首本地歌曲" : "扫描期间歌单已修改，已保留编辑；可重新扫描"); });
         });
     }, [epoch] { if (epoch == g_library_epoch) g_ui.importing_playlist = false; });
 }
@@ -4612,7 +4621,9 @@ static void refresh_watched_folders() {
             library_edit([updates = std::move(updates), snapshot](library::Library& next) {
                 for (const auto& update : updates) for (auto& current : next.playlists) if (current.key == update.key) {
                     const auto old = std::find_if(snapshot->playlists.begin(), snapshot->playlists.end(), [&](const auto& p) { return p.key == update.key; });
-                    if (old == snapshot->playlists.end() || current.local_folder != old->local_folder || current.files != old->files) break;
+                    if (old == snapshot->playlists.end() || current.local_folder != old->local_folder ||
+                        current.recursive != old->recursive || current.files != old->files ||
+                        !current.tracks.shares_storage_with(old->tracks)) break;
                     current.tracks = update.tracks; current.files = update.files; current.cover = update.cover;
                     break;
                 }

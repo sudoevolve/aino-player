@@ -564,6 +564,37 @@ int main(int argc, char** argv) {
                 auto updated = std::find_if(changed.tracks.begin(), changed.tracks.end(), [&](const auto& track) { return track.current().id == id3_path; });
                 check(error.empty() && updated != changed.tracks.end() && updated->title == metadata.title, "changed file invalidates cached metadata");
                 check(found->title == "cached metadata", "rescan preserves previous snapshot");
+                const auto extra_path = write_metadata("order-extra.mp3", id3);
+                auto ordered = library::scan_folder(dir, false, error, {}, &changed);
+                std::reverse(ordered.tracks.begin(), ordered.tracks.end());
+                auto shared = ordered.tracks;
+                check(shared.shares_storage_with(ordered.tracks), "playlist snapshots share immutable storage");
+                const auto first_path = ordered.tracks.front().current().id;
+                check(!shared.shares_storage_with(ordered.tracks), "editable access changes the playlist revision");
+                auto reordered = library::scan_folder(dir, false, error, {}, &ordered);
+                check(error.empty() && reordered.tracks.front().current().id == first_path,
+                    "folder refresh preserves manual song order");
+                ordered.tracks.erase(std::remove_if(ordered.tracks.begin(), ordered.tracks.end(),
+                    [&](const auto& track) { return track.current().id == id3_path; }), ordered.tracks.end());
+                auto excluded = library::scan_folder(dir, false, error, {}, &ordered);
+                check(error.empty() && excluded.files.count(id3_path) &&
+                    std::none_of(excluded.tracks.begin(), excluded.tracks.end(), [&](const auto& track) { return track.current().id == id3_path; }),
+                    "folder refresh keeps manually excluded files indexed without resurrecting songs");
+                platform::remove(extra_path);
+                const auto empty_folder = platform::join(dir, "empty-scan");
+                check(platform::make_dirs(empty_folder), "empty folder fixture");
+                check(library::scan_folder(empty_folder, false, error).tracks.empty() && !error.empty(), "initial empty import is rejected");
+                const auto empty_song = platform::join(empty_folder, "song.mp3");
+                auto* song_file = platform::fopen(empty_song, "wb"); check(song_file != nullptr, "removable song fixture");
+                std::fwrite(id3.data(), 1, id3.size(), song_file); std::fclose(song_file);
+                auto before_empty = library::scan_folder(empty_folder, false, error);
+                check(error.empty() && before_empty.tracks.size() == 1, "folder contains removable song before refresh");
+                platform::remove(empty_song);
+                auto empty = library::scan_folder(empty_folder, false, error, {}, &before_empty);
+                check(error.empty() && empty.tracks.empty() && empty.files.empty(), "existing readable folder may become empty");
+                platform::remove(empty_folder);
+                library::scan_folder(empty_folder, false, error, {}, &before_empty);
+                check(!error.empty(), "missing folder is an error rather than a valid empty refresh");
             }
             std::string comments;
             auto le = [](std::string& bytes,uint32_t n) { for (int i=0;i<4;++i) bytes += char(n >> (i*8)); };

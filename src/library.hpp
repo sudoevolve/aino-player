@@ -11,6 +11,7 @@
 #include <map>
 #include <cmath>
 #include <unordered_set>
+#include <utility>
 
 namespace library {
 inline std::string quote(const std::string& text) {
@@ -73,6 +74,7 @@ public:
     operator const Container&() const { return *data_; }
     size_t size() const { return data_->size(); }
     bool empty() const { return data_->empty(); }
+    bool shares_storage_with(const SharedTracks& other) const { return data_ == other.data_; }
     const music::Track& operator[](size_t i) const { return (*data_)[i]; }
     music::Track& operator[](size_t i) { return edit()[i]; }
     const music::Track& front() const { return data_->front(); }
@@ -296,14 +298,31 @@ inline Playlist scan_folder(const std::string& input, bool recursive, std::strin
         Playlist::FileStamp stamp{size, std::to_string(time.time_since_epoch().count())};
         const auto found = old.find(path);
         const auto cached = previous ? previous->files.find(path) : out.files.end();
+        out.files.emplace(path, stamp);
+        // 文件仍在扫描索引中却已从曲目列表移除，表示用户主动排除；自动扫描不将其加回。
+        if (previous && cached != previous->files.end() && found == old.end()) continue;
         if (previous && found != old.end() && cached != previous->files.end() &&
             cached->second.size == stamp.size && cached->second.modified == stamp.modified)
             out.tracks.push_back(*found->second);
         else out.tracks.push_back(local_track(file));
-        out.files.emplace(path, std::move(stamp));
+    }
+    if (previous) {
+        std::map<std::string, size_t> positions;
+        for (size_t i = 0; i < out.tracks.size(); ++i) positions.emplace(std::as_const(out.tracks)[i].current().id, i);
+        SharedTracks ordered;
+        ordered.reserve(out.tracks.size());
+        for (const auto& track : previous->tracks) {
+            if (track.variants.empty()) continue;
+            const auto found = positions.find(track.current().id);
+            if (found == positions.end()) continue;
+            ordered.push_back(std::move(out.tracks[found->second])); positions.erase(found);
+        }
+        // 已有歌曲保留手动顺序，新文件按扫描路径顺序追加。
+        for (const auto& entry : positions) ordered.push_back(std::move(out.tracks[entry.second]));
+        out.tracks = std::move(ordered);
     }
     if (!out.tracks.empty()) out.cover = out.tracks.front().cover_url;
-    if (out.tracks.empty()) error = "文件夹内没有支持的音频文件，原歌单已保留";
+    if (out.tracks.empty() && !previous) error = "文件夹内没有支持的音频文件，原歌单已保留";
     return out;
 }
 inline bool m3u_path(const std::string& path) {
