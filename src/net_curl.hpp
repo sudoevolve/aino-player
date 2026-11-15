@@ -54,6 +54,10 @@ struct Transfer {
     ~Transfer() { if (handle) curl_easy_cleanup(handle); if (headers) curl_slist_free_all(headers); }
     bool setup(const Request& req) {
         if (!handle) return false;
+        // reset 清除上次的回调、凭据和方法，保留同一 easy handle 的连接/DNS 缓存。
+        curl_easy_reset(handle);
+        if (headers) { curl_slist_free_all(headers); headers = nullptr; }
+        content_range.clear(); set_cookies.clear(); response_headers.clear(); location.clear();
         curl_easy_setopt(handle, CURLOPT_URL, req.url.c_str());
         curl_easy_setopt(handle, CURLOPT_NOSIGNAL, 1L);
         curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT_MS, long(req.timeout_ms));
@@ -123,22 +127,33 @@ struct Transfer {
     }
 };
 }
-inline Response execute(const Request& req) {
-    Response out;
+/** @brief 由单个工作线程持有，重置请求选项并复用 libcurl 的连接缓存。 */
+class HttpSession {
     detail::Transfer transfer;
-    if (!transfer.setup(req)) { out.error = "网络初始化失败"; return out; }
-    struct Body { std::string& text; size_t limit; } body{out.body, req.max_body};
-    curl_easy_setopt(transfer.handle, CURLOPT_WRITEFUNCTION, +[](char* p, size_t a, size_t b, void* data) -> size_t {
-        auto& body = *static_cast<Body*>(data);
-        const auto n = a * b;
-        if (body.text.size() > body.limit || n > body.limit - body.text.size()) return 0;
-        body.text.append(p, n); return n;
-    });
-    curl_easy_setopt(transfer.handle, CURLOPT_WRITEDATA, &body);
-    const auto rc = curl_easy_perform(transfer.handle);
-    transfer.response(out);
-    if (rc != CURLE_OK) out.error = curl_easy_strerror(rc);
-    return out;
+public:
+    HttpSession() = default;
+    HttpSession(const HttpSession&) = delete;
+    HttpSession& operator=(const HttpSession&) = delete;
+    Response execute(const Request& req) {
+        Response out;
+        if (!transfer.setup(req)) { out.error = "网络初始化失败"; return out; }
+        struct Body { std::string& text; size_t limit; } body{out.body, req.max_body};
+        curl_easy_setopt(transfer.handle, CURLOPT_WRITEFUNCTION, +[](char* p, size_t a, size_t b, void* data) -> size_t {
+            auto& body = *static_cast<Body*>(data);
+            const auto n = a * b;
+            if (body.text.size() > body.limit || n > body.limit - body.text.size()) return 0;
+            body.text.append(p, n); return n;
+        });
+        curl_easy_setopt(transfer.handle, CURLOPT_WRITEDATA, &body);
+        const auto rc = curl_easy_perform(transfer.handle);
+        transfer.response(out);
+        if (rc != CURLE_OK) out.error = curl_easy_strerror(rc);
+        return out;
+    }
+};
+inline Response execute(const Request& req) {
+    HttpSession session;
+    return session.execute(req);
 }
 inline Response get(const std::string& url, const std::vector<std::string>& headers = {}, int timeout_ms = 8000) {
     return execute({url, {}, headers, timeout_ms, true});

@@ -237,6 +237,7 @@ int main(int argc, char** argv) {
             check(args && count > 2, "native stream file argument"); spec.local_path = platform::narrow(args[2]); LocalFree(args);
 #endif
             std::string error; std::atomic<bool> cancelled{false};
+            struct DrainStreams { ~DrainStreams() { audio::wait_for_stream_cleanup(); } } drain;
             for (const int offset : {0, 350}) {
                 spec.start_ms = offset;
                 auto stream = audio::Stream::open(spec, [&] { return cancelled.load(); }, error);
@@ -251,10 +252,12 @@ int main(int argc, char** argv) {
                 check(player.is_ended() && !player.stream_failed() && player.position_ms() >= 900, "stream consumes complete decoded audio including offset");
                 player.close();
                 const auto began = platform::ticks(); stream->cancel(); stream.reset();
-                check(platform::ticks() - began < 2500, "cancel reaps stream with a full or partially full ring");
+                check(platform::ticks() - began < 2500, "cancel hands off a full or partially full ring without joining on the caller");
+                audio::wait_for_stream_cleanup();
             }
             cancelled.store(true);
             check(!audio::Stream::open(spec, [&] { return cancelled.load(); }, error) && !error.empty(), "cancelled stream cannot publish media");
+            audio::wait_for_stream_cleanup();
             std::cout << "Stream prebuffer, seek rebuild and cancellation checks passed\n"; return 0;
         }
         if (argc > 2 && (std::string(argv[1]) == "--audio-device" || std::string(argv[1]) == "--audio-decode" ||

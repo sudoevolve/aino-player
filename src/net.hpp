@@ -339,76 +339,87 @@ inline std::string final_url_of(HINTERNET hreq) {
 
 }  // namespace detail
 
-// 通用请求：整段读进内存（接口 JSON 用）
-inline Response execute(const Request& req) {
-    detail::RequestControl cancellation;
-    Response out;
-    detail::Session s;
-    if (!detail::open_session(s)) {
-        out.error = detail::last_error_text("WinHttpOpen");
-        return out;
-    }
-    HINTERNET conn = nullptr;
-    const auto verb = widen(req.method.empty() ? (req.body.empty() ? "GET" : "POST") : req.method);
-    HINTERNET hreq = detail::send(s.h, req, verb.c_str(), &conn, req.body.empty() ? nullptr : req.body.data(),
-                                  DWORD(req.body.size()), out.error);
-    if (!hreq) return out;
+/** @brief 单个工作线程持有的 HTTP 会话；连续请求复用连接池，不跨线程共享请求状态。 */
+class HttpSession {
+    detail::Session session_;
+public:
+    HttpSession() = default;
+    HttpSession(const HttpSession&) = delete;
+    HttpSession& operator=(const HttpSession&) = delete;
+    Response execute(const Request& req) {
+        detail::RequestControl cancellation;
+        Response out;
+        if (!session_.h && !detail::open_session(session_)) {
+            out.error = detail::last_error_text("WinHttpOpen");
+            return out;
+        }
+        HINTERNET conn = nullptr;
+        const auto verb = widen(req.method.empty() ? (req.body.empty() ? "GET" : "POST") : req.method);
+        HINTERNET hreq = detail::send(session_.h, req, verb.c_str(), &conn, req.body.empty() ? nullptr : req.body.data(),
+                                      DWORD(req.body.size()), out.error);
+        if (!hreq) return out;
 
-    if (!detail::receive(hreq)) {
-        out.error = detail::last_error_text("WinHttpReceiveResponse");
+        if (!detail::receive(hreq)) {
+            out.error = detail::last_error_text("WinHttpReceiveResponse");
+            detail::close_request(hreq);
+            WinHttpCloseHandle(conn);
+            return out;
+        }
+        DWORD status = 0, slen = sizeof status;
+        WinHttpQueryHeaders(hreq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &slen, WINHTTP_NO_HEADER_INDEX);
+        out.status = int(status);
+        out.content_range = detail::query_header(hreq, WINHTTP_QUERY_CONTENT_RANGE);
+        out.content_type = detail::query_header(hreq, WINHTTP_QUERY_CONTENT_TYPE);
+        out.final_url = detail::final_url_of(hreq);
+        out.location = detail::query_header(hreq, WINHTTP_QUERY_LOCATION);
+        const auto raw_headers = detail::query_header(hreq, WINHTTP_QUERY_RAW_HEADERS_CRLF);
+        for (size_t pos = 0; pos < raw_headers.size();) {
+            const auto end = raw_headers.find("\r\n", pos);
+            const auto line = raw_headers.substr(pos, end == std::string::npos ? end : end - pos);
+            const auto colon = line.find(':');
+            if (colon != std::string::npos) {
+                auto key = line.substr(0, colon);
+                for (char& c : key) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+                const auto first = line.find_first_not_of(" \t", colon + 1);
+                out.headers.emplace_back(std::move(key), first == std::string::npos ? "" : line.substr(first));
+            }
+            if (end == std::string::npos) break;
+            pos = end + 2;
+        }
+        DWORD cookie_index = 0;
+        for (int i = 0; i < 64; ++i) {
+            std::wstring buffer(16384, L'\0');
+            DWORD length = DWORD(buffer.size() * sizeof(wchar_t));
+            if (!WinHttpQueryHeaders(hreq, WINHTTP_QUERY_SET_COOKIE, WINHTTP_HEADER_NAME_BY_INDEX,
+                                     buffer.data(), &length, &cookie_index)) break;
+            buffer.resize(length / sizeof(wchar_t));
+            out.set_cookies.push_back(narrow(buffer));
+        }
+
+        for (;;) {
+            DWORD avail = 0;
+            if (!detail::available(hreq, &avail)) { out.error = detail::last_error_text("读取响应"); break; }
+            if (!avail) break;
+            avail = std::min<DWORD>(avail, 65536);
+            std::vector<char> buf(avail);
+            DWORD read = 0;
+            if (!detail::read(hreq, buf.data(), avail, &read)) { out.error = detail::last_error_text("读取响应"); break; }
+            if (!read) break;
+            if (out.body.size() > req.max_body || read > req.max_body - out.body.size()) { out.error = "接口响应过大"; break; }
+            out.body.append(buf.data(), read);
+        }
         detail::close_request(hreq);
         WinHttpCloseHandle(conn);
+        if (net::cancelled()) out.error = "已取消";
+        if (!out.error.empty()) { out.status = 0; out.body.clear(); }
         return out;
     }
-    DWORD status = 0, slen = sizeof status;
-    WinHttpQueryHeaders(hreq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                        WINHTTP_HEADER_NAME_BY_INDEX, &status, &slen, WINHTTP_NO_HEADER_INDEX);
-    out.status = int(status);
-    out.content_range = detail::query_header(hreq, WINHTTP_QUERY_CONTENT_RANGE);
-    out.content_type = detail::query_header(hreq, WINHTTP_QUERY_CONTENT_TYPE);
-    out.final_url = detail::final_url_of(hreq);
-    out.location = detail::query_header(hreq, WINHTTP_QUERY_LOCATION);
-    const auto raw_headers = detail::query_header(hreq, WINHTTP_QUERY_RAW_HEADERS_CRLF);
-    for (size_t pos = 0; pos < raw_headers.size();) {
-        const auto end = raw_headers.find("\r\n", pos);
-        const auto line = raw_headers.substr(pos, end == std::string::npos ? end : end - pos);
-        const auto colon = line.find(':');
-        if (colon != std::string::npos) {
-            auto key = line.substr(0, colon);
-            for (char& c : key) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
-            const auto first = line.find_first_not_of(" \t", colon + 1);
-            out.headers.emplace_back(std::move(key), first == std::string::npos ? "" : line.substr(first));
-        }
-        if (end == std::string::npos) break;
-        pos = end + 2;
-    }
-    DWORD cookie_index = 0;
-    for (int i = 0; i < 64; ++i) {
-        std::wstring buffer(16384, L'\0');
-        DWORD length = DWORD(buffer.size() * sizeof(wchar_t));
-        if (!WinHttpQueryHeaders(hreq, WINHTTP_QUERY_SET_COOKIE, WINHTTP_HEADER_NAME_BY_INDEX,
-                                 buffer.data(), &length, &cookie_index)) break;
-        buffer.resize(length / sizeof(wchar_t));
-        out.set_cookies.push_back(narrow(buffer));
-    }
-
-    for (;;) {
-        DWORD avail = 0;
-        if (!detail::available(hreq, &avail)) { out.error = detail::last_error_text("读取响应"); break; }
-        if (!avail) break;
-        avail = std::min<DWORD>(avail, 65536);
-        std::vector<char> buf(avail);
-        DWORD read = 0;
-        if (!detail::read(hreq, buf.data(), avail, &read)) { out.error = detail::last_error_text("读取响应"); break; }
-        if (!read) break;
-        if (out.body.size() > req.max_body || read > req.max_body - out.body.size()) { out.error = "接口响应过大"; break; }
-        out.body.append(buf.data(), read);
-    }
-    detail::close_request(hreq);
-    WinHttpCloseHandle(conn);
-    if (net::cancelled()) out.error = "已取消";
-    if (!out.error.empty()) { out.status = 0; out.body.clear(); }
-    return out;
+};
+// 普通接口请求仍使用独立会话；连续音频分块由调用方显式持有 HttpSession。
+inline Response execute(const Request& req) {
+    HttpSession session;
+    return session.execute(req);
 }
 
 inline Response get(const std::string& url, const std::vector<std::string>& headers = {},

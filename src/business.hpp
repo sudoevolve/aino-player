@@ -1343,6 +1343,7 @@ static void do_play(HostCallbacks* win, music::Track track, music::Settings st, 
             if (stream_allowed) {
                 playback_stage(gen, PlaybackStage::Buffering);
                 audio::StreamSpec spec; spec.url = rr.url; spec.headers = rr.headers; spec.duration_ms = v.duration_ms > 0 ? v.duration_ms : track.duration_ms;
+                spec.probe = audio::StreamSpec::Probe{probe.status == 206, probe.total_bytes};
                 { std::lock_guard<std::mutex> lock(g_mu); spec.start_ms = g_as.position_ms; }
                 std::string error;
                 auto stream = audio::Stream::open(spec, st.cancelled, error, [] { return net::cancelled(); });
@@ -4912,6 +4913,7 @@ void shutdown(bool smoke_test) {
     g_player.shutdown(); // 入口仍持有 UI 线程的 COM apartment，此处先释放音频引擎。
     { std::lock_guard<std::mutex> lock(g_mu); g_pending_stream.reset(); g_active_stream_spec = {}; }
     background::stop();
+    audio::wait_for_stream_cleanup();
     if (!smoke_test) lx::Engine::instance().save_metrics(platform::network_signature());
     g_current_media.reset();
     if (!smoke_test) {

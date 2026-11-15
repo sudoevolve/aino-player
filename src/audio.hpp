@@ -6,6 +6,7 @@
 #include <vector>
 #include <cstddef>
 #include <array>
+#include <optional>
 namespace audio {
 struct EqualizerSettings {
     bool enabled = false;
@@ -26,10 +27,12 @@ std::string decoder_info();
 std::string decoder_license();
 bool prepare_file(const std::string& path, std::string& playable, std::string& err, const std::string& conversion_path = {}, const std::function<bool()>& cancelled = {});
 struct StreamSpec {
+    struct Probe { bool range_supported = false; long long total_bytes = 0; };
     std::string url, local_path;
     std::vector<std::string> headers;
     long long duration_ms = 0, start_ms = 0;
     bool range_allowed = true;
+    std::optional<Probe> probe;
 };
 struct OutputDevice { std::string id, name; bool is_default = false; };
 /** @brief 枚举系统播放设备；应在后台执行，返回的 ID 可供 Player 选择。 */
@@ -38,7 +41,7 @@ std::vector<OutputDevice> output_devices(std::string& error);
  * @brief 后台网络/解码管线，PCM 容量固定为三秒，音频回调只读取原子环形缓冲。
  *
  * open 在工作线程预缓冲；不能流式读取的容器返回失败，调用方可退回完整文件。
- * cancel 立即发出停止信号；析构回收所有线程，因此须在音频设备解绑后销毁。
+ * cancel 立即发出停止信号；最后一个共享引用释放后交由有界回收线程销毁。
  */
 class Stream {
 public:
@@ -56,6 +59,8 @@ private:
     std::unique_ptr<Impl> impl_;
     friend class Player;
 };
+/** @brief 退出时等待已取消的流完成回收；须先停止提交播放任务并解除设备对流的引用。 */
+void wait_for_stream_cleanup();
 class Player {
 public:
     explicit Player(bool offline = false);

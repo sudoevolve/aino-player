@@ -11,6 +11,7 @@
 #include <mutex>
 #include <random>
 #include <cmath>
+#include <stdexcept>
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -18,6 +19,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/eventfd.h>
+#include <poll.h>
 #endif
 #ifdef AINO_BUNDLED_FFMPEG
 #include "aino_ffmpeg_data.hpp"
@@ -155,7 +158,7 @@ bool prepare_file(const std::string& path, std::string& playable, std::string& e
     return true;
 }
 // FFmpeg 只连接随机路径的 loopback HTTP。TLS、账号头和远端 Range 校验仍归播放器，
-// 每个连接最多缓存 256 KiB，不猜测时间/码率对应的字节位置，由容器索引准确定位。
+// 每个连接最多缓存 512 KiB，不猜测时间/码率对应的字节位置，由容器索引准确定位。
 class RangeBridge {
 #ifdef _WIN32
     using Socket = SOCKET;
@@ -253,14 +256,18 @@ class RangeBridge {
         response += "\r\n";
         if (!send_bytes(socket, response.data(), response.size()) || head) return;
         net::CancelScope signal([this] { return stopped(); });
+        net::HttpSession session;
+        size_t block_size = 256 * 1024;
         for (auto offset = begin; offset <= end && !stopped();) {
-            const auto last = offset + std::min(end - offset, 256LL * 1024 - 1);
+            const auto last = offset + std::min(end - offset, static_cast<long long>(block_size) - 1);
             auto headers = spec.headers;
             headers.erase(std::remove_if(headers.begin(), headers.end(), [](std::string h) { std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c) { return char(std::tolower(c)); }); return h.rfind("range:", 0) == 0 || h.rfind("accept-encoding:", 0) == 0; }), headers.end());
             headers.push_back("Range: bytes=" + std::to_string(offset) + "-" + std::to_string(last));
             headers.push_back("Accept-Encoding: identity");
-            net::Request query{spec.url, {}, headers, 10000, true}; query.max_body = 256 * 1024;
-            const auto chunk = net::execute(query);
+            net::Request query{spec.url, {}, headers, 10000, true}; query.max_body = block_size;
+            const auto started = std::chrono::steady_clock::now();
+            const auto chunk = session.execute(query);
+            const auto elapsed = std::chrono::steady_clock::now() - started;
             auto content_range = chunk.content_range;
             const auto first = content_range.find_first_not_of(" \t"); if (first != std::string::npos) content_range.erase(0, first);
             while (!content_range.empty() && std::isspace(static_cast<unsigned char>(content_range.back()))) content_range.pop_back();
@@ -268,15 +275,25 @@ class RangeBridge {
             if (!chunk.ok() || chunk.status != 206 || content_range != expected || chunk.body.size() != size_t(last - offset + 1)) { if (!stopped()) bad.store(true); return; }
             if (!send_bytes(socket, chunk.body.data(), chunk.body.size())) return; // 解码器定位会主动抛弃旧连接。
             offset = last + 1;
+            if (chunk.body.size() == block_size) {
+                if (elapsed < std::chrono::milliseconds(250)) block_size = std::min(block_size * 2, size_t(512 * 1024));
+                else if (elapsed > std::chrono::seconds(1)) block_size = std::max(block_size / 2, size_t(64 * 1024));
+            }
         }
     }
 public:
     ~RangeBridge() { stop(); }
     bool start(const StreamSpec& value, std::function<bool()> signal) {
         spec = value; cancelled = std::move(signal);
-        const auto probe = net::probe_audio(spec.url, spec.headers, 6000);
-        if (stopped() || probe.status != 206 || probe.total_bytes <= 0 || !probe.playable) return false;
-        total = probe.total_bytes;
+        if (spec.probe) {
+            if (!spec.probe->range_supported || spec.probe->total_bytes <= 0) return false;
+            total = spec.probe->total_bytes;
+        } else {
+            const auto probe = net::probe_audio(spec.url, spec.headers, 6000);
+            if (!probe.playable || probe.status != 206 || probe.total_bytes <= 0) return false;
+            total = probe.total_bytes;
+        }
+        if (stopped()) return false;
 #ifdef _WIN32
         WSADATA data{}; if (WSAStartup(MAKEWORD(2,2), &data) != 0) return false; sockets_ready = true;
 #endif
@@ -323,6 +340,52 @@ public:
 #endif
     }
 };
+namespace {
+// 自动复位的原生事件会记住先于 wait 到达的通知；音频回调只发信号，不获取互斥锁。
+class StreamSignal {
+#ifdef _WIN32
+    HANDLE event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+#else
+    int event_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+#endif
+public:
+    StreamSignal() {
+#ifdef _WIN32
+        if (!event_)
+#else
+        if (event_ < 0)
+#endif
+            throw std::runtime_error("无法创建音频唤醒事件");
+    }
+    StreamSignal(const StreamSignal&) = delete;
+    ~StreamSignal() {
+#ifdef _WIN32
+        CloseHandle(event_);
+#else
+        ::close(event_);
+#endif
+    }
+    void notify() noexcept {
+#ifdef _WIN32
+        SetEvent(event_);
+#else
+        const uint64_t value = 1;
+        while (::write(event_, &value, sizeof value) < 0 && errno == EINTR) {}
+#endif
+    }
+    void wait(int milliseconds = -1) {
+#ifdef _WIN32
+        WaitForSingleObject(event_, milliseconds < 0 ? INFINITE : DWORD(milliseconds));
+#else
+        pollfd item{event_, POLLIN, 0};
+        if (::poll(&item, 1, milliseconds) > 0) {
+            uint64_t value;
+            while (::read(event_, &value, sizeof value) < 0 && errno == EINTR) {}
+        }
+#endif
+    }
+};
+}
 struct Stream::Impl {
     static constexpr uint64_t rate = 48000, capacity = rate * 3, prebuffer = rate / 4;
     struct Source { ma_data_source_base base{}; Impl* owner = nullptr; } source;
@@ -335,18 +398,24 @@ struct Stream::Impl {
     std::atomic<uint64_t> resume_buffer{prebuffer};
     std::atomic<bool> stop{false}, decoded{false}, broken{false}, waiting{true};
     std::atomic<bool> input_complete{false}, input_abort{false};
+    std::atomic<bool> producer_waiting{false};
+    StreamSignal space_ready, progress_ready;
     std::thread input, output, monitor;
     mutable std::mutex mutex;
     std::condition_variable cv;
     std::string failure;
     bool source_ready = false;
     bool stopped() const { return stop.load() || (cancelled && cancelled()); }
+    void stop_pipeline() {
+        stop.store(true); process.terminate(); cv.notify_all();
+        space_ready.notify(); progress_ready.notify();
+    }
     void fail(const std::string& message) {
         { std::lock_guard<std::mutex> lock(mutex); if (failure.empty()) failure = message; }
-        broken.store(true); cv.notify_all();
+        broken.store(true); cv.notify_all(); progress_ready.notify();
     }
     ~Impl() {
-        stop.store(true); process.terminate(); cv.notify_all();
+        stop_pipeline();
         if (bridge) bridge->stop();
         if (input.joinable()) input.join();
         if (output.joinable()) output.join();
@@ -362,7 +431,10 @@ struct Stream::Impl {
         // 暂时断流输出静音且不推进曲目位置，不能把网络空隙误报为自然结束。
         if (!ended && (available < count || (self.waiting.load() && available < self.resume_buffer.load()))) {
             if (frames) std::memset(frames, 0, size_t(count) * 2 * sizeof(float));
-            if (!self.waiting.exchange(true)) self.resume_buffer.store(std::min<uint64_t>(rate, self.resume_buffer.load() + prebuffer));
+            if (!self.waiting.exchange(true)) {
+                self.resume_buffer.store(std::min<uint64_t>(rate, self.resume_buffer.load() + prebuffer));
+                self.progress_ready.notify();
+            }
             *read_count = count; return MA_SUCCESS;
         }
         const auto n = std::min<uint64_t>(count, available);
@@ -372,8 +444,10 @@ struct Stream::Impl {
             for (uint64_t i = 0; i < first * 2; ++i) output[i] = self.pcm[(begin % capacity) * 2 + i] / 32768.0f;
             for (uint64_t i = 0; i < (n - first) * 2; ++i) output[first * 2 + i] = self.pcm[i] / 32768.0f;
         }
-        self.consumed.store(begin + n, std::memory_order_release);
-        self.waiting.store(false); *read_count = n;
+        self.consumed.store(begin + n, std::memory_order_seq_cst);
+        if (self.producer_waiting.exchange(false, std::memory_order_seq_cst)) self.space_ready.notify();
+        if (self.waiting.exchange(false)) self.progress_ready.notify();
+        *read_count = n;
         return n ? MA_SUCCESS : MA_AT_END;
     }
     static ma_result seek(ma_data_source* data, ma_uint64 frame) {
@@ -411,7 +485,7 @@ struct Stream::Impl {
             auto last_progress = std::chrono::steady_clock::now();
             uint64_t previous_written = 0;
             while (!decoded.load() && !stop.load()) {
-                if (stopped()) { stop.store(true); process.terminate(); cv.notify_all(); return; }
+                if (stopped()) { stop_pipeline(); return; }
                 const auto produced = written.load();
                 const auto read = consumed.load();
                 const auto now = std::chrono::steady_clock::now();
@@ -421,9 +495,10 @@ struct Stream::Impl {
                 previous_written = produced;
                 if (waiting.load() && now - last_progress >= std::chrono::seconds(15)) {
                     fail("音频缓冲超过 15 秒没有进展");
-                    input_abort.store(true); process.terminate(); cv.notify_all(); return;
+                    input_abort.store(true); stop_pipeline(); return;
                 }
-                platform::sleep_ms(20);
+                // PCM 生产/欠载通知负责唤醒；一秒兜底只检查外部取消，不再每 20 ms 轮询。
+                progress_ready.wait(1000);
             }
         });
         if (spec.local_path.empty() && !bridge) input = std::thread([this] {
@@ -450,9 +525,15 @@ struct Stream::Impl {
                     const auto begin = written.load(std::memory_order_relaxed);
                     const auto free = capacity - (begin - consumed.load(std::memory_order_acquire));
                     const auto n = std::min<uint64_t>(frames - done, std::min<uint64_t>(free, capacity - begin % capacity));
-                    if (!n) { std::unique_lock<std::mutex> lock(mutex); cv.wait_for(lock,std::chrono::milliseconds(5)); continue; }
+                    if (!n) {
+                        producer_waiting.store(true, std::memory_order_seq_cst);
+                        if (!stopped() && written.load() - consumed.load(std::memory_order_seq_cst) >= capacity) space_ready.wait();
+                        producer_waiting.store(false, std::memory_order_seq_cst);
+                        continue;
+                    }
                     std::memcpy(pcm.data() + begin % capacity * 2, bytes.data() + done * 4, size_t(n) * 4);
-                    written.store(begin + n, std::memory_order_release); done += size_t(n); cv.notify_all();
+                    written.store(begin + n, std::memory_order_release); done += size_t(n);
+                    cv.notify_all(); progress_ready.notify();
                 }
                 tail = (got + tail) % 4;
                 if (tail) std::memmove(bytes.data(), bytes.data() + frames * 4, tail);
@@ -468,7 +549,7 @@ struct Stream::Impl {
                 fail("流式音频提前结束，正在恢复剩余播放位置");
             if (!stopped() && !input_complete.load(std::memory_order_acquire)) fail("音频传输未完成，解码已提前结束");
             input_abort.store(true);
-            decoded.store(true, std::memory_order_release); cv.notify_all();
+            decoded.store(true, std::memory_order_release); cv.notify_all(); progress_ready.notify();
         });
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
         std::unique_lock<std::mutex> lock(mutex);
@@ -477,35 +558,101 @@ struct Stream::Impl {
             cv.wait_for(lock, std::chrono::milliseconds(40));
         }
         if ((startup_cancelled && startup_cancelled()) || stopped() || broken.load() || written.load() == 0 || (written.load() < prebuffer && !decoded.load())) {
-            error = stopped() ? "流式播放已取消" : failure.empty() ? "流式预缓冲失败，尝试完整文件" : failure;
-            lock.unlock(); stop.store(true); process.terminate(); cv.notify_all(); return false;
+            error = !failure.empty() ? failure : stopped() ? "流式播放已取消" : "流式预缓冲失败，尝试完整文件";
+            lock.unlock(); stop_pipeline(); return false;
         }
         return true;
     }
 };
 Stream::Stream() : impl_(std::make_unique<Impl>()) {}
 Stream::~Stream() = default;
+namespace {
+// 包含当前、准备中和回收中的流，总数最多四个；容量耗尽时由调用方回退文件播放。
+// UI 只取消并移交指针，join 网络/解码线程和关闭 loopback 连接均在这个线程完成。
+class StreamRetirement {
+    static constexpr size_t limit = 4;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::array<Stream*, limit> pending_{};
+    size_t head_ = 0, count_ = 0, outstanding_ = 0;
+    bool stopping_ = false;
+    std::thread worker_;
+    void run() {
+        for (;;) {
+            Stream* stream = nullptr;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                changed_.wait(lock, [&] { return stopping_ || count_ != 0; });
+                if (!count_ && stopping_) return;
+                stream = pending_[head_]; head_ = (head_ + 1) % limit; --count_;
+            }
+            delete stream;
+            release_slot();
+        }
+    }
+public:
+    StreamRetirement() : worker_([this] { run(); }) {}
+    ~StreamRetirement() {
+        { std::lock_guard<std::mutex> lock(mutex_); stopping_ = true; }
+        changed_.notify_all();
+        worker_.join();
+    }
+    bool acquire_slot() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (outstanding_ >= limit || stopping_) return false;
+        ++outstanding_; return true;
+    }
+    void release_slot() {
+        { std::lock_guard<std::mutex> lock(mutex_); --outstanding_; }
+        changed_.notify_all();
+    }
+    void retire(Stream* stream) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pending_[(head_ + count_) % limit] = stream; ++count_;
+        }
+        changed_.notify_all();
+    }
+    void wait_idle() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        changed_.wait(lock, [&] { return outstanding_ == 0; });
+    }
+};
+std::shared_ptr<StreamRetirement> stream_retirement() {
+    static const auto instance = std::make_shared<StreamRetirement>();
+    return instance;
+}
+}
+void wait_for_stream_cleanup() { stream_retirement()->wait_idle(); }
 std::shared_ptr<Stream> Stream::open(StreamSpec spec, std::function<bool()> cancelled, std::string& error,
                                      const std::function<bool()>& startup_cancelled) {
     error.clear();
-    auto stream = std::shared_ptr<Stream>(new Stream);
-    stream->impl_->spec = std::move(spec); stream->impl_->cancelled = std::move(cancelled);
     try {
+        auto retirement = stream_retirement();
+        if (!retirement->acquire_slot()) { error = "旧音频管线正在回收，暂时使用文件播放"; return {}; }
+        Stream* raw = nullptr;
+        try { raw = new Stream; }
+        catch (...) { retirement->release_slot(); throw; }
+        auto stream = std::shared_ptr<Stream>(raw, [retirement](Stream* retired) {
+            retired->cancel();
+            retirement->retire(retired);
+        });
+        stream->impl_->spec = std::move(spec); stream->impl_->cancelled = std::move(cancelled);
         if (!stream->impl_->start(error, startup_cancelled)) {
             if (stream->impl_->bridge && stream->impl_->spec.range_allowed &&
                 !(stream->impl_->cancelled && stream->impl_->cancelled()) && !(startup_cancelled && startup_cancelled())) {
                 auto fallback = stream->impl_->spec; fallback.range_allowed = false;
                 auto signal = stream->impl_->cancelled;
-                stream.reset(); // 先回收旧进程、网络请求和端口，再走顺序管道。
+                stream.reset(); // 先取消旧管线，异步回收；顺序管道不复用旧端口或进程。
                 return open(std::move(fallback), std::move(signal), error, startup_cancelled);
             }
             return {};
         }
+        return stream;
     }
     catch (...) { error = "无法创建流式音频任务"; return {}; }
-    return stream;
 }
-void Stream::cancel() { impl_->stop.store(true); impl_->process.terminate(); impl_->cv.notify_all(); }
+void Stream::cancel() { impl_->stop_pipeline(); }
 bool Stream::failed() const { return impl_->broken.load(); }
 bool Stream::buffering() const { return impl_->waiting.load() && !impl_->decoded.load(); }
 long long Stream::buffered_ms() const {
