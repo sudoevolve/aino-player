@@ -1,4 +1,4 @@
-﻿// =============================================================================
+// =============================================================================
 //  aino.hpp — 单头文件 C++17 桌面 UI 库
 //
 //  立即模式 API：应用持有状态，Stack 负责顺序布局，Theme 提供语义颜色。
@@ -30,9 +30,9 @@
 #endif
 
 #define AINO_VERSION_MAJOR 0
-#define AINO_VERSION_MINOR 4
-#define AINO_VERSION_PATCH 14
-#define AINO_VERSION "0.4.14"
+#define AINO_VERSION_MINOR 5
+#define AINO_VERSION_PATCH 2
+#define AINO_VERSION "0.5.2"
 
 #include <cstdint>
 #include <cstddef>
@@ -489,6 +489,7 @@ struct Style {
 
     // --- 交互 ---
     float press_scale = 1.0f;     // 按压缩放，1.0 = 不缩放
+    uint64_t identity = 0;        // 非零稳定身份，在本 Ui / state_scope 内唯一，与坐标无关
 
     // -------- 链式修饰 --------
     Style& color(const Color& c) { fg = c; return *this; }
@@ -521,6 +522,7 @@ struct Style {
     Style& indicator(bool show) { show_indicator = show; return *this; }
     Style& secret(bool on = true) { password = on; return *this; }
     Style& scale_on_press(float s) { press_scale = s; return *this; }
+    Style& id(uint64_t value) { identity = value; return *this; }
     Style& wrap_text(bool v = true) { wrap = v; return *this; }
     Style& line_spacing(float g) { line_gap = g; return *this; }
     Style& animate(bool v = true) { animated = v; return *this; }
@@ -590,7 +592,7 @@ struct Input {
     bool key_ctrl[KEY_COUNT]  = {};
     bool key_shift[KEY_COUNT] = {};
     bool key_alt[KEY_COUNT]   = {};
-    std::string text_input;     // 本帧输入的 UTF-8 文本（已过滤控制字符）
+    std::string text_input;     // 本帧输入的 UTF-8 文本（多行编辑可能包含 Tab）
     bool shift() const { return key_down[KEY_SHIFT]; }
     bool ctrl()  const { return key_down[KEY_CTRL]; }
     bool alt()   const { return key_down[KEY_ALT]; }
@@ -648,11 +650,28 @@ struct Input {
 //    · 子布局可以嵌套，父子之间继承 gap。
 //
 //  刻意不做：内容自适应高度、自动换行、网格、约束求解。它们要么需要两趟
-//  遍历，要么需要尺寸缓存依赖图，与"单头文件 + 110KB"的目标直接冲突。
+//  遍历，要么需要尺寸缓存依赖图，与"单头文件、最小示例 exe 约 380 KiB"的目标直接冲突。
 //  布局器本身是纯值语义（一个 Rect + 一个方向 + 一个间距），不注册任何
 //  状态，所以嵌套/丢弃/复制都没有代价。
 // =============================================================================
 class Ui;
+
+/** @brief 临时选择控件状态的拥有者；析构恢复之前的作用域，不销毁状态。
+ * 只在所属 Ui 存活期间、同一 UI 线程内按嵌套顺序使用。
+ */
+class StateScope {
+public:
+    StateScope(const StateScope&) = delete;
+    StateScope& operator=(const StateScope&) = delete;
+    StateScope(StateScope&& other) noexcept;
+    StateScope& operator=(StateScope&&) = delete;
+    ~StateScope();
+private:
+    friend class Ui;
+    StateScope(Ui* ui, uint64_t previous) : ui_(ui), previous_(previous) {}
+    Ui* ui_ = nullptr;
+    uint64_t previous_ = 0;
+};
 
 // -----------------------------------------------------------------------------
 //  ScrollScope —— 一个滚动视口的句柄（`ui.scroll()` 的返回值）
@@ -667,6 +686,7 @@ class Ui;
 struct ScrollScope {
     Ui*      ui         = nullptr;
     uint64_t id         = 0;
+    uint64_t state_scope_id = 0;   // 偏移属于创建句柄时的拥有者
     Rect     box;
     float    content_h  = 0.0f;
     float    max_offset = 0.0f;
@@ -679,7 +699,7 @@ struct ScrollScope {
     ScrollScope(ScrollScope&& o) noexcept { *this = std::move(o); }
     ScrollScope& operator=(ScrollScope&& o) noexcept {
         if (this == &o) return *this;
-        ui = o.ui; id = o.id; box = o.box; content_h = o.content_h;
+        ui = o.ui; id = o.id; state_scope_id = o.state_scope_id; box = o.box; content_h = o.content_h;
         max_offset = o.max_offset; offset = o.offset; active = o.active;
         o.active = false; o.ui = nullptr;
         return *this;
@@ -787,10 +807,26 @@ class Ui {
 public:
     Ui();
     ~Ui();
+    Ui(const Ui&) = delete;
+    Ui& operator=(const Ui&) = delete;
+    Ui(Ui&&) = delete;
+    Ui& operator=(Ui&&) = delete;
 
     // ---------------- 帧生命周期（由 Window::run 调用，通常不用手动调）-------
     void begin_frame(float width, float height, float dt, float dpi_scale);
     void end_frame();
+
+    /** @brief 为页面、会话或动态控件指定稳定的状态拥有者；隐藏时保留状态。
+     * id 在本 Ui 内唯一，0 表示原有未分组状态；嵌套作用域使用各自独立的 id。
+     * 返回的句柄只恢复当前作用域，永久销毁拥有者时调用 release_state_scope(id)。
+     */
+    [[nodiscard]] StateScope state_scope(uint64_t id);
+    /** @brief 明确销毁指定拥有者的内部状态；不修改应用持有的业务数据。
+     * 仅 UI 线程调用。帧内延迟到所有 deferred 结束后释放，帧外立即释放。
+     * 隐藏、切页、离屏不应调用；0 和测量期间的调用忽略，其他作用域不受影响。
+     * 销毁后不要继续使用该拥有者；若复用 id，须等本帧 end_frame() 完成。
+     */
+    void release_state_scope(uint64_t id);
 
     // ---------------- 环境查询 ----------------
     /** @brief 当前调用层可见的输入；被浮层或裁剪挡住时屏蔽鼠标按键、滚轮和拖拽。
@@ -974,6 +1010,10 @@ public:
     bool search_field(std::string* value, const Rect& box, const Style& st = Style());
     // 颜色池（NSColorWell）：48×24 的圆角色块，点击返回 true，由调用方弹选择器。
     bool color_well(const Color& c, const Rect& box, const Style& st = Style());
+    // 颜色选择器：触发器 + RGB 三滑杆浮层，保留输入颜色的 alpha。
+    // 浮层在帧末更新 *value 并调用 on_change；value/open 须存活至本帧结束。
+    void color_picker(Color* value, bool* open, const Rect& box,
+                      const std::function<void(Color)>& on_change = {}, const Style& st = Style());
     // 图像池：中性填充、细边、系统图片符号与说明；不处理文件拖放。
     void image_well(const Rect& box, const Style& st = Style());
     bool checkbox(bool* value, const std::string& label, const Rect& box, const Style& st = Style());
@@ -1241,6 +1281,10 @@ public:
     // 老写法，等价于只填 width / height / title。
     Window(int width, int height, const std::string& title);
     ~Window();
+    Window(const Window&) = delete;
+    Window& operator=(const Window&) = delete;
+    Window(Window&&) = delete;
+    Window& operator=(Window&&) = delete;
 
     bool ok() const;                   // 创建是否成功
     Ui&  ui();
@@ -1270,8 +1314,8 @@ public:
     //         while (running) { if (recv_new_bytes()) win.wake(); }
     //     }).detach();
     //
-    // 它只做两件事：置 need_frame、往自己窗口投一条无副作用的消息/空事件。
-    // 主线程调用也可以用来主动唤醒窗口。
+    // 通知内核事件/管道，由 UI 线程消费后请求一帧；不会从后台调用 Xlib/AppKit。
+    // 主线程也可调用。调用方保证窗口存活，后台线程须在窗口析构前结束。
     void wake();
 
     // 常驻动画（spinner / 光标闪烁 / hover 插值）的重绘帧率上限，默认 60fps。
@@ -1299,6 +1343,7 @@ public:
     // 单步：给需要自己控制循环的人用
     bool poll();                       // 处理一批消息，返回是否仍存活
     void render();
+    void render(const std::function<void(Ui&)>& frame); // 同步绘制一帧，含 begin/end/present
 
     // 剪贴板（input 组件的复制粘贴用）
     void set_clipboard(const std::string& text);
@@ -1413,9 +1458,19 @@ extern char** environ;
 #include <cstdlib>
 #include <cstdarg>
 #include <algorithm>
+#include <chrono>
+#include <list>
+#include <limits>
 #include <unordered_map>
+#include <deque>
 #include <memory>
 #include <fstream>
+#include <atomic>
+#if !defined(AINO_PLATFORM_WINDOWS)
+#  include <poll.h>
+#  include <fcntl.h>
+#  include <cerrno>
+#endif
 
 namespace aino {
 namespace detail {
@@ -1484,6 +1539,29 @@ inline int utf8_decode(const char* s, uint32_t* out) {
     }
     *out = 0xFFFD; return 1;
 }
+
+// 带长度的解码：截断的多字节序列（粘贴被切断、网络/文件读了一半）按替换符处理，
+// **不越界读**。返回值（前进多少字节）与上面的版本一致 —— 这样调用方的迭代次数、
+// 码点计数在畸形输入下也不变，只是不再踩到字符串末尾之外。
+inline int utf8_decode_n(const char* s, size_t avail, uint32_t* out) {
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(s);
+    if (avail == 0) { *out = 0; return 0; }
+    if (p[0] < 0x80) { *out = p[0]; return 1; }
+    if ((p[0] & 0xE0) == 0xC0) {
+        *out = avail >= 2 ? (((p[0] & 0x1Fu) << 6) | (p[1] & 0x3Fu)) : 0xFFFD;
+        return 2;
+    }
+    if ((p[0] & 0xF0) == 0xE0) {
+        *out = avail >= 3 ? (((p[0] & 0x0Fu) << 12) | ((p[1] & 0x3Fu) << 6) | (p[2] & 0x3Fu)) : 0xFFFD;
+        return 3;
+    }
+    if ((p[0] & 0xF8) == 0xF0) {
+        *out = avail >= 4 ? (((p[0] & 0x07u) << 18) | ((p[1] & 0x3Fu) << 12)
+                            | ((p[2] & 0x3Fu) << 6) | (p[3] & 0x3Fu)) : 0xFFFD;
+        return 4;
+    }
+    *out = 0xFFFD; return 1;
+}
 inline int utf8_encode(uint32_t cp, char* out) {
     if (cp < 0x80) { out[0] = char(cp); return 1; }
     if (cp < 0x800) { out[0] = char(0xC0 | (cp >> 6)); out[1] = char(0x80 | (cp & 0x3F)); return 2; }
@@ -1500,7 +1578,7 @@ inline std::vector<uint32_t> utf8_codepoints(const std::string& s) {
     size_t i = 0;
     while (i < s.size()) {
         uint32_t cp = 0;
-        int n = utf8_decode(s.c_str() + i, &cp);
+        int n = utf8_decode_n(s.c_str() + i, s.size() - i, &cp);
         cps.push_back(cp);
         i += size_t(n < 1 ? 1 : n);
     }
@@ -1516,11 +1594,29 @@ inline std::string utf8_from_codepoints(const std::vector<uint32_t>& cps, size_t
     }
     return out;
 }
-inline int utf8_count(const std::string& s) { return int(utf8_codepoints(s).size()); }
+// 码点计数：单遍扫描，**不分配**。老实现是 utf8_codepoints(s).size()，每调一次
+// 就要为整串分配一个 uint32 数组 —— 输入框/多行文本框每帧都调它，20 万字的文档
+// 每帧白分配 800 KB。前进步长只由首字节决定，与 utf8_codepoints 的计数完全一致。
+inline int utf8_count(const std::string& s) {
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(s.data());
+    const size_t n = s.size();
+    int count = 0;
+    size_t i = 0;
+    while (i < n) {
+        const unsigned char c = p[i];
+        size_t step = 1;
+        if ((c & 0xE0u) == 0xC0u) step = 2;
+        else if ((c & 0xF0u) == 0xE0u) step = 3;
+        else if ((c & 0xF8u) == 0xF0u) step = 4;
+        i += step;
+        ++count;
+    }
+    return count;
+}
 // 取第 idx 个码点之前的字节偏移
 inline size_t utf8_byte_offset(const std::string& s, int idx) {
     size_t i = 0; int k = 0;
-    while (i < s.size() && k < idx) { uint32_t cp; i += size_t(utf8_decode(s.c_str() + i, &cp)); ++k; }
+    while (i < s.size() && k < idx) { uint32_t cp; i += size_t(utf8_decode_n(s.c_str() + i, s.size() - i, &cp)); ++k; }
     return i;
 }
 
@@ -1729,6 +1825,45 @@ struct Canvas {
         blend_row(y, x0, x1, c, 1.0f);
     }
 
+    // 预乘了覆盖率的掩膜整行合成（图标：8 位；投影：16 位）。
+    //
+    // 存在的理由：图标与投影的覆盖率是**预先算好的常量**，每帧只需要"把掩膜贴上去"。
+    // 走 blend() 的话每个像素都要重判边界与裁剪区 —— 一个 24×24 图标 576 次判断，
+    // 一块弹窗投影几十万次。这里由调用方保证 [x0,x1) 已经裁到画布与裁剪区内，
+    // 循环里只剩混合本身；算式与 blend() 逐项一致，输出逐像素相同。
+    inline void blend_mask_row8(int y, int x0, int x1, const Color& c, const uint8_t* a) {
+        if (x1 <= x0) return;
+        uint8_t* p = px + size_t(y) * size_t(stride) + size_t(x0) * 4u;
+        // 与 blend() 同序计算：sa = (c.a/255) * (alpha/255)，不要先合并常数，
+        // 否则浮点结合顺序变了，个别像素会差 1。
+        const float ca = float(c.a) * (1.0f / 255.0f);
+        for (int i = x1 - x0; i > 0; --i, p += 4, ++a) {
+            const float sa = ca * (float(*a) * (1.0f / 255.0f));
+            if (sa <= 0.0015f) continue;
+            if (sa >= 0.9985f) { p[CH_R] = c.r; p[CH_G] = c.g; p[CH_B] = c.b; p[CH_A] = 255; continue; }
+            const float inv = 1.0f - sa;
+            p[CH_R] = uint8_t(c.r * sa + p[CH_R] * inv + 0.5f);
+            p[CH_G] = uint8_t(c.g * sa + p[CH_G] * inv + 0.5f);
+            p[CH_B] = uint8_t(c.b * sa + p[CH_B] * inv + 0.5f);
+            p[CH_A] = 255;
+        }
+    }
+    inline void blend_mask_row16(int y, int x0, int x1, const Color& c, const uint16_t* a) {
+        if (x1 <= x0) return;
+        uint8_t* p = px + size_t(y) * size_t(stride) + size_t(x0) * 4u;
+        const float ca = float(c.a) * (1.0f / 255.0f);
+        for (int i = x1 - x0; i > 0; --i, p += 4, ++a) {
+            const float sa = ca * (float(*a) * (1.0f / 65535.0f));
+            if (sa <= 0.0015f) continue;
+            if (sa >= 0.9985f) { p[CH_R] = c.r; p[CH_G] = c.g; p[CH_B] = c.b; p[CH_A] = 255; continue; }
+            const float inv = 1.0f - sa;
+            p[CH_R] = uint8_t(c.r * sa + p[CH_R] * inv + 0.5f);
+            p[CH_G] = uint8_t(c.g * sa + p[CH_G] * inv + 0.5f);
+            p[CH_B] = uint8_t(c.b * sa + p[CH_B] * inv + 0.5f);
+            p[CH_A] = 255;
+        }
+    }
+
     void clear(const Color& c) {
         if (w <= 0 || h <= 0 || !px) return;
         // 先铺满第 0 行的 w 个像素，其余行整块拷贝 —— 3 MB 的 memcpy 比
@@ -1890,16 +2025,6 @@ inline Span rr_span(float y, const RRectGeo& g) {
     return s;
 }
 
-// 兼容旧调用点：没有 smoothing 的纯圆弧
-inline Span rrect_span(float y, const Rect& r, float rad) {
-    if (rad <= 0.0f) {
-        Span s{r.x, r.right()};
-        if (y < r.y || y > r.bottom()) { s.xl = 1.0f; s.xr = 0.0f; }
-        return s;
-    }
-    RRectGeo g = make_rrgeo(r, rad, 0.0f);
-    return rr_span(y, g);
-}
 
 // 4 倍垂直子采样 × 水平解析覆盖 —— 半径 8px 的圆角能得到干净的边缘
 static const int AINO_SS = 4;
@@ -1929,7 +2054,7 @@ inline void raster_rrect_paint(Canvas& cv, const Rect& r, const RowPaint& paint,
     if (y1 > cv.h) y1 = cv.h;
     if (y0 < 0) y0 = 0;
     if (y1 <= y0) return;
-    // 半径按短边折半，和 rrect_span 内部一致；先算好才能推出"必定被覆盖"的内区
+    // 半径按短边折半，和 rr_span 内部一致；先算好才能推出"必定被覆盖"的内区
     const RRectGeo geo = make_rrgeo(r, rad, smooth);
 
     for (int py = y0; py < y1; ++py) {
@@ -1944,7 +2069,7 @@ inline void raster_rrect_paint(Canvas& cv, const Rect& r, const RowPaint& paint,
             float sy = float(py) + (float(s) + 0.5f) / float(AINO_SS);
             Span sp = rr_span(sy, geo);
             xls[s] = sp.xl; xrs[s] = sp.xr;
-            // rrect_span 对"行在矩形外"返回空哨兵 (xl=1, xr=0)。哨兵会把
+            // rr_span 对"行在矩形外"返回空哨兵 (xl=1, xr=0)。哨兵会把
             // min/max 带偏，所以必须用「是否真落在矩形内」显式判定。
             if (!(sp.xr > sp.xl)) all_inside = false;
             if (sp.xl < mn) mn = sp.xl;
@@ -1990,7 +2115,7 @@ inline void raster_rrect_paint(Canvas& cv, const Rect& r, const RowPaint& paint,
 // 描边：outer 覆盖 - inner 覆盖
 // 同样有"恒 1 区"快路径：左右两条竖边里，coverage 恒为 1（外框整覆盖、内框不沾边），
 // 一整条 1px 边框按逐像素 4 倍子采样跑会非常贵 —— 大面板的边框就是靠这条吃掉的。
-// 注意 rrect_span 对"行在矩形外"返回空哨兵 (xl=1, xr=0)，直接用 min/max 会被带偏
+// 注意 rr_span 对"行在矩形外"返回空哨兵 (xl=1, xr=0)，直接用 min/max 会被带偏
 // （内框在某行为空时 inr 会变成 0，右竖边下界退化成 0 → 整行被当成边框填满），
 // 所以下面一律按「有效样本」分别求边界。
 inline void raster_rrect_stroke(Canvas& cv, const Rect& r, const Color& c, float rad, float width, float smooth = 0.0f) {
@@ -2494,16 +2619,25 @@ inline void raster_rrect_inner(Canvas& cv, const Rect& r, float rad, float blur,
 }
 
 // 阴影轮廓边界的覆盖率为 50%；blur 对应高斯 σ = blur/2。使用 logistic 查表近似累积分布，避免逐像素 exp。
-inline float shadow_cov(float u) {
-    static float tab[65];
-    static bool init = false;
-    if (!init) {
+//
+// 查表放在函数外的 MAGIC STATIC 里：C++11 起它的初始化是线程安全的。
+// 早先用手工 `init` 标志，两个线程（画廊的素材窗口就走这条路）同时首次调用会竞争。
+struct ShadowCurve {
+    float tab[65];
+    ShadowCurve() {
         for (int i = 0; i < 65; ++i) {
             const float x = -2.0f + 4.0f * float(i) / 64.0f;   // u ∈ [-2, 2]
             tab[i] = 1.0f / (1.0f + std::exp(3.404f * x));
         }
-        init = true;
     }
+};
+inline const ShadowCurve& shadow_curve() {
+    static const ShadowCurve t;
+    return t;
+}
+
+inline float shadow_cov(float u) {
+    const float* tab = shadow_curve().tab;
     const float t = (u * 0.25f + 0.5f) * 64.0f;                // u ∈ [-2,2] → [0,64]
     if (t <= 0.0f) return 1.0f;
     if (t >= 64.0f) return 0.0f;
@@ -2512,21 +2646,61 @@ inline float shadow_cov(float u) {
     return tab[i] + (tab[i + 1] - tab[i]) * f;
 }
 
-// 阴影：对"外扩 blur"的包围盒逐像素求到圆角矩形边界的有符号距离 d，
-// 再按高斯覆盖率曲线取 alpha。距离场一次遍历就够，曲线不随 blur 变味。
-inline void raster_shadow(Canvas& cv, const Rect& r, float rad, float blur, const Color& c, float dy) {
-    if (blur <= 0.5f || c.a == 0) return;
-    const Rect s = r.offset(0.0f, dy);
-    const float inv_blur = 1.0f / blur;
-    // 拖尾截断到 ±1.35·blur（覆盖率 < 0.3%，肉眼不可见）
-    const float ext = blur * 1.35f;
+// -----------------------------------------------------------------------------
+//  投影掩膜缓存
+//
+//  掩膜里每个像素只取决于三件事：矩形在包围盒内的**亚像素相位**、矩形宽高、
+//  圆角与模糊半径。与颜色、与屏幕位置都无关（距离场是平移不变的）。所以一个
+//  弹窗的掩膜从第二帧起可以整块复用 —— 挡住的是逐像素的 sqrt。
+//
+//  为什么值得做：level2 投影（dialog/sheet/drawer 用 blur 90）在 480×300 上
+//  实测 3.92 ms/帧，是整帧最大单项；而它每帧的形状一个像素都没变。
+//
+//  为什么不存 8 位：软阴影的 alpha 跨度只有 0..≈1，8 位量化在渐变段会让整块
+//  阴影出现台阶（马赫带）。16 位把误差压到输出端 1 LSB 以内，实测与直接计算
+//  的逐像素最大差 ≤1。
+//
+//  内存：按 16 位存。480×300 / blur90 的掩膜是 723×543×2 ≈ 785 KiB。
+//  单块超过 kMaskCap 就退回逐像素直算（整窗尺寸的投影属于罕见路径，不值得为它
+//  常驻几 MB）；总量超过 kBudget 按最久未用淘汰。
+// -----------------------------------------------------------------------------
+struct ShadowMask {
+    int w = 0, h = 0;
+    float px = 0, py = 0;           // 矩形在包围盒内的相位（0..1）
+    float rw = 0, rh = 0;           // 矩形宽高
+    float rad = 0, blur = 0;
+    uint64_t stamp = 0;
+    std::vector<uint16_t> a;
 
+    bool same_shape(float px_, float py_, float rw_, float rh_, float rad_, float blur_) const {
+        return px == px_ && py == py_ && rw == rw_ && rh == rh_ && rad == rad_ && blur == blur_;
+    }
+};
+
+struct ShadowCache {
+    static const size_t kSlots   = 4;
+    static const size_t kMaskCap = size_t(2u << 20);    // 单块上限 2 MiB
+    static const size_t kBudget  = size_t(4u << 20);    // 总量上限 4 MiB
+    std::vector<ShadowMask> slots;
+    uint64_t tick = 0;
+};
+
+inline ShadowCache& shadow_cache() {
+    // 每个渲染线程一份：画廊的素材窗口在独立线程里画自己的帧。
+    static thread_local ShadowCache c;
+    return c;
+}
+
+// 直算路径：掩膜太大不进缓存时走这里（原实现，逐像素求距离场）。
+inline void raster_shadow_direct(Canvas& cv, const Rect& s, float rad, float blur, const Color& c) {
+    const float inv_blur = 1.0f / blur;
+    // 拖尾截断到 ±1.35·blur：该处覆盖率为 1%，肉眼不可见。
+    const float ext = blur * 1.35f;
     const int x0 = std::max(0, int(std::floor(s.x - ext)));
     const int x1 = std::min(cv.w, int(std::ceil(s.right() + ext)));
     const int y0 = std::max(0, int(std::floor(s.y - ext)));
     const int y1 = std::min(cv.h, int(std::ceil(s.bottom() + ext)));
     if (x0 >= x1 || y0 >= y1) return;
-
     for (int y = y0; y < y1; ++y) {
         const float pyc = float(y) + 0.5f;
         for (int x = x0; x < x1; ++x) {
@@ -2535,6 +2709,82 @@ inline void raster_shadow(Canvas& cv, const Rect& r, float rad, float blur, cons
             if (cov < 0.004f) continue;
             cv.blend(x, y, c, cov);   // alpha 由 blend 里的 c.a 负责
         }
+    }
+}
+
+// 阴影：对"外扩 blur"的包围盒逐像素求到圆角矩形边界的有符号距离 d，
+// 再按高斯覆盖率曲线取 alpha。距离场一次遍历就够，曲线不随 blur 变味。
+inline void raster_shadow(Canvas& cv, const Rect& r, float rad, float blur, const Color& c, float dy) {
+    if (blur <= 0.5f || c.a == 0) return;
+    const Rect s = r.offset(0.0f, dy);
+    const float ext = blur * 1.35f;
+
+    // 掩膜包围盒：不裁到画布 —— 裁了相位就变了，同一块弹窗在窗口边缘会算出
+    // 另一张掩膜，缓存直接失效。裁剪留到合成那一步做。
+    const int bx0 = int(std::floor(s.x - ext));
+    const int by0 = int(std::floor(s.y - ext));
+    const int bx1 = int(std::ceil(s.right() + ext));
+    const int by1 = int(std::ceil(s.bottom() + ext));
+    const int bw = bx1 - bx0, bh = by1 - by0;
+    if (bw <= 0 || bh <= 0) return;
+    if (bx1 <= 0 || by1 <= 0 || bx0 >= cv.w || by0 >= cv.h) return;   // 完全在画布外
+
+    const float phx = s.x - float(bx0), phy = s.y - float(by0);
+    const size_t bytes = size_t(bw) * size_t(bh) * sizeof(uint16_t);
+    if (bytes > ShadowCache::kMaskCap) { raster_shadow_direct(cv, s, rad, blur, c); return; }
+
+    ShadowCache& cache = shadow_cache();
+    ShadowMask* hit = nullptr;
+    for (ShadowMask& m : cache.slots) {
+        if (m.w == bw && m.h == bh && m.same_shape(phx, phy, s.w, s.h, rad, blur)) { hit = &m; break; }
+    }
+
+    if (!hit) {
+        // 腾位置：先按最久未用淘汰，再插入。插入前就把这块算出来 —— 算的时候
+        // 不持任何锁，也不看画布。
+        size_t used = 0;
+        for (const ShadowMask& m : cache.slots) used += m.a.size() * sizeof(uint16_t);
+        while (!cache.slots.empty() && (cache.slots.size() >= ShadowCache::kSlots
+                                        || used + bytes > ShadowCache::kBudget)) {
+            size_t oldest = 0;
+            for (size_t i = 1; i < cache.slots.size(); ++i)
+                if (cache.slots[i].stamp < cache.slots[oldest].stamp) oldest = i;
+            used -= cache.slots[oldest].a.size() * sizeof(uint16_t);
+            cache.slots.erase(cache.slots.begin() + long(oldest));
+        }
+        cache.slots.emplace_back();
+        ShadowMask& m = cache.slots.back();
+        m.w = bw; m.h = bh;
+        m.px = phx; m.py = phy; m.rw = s.w; m.rh = s.h; m.rad = rad; m.blur = blur;
+        m.a.resize(size_t(bw) * size_t(bh));
+        // 与直算路径逐项相同：像素中心 (bx0+i+0.5, by0+j+0.5) 到圆角矩形的距离。
+        const float inv_blur = 1.0f / blur;
+        for (int j = 0; j < bh; ++j) {
+            const float pyc = float(by0 + j) + 0.5f;
+            uint16_t* row = m.a.data() + size_t(j) * size_t(bw);
+            for (int i = 0; i < bw; ++i) {
+                const float d = rrect_sdf(float(bx0 + i) + 0.5f, pyc, s, rad);
+                const float cov = shadow_cov(d * inv_blur);
+                row[i] = uint16_t(cov * 65535.0f + 0.5f);
+            }
+        }
+        hit = &m;
+    }
+    hit->stamp = ++cache.tick;
+
+    // ---- 合成：只把落在画布与裁剪区内的那一段贴上去 ----
+    const int cx0 = std::max(bx0, 0), cx1 = std::min(bx1, cv.w);
+    const int cy0 = std::max(by0, 0), cy1 = std::min(by1, cv.h);
+    for (int y = cy0; y < cy1; ++y) {
+        if (cv.clipped && (y < cv.clip_y0 || y >= cv.clip_y1)) continue;
+        int x0 = cx0, x1 = cx1;
+        if (cv.clipped) {
+            if (x0 < cv.clip_x0) x0 = cv.clip_x0;
+            if (x1 > cv.clip_x1) x1 = cv.clip_x1;
+        }
+        if (x1 <= x0) continue;
+        const uint16_t* src = hit->a.data() + size_t(y - by0) * size_t(bw) + size_t(x0 - bx0);
+        cv.blend_mask_row16(y, x0, x1, c, src);
     }
 }
 
@@ -2985,7 +3235,12 @@ public:
         SIZE sz{0, 0};
         GetTextExtentPoint32W(metric_dc_, w.c_str(), int(w.size()), &sz);
         SelectObject(metric_dc_, old);
-        if (measure_cache_.size() >= 2048) measure_cache_.clear();
+        // 满了一律清空会让接下来几十段文字全部回落到 GDI 往返（周期性卡顿）。
+        // 丢一半就腾得出空间，热的一半还在。
+        if (measure_cache_.size() >= 2048) {
+            auto it = measure_cache_.begin();
+            for (int i = 0; i < 1024 && it != measure_cache_.end(); ++i) it = measure_cache_.erase(it);
+        }
         measure_cache_.emplace(h, std::make_pair(utf8, float(sz.cx)));
         return float(sz.cx);
     }
@@ -3174,7 +3429,7 @@ namespace detail {
 inline constexpr float kAlertPad = 12.0f;
 } // namespace detail
 
-inline Theme Theme::light() {
+Theme Theme::light() {
     Theme t;
     // ---- 标签 ----
     t.label             = Color::rgba(0, 0, 0, 217);         // Labels/Primary      85%
@@ -3243,7 +3498,7 @@ inline Theme Theme::light() {
     return t;
 }
 
-inline Theme Theme::dark() {
+Theme Theme::dark() {
     Theme t;
     // ---- 标签 ----
     t.label             = Color::rgba(255, 255, 255, 217);
@@ -3313,17 +3568,19 @@ inline Theme Theme::dark() {
 }
 
 namespace icons {
-const char* check         = "\xE2\x9C\x93";              // ✓
-const char* chevron_down  = "\xE2\x8C\x84";              // ⌄
-const char* chevron_right = "\xE2\x80\xBA";              // ›
-const char* close         = "\xE2\x9C\x95";              // ✕
-const char* plus          = "+";
-const char* minus         = "\xE2\x88\x92";              // −
-const char* search        = "\xE2\x8C\x95";              // ⌕
-const char* settings      = "\xE2\x9A\x99";              // ⚙
-const char* sun           = "\xE2\x98\x80";              // ☀
-const char* moon          = "\xE2\x98\xBE";              // ☾
-const char* dot           = "\xE2\x80\xA2";              // •
+// inline：这些是**定义**而不是声明，两个编译单元都定义 AINO_IMPLEMENTATION 时
+// 原来的写法会重定义（链接期 duplicate symbol）。inline 变量要 C++17，本项目正好是。
+inline const char* check         = "\xE2\x9C\x93";              // ✓
+inline const char* chevron_down  = "\xE2\x8C\x84";              // ⌄
+inline const char* chevron_right = "\xE2\x80\xBA";              // ›
+inline const char* close         = "\xE2\x9C\x95";              // ✕
+inline const char* plus          = "+";
+inline const char* minus         = "\xE2\x88\x92";              // −
+inline const char* search        = "\xE2\x8C\x95";              // ⌕
+inline const char* settings      = "\xE2\x9A\x99";              // ⚙
+inline const char* sun           = "\xE2\x98\x80";              // ☀
+inline const char* moon          = "\xE2\x98\xBE";              // ☾
+inline const char* dot           = "\xE2\x80\xA2";              // •
 } // namespace icons
 
 namespace detail {
@@ -3344,7 +3601,10 @@ inline uint64_t prof_now() {
     LARGE_INTEGER c{}; QueryPerformanceCounter(&c);
     return uint64_t(double(c.QuadPart) * 1e6 / double(freq.QuadPart));
 #else
-    return uint64_t(clock() * 1000000 / CLOCKS_PER_SEC);
+    // clock() 是**进程 CPU 时间**，不是墙钟：在 Linux/macOS 上把"这一帧花了
+    // 多久"和"等了多久"混在一起，数字没有可比性。用 steady_clock。
+    using namespace std::chrono;
+    return uint64_t(duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count());
 #endif
 }
 
@@ -3361,6 +3621,77 @@ struct ProfTick {
         if (!live || !acc) return;
         *acc += prof_now() - t0;
         ++*cnt;
+    }
+};
+// 以 (拥有者, 控件键) 隔离状态。未绘制无法区分隐藏和删除，因此不按帧数淘汰；
+// 只有拥有者明确销毁时释放整组，避免误删离屏输入框的撤销历史或滚动位置。
+template<class T>
+class WidgetStateTable {
+    struct Key {
+        uint64_t scope, id;
+        bool operator==(const Key& other) const { return scope == other.scope && id == other.id; }
+    };
+    struct Hash {
+        size_t operator()(const Key& key) const {
+            return size_t(key.scope ? hash_combine(key.scope, key.id) : key.id);
+        }
+    };
+    std::unordered_map<Key, T, Hash> entries_;
+    std::vector<Key> measured_entries_;
+    uint64_t scope_ = 0;
+    bool measuring_ = false;
+
+public:
+    void set_scope(uint64_t scope) { scope_ = scope; }
+    // 测量中新建的节点仅供这次布局借用，结束即释放，不累积幽灵状态。
+    void set_measuring(bool on) {
+        measuring_ = on;
+        if (!on) {
+            for (const Key& key : measured_entries_) entries_.erase(key);
+            measured_entries_.clear();
+            if (measured_entries_.capacity() > 64) std::vector<Key>().swap(measured_entries_);
+        }
+    }
+    T& operator[](uint64_t id) {
+        const Key key{scope_, id};
+        auto result = entries_.try_emplace(key);
+        if (measuring_ && result.second) measured_entries_.push_back(key);
+        return result.first->second;
+    }
+    T& get_or_insert(uint64_t id, const T& initial) {
+        const Key key{scope_, id};
+        auto result = entries_.try_emplace(key, initial);
+        if (measuring_ && result.second) measured_entries_.push_back(key);
+        return result.first->second;
+    }
+    T* get_if(uint64_t id) {
+        auto it = entries_.find(Key{scope_, id});
+        return it == entries_.end() ? nullptr : &it->second;
+    }
+    const T* peek(uint64_t id) const {
+        auto it = entries_.find(Key{scope_, id});
+        return it == entries_.end() ? nullptr : &it->second;
+    }
+    size_t erase(uint64_t id) { return entries_.erase(Key{scope_, id}); }
+    size_t size() const { return entries_.size(); }
+    bool empty() const { return entries_.empty(); }
+    size_t bucket_count() const { return entries_.bucket_count(); }
+
+    void release_scope(uint64_t scope) {
+        for (auto it = entries_.begin(); it != entries_.end();) {
+            if (it->first.scope == scope) it = entries_.erase(it);
+            else ++it;
+        }
+        // erase 只释放节点。大页面关闭后，还要收缩高水位留下的 bucket 数组；
+        // 留四倍余量与小表底线，避免普通增删反复触发 rehash。
+        if (entries_.bucket_count() > 64 && entries_.size() < entries_.bucket_count() / 4) {
+            // 部分标准库的 rehash 不缩容。转移节点到小表后交换，明确释放旧桶，
+            // 不复制字符串、撤销历史，也不改变存活节点的值或引用。
+            decltype(entries_) compact;
+            compact.reserve(entries_.size());
+            compact.merge(entries_);
+            entries_.swap(compact);
+        }
     }
 };
 } // namespace detail
@@ -3423,11 +3754,14 @@ struct Ui::Impl {
     // 立即模式交互状态（跨帧存活）
     uint64_t hot = 0;             // 本帧鼠标悬停的控件
     uint64_t active = 0;          // 正在被按住的控件
+    uint64_t active_scope_id = 0;
+    uint64_t hot_scope_id = 0;
     // 本帧的按下已经被谁领走了。一帧里可能有多个控件同时包含指针位置
     // （叠放的卡片、滚出视口但还压在页脚下面的列表行），而"按下"这个事件
     // 只属于其中一个 —— 否则一次点击会被画两次、动两个状态。
     bool press_taken = false;
     uint64_t next_hot = 0;
+    uint64_t next_hot_scope_id = 0;
     // 仅在悬停目标变化时请求重绘，避免控件内部指针移动产生无效帧。
     Rect next_hot_rect{};
     Rect hot_rect{};
@@ -3461,10 +3795,12 @@ struct Ui::Impl {
         if (active == 0 && reg.contains(input.mouse.x, input.mouse.y)) {
             next_hot_rect = reg;
             next_region_hit = true;
+            next_hot_scope_id = state_scope_id;
         }
     }
     void* focus = nullptr;        // 当前获得键盘焦点的控件
     uint64_t focus_id = 0;
+    uint64_t focus_scope_id = 0;
     // 焦点是**鼠标点出来**的还是键盘走出来的。macOS 只有键盘焦点画焦点环：
     // 点一下按钮就留一圈蓝（Web 的 :focus-visible 之外的默认行为）很有"网页感"，
     // 而文本类控件点进去本来就有环，所以它们照旧画。
@@ -3475,6 +3811,22 @@ struct Ui::Impl {
     int   caret = 0;              // 光标位置（码点索引）
     int   sel_anchor = -1;        // 选区锚点
     float caret_blink = 0.0f;
+    bool timed_repaint = false;
+    std::chrono::steady_clock::time_point repaint_at;
+
+    void schedule_caret() {
+        if (measure_on) return;
+        const float phase = std::fmod(caret_blink, 1.06f);
+        const int delay = std::max(1, int(std::ceil(((phase < 0.62f ? 0.62f : 1.06f) - phase) * 1000.0f)));
+        const auto at = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay);
+        if (!timed_repaint || at < repaint_at) repaint_at = at;
+        timed_repaint = true;
+    }
+    int repaint_timeout_ms() const {
+        if (!timed_repaint) return -1;
+        const auto remaining = repaint_at - std::chrono::steady_clock::now();
+        return std::max(0, int(std::chrono::ceil<std::chrono::milliseconds>(remaining).count()));
+    }
 
     // 组合键后短暂抑制字符输入，避免输入法将快捷键同时提交为文本。
     float text_veto = 0.0f;
@@ -3482,23 +3834,31 @@ struct Ui::Impl {
     // 撤销栈（每个编辑控件一份，按 id 记忆）
     struct EditSnap { std::string text; int caret = 0; int anchor = -1; };
     struct EditStack {
-        std::vector<EditSnap> undo, redo;
+        std::deque<EditSnap> undo, redo;
         float last = -1e9f;       // 上次压栈时间（合并连续输入用）
         uint64_t kind = 0;
     };
-    std::unordered_map<uint64_t, EditStack> edit_stack;
+    detail::WidgetStateTable<EditStack> edit_stack;
 
     // hover 等状态的插值动画表
-    std::unordered_map<uint64_t, float> anim;
+    detail::WidgetStateTable<float> anim;
     // 常驻动画的**局部相位**（spinner 的转角、skeleton 的呼吸）。和 clock 的区别：
     // 只在"该动"的时候按 dt 累加，停下就冻结 —— 所以鼠标移开再移回来是
     // "接着动"，而不是跳到全局时钟对应的相位。
-    std::unordered_map<uint64_t, float> phase;
+    detail::WidgetStateTable<float> phase;
     // 离散的跨帧状态（如 select 是否展开）
-    std::unordered_map<uint64_t, float> flags;
+    detail::WidgetStateTable<float> flags;
     // 组件私有的字符串状态（目前只有 combobox 的搜索词用）。
-    // 不主动清理：只有真的输入过才涨，量级是"每用过一次的 combobox 一条"。
-    std::unordered_map<uint64_t, std::string> strings;
+    detail::WidgetStateTable<std::string> strings;
+    // 多行文本框的切行结果。切行是 O(全文)，而光标闪烁期间每帧都要重画 ——
+    // 大文档静止时不该每帧重新切一遍。命中判据是"全文 memcmp 相等"，
+    // 所以程序改内容、长度不变也能立刻发现，不会画出上一版的行。
+    struct TextLines {
+        std::string src;                    // 上一帧的全文，用于校验
+        std::vector<std::string> lines;
+        std::vector<int> cps_n, cp_base;
+    };
+    detail::WidgetStateTable<TextLines> text_lines;
 
     // 本帧 interact() 的调用序号。立即模式下"调用顺序 = 绘制顺序 = 层级"，
     // 序号小的先画、在下面，所以它可以直接当 z 序用。每帧归零重数。
@@ -3539,9 +3899,11 @@ struct Ui::Impl {
     bool gate_next = false;
     Rect gate_allow[GATE_SLOTS] = {};
     uint64_t gate_allow_z[GATE_SLOTS] = {};    // 该浮层"第一个属于自己的控件"的序号
+    uint64_t gate_allow_scope[GATE_SLOTS] = {};
     int  gate_allow_n = 0;
     Rect gate_next_allow[GATE_SLOTS] = {};
     uint64_t gate_next_allow_z[GATE_SLOTS] = {};
+    uint64_t gate_next_allow_scope[GATE_SLOTS] = {};
     int  gate_next_allow_n = 0;
 
     // 判定 = 位置 + 层级。两条都要，缺一条就漏：
@@ -3586,6 +3948,7 @@ struct Ui::Impl {
         if (gate_next_allow_n < GATE_SLOTS) {
             gate_next_allow[gate_next_allow_n] = r;
             gate_next_allow_z[gate_next_allow_n] = z;
+            gate_next_allow_scope[gate_next_allow_n] = state_scope_id;
             ++gate_next_allow_n;
         }
         gate_next = true;
@@ -3607,18 +3970,20 @@ struct Ui::Impl {
         int weight = 0;
         bool wrap = false;
         std::vector<std::string> lines;
-        uint64_t used = 0;
+        std::list<uint64_t>::iterator recency;
         size_t bytes = 0;
     };
     std::unordered_map<uint64_t, WrapEntry> wrap_cache;
+    std::list<uint64_t> wrap_lru; // 首部最近使用，尾部可 O(1) 淘汰。
+    std::vector<std::string> wrap_scratch; // 超预算结果只保留到下次折行调用。
     size_t   wrap_bytes = 0;
-    uint64_t wrap_clock = 0;
     size_t   wrap_evictions = 0;      // 统计：被淘汰的段数（探针用）
 
     // 单字宽度缓存：首次折行时每个码点只问一次 GDI。
     std::unordered_map<uint64_t, float> adv_cache;
 
-    std::vector<std::function<void()>> defer;
+    struct DeferredCall { uint64_t scope; std::function<void()> fn; };
+    std::deque<DeferredCall> defer;
 
     // 布局栈
     std::vector<Rect> group;
@@ -3652,17 +4017,30 @@ struct Ui::Impl {
         return clip_logic_on && !clip_logic_cur.contains(x, y);
     }
     // begin_scroll 的嵌套上下文（支持滚动区套滚动区）
-    struct ScrollCtx { uint64_t id = 0; Rect box; float offset = 0.0f; float max_offset = 0.0f; };
+    struct ScrollCtx {
+        uint64_t id = 0, state_scope_id = 0;
+        Rect box;
+        float offset = 0.0f, max_offset = 0.0f;
+    };
     std::vector<ScrollCtx> scroll_stack;
     // ID 由滚动区内的内容位置生成，屏幕位移不会重置控件状态或串用相邻控件的动画。
-    uint64_t widget_id(const char* kind, const Rect& box, uint64_t extra = 0) const {
-        if (scroll_stack.empty()) return detail::make_id(kind, box, extra);
+    uint64_t widget_id(const char* kind, const Rect& box, uint64_t extra = 0,
+                       uint64_t stable = 0) const {
+        if (stable) {
+            const uint64_t id = detail::hash_combine(detail::hash_string(kind), stable);
+            return state_scope_id ? detail::hash_combine(state_scope_id, id) : id;
+        }
+        if (scroll_stack.empty()) {
+            const uint64_t id = detail::make_id(kind, box, extra);
+            return state_scope_id ? detail::hash_combine(state_scope_id, id) : id;
+        }
         const auto& parent = scroll_stack.back();
         Rect local = box.offset(-parent.box.x, parent.offset - parent.box.y);
         // ID 使用半像素精度；四舍五入避免小数滚动抵消后 120 变成 119.99999 而换 ID。
         local.x = std::round(local.x * 2.f) * .5f;
         local.y = std::round(local.y * 2.f) * .5f;
-        return detail::hash_combine(parent.id, detail::make_id(kind, local, extra));
+        const uint64_t id = detail::hash_combine(parent.id, detail::make_id(kind, local, extra));
+        return state_scope_id ? detail::hash_combine(state_scope_id, id) : id;
     }
     float last_scroll = 0.0f;    // 最近一个滚动区的偏移（end_scroll 之后 scroll_y() 仍可读）
 
@@ -3763,7 +4141,7 @@ struct Ui::Impl {
         bool  init = false;
         Easing e = nullptr;
     };
-    std::unordered_map<uint64_t, Tween> tweens;
+    detail::WidgetStateTable<Tween> tweens;
 
     struct ColorTween {
         Color from{}, to{};
@@ -3771,7 +4149,42 @@ struct Ui::Impl {
         bool  init = false;
         Easing e = nullptr;
     };
-    std::unordered_map<uint64_t, ColorTween> color_tweens;
+    detail::WidgetStateTable<ColorTween> color_tweens;
+
+    uint64_t state_scope_id = 0;
+    std::vector<uint64_t> released_state_scopes;
+    template<class Fn> void each_widget_state(Fn fn) {
+        fn(anim); fn(phase); fn(flags); fn(strings); fn(edit_stack); fn(text_lines);
+        fn(tweens); fn(color_tweens);
+    }
+    void set_state_scope(uint64_t id) {
+        state_scope_id = id;
+        each_widget_state([&](auto& table) { table.set_scope(id); });
+    }
+    void release_widget_state(uint64_t id) {
+        each_widget_state([&](auto& table) { table.release_scope(id); });
+        if (active_scope_id == id) { active = 0; active_scope_id = 0; }
+        if (focus_scope_id == id) {
+            focus = nullptr; focus_id = 0; focus_scope_id = 0; ime_comp.clear();
+            ime_owner = false;
+        }
+        if (hot_scope_id == id) { hot = 0; hot_scope_id = 0; hot_rect_valid = false; }
+        if (next_hot_scope_id == id) {
+            next_hot = 0; next_hot_scope_id = 0; next_hot_rect = Rect{}; next_region_hit = false;
+        }
+        auto remove_gates = [id](Rect* rects, uint64_t* z, uint64_t* owners, int& count) {
+            int kept = 0;
+            for (int i = 0; i < count; ++i) {
+                if (owners[i] == id) continue;
+                rects[kept] = rects[i]; z[kept] = z[i]; owners[kept] = owners[i]; ++kept;
+            }
+            count = kept;
+        };
+        remove_gates(gate_allow, gate_allow_z, gate_allow_scope, gate_allow_n);
+        remove_gates(gate_next_allow, gate_next_allow_z, gate_next_allow_scope, gate_next_allow_n);
+        gate_on = gate_allow_n > 0;
+        gate_next = gate_next_allow_n > 0;
+    }
 
     float tween_now(const Tween& tw) const {
         Easing e = tw.e ? tw.e : easing::out_cubic;
@@ -3783,11 +4196,28 @@ struct Ui::Impl {
 // -----------------------------------------------------------------------------
 //  Ui 基础
 // -----------------------------------------------------------------------------
-inline Ui::Ui() : impl(new Impl()) {}
-inline Ui::~Ui() { delete impl; impl = nullptr; }
+Ui::Ui() : impl(new Impl()) {}
+Ui::~Ui() { delete impl; impl = nullptr; }
 
-inline void Ui::begin_frame(float w, float h, float dt, float dpi) {
+StateScope::StateScope(StateScope&& other) noexcept
+    : ui_(other.ui_), previous_(other.previous_) { other.ui_ = nullptr; }
+StateScope::~StateScope() { if (ui_) ui_->impl->set_state_scope(previous_); }
+StateScope Ui::state_scope(uint64_t id) {
+    const uint64_t previous = impl->state_scope_id;
+    impl->set_state_scope(id);
+    return StateScope(this, previous);
+}
+void Ui::release_state_scope(uint64_t id) {
+    if (!id || impl->measure_on) return;
+    if (impl->frame_open) {
+        auto& pending = impl->released_state_scopes;
+        if (std::find(pending.begin(), pending.end(), id) == pending.end()) pending.push_back(id);
+    } else impl->release_widget_state(id);
+}
+
+void Ui::begin_frame(float w, float h, float dt, float dpi) {
     impl->frame_open = true;
+    impl->timed_repaint = false;
     impl->width = w;
     impl->height = h;
     impl->dt = (dt > 0.0f && dt < 1.0f) ? dt : (1.0f / 60.0f);
@@ -3805,13 +4235,16 @@ inline void Ui::begin_frame(float w, float h, float dt, float dpi) {
     for (int i = 0; i < impl->gate_next_allow_n; ++i) {
         impl->gate_allow[i] = impl->gate_next_allow[i];
         impl->gate_allow_z[i] = impl->gate_next_allow_z[i];
+        impl->gate_allow_scope[i] = impl->gate_next_allow_scope[i];
     }
     impl->gate_next = false;
     impl->gate_next_allow_n = 0;
     impl->seq = 0;          // 本帧的 z 序从头数
     impl->defer.clear();
     impl->hot = impl->next_hot;
+    impl->hot_scope_id = impl->next_hot_scope_id;
     impl->next_hot = 0;
+    impl->next_hot_scope_id = 0;
     impl->hot_rect = impl->next_hot_rect;
     impl->hot_rect_valid = (impl->hot != 0 || impl->next_region_hit) && impl->hot_rect.w > 0.0f;
     impl->next_hot_rect = Rect{};
@@ -3827,6 +4260,9 @@ inline void Ui::begin_frame(float w, float h, float dt, float dpi) {
     impl->pad.resize(1);
     impl->clips.clear();
     impl->clip_logic.clear();
+    // 帧回调抛异常时滚动区不会走 end_scroll()。不清栈的话下一帧会在"上一个
+    // 滚动区里"开始画，整页偏移一个滚动量 —— 症状很难查，代价只有一行。
+    impl->scroll_stack.clear();
     impl->recompute_clip_logic();
     // 一次按下只能归一个控件。见 detail::interact() 里的用法。
     impl->press_taken = false;
@@ -3834,15 +4270,24 @@ inline void Ui::begin_frame(float w, float h, float dt, float dpi) {
     impl->cursor = Cursor::Arrow;
 }
 
-inline void Ui::end_frame() {
+void Ui::end_frame() {
     // 帧末统一绘制弹出层，保证它盖在所有常规组件之上。
     // 序号同时抬到 Z_FRAME_END：面板里的控件从这一段开始数，和普通控件分开，
     // 闸门才分得清"弹层自己的内容"和"排在弹层后面画的普通控件"。
     impl->seq = Impl::Z_FRAME_END;
     for (size_t i = 0; i < impl->defer.size(); ++i) {
-        if (impl->defer[i]) impl->defer[i]();
+        // deque 追加不搬动已有节点；父回调的捕获须存活到所有嵌套回调结束。
+        auto& call = impl->defer[i];
+        auto state = state_scope(call.scope);
+        if (call.fn) call.fn();
     }
     impl->defer.clear();
+
+    // 只处理显式销毁请求，且等延迟回调及其捕获引用全部结束后再删除节点。
+    for (uint64_t id : impl->released_state_scopes) impl->release_widget_state(id);
+    impl->released_state_scopes.clear();
+    if (impl->released_state_scopes.capacity() > 64)
+        std::vector<uint64_t>().swap(impl->released_state_scopes);
 
     // 清掉"本帧一次性"的输入事件
     Input& in = impl->input;
@@ -3860,12 +4305,12 @@ inline void Ui::end_frame() {
 }
 
 // 测量模式下浮层不入队：测量跑的是同一份绘制代码，弹层会被登记两遍。
-inline void Ui::deferred(std::function<void()> fn) {
+void Ui::deferred(std::function<void()> fn) {
     if (impl->measure_on) return;
-    impl->defer.push_back(std::move(fn));
+    impl->defer.push_back({impl->state_scope_id, std::move(fn)});
 }
 
-inline const Input& Ui::input() const {
+const Input& Ui::input() const {
     if (pointer_available()) return impl->input;
     // 不修改后端事件：同一帧的浮层内容仍须收到原始按下和松手。
     Input& masked = impl->masked_input;
@@ -3879,44 +4324,49 @@ inline const Input& Ui::input() const {
     masked.dragging = false;
     return masked;
 }
-inline const Input& Ui::raw_input() const { return impl->input; }
-inline bool Ui::pointer_available() const {
+const Input& Ui::raw_input() const { return impl->input; }
+bool Ui::pointer_available() const {
     return !impl->measure_on && !impl->gate_blocked_pointer() &&
            !impl->clip_excludes(impl->input.mouse.x, impl->input.mouse.y);
 }
-inline const Theme& Ui::theme() const { return impl->theme; }
-inline void  Ui::set_theme(const Theme& t) { impl->theme = t; }
-inline float Ui::dpi_scale() const { return impl->scale; }
-inline float Ui::width() const { return impl->width; }
-inline float Ui::height() const { return impl->height; }
-inline float Ui::time() const { return impl->clock; }
-inline float Ui::frame_dt() const { return impl->dt; }
-inline bool Ui::request_next_frame() {
+const Theme& Ui::theme() const { return impl->theme; }
+void  Ui::set_theme(const Theme& t) { impl->theme = t; }
+float Ui::dpi_scale() const { return impl->scale; }
+float Ui::width() const { return impl->width; }
+float Ui::height() const { return impl->height; }
+float Ui::time() const { return impl->clock; }
+float Ui::frame_dt() const { return impl->dt; }
+bool Ui::request_next_frame() {
     if (impl->measure_on || impl->frame_open || !impl->request_repaint) return false;
     impl->request_repaint();
     return true;
 }
-inline void Ui::repaint() {
+void Ui::repaint() {
     if (!impl->measure_on && impl->request_repaint) impl->request_repaint();
 }
-inline bool Ui::request_animation_frame() {
+bool Ui::request_animation_frame() {
     if (impl->measure_on || !impl->frame_open || !impl->request_repaint) return false;
     repaint();
     return true;
 }
-inline void Ui::set_animating(bool on) {
+void Ui::set_animating(bool on) {
     if (impl->measure_on) return;
     impl->animating = on;
     if (on) repaint();
 }
-inline bool  Ui::animating() const { return impl->animating; }
-inline void  Ui::set_cursor(Cursor c) { if (impl->measure_on) return; impl->cursor = c; }
-inline Cursor Ui::cursor() const { return impl->cursor; }
-inline void* Ui::focused_id() const { return impl->focus; }
-inline void  Ui::set_focus(void* id) { impl->focus = id; if (id) impl->caret_blink = 0.0f; }
+bool  Ui::animating() const { return impl->animating; }
+void  Ui::set_cursor(Cursor c) { if (impl->measure_on) return; impl->cursor = c; }
+Cursor Ui::cursor() const { return impl->cursor; }
+void* Ui::focused_id() const { return impl->focus; }
+void  Ui::set_focus(void* id) {
+    impl->focus = id;
+    impl->focus_scope_id = id ? impl->state_scope_id : 0;
+    if (id) impl->caret_blink = 0.0f;
+}
 
-inline void Ui::begin_measure() {
+void Ui::begin_measure() {
     impl->measure_on = true;
+    impl->each_widget_state([](auto& table) { table.set_measuring(true); });
     impl->measure_any = false;
     impl->measure_acc = Rect{};
     // 摘掉画布：万一有控件忘了判 measure_on，也不会把真实图形糊到屏幕左上角
@@ -3924,15 +4374,16 @@ inline void Ui::begin_measure() {
     impl->measure_canvas = impl->canvas;
     impl->canvas = nullptr;
 }
-inline Rect Ui::end_measure() {
+Rect Ui::end_measure() {
     impl->measure_on = false;
+    impl->each_widget_state([](auto& table) { table.set_measuring(false); });
     impl->canvas = impl->measure_canvas;
     impl->measure_canvas = nullptr;
     return impl->measure_any ? impl->measure_acc : Rect{};
 }
-inline bool Ui::measuring() const { return impl->measure_on; }
+bool Ui::measuring() const { return impl->measure_on; }
 
-inline bool Ui::hovered(const Rect& box) {
+bool Ui::hovered(const Rect& box) {
     if (impl->measure_on) return false;
     impl->hover_region(box);
     return box.contains(impl->input.mouse.x, impl->input.mouse.y)
@@ -3946,8 +4397,10 @@ inline bool Ui::hovered(const Rect& box) {
 namespace detail {
 inline float animate_value(Ui::Impl* im, uint64_t id, float target, float speed = 14.0f) {
     // 测量不能创建动画状态；否则首次显示时会把选中控件从零重新播放。
-    auto found = im->anim.find(id);
-    if (im->measure_on) return found == im->anim.end() ? target : found->second;
+    if (im->measure_on) {
+        const float* found = im->anim.peek(id);
+        return found ? *found : target;
+    }
     float& cur = im->anim[id];
     float d = target - cur;
     if (std::fabs(d) < 0.0015f) {
@@ -3961,7 +4414,7 @@ inline float animate_value(Ui::Impl* im, uint64_t id, float target, float speed 
 
 inline float animate_state(Ui::Impl* im, uint64_t id, float target, float speed = 14.0f) {
     // 首次出现直接显示真实值，仅对已存在控件的状态变化插值。
-    if (!im->measure_on) im->anim.emplace(id, target);
+    if (!im->measure_on) im->anim.get_or_insert(id, target);
     return animate_value(im, id, target, speed);
 }
 
@@ -3997,12 +4450,15 @@ inline Interact interact(Ui::Impl* im, uint64_t id, const Rect& r, bool enabled)
     }
     if (inside) {
         res.hovered = true;
-        if (im->active == 0) { im->next_hot = id; im->next_hot_rect = r; }
+        if (im->active == 0) {
+            im->next_hot = id; im->next_hot_rect = r; im->next_hot_scope_id = im->state_scope_id;
+        }
         // 一帧里可能有多个控件都包含指针（叠放的、或没被裁干净的），但"按下"
         // 只属于一个控件：谁先画谁先认领。少了这道闸，一次点击会被后面的控件
         // 重新认领一遍 —— 按下和松开落在同一帧时尤其明显（两个控件各点一次）。
         if (in.pressed[0] && im->active == 0 && !im->press_taken) {
             im->active = id;
+            im->active_scope_id = im->state_scope_id;
             im->press_taken = true;
             res.pressed = true;
         }
@@ -4084,12 +4540,12 @@ inline void rrect_poly(const Ui::Impl* im, const Rect& r, float radius, std::vec
 // =============================================================================
 //  8.6  图元
 // =============================================================================
-inline void Ui::clear(const Color& c) {
+void Ui::clear(const Color& c) {
     if (impl->measure_on) return;
     if (impl->canvas) impl->canvas->clear(c);
 }
 
-inline void Ui::fill_rect(const Rect& r, const Color& c, float radius) {
+void Ui::fill_rect(const Rect& r, const Color& c, float radius) {
     detail::ProfTick _pt(&impl->pf_fill_us, &impl->pf_fill_n, impl->prof_on);
     if (impl->prof_on) impl->pf_fill_px += uint64_t(std::max(r.w, 0.0f) * std::max(r.h, 0.0f) * impl->scale * impl->scale);
     if (impl->measure_on) { if (c.a != 0 && !r.empty()) impl->measure_add(r); return; }
@@ -4137,7 +4593,7 @@ inline void Ui::fill_rect(const Rect& r, const Color& c, float radius) {
     detail::raster_rrect(*impl->canvas, p, c, rad, impl->theme.corner_smoothing);
 }
 
-inline void Ui::stroke_rect(const Rect& r, const Color& c, float radius, float width) {
+void Ui::stroke_rect(const Rect& r, const Color& c, float radius, float width) {
     detail::ProfTick _pt(&impl->pf_stroke_us, &impl->pf_stroke_n, impl->prof_on);
     if (impl->prof_on) impl->pf_stroke_px += uint64_t(std::max(r.w, 0.0f) * std::max(r.h, 0.0f) * impl->scale * impl->scale);
     if (impl->measure_on) { if (c.a != 0 && !r.empty()) impl->measure_add(r); return; }
@@ -4163,7 +4619,7 @@ inline void Ui::stroke_rect(const Rect& r, const Color& c, float radius, float w
     detail::raster_rrect_stroke(*impl->canvas, p, c, rad, w, impl->theme.corner_smoothing);
 }
 
-inline void Ui::fill_rect_s(const Rect& r, const Color& c, float radius, float smooth) {
+void Ui::fill_rect_s(const Rect& r, const Color& c, float radius, float smooth) {
     detail::ProfTick _pt(&impl->pf_fill_us, &impl->pf_fill_n, impl->prof_on);
     if (impl->prof_on) impl->pf_fill_px += uint64_t(std::max(r.w, 0.0f) * std::max(r.h, 0.0f) * impl->scale * impl->scale);
     if (impl->measure_on) { if (c.a != 0 && !r.empty()) impl->measure_add(r); return; }
@@ -4173,7 +4629,7 @@ inline void Ui::fill_rect_s(const Rect& r, const Color& c, float radius, float s
                          smooth < 0.0f ? impl->theme.corner_smoothing : smooth);
 }
 
-inline void Ui::stroke_rect_s(const Rect& r, const Color& c, float radius, float width, float smooth) {
+void Ui::stroke_rect_s(const Rect& r, const Color& c, float radius, float width, float smooth) {
     if (impl->measure_on) { if (c.a != 0 && !r.empty()) impl->measure_add(r); return; }
     if (!impl->canvas || c.a == 0 || r.empty()) return;
     detail::raster_rrect_stroke(*impl->canvas, impl->xf_phys(r), c,
@@ -4182,7 +4638,7 @@ inline void Ui::stroke_rect_s(const Rect& r, const Color& c, float radius, float
                                 smooth < 0.0f ? impl->theme.corner_smoothing : smooth);
 }
 
-inline void Ui::inner_shadow(const Rect& r, const Color& c, float radius, float blur, float dy,
+void Ui::inner_shadow(const Rect& r, const Color& c, float radius, float blur, float dy,
                              float smooth) {
     if (impl->measure_on) return;          // 内阴影不占布局
     if (!impl->canvas || c.a == 0 || r.empty()) return;
@@ -4191,7 +4647,7 @@ inline void Ui::inner_shadow(const Rect& r, const Color& c, float radius, float 
                                impl->xf_len(std::max(blur, 0.01f)), c, impl->xf_len(dy));
 }
 
-inline void Ui::fill_rect_grad(const Rect& r, const Color& top, const Color& bottom,
+void Ui::fill_rect_grad(const Rect& r, const Color& top, const Color& bottom,
                                float radius, float smooth) {
     if (impl->measure_on) { if (!r.empty()) impl->measure_add(r); return; }
     if (!impl->canvas || r.empty()) return;
@@ -4205,7 +4661,7 @@ inline void Ui::fill_rect_grad(const Rect& r, const Color& top, const Color& bot
 }
 
 // 顶部高光：bezel 的一条 1px 亮边只出现在上半圈，整圈描边会变成"描边感"。
-inline void Ui::stroke_rect_top(const Rect& r, const Color& c, float radius, float width, float height,
+void Ui::stroke_rect_top(const Rect& r, const Color& c, float radius, float width, float height,
                                 float smooth) {
     if (impl->measure_on) { if (c.a != 0 && !r.empty()) impl->measure_add(r); return; }
     if (!impl->canvas || c.a == 0 || r.empty()) return;
@@ -4220,7 +4676,7 @@ inline void Ui::stroke_rect_top(const Rect& r, const Color& c, float radius, flo
     pop_clip();
 }
 
-inline void Ui::fill_circle(float cx, float cy, float radius, const Color& c) {
+void Ui::fill_circle(float cx, float cy, float radius, const Color& c) {
     detail::ProfTick _pt(&impl->pf_circle_us, &impl->pf_circle_n, impl->prof_on);
     if (impl->measure_on) {
         if (c.a != 0 && radius > 0.0f)
@@ -4234,7 +4690,7 @@ inline void Ui::fill_circle(float cx, float cy, float radius, const Color& c) {
 
 // 位图绘制：逐像素双线性采样 + 圆角遮罩。
 // 只做"缩小的静态图"，不做旋转/缩放变换（xf_rotated 时不处理，直接按轴对齐画）。
-inline void Ui::draw_bitmap(const Rect& box, const uint8_t* rgba, int w, int h, float radius) {
+void Ui::draw_bitmap(const Rect& box, const uint8_t* rgba, int w, int h, float radius) {
     if (!rgba || w <= 0 || h <= 0 || box.w <= 0.0f || box.h <= 0.0f) return;
     if (impl->measure_on) { impl->measure_add(box); return; }
     if (!impl->canvas) return;
@@ -4284,7 +4740,7 @@ inline void Ui::draw_bitmap(const Rect& box, const uint8_t* rgba, int w, int h, 
 }
 
 
-inline void Ui::fill_crescent(float cx, float cy, float radius,
+void Ui::fill_crescent(float cx, float cy, float radius,
                               float cut_cx, float cut_cy, float cut_radius, const Color& c) {
     if (impl->measure_on) {
         if (c.a != 0 && radius > 0.0f) {
@@ -4303,7 +4759,7 @@ inline void Ui::fill_crescent(float cx, float cy, float radius,
                             q.x, q.y, impl->xf_len(cut_radius), c);
 }
 
-inline void Ui::draw_line(float x0, float y0, float x1, float y1, const Color& c, float width) {
+void Ui::draw_line(float x0, float y0, float x1, float y1, const Color& c, float width) {
     if (impl->measure_on) {
         if (c.a != 0) {
             const float hw = std::max(width, 1.0f) * 0.5f;
@@ -4319,7 +4775,7 @@ inline void Ui::draw_line(float x0, float y0, float x1, float y1, const Color& c
     detail::raster_line(*impl->canvas, a.x, a.y, b.x, b.y, c, impl->xf_len(width));
 }
 
-inline void Ui::drop_shadow(const Rect& r, float radius, float blur, const Color& c, float dy) {
+void Ui::drop_shadow(const Rect& r, float radius, float blur, const Color& c, float dy) {
     if (impl->measure_on) {
         if (c.a != 0) impl->measure_add(Rect(r.x - blur, r.y - blur + dy,
                                              r.w + blur * 2.0f, r.h + blur * 2.0f));
@@ -4335,7 +4791,7 @@ inline void Ui::drop_shadow(const Rect& r, float radius, float blur, const Color
 // -----------------------------------------------------------------------------
 //  背景模糊 / 玻璃面板
 // -----------------------------------------------------------------------------
-inline void Ui::backdrop_blur(const Rect& r, float radius, float blur) {
+void Ui::backdrop_blur(const Rect& r, float radius, float blur) {
     if (impl->measure_on) { if (!r.empty()) impl->measure_add(r); return; }
     if (!impl->canvas || r.empty() || blur < 0.8f) return;
     // 旋转时不做：模糊要按"屏幕空间的一块矩形"采样，跟着转就不是那块像素了。
@@ -4344,7 +4800,7 @@ inline void Ui::backdrop_blur(const Rect& r, float radius, float blur) {
                           impl->xf_len(blur));
 }
 
-inline void Ui::glass(const Rect& r, float radius, const Style& st) {
+void Ui::glass(const Rect& r, float radius, const Style& st) {
     if (impl->measure_on) { if (!r.empty()) impl->measure_add(r); return; }
     if (!impl->canvas || r.empty()) return;
     const Theme& th = impl->theme;
@@ -4379,7 +4835,11 @@ inline void Ui::glass(const Rect& r, float radius, const Style& st) {
 // -----------------------------------------------------------------------------
 //  动画
 // -----------------------------------------------------------------------------
-inline float Ui::tween(uint64_t id, float target, float duration, Easing e) {
+float Ui::tween(uint64_t id, float target, float duration, Easing e) {
+    if (impl->measure_on) {
+        const auto* tw = impl->tweens.peek(id);
+        return tw && tw->init ? impl->tween_now(*tw) : target;
+    }
     if (!e) e = easing::out_cubic;
     auto& tw = impl->tweens[id];
     if (!tw.init) {
@@ -4387,7 +4847,6 @@ inline float Ui::tween(uint64_t id, float target, float duration, Easing e) {
         tw.t = duration; tw.dur = duration; tw.e = e;
         return target;
     }
-    if (impl->measure_on) return impl->tween_now(tw);    // 测量不推进时间轴
     if (target != tw.to) {
         // 从**当前显示值**重新起跑：目标中途改变不会跳变
         tw.from = impl->tween_now(tw);
@@ -4404,24 +4863,27 @@ inline float Ui::tween(uint64_t id, float target, float duration, Easing e) {
     return impl->tween_now(tw);
 }
 
-inline Color Ui::tween_color(uint64_t id, const Color& target, float duration, Easing e) {
+Color Ui::tween_color(uint64_t id, const Color& target, float duration, Easing e) {
     // 一个进度驱动四个通道。拆成 4 个独立 tween 会让各通道进度一致但**起点**
     // 被分别重置，颜色在中途会发灰发脏 —— 单状态才能保证插值路径是直线。
-    if (!e) e = easing::out_cubic;
-    auto& ct = impl->color_tweens[id];
-    if (!ct.init) {
-        ct.init = true; ct.from = target; ct.to = target;
-        ct.t = duration; ct.dur = duration; ct.e = e;
-        return target;
-    }
     // 测量模式：只读当前插值结果，不改状态（同 tween）
     if (impl->measure_on) {
+        const auto* saved = impl->color_tweens.peek(id);
+        if (!saved || !saved->init) return target;
+        const auto& ct = *saved;
         const float k0 = ct.dur > 0.0001f ? clampf(ct.t / ct.dur, 0.0f, 1.0f) : 1.0f;
         const float e0 = (ct.e ? ct.e : easing::out_cubic)(k0);
         return Color(uint8_t(float(ct.from.r) + (float(ct.to.r) - float(ct.from.r)) * e0),
                      uint8_t(float(ct.from.g) + (float(ct.to.g) - float(ct.from.g)) * e0),
                      uint8_t(float(ct.from.b) + (float(ct.to.b) - float(ct.from.b)) * e0),
                      uint8_t(float(ct.from.a) + (float(ct.to.a) - float(ct.from.a)) * e0));
+    }
+    if (!e) e = easing::out_cubic;
+    auto& ct = impl->color_tweens[id];
+    if (!ct.init) {
+        ct.init = true; ct.from = target; ct.to = target;
+        ct.t = duration; ct.dur = duration; ct.e = e;
+        return target;
     }
     if (target.r != ct.to.r || target.g != ct.to.g || target.b != ct.to.b || target.a != ct.to.a) {
         const float k = ct.dur > 0.0001f ? clampf(ct.t / ct.dur, 0.0f, 1.0f) : 1.0f;
@@ -4449,21 +4911,21 @@ inline Color Ui::tween_color(uint64_t id, const Color& target, float duration, E
                  lerp_ch(ct.from.b, ct.to.b), lerp_ch(ct.from.a, ct.to.a));
 }
 
-inline float Ui::smooth(float current, float target, float rate) const {
+float Ui::smooth(float current, float target, float rate) const {
     // 指数逼近，和帧率无关：dt=1/60 与 dt=1/30 落到同一个位置
     const float k = 1.0f - std::exp(-std::max(rate, 0.0f) * impl->dt);
     const float v = current + (target - current) * k;
     return std::fabs(target - v) < 0.001f ? target : v;
 }
 
-inline float Ui::fade(uint64_t id, bool visible, float duration, Easing e) {
+float Ui::fade(uint64_t id, bool visible, float duration, Easing e) {
     return tween(id, visible ? 1.0f : 0.0f, duration, e);
 }
 
 // -----------------------------------------------------------------------------
 //  变换
 // -----------------------------------------------------------------------------
-inline void Ui::push_transform(const Transform& t) {
+void Ui::push_transform(const Transform& t) {
     impl->xf_stack.push_back(impl->xf);
 
     const float rad = t.rotate * 3.14159265358979f / 180.0f;
@@ -4488,15 +4950,15 @@ inline void Ui::push_transform(const Transform& t) {
     impl->xf = M;
 }
 
-inline void Ui::pop_transform() {
+void Ui::pop_transform() {
     if (impl->xf_stack.empty()) { impl->xf = Impl::Affine(); return; }
     impl->xf = impl->xf_stack.back();
     impl->xf_stack.pop_back();
 }
 
-inline bool Ui::transformed() const { return !impl->xf_identity(); }
+bool Ui::transformed() const { return !impl->xf_identity(); }
 
-inline Transform Ui::transform() const {
+Transform Ui::transform() const {
     Transform t;
     t.scale   = impl->xf_scale();
     t.rotate  = impl->xf_angle() * 57.2957795f;
@@ -4504,19 +4966,19 @@ inline Transform Ui::transform() const {
     return t;
 }
 
-inline float Ui::text_width(const std::string& text, float font_size, int weight) const {
+float Ui::text_width(const std::string& text, float font_size, int weight) const {
     if (!impl->text || text.empty()) return 0.0f;
     float fs = font_size > 0.0f ? font_size : impl->theme.font_size;
     return impl->text->measure(text, impl->px(fs), weight < 0 ? 400 : weight) / impl->scale;
 }
 
-inline float Ui::line_height(float font_size) const {
+float Ui::line_height(float font_size) const {
     float fs = font_size > 0.0f ? font_size : impl->theme.font_size;
     if (!impl->text) return fs * 1.42f;
     return impl->text->line_height(impl->px(fs), 400) / impl->scale;
 }
 
-inline void Ui::set_clipboard(const std::string& text) {
+void Ui::set_clipboard(const std::string& text) {
     if (impl->set_clipboard) impl->set_clipboard(text);
 }
 
@@ -4530,30 +4992,37 @@ inline void Ui::set_clipboard(const std::string& text) {
 //  绘制不做旋转、不做折行、不做居中：终端网格的内容全部由调用方按 (row, col)
 //  算好坐标，越界部分交给裁剪区。样式越少，长滚动区里的行开销越可预测。
 // -----------------------------------------------------------------------------
-inline float Ui::mono_width(const std::string& text, float font_size, int weight) const {
+float Ui::mono_width(const std::string& text, float font_size, int weight) const {
     if (!impl->text || text.empty()) return 0.0f;
     const float fs = font_size > 0.0f ? font_size : impl->theme.font_size;
     return impl->text->measure_mono(text, impl->px(fs), weight) / impl->scale;
 }
 
-inline float Ui::mono_advance(float font_size, int weight) const {
+float Ui::mono_advance(float font_size, int weight) const {
     const float fs = font_size > 0.0f ? font_size : impl->theme.font_size;
     if (!impl->text) return fs * 0.6f;
     // 用 'M' 量：等宽字体里所有半角字符步进相同，'M' 不会退化成零宽。
     return impl->text->measure_mono("M", impl->px(fs), weight) / impl->scale;
 }
 
-inline float Ui::mono_ascent(float font_size, int weight) const {
+float Ui::mono_ascent(float font_size, int weight) const {
     const float fs = font_size > 0.0f ? font_size : impl->theme.font_size;
     if (!impl->text) return fs * 1.1f;
     return impl->text->ascent_mono(impl->px(fs), weight) / impl->scale;
 }
 
-inline void Ui::draw_mono_text(const std::string& text, float x, float y_top, const Color& c,
+void Ui::draw_mono_text(const std::string& text, float x, float y_top, const Color& c,
                                float font_size, int weight) {
-    if (impl->measure_on) return;
-    if (!impl->canvas || !impl->text || text.empty() || c.a == 0) return;
     const float fs = font_size > 0.0f ? font_size : impl->theme.font_size;
+    // 参与布局测量，和 draw_text 一致。等宽文字的外接矩形只由字符串和字号决定，
+    // 量的成本就是一次（已缓存的）字宽查询。早先这里直接 return —— 用等宽字自绘的
+    // 组件在 begin_measure() 里量出来的高度不含它，示例只好自己补一份 mono_label。
+    if (impl->measure_on) {
+        if (text.empty() || c.a == 0) return;
+        impl->measure_add(Rect(x, y_top, mono_width(text, fs, weight), line_height(fs)));
+        return;
+    }
+    if (!impl->canvas || !impl->text || text.empty() || c.a == 0) return;
     const Rect clip = impl->effective_clip;     // w < 0 表示没裁
     impl->text->draw_mono(*impl->canvas, text, impl->px(x), impl->px(y_top), impl->px(fs),
                           weight, c, clip);
@@ -4604,7 +5073,10 @@ inline float glyph_adv(Ui::Impl* im, uint32_t cp, float pfs, int weight) {
         buf[n++] = char(0x80 | (cp & 0x3F));
     }
     const float w = im->text->measure(std::string(buf, size_t(n)), pfs, weight);
-    if (im->adv_cache.size() > 8192) im->adv_cache.clear();   // 不可控输入，别无限长
+    if (im->adv_cache.size() > 8192) {                        // 不可控输入，别无限长
+        auto it = im->adv_cache.begin();                      // 同样只丢一半，保住热字形
+        for (int i = 0; i < 4096 && it != im->adv_cache.end(); ++i) it = im->adv_cache.erase(it);
+    }
     im->adv_cache.emplace(k, w);
     return w;
 }
@@ -4682,13 +5154,26 @@ inline void layout_wrapped_lines(TextRenderer* tr, const std::string& text,
 // 内存有上限（默认 6 MB，环境变量 AINO_WRAP_BUDGET 可改，单位 KiB）：超了按
 // 最久未用淘汰。一段 20 万字的中文大约 1.6 MB 行文本，够放 3~4 段，覆盖
 // "正在看的文档 + 上一份文档"这种真实场景。
+inline size_t memory_budget_kib(const char* variable, size_t fallback) {
+    const char* value = std::getenv(variable);
+    if (!value || *value < '1' || *value > '9') return fallback;
+    char* end = nullptr;
+    const auto n = std::strtoull(value, &end, 10);
+    if (!end || *end || !n || n > std::numeric_limits<size_t>::max() / 1024u) return fallback;
+    return size_t(n) * 1024u;
+}
+
 inline const std::vector<std::string>& wrap_layout(Ui::Impl* im, const std::string& text,
                                                    float max_w, float pfs, int weight, bool wrap) {
     static const std::vector<std::string> kEmpty;
     if (!im->text) return kEmpty;
     // 空串按直接折行的结果走（1 个空行），别在这里搞特殊 —— 否则
     // "缓存命中"和"直接折行"在边界上会给出不同的行数。
-    if (text.empty()) { static const std::vector<std::string> kOne(1); return kOne; }
+    if (text.empty()) {
+        std::vector<std::string>().swap(im->wrap_scratch);
+        static const std::vector<std::string> kOne(1);
+        return kOne;
+    }
 
     // 键里放地址而不是内容哈希：内容哈希要遍历整串（20 万字 ≈ 200µs/帧），
     // 地址在调用方的 string 不扩容时是稳定的。命中后用 memcmp 兜底校验，
@@ -4700,17 +5185,18 @@ inline const std::vector<std::string>& wrap_layout(Ui::Impl* im, const std::stri
     k ^= (uint64_t(uint32_t(weight & 0xFFFF)) << 9);
     k ^= wrap ? 1u : 0u;
 
-    ++im->wrap_clock;
     auto it = im->wrap_cache.find(k);
     if (it != im->wrap_cache.end()) {
         Ui::Impl::WrapEntry& e = it->second;
         if (e.max_w == max_w && e.pfs == pfs && e.weight == weight && e.wrap == wrap
             && e.text.size() == text.size()
             && std::memcmp(e.text.data(), text.data(), text.size()) == 0) {
-            e.used = im->wrap_clock;
+            im->wrap_lru.splice(im->wrap_lru.begin(), im->wrap_lru, e.recency);
+            std::vector<std::string>().swap(im->wrap_scratch);
             return e.lines;
         }
         im->wrap_bytes -= e.bytes;            // 过期条目直接换掉
+        im->wrap_lru.erase(e.recency);
         im->wrap_cache.erase(it);
     }
 
@@ -4721,37 +5207,35 @@ inline const std::vector<std::string>& wrap_layout(Ui::Impl* im, const std::stri
     e.pfs    = pfs;
     e.weight = weight;
     e.wrap   = wrap;
-    e.used   = im->wrap_clock;
-    e.bytes  = e.text.size() + 64;
-    for (const std::string& l : e.lines) e.bytes += l.size() + 40;   // 行内容 + string 头部
+    e.bytes = sizeof(e) + e.text.capacity() + 1 + e.lines.capacity() * sizeof(std::string);
+    for (const std::string& l : e.lines) e.bytes += l.capacity() + 1;
 
-    static const size_t kBudget = [] {
-        if (const char* v = std::getenv("AINO_WRAP_BUDGET")) {
-            const long n = std::strtol(v, nullptr, 10);
-            if (n > 0) return size_t(n) * 1024u;
-        }
-        return size_t(6u << 20);
-    }();
+    static const size_t kBudget = memory_budget_kib("AINO_WRAP_BUDGET", size_t(6u << 20));
+    if (e.bytes > kBudget) {
+        im->wrap_scratch = std::move(e.lines);
+        return im->wrap_scratch; // 不驱逐热缓存，也不将超大条目塞进预算。
+    }
 
     // 先腾地方再插入：保证"刚算出来的这段"不会一进去就把自己挤掉
-    while (im->wrap_bytes + e.bytes > kBudget && !im->wrap_cache.empty()) {
-        uint64_t oldest_key = 0, oldest = ~0ull;
-        for (const auto& kv : im->wrap_cache)
-            if (kv.second.used < oldest) { oldest = kv.second.used; oldest_key = kv.first; }
-        auto o = im->wrap_cache.find(oldest_key);
+    while (im->wrap_bytes > kBudget - e.bytes && !im->wrap_lru.empty()) {
+        auto o = im->wrap_cache.find(im->wrap_lru.back());
         im->wrap_bytes -= o->second.bytes;
         im->wrap_cache.erase(o);
+        im->wrap_lru.pop_back();
         ++im->wrap_evictions;
     }
 
     im->wrap_bytes += e.bytes;
+    im->wrap_lru.push_front(k);
+    e.recency = im->wrap_lru.begin();
     auto ins = im->wrap_cache.emplace(k, std::move(e));
+    std::vector<std::string>().swap(im->wrap_scratch);
     return ins.first->second.lines;
 }
 
 } // namespace detail
 
-inline void Ui::draw_text(const std::string& text, const Rect& box, const Color& c, const Style& st) {
+void Ui::draw_text(const std::string& text, const Rect& box, const Color& c, const Style& st) {
     detail::ProfTick _pt(&impl->pf_text_us, &impl->pf_text_n, impl->prof_on);
     if (impl->prof_on) impl->pf_text_ch += uint32_t(text.size());
     if (impl->measure_on) { if (c.a != 0) impl->measure_add(box); return; }
@@ -4856,7 +5340,7 @@ inline void Ui::draw_text(const std::string& text, const Rect& box, const Color&
 //  多行文字的实际高度 —— 和 draw_text 用同一套折行规则，所以是"量出来的"，
 //  不是"估出来的"。给组件留高度时：width 用 text_width()，height 用 text_height()。
 // -----------------------------------------------------------------------------
-inline float Ui::text_height(const std::string& text, float width, const Style& st) const {
+float Ui::text_height(const std::string& text, float width, const Style& st) const {
     if (text.empty() || width <= 1.0f) return 0.0f;
     const float fs = st.font_size > 0.0f ? st.font_size : impl->theme.font_size;
     const int   wt = st.font_weight > 0 ? st.font_weight : 400;
@@ -4870,7 +5354,7 @@ inline float Ui::text_height(const std::string& text, float width, const Style& 
 }
 
 // 计算给定宽度下的 alert 高度；正文可折行，标题按单行裁剪。
-inline float Ui::alert_height(const std::string& title, const std::string& description,
+float Ui::alert_height(const std::string& title, const std::string& description,
                               float width, const Style& st) const {
     const float fs  = st.font_size > 0.0f ? st.font_size : impl->theme.font_size;
     const float pad = st.pad_x >= 0.0f ? st.pad_x : detail::kAlertPad;
@@ -4889,7 +5373,7 @@ inline float Ui::alert_height(const std::string& title, const std::string& descr
 // =============================================================================
 //  8.7  轻量布局（立即模式下的顺序布局）
 // =============================================================================
-inline Rect Ui::row(float h) {
+Rect Ui::row(float h) {
     if (impl->group.empty()) return Rect();
     Rect& g = impl->group.back();
     float amount = std::min(h, g.h);
@@ -4900,13 +5384,13 @@ inline Rect Ui::row(float h) {
 }
 
 // ratio = 宽 / 高。ratio <= 0 时原样返回（别把高度算成 inf）。
-inline Rect Ui::aspect_rect(const Rect& box, float ratio) {
+Rect Ui::aspect_rect(const Rect& box, float ratio) {
     Rect r = box;
     if (ratio > 0.0f) r.h = std::floor(box.w / ratio + 0.5f);
     return r;
 }
 
-inline Rect Ui::column(float w) {
+Rect Ui::column(float w) {
     if (impl->group.empty()) return Rect();
     Rect& g = impl->group.back();
     float amount = std::min(w, g.w);
@@ -4916,20 +5400,20 @@ inline Rect Ui::column(float w) {
     return r;
 }
 
-inline void Ui::push_padding(float x, float y) {
+void Ui::push_padding(float x, float y) {
     if (impl->group.empty()) return;
     impl->group.push_back(impl->group.back().inset(x, y));
 }
 
-inline void Ui::pop_padding() {
+void Ui::pop_padding() {
     if (impl->group.size() > 1) impl->group.pop_back();
 }
 
-inline void Ui::begin_group(const Rect& box) {
+void Ui::begin_group(const Rect& box) {
     impl->group.push_back(box);
 }
 
-inline void Ui::end_group() {
+void Ui::end_group() {
     if (impl->group.size() > 1) impl->group.pop_back();
 }
 
@@ -4938,14 +5422,14 @@ inline void Ui::end_group() {
 //  整个布局器只做加法和一次比较：不持有控件、不注册任何东西、不需要帧间
 //  状态，所以嵌套、临时丢弃、值拷贝都是零代价的。
 // -----------------------------------------------------------------------------
-inline void Stack::advance(float d) {
+void Stack::advance(float d) {
     if (vertical_) { area.y += d; area.h = std::max(0.0f, area.h - d); }
     else           { area.x += d; area.w = std::max(0.0f, area.w - d); }
 }
 
 // 结算"待垫的 gap"后的区域。rest / remain / part 都基于它，这样"剩余空间"
 // 始终指"下一个元素开始的位置"，而不是游标当前所在的（还差一个间距的）位置。
-inline Rect Stack::rest() const {
+Rect Stack::rest() const {
     Rect a = area;
     if (pending_) {
         if (vertical_) { a.y += gap; a.h = std::max(0.0f, a.h - gap); }
@@ -4954,7 +5438,7 @@ inline Rect Stack::rest() const {
     return a;
 }
 
-inline Rect Stack::next(float size) {
+Rect Stack::next(float size) {
     if (pending_) { advance(gap); pending_ = false; }   // 间距只在元素之间垫
     float s = std::max(0.0f, size);
     Rect r;
@@ -4970,13 +5454,13 @@ inline Rect Stack::next(float size) {
     return r;
 }
 
-inline Rect Stack::next_frac(float fraction) {
+Rect Stack::next_frac(float fraction) {
     if (pending_) { advance(gap); pending_ = false; }
     const float span = vertical_ ? area.h : area.w;
     return next(std::max(0.0f, span * fraction));
 }
 
-inline Rect Stack::next_text(const std::string& s, float extra, float font_size, int weight) {
+Rect Stack::next_text(const std::string& s, float extra, float font_size, int weight) {
     float w = 0.0f;
     if (ui && !s.empty()) {
         const float fs = font_size > 0.0f ? font_size : ui->theme().font_size;
@@ -4985,19 +5469,19 @@ inline Rect Stack::next_text(const std::string& s, float extra, float font_size,
     return next(w + extra);
 }
 
-inline Rect Stack::fill() {
+Rect Stack::fill() {
     if (pending_) { advance(gap); pending_ = false; }
     Rect r = area;
     advance(vertical_ ? area.h : area.w);
     return r;
 }
 
-inline void Stack::skip(float amount) {
+void Stack::skip(float amount) {
     if (pending_) { advance(gap); pending_ = false; }
     advance(std::max(0.0f, amount));
 }
 
-inline Rect Stack::part(int index, int count) const {
+Rect Stack::part(int index, int count) const {
     if (count <= 0 || index < 0 || index >= count) return Rect();
     const Rect  a      = rest();
     const float span   = vertical_ ? a.h : a.w;
@@ -5009,23 +5493,23 @@ inline Rect Stack::part(int index, int count) const {
                      : Rect(a.x + off, a.y, each, a.h);
 }
 
-inline Stack Stack::vbox(const Rect& box, float g) const {
+Stack Stack::vbox(const Rect& box, float g) const {
     return Stack(ui, box, true,  g >= 0.0f ? g : gap);
 }
-inline Stack Stack::hbox(const Rect& box, float g) const {
+Stack Stack::hbox(const Rect& box, float g) const {
     return Stack(ui, box, false, g >= 0.0f ? g : gap);
 }
-inline Stack Stack::vbox(float size, float g) { return vbox(next(size), g); }
-inline Stack Stack::hbox(float size, float g) { return hbox(next(size), g); }
+Stack Stack::vbox(float size, float g) { return vbox(next(size), g); }
+Stack Stack::hbox(float size, float g) { return hbox(next(size), g); }
 
-inline Stack Ui::vbox(const Rect& box, float gap, float pad) {
+Stack Ui::vbox(const Rect& box, float gap, float pad) {
     return Stack(this, pad > 0.0f ? box.inset(pad) : box, true, gap);
 }
-inline Stack Ui::hbox(const Rect& box, float gap, float pad) {
+Stack Ui::hbox(const Rect& box, float gap, float pad) {
     return Stack(this, pad > 0.0f ? box.inset(pad) : box, false, gap);
 }
 
-inline void Ui::push_clip(const Rect& r) {
+void Ui::push_clip(const Rect& r) {
     // 裁剪区跟着变换走（旋转时用包围盒 —— 轴对齐的裁剪区表达不了旋转矩形，
     // 这一点在文档里写明；要精确裁旋转内容就自己用多边形，或者干脆别套裁剪）
     impl->clips.push_back(impl->xf_phys(r));
@@ -5035,7 +5519,7 @@ inline void Ui::push_clip(const Rect& r) {
     impl->recompute_clip_logic();
 }
 
-inline void Ui::pop_clip() {
+void Ui::pop_clip() {
     if (!impl->clips.empty()) impl->clips.pop_back();
     impl->recompute_clip();
     if (!impl->clip_logic.empty()) impl->clip_logic.pop_back();
@@ -5256,10 +5740,11 @@ inline bool is_focused(Ui::Impl* im, uint64_t id) {
 inline void grab_focus(Ui::Impl* im, uint64_t id) {
     im->focus = reinterpret_cast<void*>(static_cast<uintptr_t>(id));
     im->focus_id = id;
+    im->focus_scope_id = im->state_scope_id;
     im->caret_blink = 0.0f;
     im->focus_by_mouse = im->input.pressed[0] || im->input.pressed[1];
 }
-inline void drop_focus(Ui::Impl* im) { im->focus = nullptr; im->focus_id = 0; }
+inline void drop_focus(Ui::Impl* im) { im->focus = nullptr; im->focus_id = 0; im->focus_scope_id = 0; }
 
 // -----------------------------------------------------------------------------
 //  文本编辑小工具（input 组件用）
@@ -5333,32 +5818,62 @@ enum : uint64_t { EDIT_TYPE = 1, EDIT_DELETE = 2, EDIT_OTHER = 3 };
 
 // 压一份"改动前"的快照。连续同类输入（0.7s 内）合并成一步 —— 否则打 20 个字
 // 要按 20 次 Ctrl+Z 才能退掉一句话，这是编辑器最让人烦的细节之一。
+inline size_t edit_history_bytes(const Ui::Impl::EditStack& st) {
+    size_t bytes = 0;
+    for (const auto& s : st.undo) bytes += sizeof(s) + s.text.capacity() + 1;
+    for (const auto& s : st.redo) bytes += sizeof(s) + s.text.capacity() + 1;
+    return bytes;
+}
+inline size_t edit_history_budget() {
+    static const size_t budget = memory_budget_kib("AINO_UNDO_BUDGET", size_t(4u << 20));
+    return budget;
+}
+inline void trim_edit_history(Ui::Impl::EditStack& st) {
+    const size_t budget = edit_history_budget();
+    size_t bytes = edit_history_bytes(st);
+    while (st.undo.size() + st.redo.size() > 200 || bytes > budget) {
+        // 两端只删最远历史，留下的撤销/重做链仍连续；空栈不参与选择。
+        auto& stack = st.undo.size() > st.redo.size() ? st.undo : st.redo;
+        if (stack.empty()) break;
+        bytes -= sizeof(stack.front()) + stack.front().text.capacity() + 1;
+        stack.pop_front();
+    }
+}
+
 inline void edit_snapshot(Ui::Impl* im, uint64_t id, const std::string& before,
                           int caret0, int anchor0, uint64_t kind) {
     auto& st = im->edit_stack[id];
     const float now = im->clock;
+    if (before.size() > edit_history_budget() - sizeof(Ui::Impl::EditSnap) - 1) {
+        st.undo.clear();
+        st.redo.clear();
+        st.kind = 0;
+        st.last = now;
+        return;
+    }
     if (kind != EDIT_OTHER && st.kind == kind && !st.undo.empty() && (now - st.last) < 0.7f) {
         st.last = now;
         st.redo.clear();
         return;
     }
     st.undo.push_back(Ui::Impl::EditSnap{before, caret0, anchor0});
-    if (st.undo.size() > 200) st.undo.erase(st.undo.begin());
     st.redo.clear();
+    trim_edit_history(st);
     st.last = now;
     st.kind = kind;
 }
 
 inline bool edit_undo(Ui::Impl* im, uint64_t id, std::string* text, int* caret, int* anchor) {
-    auto it = im->edit_stack.find(id);
-    if (it == im->edit_stack.end() || it->second.undo.empty()) return false;
-    auto& st = it->second;
+    auto* saved = im->edit_stack.get_if(id);
+    if (!saved || saved->undo.empty()) return false;
+    auto& st = *saved;
     st.redo.push_back(Ui::Impl::EditSnap{*text, *caret, *anchor});
-    const Ui::Impl::EditSnap s = st.undo.back();
+    Ui::Impl::EditSnap s = std::move(st.undo.back());
     st.undo.pop_back();
-    *text = s.text;
+    *text = std::move(s.text);
     *caret = s.caret;
     *anchor = s.anchor;
+    trim_edit_history(st);
     st.kind = 0;
     st.last = -1e9f;                       // 撤销之后不再和后续输入合并
     if (im->request_repaint) im->request_repaint();
@@ -5366,15 +5881,16 @@ inline bool edit_undo(Ui::Impl* im, uint64_t id, std::string* text, int* caret, 
 }
 
 inline bool edit_redo(Ui::Impl* im, uint64_t id, std::string* text, int* caret, int* anchor) {
-    auto it = im->edit_stack.find(id);
-    if (it == im->edit_stack.end() || it->second.redo.empty()) return false;
-    auto& st = it->second;
+    auto* saved = im->edit_stack.get_if(id);
+    if (!saved || saved->redo.empty()) return false;
+    auto& st = *saved;
     st.undo.push_back(Ui::Impl::EditSnap{*text, *caret, *anchor});
-    const Ui::Impl::EditSnap s = st.redo.back();
+    Ui::Impl::EditSnap s = std::move(st.redo.back());
     st.redo.pop_back();
-    *text = s.text;
+    *text = std::move(s.text);
     *caret = s.caret;
     *anchor = s.anchor;
+    trim_edit_history(st);
     st.kind = 0;
     st.last = -1e9f;
     if (im->request_repaint) im->request_repaint();
@@ -5386,7 +5902,7 @@ inline bool edit_redo(Ui::Impl* im, uint64_t id, std::string* text, int* caret, 
 // =============================================================================
 //  8.9  文本类组件
 // =============================================================================
-inline void Ui::label(const std::string& text, const Rect& box, const Style& st) {
+void Ui::label(const std::string& text, const Rect& box, const Style& st) {
     Style s = st;
     if (s.font_size <= 0.0f) s.font_size = impl->theme.font_size;
     if (s.font_weight <= 0) s.font_weight = 400;
@@ -5395,7 +5911,7 @@ inline void Ui::label(const std::string& text, const Rect& box, const Style& st)
     draw_text(text, box, c, s);
 }
 
-inline void Ui::heading(const std::string& text, const Rect& box, const Style& st) {
+void Ui::heading(const std::string& text, const Rect& box, const Style& st) {
     Style s = st;
     // 默认标题使用 22pt Bold。
     if (s.font_size <= 0.0f) s.font_size = 22.0f;
@@ -5405,7 +5921,7 @@ inline void Ui::heading(const std::string& text, const Rect& box, const Style& s
     draw_text(text, box, c, s);
 }
 
-inline void Ui::subheading(const std::string& text, const Rect& box, const Style& st) {
+void Ui::subheading(const std::string& text, const Rect& box, const Style& st) {
     Style s = st;
     // Title 3 = 15/20 Semibold
     if (s.font_size <= 0.0f) s.font_size = 15.0f;
@@ -5415,7 +5931,7 @@ inline void Ui::subheading(const std::string& text, const Rect& box, const Style
     draw_text(text, box, c, s);
 }
 
-inline void Ui::muted_text(const std::string& text, const Rect& box, const Style& st) {
+void Ui::muted_text(const std::string& text, const Rect& box, const Style& st) {
     Style s = st;
     if (s.font_size <= 0.0f) s.font_size = impl->theme.font_size;
     if (s.font_weight <= 0) s.font_weight = 400;
@@ -5423,7 +5939,7 @@ inline void Ui::muted_text(const std::string& text, const Rect& box, const Style
     draw_text(text, box, c, s);
 }
 
-inline void Ui::code_text(const std::string& text, const Rect& box, const Style& st) {
+void Ui::code_text(const std::string& text, const Rect& box, const Style& st) {
     const Theme& th = impl->theme;
     const float rad = st.radius >= 0.0f ? st.radius : th.radius_sm;
     const float fs  = st.font_size > 0.0f ? st.font_size : th.font_size - 1.0f;
@@ -5621,13 +6137,13 @@ inline std::string code_line_at(const std::string& code, int index) {
 
 } // namespace detail
 
-inline float Ui::code_block_height(const std::string& code, const Style& st) const {
+float Ui::code_block_height(const std::string& code, const Style& st) const {
     const float fs = st.font_size > 0.0f ? st.font_size : 12.5f;
     const float lh = std::max(fs * 1.62f, 15.0f);
     return 10.0f + lh * float(detail::code_line_count(code)) + 10.0f;
 }
 
-inline void Ui::code_block(const std::string& code, const Rect& box, const Style& st) {
+void Ui::code_block(const std::string& code, const Rect& box, const Style& st) {
     // 代码块自己画文字（走 TextRenderer 的 mono 通道，不经过 draw_text），
     // 所以测量模式要在这里单独拦一道，否则测量阶段会真把字画到屏幕上。
     if (impl->measure_on) { impl->measure_add(box); return; }
@@ -5701,7 +6217,7 @@ inline void Ui::code_block(const std::string& code, const Rect& box, const Style
 // =============================================================================
 //  8.10  容器类组件
 // =============================================================================
-inline void Ui::panel(const Rect& box, const Style& st) {
+void Ui::panel(const Rect& box, const Style& st) {
     const Theme& th = impl->theme;
     const Color bg = !st.bg.is_none() ? st.bg : th.card;
     // macOS 的 Group Box 是**一层填充，没有描边**（Figma `Group Box`：r12、
@@ -5720,9 +6236,9 @@ inline void Ui::panel(const Rect& box, const Style& st) {
     if (bw > 0.0f && bd.a > 0) stroke_rect(box, bd, rad, bw);
 }
 
-inline void Ui::card(const Rect& box, const Style& st) { panel(box, st); }
+void Ui::card(const Rect& box, const Style& st) { panel(box, st); }
 
-inline void Ui::separator(const Rect& box, const Style& st) {
+void Ui::separator(const Rect& box, const Style& st) {
     const Color c = !st.bg.is_none() ? st.bg : impl->theme.border;
     if (box.w >= box.h)
         fill_rect(Rect(box.x, box.cy() - 0.5f, box.w, 1.0f), c, 0.0f);
@@ -5730,7 +6246,7 @@ inline void Ui::separator(const Rect& box, const Style& st) {
         fill_rect(Rect(box.cx() - 0.5f, box.y, 1.0f, box.h), c, 0.0f);
 }
 
-inline void Ui::badge(const std::string& text, const Rect& box, const Style& st) {
+void Ui::badge(const std::string& text, const Rect& box, const Style& st) {
     const Theme& th = impl->theme;
     // 参考资料标记是小圆角矩形（r4.5 = Global/Radius 的 3/4），不是胶囊；
     // 字号 Caption 1 = 10/13。
@@ -5758,7 +6274,7 @@ inline void Ui::badge(const std::string& text, const Rect& box, const Style& st)
     draw_text(text, box.inset(6.0f, 0.0f), sk.fg, ts);
 }
 
-inline void Ui::progress(float value, const Rect& box, const Style& st) {
+void Ui::progress(float value, const Rect& box, const Style& st) {
     const Theme& th = impl->theme;
     const bool dark = th.window_bg.luminance() < 0.5f;
     // 参考资料 Determinate/Medium：100×10，圆角 100（胶囊），cornerSmoothing 0.6。
@@ -5779,7 +6295,7 @@ inline void Ui::progress(float value, const Rect& box, const Style& st) {
     }
 }
 
-inline void Ui::progress_ring(float value, const Rect& box, const Style& st) {
+void Ui::progress_ring(float value, const Rect& box, const Style& st) {
     if (box.empty()) return;
     if (impl->measure_on) { impl->measure_add(box); return; }
     if (!impl->canvas) return;
@@ -5803,7 +6319,7 @@ inline void Ui::progress_ring(float value, const Rect& box, const Style& st) {
     arc(value, color);
 }
 
-inline void Ui::skeleton(const Rect& box, const Style& st) {
+void Ui::skeleton(const Rect& box, const Style& st) {
     if (impl->measure_on) { impl->measure_add(box); return; }
     const Theme& th = impl->theme;
     const float rad = st.radius >= 0.0f ? st.radius : th.radius;
@@ -5825,8 +6341,8 @@ inline void Ui::skeleton(const Rect& box, const Style& st) {
 // =============================================================================
 //  8.11  交互类组件
 // =============================================================================
-inline bool Ui::button(const std::string& text, const Rect& box, const Style& st) {
-    uint64_t id = impl->widget_id("button", box, detail::hash_string(text.c_str()));
+bool Ui::button(const std::string& text, const Rect& box, const Style& st) {
+    uint64_t id = impl->widget_id("button", box, detail::hash_string(text.c_str()), st.identity);
     Style s = st;
     if (!s.align_set) s.align = Align::Center;
     if (!s.valign_set) s.valign = VAlign::Middle;
@@ -5864,8 +6380,8 @@ inline bool Ui::button(const std::string& text, const Rect& box, const Style& st
     return in.clicked && enabled;
 }
 
-inline bool Ui::icon_button(const std::string& glyph, const Rect& box, const Style& st) {
-    uint64_t id = impl->widget_id("iconbtn", box, detail::hash_string(glyph.c_str()));
+bool Ui::icon_button(const std::string& glyph, const Rect& box, const Style& st) {
+    uint64_t id = impl->widget_id("iconbtn", box, detail::hash_string(glyph.c_str()), st.identity);
     Style s = st;
     if (s.variant < 0) s.variant = Style::Ghost;
     if (!s.align_set) s.align = Align::Center;
@@ -5901,9 +6417,9 @@ inline bool Ui::icon_button(const std::string& glyph, const Rect& box, const Sty
 //  和 button 的区别全在"它是导航，不是动作"：文字左对齐（button 居中）、
 //  选中态是持续的（button 只有 hover/press），并且右侧可以留白给计数或快捷键。
 // -----------------------------------------------------------------------------
-inline bool Ui::nav_item(const std::string& label, bool active, const Rect& box, const Style& st) {
+bool Ui::nav_item(const std::string& label, bool active, const Rect& box, const Style& st) {
     const Theme& th = impl->theme;
-    uint64_t id = impl->widget_id("navitem", box, detail::hash_string(label.c_str()));
+    uint64_t id = impl->widget_id("navitem", box, detail::hash_string(label.c_str()), st.identity);
     const bool enabled = !st.disabled;
 
     detail::Interact in = detail::interact(impl, id, box, enabled);
@@ -5948,10 +6464,11 @@ inline bool Ui::nav_item(const std::string& label, bool active, const Rect& box,
 // -----------------------------------------------------------------------------
 //  input —— 带光标、选区、编辑、剪贴板的单行文本框
 // -----------------------------------------------------------------------------
-inline bool Ui::input(std::string* value, const Rect& box, const Style& st) {
+bool Ui::input(std::string* value, const Rect& box, const Style& st) {
     if (!value) return false;
     const Theme& th = impl->theme;
-    uint64_t id = impl->widget_id("input", box);
+    uint64_t id = impl->widget_id("input", box, 0,
+        st.identity ? st.identity : uint64_t(reinterpret_cast<uintptr_t>(value)));
     const bool enabled = !st.disabled;
 
     detail::Interact in = detail::interact(impl, id, box, enabled);
@@ -5988,7 +6505,10 @@ inline bool Ui::input(std::string* value, const Rect& box, const Style& st) {
         for (int i = 0; i < count; ++i) masked += "•";
         return masked;
     };
-    const std::string hit_text = display(*value);
+    // 非密码框直接引用调用方的串：这个函数每帧都跑，按值接一份等于每帧复制
+    // 整段文本（长输入 / 大段粘贴时很可观）。密码框才需要一份打码副本。
+    const std::string masked = st.password ? display(*value) : std::string();
+    const std::string& hit_text = st.password ? masked : *value;
     const float avail = std::max(box.w - pad * 2.0f, 1.0f);
 
     if (focused) {
@@ -6155,9 +6675,9 @@ inline bool Ui::input(std::string* value, const Rect& box, const Style& st) {
         }
         if (!undone && kin.ctrl_of('V')) {
             std::string paste = impl->get_clipboard ? impl->get_clipboard() : std::string();
-            // 单行输入：过滤换行
+            // 单行输入不接收 Tab、换行及其它控制字符，保留 UTF-8 字节。
             std::string filtered;
-            for (char ch : paste) if (ch != '\n' && ch != '\r') filtered.push_back(ch);
+            for (unsigned char ch : paste) if (ch >= 32 && ch != 127) filtered.push_back(char(ch));
             // 先确认有东西可粘再删选区 —— 剪贴板为空（或只有换行）时先删后插
             // 会把选区直接抹掉，什么都没换来。
             if (!filtered.empty()) {
@@ -6178,15 +6698,19 @@ inline bool Ui::input(std::string* value, const Rect& box, const Style& st) {
 
         // 组合键期间不提交文本，避免输入法将快捷键字符写入输入框。
         if (!undone && !kin.ctrl() && impl->text_veto <= 0.0f && !kin.text_input.empty()) {
-            edit_kind = detail::EDIT_TYPE;
-            delete_selection();
-            std::vector<uint32_t> cps = utf8_codepoints(*value);
-            std::vector<uint32_t> ins = utf8_codepoints(kin.text_input);
-            cps.insert(cps.begin() + impl->caret, ins.begin(), ins.end());
-            *value = utf8_from_codepoints(cps, 0, cps.size());
-            impl->caret += int(ins.size());
-            impl->caret_blink = 0.0f;
-            changed = true;
+            std::string filtered;
+            for (unsigned char ch : kin.text_input) if (ch >= 32 && ch != 127) filtered.push_back(char(ch));
+            if (!filtered.empty()) {
+                edit_kind = detail::EDIT_TYPE;
+                delete_selection();
+                std::vector<uint32_t> cps = utf8_codepoints(*value);
+                std::vector<uint32_t> ins = utf8_codepoints(filtered);
+                cps.insert(cps.begin() + impl->caret, ins.begin(), ins.end());
+                *value = utf8_from_codepoints(cps, 0, cps.size());
+                impl->caret += int(ins.size());
+                impl->caret_blink = 0.0f;
+                changed = true;
+            }
         }
 
         // 有实际文本改动才进撤销栈（光标移动、选区变化不算）
@@ -6293,8 +6817,8 @@ inline bool Ui::input(std::string* value, const Rect& box, const Style& st) {
     if (focused && std::fmod(impl->caret_blink, 1.06f) < 0.62f) {
         float ch = fs * 1.15f;
         fill_rect(Rect(caret_x, box.cy() - ch * 0.5f, 1.4f, ch), th.foreground, 0.7f);
-        repaint();   // 光标要闪，持续要帧
     }
+    if (focused) impl->schedule_caret();
     // 输入法：把拼音串钉在输入框下沿、候选框再往下一点。
     // 不做这一步，系统会把它们放在客户区左上角，和输入框完全对不上。
     if (focused && impl->ime_pos) {
@@ -6312,11 +6836,11 @@ inline bool Ui::input(std::string* value, const Rect& box, const Style& st) {
 // -----------------------------------------------------------------------------
 //  checkbox
 // -----------------------------------------------------------------------------
-inline bool Ui::checkbox(bool* value, const std::string& label_text, const Rect& box, const Style& st) {
+bool Ui::checkbox(bool* value, const std::string& label_text, const Rect& box, const Style& st) {
     if (!value) return false;
     const Theme& th = impl->theme;
     const bool dark = th.window_bg.luminance() < 0.5f;
-    uint64_t id = impl->widget_id("checkbox", box, detail::hash_string(label_text.c_str()));
+    uint64_t id = impl->widget_id("checkbox", box, detail::hash_string(label_text.c_str()), st.identity);
     const bool enabled = !st.disabled;
 
     detail::Interact in = detail::interact(impl, id, box, enabled);
@@ -6388,12 +6912,12 @@ inline bool Ui::checkbox(bool* value, const std::string& label_text, const Rect&
 // -----------------------------------------------------------------------------
 //  toggle —— NSSwitch（54×24 轨道 + 32×20 白胶囊滑块）
 // -----------------------------------------------------------------------------
-inline bool Ui::toggle(bool* value, const Rect& box, const Style& st) {
+bool Ui::toggle(bool* value, const Rect& box, const Style& st) {
     if (!value || box.empty()) return false;
     if (impl->measure_on) { impl->measure_add(box); return false; }
     const Theme& th = impl->theme;
     const bool dark = th.window_bg.luminance() < 0.5f;
-    uint64_t id = impl->widget_id("toggle", box);
+    uint64_t id = impl->widget_id("toggle", box, 0, st.identity);
     const bool enabled = !st.disabled;
 
     detail::Interact in = detail::interact(impl, id, box, enabled);
@@ -6448,10 +6972,10 @@ inline bool Ui::toggle(bool* value, const Rect& box, const Style& st) {
 // -----------------------------------------------------------------------------
 //  slider
 // -----------------------------------------------------------------------------
-inline bool Ui::slider(float* value, float min_value, float max_value, const Rect& box, const Style& st) {
+bool Ui::slider(float* value, float min_value, float max_value, const Rect& box, const Style& st) {
     if (!value) return false;
     const Theme& th = impl->theme;
-    uint64_t id = impl->widget_id("slider", box);
+    uint64_t id = impl->widget_id("slider", box, 0, st.identity);
     const bool enabled = !st.disabled;
 
     Rect hit(box.x, box.y, box.w, box.h);
@@ -6502,16 +7026,16 @@ inline bool Ui::slider(float* value, float min_value, float max_value, const Rec
 }
 
 // Tabs 按文字宽度排列，Segmented 等分并共用凹槽背景；两者均返回选中索引。
-inline bool Ui::tabs(const std::vector<std::string>& labels, int* index, const Rect& box, const Style& st) {
+bool Ui::tabs(const std::vector<std::string>& labels, int* index, const Rect& box, const Style& st) {
     return tabs(labels, index, box, TabOptions{}, st);
 }
 
-inline bool Ui::tabs(const std::vector<std::string>& labels, int* index, const Rect& box,
+bool Ui::tabs(const std::vector<std::string>& labels, int* index, const Rect& box,
                      const TabOptions& options, const Style& st) {
     if (options.close_index) *options.close_index = -1;
     if (!index || labels.empty() || box.w <= 0.0f || box.h <= 0.0f) return false;
     const Theme& th = impl->theme;
-    uint64_t base_id = impl->widget_id("tabs", box);
+    uint64_t base_id = impl->widget_id("tabs", box, 0, st.identity);
     const bool pill = (st.variant == Style::Secondary || st.variant == Style::Outline);
     // 参考资料 Segmented Control 是**胶囊**（Figma 里 r=1000，按钮 r=100），不是
     // r6 的圆角矩形：24 高的控件整个是圆的，选中段内缩 2 之后也是胶囊。
@@ -6599,7 +7123,7 @@ inline bool Ui::tabs(const std::vector<std::string>& labels, int* index, const R
         const Rect close(item.right() - 6.0f - close_side, item.cy() - close_side * 0.5f, close_side, close_side);
         Rect hit = item;
         if (closable) hit.w = std::max(0.0f, close.x - item.x - 2.0f);
-        uint64_t id = impl->widget_id("tab", item, base_id + i);
+        uint64_t id = impl->widget_id("tab", item, base_id + i, st.identity ? base_id + i : 0);
         detail::Interact in = detail::interact(impl, id, hit, !st.disabled);
         if (in.hovered) set_cursor(Cursor::Arrow);
         if (in.clicked && *index != int(i)) { *index = int(i); changed = true; }
@@ -6663,7 +7187,7 @@ inline bool Ui::tabs(const std::vector<std::string>& labels, int* index, const R
 // -----------------------------------------------------------------------------
 //  segmented —— 语义上"选一个值"，视觉固定走胶囊式（凹槽 + 浮起的滑块）
 // -----------------------------------------------------------------------------
-inline bool Ui::segmented(const std::vector<std::string>& items, int* index, const Rect& box, const Style& st) {
+bool Ui::segmented(const std::vector<std::string>& items, int* index, const Rect& box, const Style& st) {
     // 调用方没点明变体时补成 Secondary；显式传了别的就照它画。
     Style ps = st;
     if (ps.variant < 0) ps.variant = Style::Secondary;
@@ -6673,10 +7197,10 @@ inline bool Ui::segmented(const std::vector<std::string>& items, int* index, con
 // -----------------------------------------------------------------------------
 //  select —— 下拉选择。弹层用 deferred 画到帧末，保证盖在其它组件之上
 // -----------------------------------------------------------------------------
-inline bool Ui::select(const std::vector<std::string>& items, int* index, const Rect& box, const Style& st) {
+bool Ui::select(const std::vector<std::string>& items, int* index, const Rect& box, const Style& st) {
     if (!index || items.empty()) return false;
     const Theme& th = impl->theme;
-    uint64_t id = impl->widget_id("select", box);
+    uint64_t id = impl->widget_id("select", box, 0, st.identity);
     // 本组件第一个控件的层级号。弹层下一帧用它判定"谁在下面"。
     const uint64_t z_first = impl->seq + 1;
     // 下拉触发器与普通按钮共用默认圆角。
@@ -6742,7 +7266,7 @@ inline bool Ui::select(const std::vector<std::string>& items, int* index, const 
             for (size_t i = 0; i < items.size(); ++i) {
                 rects[i] = Rect(list.x + pad, list.y + pad + item_h * float(i),
                                 list.w - pad * 2.0f, item_h);
-                ids[i] = impl->widget_id("select_item", rects[i]);
+                ids[i] = impl->widget_id("select_item", rects[i], 0, st.identity ? id + i : 0);
                 detail::Interact ii = detail::interact(impl, ids[i], rects[i], true);
                 if (ii.hovered) { set_cursor(Cursor::Arrow); hov[i] = 1; }
                 if (ii.clicked) clicked_index = int(i);
@@ -6785,7 +7309,7 @@ inline bool Ui::select(const std::vector<std::string>& items, int* index, const 
 }
 
 // =============================================================================
-//  8.13  表单补充
+//  8.12  表单补充
 // =============================================================================
 
 // -----------------------------------------------------------------------------
@@ -6793,10 +7317,10 @@ inline bool Ui::select(const std::vector<std::string>& items, int* index, const 
 //  纵向等分 box.h，每行"圆环 + 标签"。选中态：圆环外圈加粗 + 内点
 //  并转成 primary，中心长出一个实心点（靠一个动画量 t 同时驱动两者）。
 // -----------------------------------------------------------------------------
-inline bool Ui::radio_group(const std::vector<std::string>& items, int* index, const Rect& box, const Style& st) {
+bool Ui::radio_group(const std::vector<std::string>& items, int* index, const Rect& box, const Style& st) {
     if (!index || items.empty() || box.h <= 0.0f) return false;
     const Theme& th = impl->theme;
-    uint64_t base = impl->widget_id("radiogroup", box);
+    uint64_t base = impl->widget_id("radiogroup", box, 0, st.identity);
     const float fs = st.font_size > 0.0f ? st.font_size : th.font_size;
     const float row_h = box.h / float(items.size());
     const float dot = std::max(16.0f, fs + 3.0f);
@@ -6804,7 +7328,7 @@ inline bool Ui::radio_group(const std::vector<std::string>& items, int* index, c
     bool changed = false;
     for (size_t i = 0; i < items.size(); ++i) {
         Rect row(box.x, box.y + row_h * float(i), box.w, row_h);
-        uint64_t id = impl->widget_id("radio", row, base + i);
+        uint64_t id = impl->widget_id("radio", row, base + i, st.identity ? base + i : 0);
         detail::Interact in = detail::interact(impl, id, row, !st.disabled);
         if (in.hovered) set_cursor(Cursor::Arrow);
         if (in.pressed) detail::grab_focus(impl, id);
@@ -6860,10 +7384,10 @@ inline bool Ui::radio_group(const std::vector<std::string>& items, int* index, c
 // -----------------------------------------------------------------------------
 //  stepper —— 数值与右侧上下增减按钮
 // -----------------------------------------------------------------------------
-inline bool Ui::stepper(float* value, float step, float min_value, float max_value, const Rect& box, const Style& st) {
+bool Ui::stepper(float* value, float step, float min_value, float max_value, const Rect& box, const Style& st) {
     if (!value || box.w <= 12.0f) return false;
     const Theme& th = impl->theme;
-    uint64_t base = impl->widget_id("stepper", box);
+    uint64_t base = impl->widget_id("stepper", box, 0, st.identity);
     const float rad = st.radius >= 0.0f ? st.radius : th.radius;
     const float fs  = st.font_size > 0.0f ? st.font_size : th.font_size;
 
@@ -6956,7 +7480,7 @@ inline void paint_clear_badge(Ui& ui, float cx, float cy, float r,
 }
 }  // namespace detail
 
-inline bool Ui::search_field(std::string* value, const Rect& box, const Style& st) {
+bool Ui::search_field(std::string* value, const Rect& box, const Style& st) {
     if (!value) return false;
     const Theme& th = impl->theme;
     Style s = st;
@@ -6967,7 +7491,7 @@ inline bool Ui::search_field(std::string* value, const Rect& box, const Style& s
     detail::Interact ci;
     // 清除键与输入框重叠，必须先认领按下事件，避免被整个输入框的热区吞掉。
     if (has_clear)
-        ci = detail::interact(impl, impl->widget_id("searchclear", box), cr, !st.disabled);
+        ci = detail::interact(impl, impl->widget_id("searchclear", box, 0, st.identity ? st.identity : uint64_t(reinterpret_cast<uintptr_t>(value))), cr, !st.disabled);
     bool changed = input(value, box, s);
 
     // 禁用时放大镜跟着文字一起淡到 45%：只淡文字、图标还是满色的话，看着像
@@ -7005,9 +7529,9 @@ inline bool Ui::search_field(std::string* value, const Rect& box, const Style& s
 //  白色色块在浅色窗口上会"消失"，所以它必须有三层：色块本身 + 内侧 1px 白边
 //  （把颜色从背景上托起来）+ 外侧 1px 分隔线（白块也能看见轮廓）。
 // -----------------------------------------------------------------------------
-inline bool Ui::color_well(const Color& c, const Rect& box, const Style& st) {
+bool Ui::color_well(const Color& c, const Rect& box, const Style& st) {
     const Theme& th = impl->theme;
-    const uint64_t id = impl->widget_id("colorwell", box);
+    const uint64_t id = impl->widget_id("colorwell", box, 0, st.identity);
     detail::Interact in = detail::interact(impl, id, box, !st.disabled);
     if (in.hovered) set_cursor(Cursor::Arrow);
     const float rad = st.radius >= 0.0f ? st.radius : th.radius;
@@ -7028,7 +7552,7 @@ inline bool Ui::color_well(const Color& c, const Rect& box, const Style& st) {
 //  5% 凹面 + 1px 分隔线 + 图片符号 + 一行说明。它是"槽"，不是按钮，所以不画
 //  悬停底色；点进去由调用方接（本库不做文件拖放）。
 // -----------------------------------------------------------------------------
-inline void Ui::image_well(const Rect& box, const Style& st) {
+void Ui::image_well(const Rect& box, const Style& st) {
     const Theme& th = impl->theme;
     const float rad = st.radius >= 0.0f ? st.radius : th.radius_lg;
     fill_rect_s(box, th.fill3, rad, th.corner_smoothing);
@@ -7050,10 +7574,11 @@ inline void Ui::image_well(const Rect& box, const Style& st) {
 //  与 input 共享同一套编辑状态（impl->caret / sel_anchor），差别只在"坐标 <-> 码点"
 //  的换算要过一层行号。'\n' 硬换行，不做软换行；超出视口时内部纵向滚动。
 // -----------------------------------------------------------------------------
-inline bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
+bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
     if (!value) return false;
     const Theme& th = impl->theme;
-    uint64_t id = impl->widget_id("textarea", box);
+    uint64_t id = impl->widget_id("textarea", box, 0,
+        st.identity ? st.identity : uint64_t(reinterpret_cast<uintptr_t>(value)));
     const bool enabled = !st.disabled;
     // 和 input() 同一档圆角（6）与同一套皮 —— 多行框不是"另一种控件"，
     // 它是同一个 Text Field 长高了。
@@ -7086,26 +7611,72 @@ inline bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
         return out;
     };
 
-    std::vector<std::string> lines = split_lines(*value);
+    // ---- 切行 + 每行码点数 + 行首 caret 偏移 ----
+    // 三者都只由全文决定，所以一起缓存：光标闪烁期间每帧都要重画，而大文档
+    // 静止时内容一个字节都没变 —— 切一遍是 O(全文) 加每行一次分配，白付。
+    //
+    // 命中判据是**全文 memcmp**，不是长度或指针相等：程序改文本而长度不变
+    // （替换、撤销到同长度）也能立刻发现，不会画出上一版的行。
+    // 64 KiB 以下不缓存：重建本身只要几十微秒，留一份副本不划算。
+    std::vector<std::string> lines_local;
+    std::vector<int> cps_local, base_local;
+    const std::vector<std::string>* lines_p = &lines_local;
+    const std::vector<int>* cps_p = &cps_local;
+    const std::vector<int>* base_p = &base_local;
+    Impl::TextLines* tc = nullptr;
+    if (value->size() >= size_t(64u << 10)) tc = &impl->text_lines[id];
+    else impl->text_lines.erase(id);    // 缩回小文档后不再留着整篇副本
 
+    // 重建（或重建后写回缓存）。原地赋值：下面所有 lambda 都按引用捕获
+    // lines / cps_n / cp_base，重建后引用仍然有效。
+    auto rebuild_lines = [&]() {
+        std::vector<std::string> nl = split_lines(*value);
+        std::vector<int> nc(nl.size()), nb(nl.size());
+        int acc = 0;
+        for (size_t i = 0; i < nl.size(); ++i) {
+            nc[i] = utf8_count(nl[i]);
+            nb[i] = acc;
+            acc += nc[i] + 1;           // +1 吃掉换行符
+        }
+        if (tc) {
+            tc->src = *value;
+            tc->lines = std::move(nl);
+            tc->cps_n = std::move(nc);
+            tc->cp_base = std::move(nb);
+            // 数据搬进缓存后局部向量是空的，指针必须跟着改过去。
+            lines_p = &tc->lines; cps_p = &tc->cps_n; base_p = &tc->cp_base;
+        } else {
+            lines_local = std::move(nl);
+            cps_local = std::move(nc);
+            base_local = std::move(nb);
+        }
+    };
+
+    const bool lines_cached = tc && tc->src.size() == value->size()
+        && (value->empty() || std::memcmp(tc->src.data(), value->data(), value->size()) == 0);
+    if (lines_cached) { lines_p = &tc->lines; cps_p = &tc->cps_n; base_p = &tc->cp_base; }
+    else              { rebuild_lines(); }
+    const std::vector<std::string>& lines = *lines_p;
+    const std::vector<int>& cps_n = *cps_p;
+    const std::vector<int>& cp_base = *base_p;
     auto to_linecol = [&](int cp) -> std::pair<int, int> {
         int remain = cp < 0 ? 0 : cp;
-        for (size_t i = 0; i < lines.size(); ++i) {
-            const int n = utf8_count(lines[i]);
-            if (remain <= n) return std::make_pair(int(i), remain);
-            remain -= n + 1;           // +1 吃掉换行符
-        }
-        const int last = int(lines.size()) - 1;
-        return std::make_pair(last, utf8_count(lines[size_t(last)]));
+        // cp_base 单调递增，二分定位行号（原来是从第一行线性扫）。
+        const auto it = std::upper_bound(cp_base.begin(), cp_base.end(), remain);
+        size_t i = it == cp_base.begin() ? 0 : size_t(it - cp_base.begin()) - 1;
+        if (i >= lines.size()) i = lines.size() - 1;
+        remain -= cp_base[i];
+        if (remain > cps_n[i]) remain = cps_n[i];    // 越过行尾时夹到行尾
+        return std::make_pair(int(i), remain);
     };
     auto to_caret = [&](int ln, int col) {
-        int cp = 0;
-        for (int i = 0; i < ln && i < int(lines.size()); ++i) cp += utf8_count(lines[i]) + 1;
-        return cp + (col < 0 ? 0 : col);
+        if (ln < 0) return col < 0 ? 0 : col;
+        if (ln >= int(lines.size())) ln = int(lines.size()) - 1;
+        return cp_base[size_t(ln)] + (col < 0 ? 0 : col);
     };
     auto line_x = [&](int ln, int col) {
         if (ln < 0 || ln >= int(lines.size())) return 0.0f;
-        const int n = utf8_count(lines[size_t(ln)]);
+        const int n = cps_n[size_t(ln)];
         if (col > n) col = n;
         const std::vector<uint32_t> cps = utf8_codepoints(lines[size_t(ln)]);
         return text_width(utf8_from_codepoints(cps, 0, size_t(col)), fs, 400);
@@ -7115,7 +7686,7 @@ inline bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
     const float view_h   = std::max(box.h - pady * 2.0f, 1.0f);
     const float need_h   = lh * float(lines.size());
     const float max_off  = std::max(0.0f, need_h - view_h);
-    int   n_cp     = utf8_count(*value);
+    int   n_cp     = cp_base.back() + cps_n.back();
 
     if (max_off > 0.0f && in.hovered && std::fabs(impl->input.wheel) > 0.001f) {
         tscroll = detail::clampf(tscroll - impl->input.wheel * 40.0f, 0.0f, max_off);
@@ -7300,7 +7871,7 @@ inline bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
             if (kin.ctrl_of(KEY_END)) impl->caret = n_cp;
             else {
                 const std::pair<int, int> lc = to_linecol(impl->caret);
-                impl->caret = to_caret(lc.first, utf8_count(lines[size_t(lc.first)]));
+                impl->caret = to_caret(lc.first, cps_n[size_t(lc.first)]);
             }
             impl->caret_blink = 0.0f;
         }
@@ -7334,8 +7905,9 @@ inline bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
         if (changed && !undone && *value != before_text)
             detail::edit_snapshot(impl, id, before_text, caret0, anchor0, edit_kind);
 
-        // 编辑完重新分行，否则下面的绘制还在用旧的 lines
-        if (changed) lines = split_lines(*value);
+        // 编辑完重新分行，否则下面的绘制还在用旧的 lines。
+        // 行首偏移表也要一起重建 —— 光标定位、选区、视口跟随都读它。
+        if (changed) rebuild_lines();
     }
 
     // 光标行保持在视口内（先按光标位置调整，再统一夹到合法区间）
@@ -7376,12 +7948,21 @@ inline bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
     if (focused && impl->sel_anchor >= 0) {
         const int sf  = std::min(impl->caret, impl->sel_anchor);
         const int stt = std::max(impl->caret, impl->sel_anchor);
-        int base = 0;
-        for (size_t i = 0; i < lines.size(); ++i) {
-            const int n = utf8_count(lines[i]);
+        // 从可见区第一行开始：整篇被选中时，屏幕外的行不需要量宽度（每行要
+        // 两次 utf8_codepoints + 一次字体度量）。前缀表让起点可以直接算出来。
+        size_t i0 = 0;
+        if (lh > 0.01f) {
+            const float first_y = box.y + pady - tscroll;
+            if (first_y < box.y) i0 = size_t(std::max(0.0f, std::floor((box.y - first_y) / lh)));
+            if (i0 >= lines.size()) i0 = lines.size() - 1;
+        }
+        for (size_t i = i0; i < lines.size(); ++i) {
+            const int base = cp_base[i];
+            const int n = cps_n[i];
+            const float y = box.y + pady + lh * float(i) - tscroll;
+            if (y > box.bottom()) break;
             const int a = std::max(sf, base) - base;
             const int b = std::min(stt, base + n) - base;
-            const float y = box.y + pady + lh * float(i) - tscroll;
             if (b > a) {
                 const float x0 = line_x(int(i), a);
                 const float x1 = line_x(int(i), b);
@@ -7390,7 +7971,6 @@ inline bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
             // 行尾的换行符也被选中时补一小段，不然"选中换行"看不出反馈
             if (stt > base + n && sf <= base + n)
                 fill_rect(Rect(box.x + padx + line_x(int(i), n), y, 6.0f, lh), th.primary.with_alpha(52), 2.0f);
-            base += n + 1;
         }
     }
 
@@ -7402,7 +7982,10 @@ inline bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
     float comp_w = 0.0f;
     if (composing) { comp_lc = to_linecol(impl->caret); comp_w = text_width(impl->ime_comp, fs, 400); }
 
-    for (size_t i = 0; i < lines.size(); ++i) {
+    size_t draw_from = 0;
+    if (lh > 0.01f && tscroll > 0.0f)
+        draw_from = size_t(std::max(0.0f, std::floor(tscroll / lh)));
+    for (size_t i = draw_from; i < lines.size(); ++i) {
         const float y = box.y + pady + lh * float(i) - tscroll;
         if (y > box.bottom()) break;
         if (y + lh < box.y) continue;
@@ -7434,8 +8017,8 @@ inline bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
         if (std::fmod(impl->caret_blink, 1.06f) < 0.62f) {
             if (cy + lh > box.y && cy < box.bottom())
                 fill_rect(Rect(cx, cy + lh * 0.06f, 1.4f, lh * 0.88f), th.foreground, 0.7f);
-            repaint();                 // 光标要闪，持续要帧
         }
+        impl->schedule_caret();
         if (impl->ime_pos) {
             // 光标滚出可视区时把 IME 钉在最近的那一行，别让它飞到框外
             const float iy = detail::clampf(cy, box.y, std::max(box.y, box.bottom() - lh));
@@ -7455,13 +8038,13 @@ inline bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
 //  星形是凹多边形，普通圆角矩形光栅化器画不了，所以这里用 raster_poly
 //  （奇偶规则扫描线填充）。点第 i 颗星 → *value = i+1；再点当前值 → 清零。
 // -----------------------------------------------------------------------------
-inline bool Ui::rating(int* value, int max_stars, const Rect& box, const Style& st) {
+bool Ui::rating(int* value, int max_stars, const Rect& box, const Style& st) {
     if (!value || max_stars <= 0 || max_stars > 32) return false;
     // 星形是直接 raster_poly 到画布的，不经过图元函数 —— 测量模式必须自己拦一道，
     // 否则"先量高度"那趟会在屏幕左上角画出一排真星星。
     if (impl->measure_on) { impl->measure_add(box); return false; }
     const Theme& th = impl->theme;
-    uint64_t base = impl->widget_id("rating", box);
+    uint64_t base = impl->widget_id("rating", box, 0, st.identity);
     const float gap = 4.0f;
     const float size = std::min((box.w - gap * float(max_stars - 1)) / float(max_stars), box.h);
     if (size <= 3.0f) return false;
@@ -7478,7 +8061,7 @@ inline bool Ui::rating(int* value, int max_stars, const Rect& box, const Style& 
     bool changed = false;
     for (int i = 0; i < max_stars; ++i) {
         const Rect sr(box.x + float(i) * (size + gap), top, size, size);
-        uint64_t id = impl->widget_id("star", sr, base + uint64_t(i));
+        uint64_t id = impl->widget_id("star", sr, base + uint64_t(i), st.identity ? base + uint64_t(i) : 0);
         detail::Interact in = detail::interact(impl, id, sr, !st.disabled);
         if (in.hovered) set_cursor(Cursor::Arrow);
         if (in.pressed) detail::grab_focus(impl, id);
@@ -7510,11 +8093,11 @@ inline bool Ui::rating(int* value, int max_stars, const Rect& box, const Style& 
 }
 
 // =============================================================================
-//  8.14  展示补充
+//  8.13  展示补充
 // =============================================================================
 
 // 头像：圆形底 + 首个码点。传 "张三" 画"张"，传 "AB" 画"A"。
-inline void Ui::avatar(const std::string& text, const Rect& box, const Style& st) {
+void Ui::avatar(const std::string& text, const Rect& box, const Style& st) {
     const Theme& th = impl->theme;
     const float d = std::min(box.w, box.h);
     if (d <= 2.0f) return;
@@ -7557,7 +8140,7 @@ inline void Ui::avatar(const std::string& text, const Rect& box, const Style& st
 // 弧身**没有端点**：整圈画满，用沿角度连续变化的 alpha 表示方向（拖尾）。
 // 带端点的弧（圆头 / 平头 / 渐隐）都会在转到起点时"断"一下 —— 尾端重新长出来，
 // 用户看到的就是接缝。COS 型 alpha 是周期的，首尾数值相等，绕多少圈都无缝。
-inline void Ui::spinner(const Rect& box, const Style& st) {
+void Ui::spinner(const Rect& box, const Style& st) {
     const Theme& th = impl->theme;
     const float d = std::min(box.w, box.h);
     if (d <= 6.0f) return;
@@ -7593,7 +8176,7 @@ inline void Ui::spinner(const Rect& box, const Style& st) {
 }
 
 // Alert 默认显示符号、标题和描述；显式背景或 Secondary 变体可绘制底面。标题使用标签色。
-inline void Ui::alert(const std::string& title, const std::string& description, const Rect& box, const Style& st) {
+void Ui::alert(const std::string& title, const std::string& description, const Rect& box, const Style& st) {
     // 不铺底时整块区域没有 fill_rect 可登记，测量阶段会只剩文字的包围盒 —— 两条
     // 提示条叠出来的高度会比实际矮一大截，第二个的描述被裁掉。所以自己登记。
     if (impl->measure_on) { impl->measure_add(box); return; }
@@ -7656,7 +8239,7 @@ inline void Ui::alert(const std::string& title, const std::string& description, 
 }
 
 // 面包屑：a › b › c，最后一段高亮
-inline void Ui::breadcrumb(const std::vector<std::string>& items, const Rect& box, const Style& st) {
+void Ui::breadcrumb(const std::vector<std::string>& items, const Rect& box, const Style& st) {
     if (items.empty()) return;
     const Theme& th = impl->theme;
     const float fs = st.font_size > 0.0f ? st.font_size : th.font_size;
@@ -7685,7 +8268,7 @@ inline void Ui::breadcrumb(const std::vector<std::string>& items, const Rect& bo
 }
 
 // 按键提示键帽
-inline void Ui::kbd(const std::string& text, const Rect& box, const Style& st) {
+void Ui::kbd(const std::string& text, const Rect& box, const Style& st) {
     const Theme& th = impl->theme;
     // macOS 的快捷键提示就是一行 11px 的灰字（⌘K），没有键帽。
     // 这里保留一个极轻的 5% 底 + r4 让它在正文里可辨识，但去掉"机械键帽"那圈
@@ -7708,10 +8291,10 @@ inline void Ui::kbd(const std::string& text, const Rect& box, const Style& st) {
 
 // 折叠面板：只有标题行可点，内容由调用方在 *open 为真时自己画。
 // 返回 true 表示本帧切换了展开状态。
-inline bool Ui::accordion(const std::string& title, bool* open, const Rect& box, const Style& st) {
+bool Ui::accordion(const std::string& title, bool* open, const Rect& box, const Style& st) {
     if (!open || box.w <= 0.0f) return false;
     const Theme& th = impl->theme;
-    uint64_t id = impl->widget_id("accordion", box, detail::hash_string(title.c_str()));
+    uint64_t id = impl->widget_id("accordion", box, detail::hash_string(title.c_str()), st.identity);
     const float fs = st.font_size > 0.0f ? st.font_size : th.font_size;
     // 折叠行是列表行：24 高（= Global/Height Medium），不是 Web 手风琴的 38
     const float head_h = std::min(box.h, std::max(fs + 8.0f, 24.0f));
@@ -7747,7 +8330,7 @@ inline bool Ui::accordion(const std::string& title, bool* open, const Rect& box,
 }
 
 // 表格使用等宽列；pad_x 只控制单元格内边距。
-inline void Ui::table(const std::vector<std::string>& headers,
+void Ui::table(const std::vector<std::string>& headers,
                       const std::vector<std::vector<std::string>>& rows,
                       const Rect& box, const Style& st) {
     const Theme& th = impl->theme;
@@ -7780,7 +8363,6 @@ inline void Ui::table(const std::vector<std::string>& headers,
     for (size_t c = 0; c < cols; ++c) {
         const Rect cr(hr.x + col_w * float(c), hr.y, col_w, hr.h);
         // 列之间不画竖线：macOS 的列表靠留白和行分隔线分列，竖线是 Excel/Web 的语汇
-        (void)c;
         if (c >= headers.size()) continue;
         Style ts;
         ts.font_size = 11.0f;               // Subheadline 11/14
@@ -7804,7 +8386,8 @@ inline void Ui::table(const std::vector<std::string>& headers,
             ts.font_size = fs;
             ts.font_weight = 400;
             // macOS 表格的数字列一律右对齐（小数点对齐是 Finder 的规矩）。
-            ts.align = detail::looks_numeric(rows[r][c]) ? Align::Right : Align::Left;
+            // 用上面预算好的 num_col：逐格再判一次，等于把每行的字符串又扫一遍。
+            ts.align = num_col[c] ? Align::Right : Align::Left;
             ts.valign = VAlign::Middle;
             Color cc = !st.fg.is_none() ? st.fg : th.foreground;
             if (st.disabled) cc.a = uint8_t(float(cc.a) * 0.45f);
@@ -7820,7 +8403,7 @@ inline void Ui::table(const std::vector<std::string>& headers,
 
 // 迷你折线图。默认在折线下方垫一层低透明度填充（经典 sparkline 观感），
 // 只想要裸折线就传 Style::ghost()。
-inline void Ui::sparkline(const std::vector<float>& values, const Rect& box, const Style& st) {
+void Ui::sparkline(const std::vector<float>& values, const Rect& box, const Style& st) {
     if (values.size() < 2 || box.w < 4.0f || box.h < 4.0f) return;
     float lo = values[0], hi = values[0];
     for (float v : values) { lo = std::min(lo, v); hi = std::max(hi, v); }
@@ -7857,7 +8440,7 @@ inline void Ui::sparkline(const std::vector<float>& values, const Rect& box, con
 }
 
 // 迷你柱状图，负值使用 muted 色。
-inline void Ui::bars(const std::vector<float>& values, const Rect& box, const Style& st) {
+void Ui::bars(const std::vector<float>& values, const Rect& box, const Style& st) {
     if (values.empty() || box.w < 4.0f || box.h < 4.0f) return;
     const Theme& th = impl->theme;
     float hi = 0.0f;
@@ -7879,13 +8462,13 @@ inline void Ui::bars(const std::vector<float>& values, const Rect& box, const St
 }
 
 // =============================================================================
-//  8.15  浮层类
+//  8.14  浮层类
 // =============================================================================
 
 // 悬停提示。点击态与普通控件一致，但显示条件多一条：指针停留满 0.4 秒。
 // 只在这段计时窗口内请求重绘，弹出之后不再要帧 —— 否则指针压着不动也会
 // 常驻刷新，把空闲 CPU 从 0% 抬起来。
-inline void Ui::tooltip(const Rect& anchor, const std::string& text, const Style& st) {
+void Ui::tooltip(const Rect& anchor, const std::string& text, const Style& st) {
     if (text.empty() || st.disabled) return;
     // 锚点不产生 interact，得自己登记成悬停区域，否则指针移上来不会重绘，
     // 计时器根本没机会开始跑。
@@ -7939,10 +8522,10 @@ inline void Ui::tooltip(const Rect& anchor, const std::string& text, const Style
 // 下拉菜单。
 // 关键点：**交互在帧内做，绘制推迟到帧末**。这样既保证了弹层盖住其它组件，
 // 又能让返回值在点击当帧就生效（不用等到下一帧）。
-inline bool Ui::menu(const std::string& label, const std::vector<std::string>& items,
+bool Ui::menu(const std::string& label, const std::vector<std::string>& items,
                      int* clicked_index, const Rect& box, const Style& st, const MenuOptions& options) {
     const Theme& th = impl->theme;
-    uint64_t id = impl->widget_id("menu", box);
+    uint64_t id = impl->widget_id("menu", box, 0, st.identity);
     // 同 select：触发器在 claim 之前就 interact 过了，层级号要取入口处。
     const uint64_t z_first = impl->seq + 1;
     const float rad = st.radius >= 0.0f ? st.radius : th.radius_sm;
@@ -8006,7 +8589,7 @@ inline bool Ui::menu(const std::string& label, const std::vector<std::string>& i
             const Rect r(list.x + 4.0f, row_y, list.w - 8.0f, row_h);
             row_y += row_h;
             rects.push_back(r);
-            ids.push_back(impl->widget_id("menu_item", r, id + i));
+            ids.push_back(impl->widget_id("menu_item", r, id + i, st.identity ? id + i : 0));
             hov.push_back(0);
             enabled_items.push_back(!items[i].empty() &&
                 std::find(options.disabled.begin(), options.disabled.end(), int(i)) == options.disabled.end());
@@ -8056,12 +8639,12 @@ inline bool Ui::menu(const std::string& label, const std::vector<std::string>& i
 //   3) 这时才把**整条菜单栏** claim 进去 —— 只有这样下一帧隔壁那几项
 //      才收得到 hover，联动才成立。只 claim 触发器本身的话，鼠标一离开
 //      当前项就被闸门挡住，看起来像"菜单卡住了"。
-inline MenuPick Ui::menubar(const std::vector<std::string>& labels,
+MenuPick Ui::menubar(const std::vector<std::string>& labels,
                             const std::vector<std::vector<std::string>>& items,
                             const Rect& box, const Style& st) {
     MenuPick pick;
     const Theme& th = impl->theme;
-    const uint64_t bar_id = impl->widget_id("menubar", box);
+    const uint64_t bar_id = impl->widget_id("menubar", box, 0, st.identity);
     // 顶级项在 claim 之前就 interact 过了，层级号必须在**入口处**取。
     const uint64_t z_first = impl->seq + 1;
     const float fs  = st.font_size > 0.0f ? st.font_size : th.font_size;
@@ -8092,7 +8675,7 @@ inline MenuPick Ui::menubar(const std::vector<std::string>& labels,
     // --- 1) 顶级项交互 ---
     std::vector<uint8_t> hov(labels.size(), 0);
     for (size_t i = 0; i < labels.size(); ++i) {
-        const uint64_t tid = impl->widget_id("menubar_item", trg[i], bar_id + i);
+        const uint64_t tid = impl->widget_id("menubar_item", trg[i], bar_id + i, st.identity ? bar_id + i : 0);
         detail::Interact in = detail::interact(impl, tid, trg[i], enabled);
         if (in.hovered) { set_cursor(Cursor::Arrow); hov[i] = 1; }
         if (in.clicked) {
@@ -8157,7 +8740,7 @@ inline MenuPick Ui::menubar(const std::vector<std::string>& labels,
         for (size_t i = 0; i < src.size(); ++i) {
             const Rect r(list.x + 4.0f, list.y + 4.0f + item_h * float(i), list.w - 8.0f, item_h);
             rects.push_back(r);
-            ids.push_back(impl->widget_id("menubar_li", r, bar_id + i));
+            ids.push_back(impl->widget_id("menubar_li", r, bar_id + i, st.identity ? bar_id + i : 0));
             lhov.push_back(0);
         }
         int chosen = -1;
@@ -8195,7 +8778,7 @@ inline MenuPick Ui::menubar(const std::vector<std::string>& labels,
 
 // 模态框。约定：在帧回调的**末尾**调用；返回 true 表示本帧处于打开态，
 // 想画自己的按钮就紧接着 dialog() 之后画，这样天然落在遮罩之上。
-inline bool Ui::dialog(const std::string& title, const std::string& body, bool* open,
+bool Ui::dialog(const std::string& title, const std::string& body, bool* open,
                        const Rect& box, const Style& st) {
     if (!open || !*open) return false;
     const Theme& th = impl->theme;
@@ -8259,7 +8842,7 @@ inline bool Ui::dialog(const std::string& title, const std::string& body, bool* 
 //
 // 图元只有"四角同半径"，所以这里把面板往上多画 12px 再裁掉 —— 上方两角被裁平，
 // 比为了一个直角去加一个"逐角半径"参数划算得多。
-inline bool Ui::sheet(const std::string& title, const std::string& body, bool* open,
+bool Ui::sheet(const std::string& title, const std::string& body, bool* open,
                       const Rect& box, const Style& st) {
     if (!open || !*open || box.w <= 0.0f || box.h <= 0.0f) return false;
     const Theme& th = impl->theme;
@@ -8310,7 +8893,7 @@ inline bool Ui::sheet(const std::string& title, const std::string& body, bool* o
 }
 
 // 轻提示条
-inline void Ui::toast(const std::string& text, const Rect& box, const Style& st) {
+void Ui::toast(const std::string& text, const Rect& box, const Style& st) {
     const Theme& th = impl->theme;
     const float rad = st.radius >= 0.0f ? st.radius : 10.0f;
     const float fs  = st.font_size > 0.0f ? st.font_size : th.font_size;
@@ -8337,7 +8920,7 @@ inline void Ui::toast(const std::string& text, const Rect& box, const Style& st)
 }
 
 // =============================================================================
-//  8.16  对齐 macOS 的基础控件（含 kit 里没有对应物的推导）
+//  8.15  对齐 macOS 的基础控件（含 kit 里没有对应物的推导）
 //
 //  本节控件的输入与绘制约定：
 //    1) 交互一律走 detail::interact()，动画一律走 detail::animate_value()；
@@ -8437,10 +9020,10 @@ inline bool group_cell(Ui& ui, Ui::Impl* im, uint64_t id, const Rect& r, const s
 //
 //  toggle() 是开关；toggle_button() 保持按钮的按下状态。
 // -----------------------------------------------------------------------------
-inline bool Ui::toggle_button(const std::string& label, bool* value, const Rect& box, const Style& st) {
+bool Ui::toggle_button(const std::string& label, bool* value, const Rect& box, const Style& st) {
     if (!value || box.w <= 0.0f) return false;
     const Theme& th = impl->theme;
-    const uint64_t id = impl->widget_id("toggle_btn", box, detail::hash_string(label.c_str()));
+    const uint64_t id = impl->widget_id("toggle_btn", box, detail::hash_string(label.c_str()), st.identity);
     const float rad = st.radius >= 0.0f ? st.radius : th.radius_sm;
     const float fs  = st.font_size > 0.0f ? st.font_size : th.font_size;
 
@@ -8479,7 +9062,7 @@ inline bool Ui::toggle_button(const std::string& label, bool* value, const Rect&
 }
 
 // 单选 Toggle Group 允许再次点击选中项以取消选择。
-inline bool Ui::toggle_group(const std::vector<std::string>& items, int* index,
+bool Ui::toggle_group(const std::vector<std::string>& items, int* index,
                              const Rect& box, const Style& st) {
     if (!index || items.empty() || box.w <= 0.0f) return false;
     const Theme& th = impl->theme;
@@ -8488,7 +9071,7 @@ inline bool Ui::toggle_group(const std::vector<std::string>& items, int* index,
     // 胶囊轨道：这三个组控件在 AppKit 里就是 NSSegmentedControl，半径 = h/2
     const float rad = st.radius >= 0.0f ? st.radius : box.h * 0.5f;
     const float iw  = box.w / float(n);
-    const uint64_t base = impl->widget_id("toggle_group", box);
+    const uint64_t base = impl->widget_id("toggle_group", box, 0, st.identity);
 
     // 分段控件使用半透明黑色凹槽背景，无外框。
     fill_rect(box, !st.bg.is_none() ? st.bg : th.track_well(), rad);
@@ -8496,7 +9079,7 @@ inline bool Ui::toggle_group(const std::vector<std::string>& items, int* index,
     bool changed = false;
     for (int i = 0; i < n; ++i) {
         const Rect r(box.x + iw * float(i), box.y, iw, box.h);
-        const uint64_t id = impl->widget_id("tg_item", r, base + uint64_t(i));
+        const uint64_t id = impl->widget_id("tg_item", r, base + uint64_t(i), st.identity ? base + uint64_t(i) : 0);
         const bool on = (*index == i);
         // 分隔线只在两侧都没选中时画：参考资料 kit 的 Separator 会被 Selected 段整块盖住
         const bool div = i > 0 && !on && !(*index == i - 1);
@@ -8511,7 +9094,7 @@ inline bool Ui::toggle_group(const std::vector<std::string>& items, int* index,
 }
 
 // Toggle Group（多选）：mask 的第 i 位对应第 i 项
-inline bool Ui::toggle_group_multi(const std::vector<std::string>& items, std::uint32_t* mask,
+bool Ui::toggle_group_multi(const std::vector<std::string>& items, std::uint32_t* mask,
                                    const Rect& box, const Style& st) {
     if (!mask || items.empty() || box.w <= 0.0f) return false;
     const Theme& th = impl->theme;
@@ -8519,14 +9102,14 @@ inline bool Ui::toggle_group_multi(const std::vector<std::string>& items, std::u
     const float fs  = st.font_size > 0.0f ? st.font_size : th.font_size;
     const float rad = st.radius >= 0.0f ? st.radius : box.h * 0.5f;
     const float iw  = box.w / float(n);
-    const uint64_t base = impl->widget_id("toggle_group_m", box);
+    const uint64_t base = impl->widget_id("toggle_group_m", box, 0, st.identity);
 
     fill_rect(box, !st.bg.is_none() ? st.bg : th.track_well(), rad);
 
     bool changed = false;
     for (int i = 0; i < n; ++i) {
         const Rect r(box.x + iw * float(i), box.y, iw, box.h);
-        const uint64_t id = impl->widget_id("tgm_item", r, base + uint64_t(i));
+        const uint64_t id = impl->widget_id("tgm_item", r, base + uint64_t(i), st.identity ? base + uint64_t(i) : 0);
         const bool on = ((*mask >> i) & 1u) != 0u;
         const bool prev_on = i > 0 && (((*mask >> (i - 1)) & 1u) != 0u);
         if (detail::group_cell(*this, impl, id, r, items[size_t(i)], on,
@@ -8541,7 +9124,7 @@ inline bool Ui::toggle_group_multi(const std::vector<std::string>& items, std::u
 
 // Button Group：相邻按钮连成一片。和 Toggle Group 的区别是**没有持久选中态** ——
 // 每个按钮都是一次性动作，点了就返回索引。
-inline bool Ui::button_group(const std::vector<std::string>& items, int* clicked_index,
+bool Ui::button_group(const std::vector<std::string>& items, int* clicked_index,
                              const Rect& box, const Style& st) {
     if (items.empty() || box.w <= 0.0f) return false;
     const Theme& th = impl->theme;
@@ -8549,7 +9132,7 @@ inline bool Ui::button_group(const std::vector<std::string>& items, int* clicked
     const float fs  = st.font_size > 0.0f ? st.font_size : th.font_size;
     const float rad = st.radius >= 0.0f ? st.radius : box.h * 0.5f;
     const float iw  = box.w / float(n);
-    const uint64_t base = impl->widget_id("button_group", box);
+    const uint64_t base = impl->widget_id("button_group", box, 0, st.identity);
 
     // 按钮组与分段控件共用凹槽背景，无外框。
     fill_rect_s(box, !st.bg.is_none() ? st.bg : th.track_well(), rad, 0.35f);
@@ -8557,7 +9140,7 @@ inline bool Ui::button_group(const std::vector<std::string>& items, int* clicked
     bool clicked = false;
     for (int i = 0; i < n; ++i) {
         const Rect r(box.x + iw * float(i), box.y, iw, box.h);
-        const uint64_t id = impl->widget_id("bg_item", r, base + uint64_t(i));
+        const uint64_t id = impl->widget_id("bg_item", r, base + uint64_t(i), st.identity ? base + uint64_t(i) : 0);
         if (detail::group_cell(*this, impl, id, r, items[size_t(i)], false,
                                fs, rad, st, false, i > 0)) {
             if (clicked_index) *clicked_index = i;
@@ -8575,7 +9158,7 @@ inline bool Ui::button_group(const std::vector<std::string>& items, int* clicked
 //  光标，不再画第二层框。input() 里 `bg.a > 0` 与 `border_width > 0` 两个
 //  判断正好让这个组合成立，不需要改 input 的实现。
 // -----------------------------------------------------------------------------
-inline bool Ui::input_group(std::string* value, const std::string& prefix, const std::string& suffix,
+bool Ui::input_group(std::string* value, const std::string& prefix, const std::string& suffix,
                             const Rect& box, const Style& st) {
     if (!value || box.w <= 0.0f) return false;
     const Theme& th = impl->theme;
@@ -8616,6 +9199,7 @@ inline bool Ui::input_group(std::string* value, const std::string& prefix, const
     is.pad_x = 4.0f;
     is.font_size = fs;
     is.disabled = st.disabled;
+    is.identity = st.identity;
 
     const Input& kin = impl->input;
     const bool outside_press = kin.pressed[0]
@@ -8629,12 +9213,14 @@ inline bool Ui::input_group(std::string* value, const std::string& prefix, const
     // 必须等 input() 跑完再抢焦点 —— 它内部遇到"按下了但不在自己框内"会主动
     // 丢掉焦点，先抢会被它丢回去。晚一帧生效，肉眼无感。
     if (outside_press) {
-        detail::grab_focus(impl, impl->widget_id("input", inner));
+        detail::grab_focus(impl, impl->widget_id("input", inner, 0,
+            st.identity ? st.identity : uint64_t(reinterpret_cast<uintptr_t>(value))));
         repaint();
     }
 
     // 组合输入框负责外层焦点边框，必须在内部 input 绘制后补画，避免被其背景覆盖。
-    if (detail::is_focused(impl, impl->widget_id("input", inner))) {
+    if (detail::is_focused(impl, impl->widget_id("input", inner, 0,
+            st.identity ? st.identity : uint64_t(reinterpret_cast<uintptr_t>(value))))) {
         stroke_rect(box, th.ring, rad, 1.4f);
         detail::paint_focus_ring(*this, box, rad, th.ring, true);
     }
@@ -8647,11 +9233,11 @@ inline bool Ui::input_group(std::string* value, const std::string& prefix, const
 //  不复用 input()：那个输入框带着选区、拖选、双击选词、IME、撤销栈一整套，
 //  塞进一个 40×40 的格子既不合适也画不进去。这里只要"数字 + 退格 + 左右键"。
 // -----------------------------------------------------------------------------
-inline bool Ui::input_otp(std::string* value, int length, const Rect& box, const Style& st) {
+bool Ui::input_otp(std::string* value, int length, const Rect& box, const Style& st) {
     if (!value || length <= 0 || box.w <= 0.0f) return false;
     if (length > 12) length = 12;
     const Theme& th = impl->theme;
-    const uint64_t id = impl->widget_id("otp", box);
+    const uint64_t id = impl->widget_id("otp", box, 0, st.identity);
     // 验证码各格使用 24px 高、r5、13pt 的文本框尺寸。
     const float fs  = st.font_size > 0.0f ? st.font_size : th.font_size;
     const float rad = st.radius >= 0.0f ? st.radius : 5.0f;
@@ -8729,7 +9315,7 @@ inline bool Ui::input_otp(std::string* value, int length, const Rect& box, const
 //  高度必须能"先算后排"：field_height() 与 field() 用的是同一组数字，
 //  改一处就必须改另一处（放得近就是为了这个）。
 // -----------------------------------------------------------------------------
-inline float Ui::field_height(const std::string& label, const std::string& hint,
+float Ui::field_height(const std::string& label, const std::string& hint,
                               const std::string& error, float control_h, const Style& st) const {
     const Theme& th = impl->theme;
     const float fs = st.font_size > 0.0f ? st.font_size : th.font_size;
@@ -8739,7 +9325,7 @@ inline float Ui::field_height(const std::string& label, const std::string& hint,
     return h;
 }
 
-inline void Ui::field(const std::string& label, const std::string& hint, const std::string& error,
+void Ui::field(const std::string& label, const std::string& hint, const std::string& error,
                       const Rect& box, const std::function<void(const Rect&)>& control,
                       const Style& st) {
     if (box.w <= 0.0f || box.h <= 0.0f) return;
@@ -8785,11 +9371,11 @@ inline void Ui::field(const std::string& label, const std::string& hint, const s
 // -----------------------------------------------------------------------------
 //  Item —— 一行条目（标题 + 描述 + 尾部文字），整行可点
 // -----------------------------------------------------------------------------
-inline bool Ui::item(const std::string& title, const std::string& description,
+bool Ui::item(const std::string& title, const std::string& description,
                      const std::string& trailing, const Rect& box, const Style& st) {
     if (box.w <= 0.0f || box.h <= 0.0f) return false;
     const Theme& th = impl->theme;
-    const uint64_t id = impl->widget_id("item", box, detail::hash_string(title.c_str()));
+    const uint64_t id = impl->widget_id("item", box, detail::hash_string(title.c_str()), st.identity);
     const float fs  = st.font_size > 0.0f ? st.font_size : th.font_size;
     const float rad = st.radius >= 0.0f ? st.radius : 5.0f;
 
@@ -8856,7 +9442,7 @@ inline bool Ui::item(const std::string& title, const std::string& description,
 // -----------------------------------------------------------------------------
 //  Empty —— 居中的空状态标题与描述
 // -----------------------------------------------------------------------------
-inline void Ui::empty_state(const std::string& title, const std::string& description,
+void Ui::empty_state(const std::string& title, const std::string& description,
                             const Rect& box, const Style& st) {
     if (box.w <= 0.0f || box.h <= 0.0f) return;
     const Theme& th = impl->theme;
@@ -8891,14 +9477,14 @@ inline void Ui::empty_state(const std::string& title, const std::string& descrip
 //
 //  页数较多时保留首尾、当前页邻域与省略号；省略号不参与交互。
 // -----------------------------------------------------------------------------
-inline bool Ui::pagination(int* page, int total_pages, const Rect& box, const Style& st) {
+bool Ui::pagination(int* page, int total_pages, const Rect& box, const Style& st) {
     if (!page || box.w <= 0.0f) return false;
     const Theme& th = impl->theme;
     int total = std::max(total_pages, 1);
     int cur = detail::clampi(*page, 0, total - 1);
     const float rad = st.radius >= 0.0f ? st.radius : th.radius_sm;
     const float fs  = st.font_size > 0.0f ? st.font_size : th.font_size;
-    const uint64_t base = impl->widget_id("pagination", box);
+    const uint64_t base = impl->widget_id("pagination", box, 0, st.identity);
 
     // 槽位编码：-1=上一页 -2=省略号 -3=下一页，>=0 是页码（0 基）。
     //
@@ -8944,7 +9530,7 @@ inline bool Ui::pagination(int* page, int total_pages, const Rect& box, const St
             continue;
         }
 
-        const uint64_t id = impl->widget_id("pg", r, base + uint64_t(i));
+        const uint64_t id = impl->widget_id("pg", r, base + uint64_t(i), st.identity ? base + uint64_t(i) : 0);
         detail::Interact in = detail::interact(impl, id, r, !st.disabled);
         if (in.hovered) set_cursor(Cursor::Arrow);
         if (in.pressed) detail::grab_focus(impl, id);
@@ -8992,7 +9578,7 @@ inline bool Ui::pagination(int* page, int total_pages, const Rect& box, const St
 //  日期运算全部在 detail:: 里做，不碰 <ctime>：时区/夏令时会让 CI 与本机
 //  差一天，而那是最难查的一类"只在我的机器上错"。
 // -----------------------------------------------------------------------------
-inline bool Ui::calendar(int* year, int* month, int* day, const Rect& box, const Style& st) {
+bool Ui::calendar(int* year, int* month, int* day, const Rect& box, const Style& st) {
     if (!year || !month || !day || box.w <= 0.0f || box.h <= 0.0f) return false;
     const Theme& th = impl->theme;
     const float fs = st.font_size > 0.0f ? st.font_size : th.font_size;
@@ -9009,7 +9595,7 @@ inline bool Ui::calendar(int* year, int* month, int* day, const Rect& box, const
     const float grid_h = std::max(box.bottom() - wkh.bottom(), 1.0f);
     const float cw = box.w / 7.0f;
     const float ch = grid_h / 6.0f;
-    const uint64_t base = impl->widget_id("calendar", box);
+    const uint64_t base = impl->widget_id("calendar", box, 0, st.identity);
 
     bool changed = false;
 
@@ -9018,7 +9604,7 @@ inline bool Ui::calendar(int* year, int* month, int* day, const Rect& box, const
     const Rect next_r(head.right() - head_h * 0.7f - 2.0f, prev_r.y, prev_r.w, prev_r.h);
     for (int k = 0; k < 2; ++k) {
         const Rect& r = (k == 0) ? prev_r : next_r;
-        const uint64_t id = impl->widget_id("cal_nav", r, base + uint64_t(k));
+        const uint64_t id = impl->widget_id("cal_nav", r, base + uint64_t(k), st.identity ? base + uint64_t(k) : 0);
         detail::Interact in = detail::interact(impl, id, r, true);
         if (in.hovered) set_cursor(Cursor::Arrow);
         const float t_h = detail::animate_value(impl, id * 109u + 1u, in.hovered ? 1.0f : 0.0f, 20.0f);
@@ -9064,7 +9650,7 @@ inline bool Ui::calendar(int* year, int* month, int* day, const Rect& box, const
             if (d > dim_now) break;
             const Rect r(box.x + cw * float(col), wkh.bottom() + ch * float(row), cw, ch);
             const Rect inner = r.inset(3.0f, 2.0f);
-            const uint64_t id = impl->widget_id("cal_day", r, base + uint64_t(d));
+            const uint64_t id = impl->widget_id("cal_day", r, base + uint64_t(d), st.identity ? base + uint64_t(d) : 0);
             detail::Interact in = detail::interact(impl, id, inner, true);
             if (in.hovered) set_cursor(Cursor::Arrow);
             const bool is_sel = (d == sel);
@@ -9106,12 +9692,12 @@ inline bool Ui::calendar(int* year, int* month, int* day, const Rect& box, const
 //  唯一要注意的是：这些控件在帧末才 interact，seq 已经到最大值，所以闸门
 //  一定会放行（面板区域本来就 claim 过，而它们的 z 更大，判定为"在上面"）。
 // -----------------------------------------------------------------------------
-inline bool Ui::popover(const std::string& label, bool* open, const Rect& box,
+bool Ui::popover(const std::string& label, bool* open, const Rect& box,
                         Vec2 content, const std::function<void(const Rect&)>& draw,
                         const Style& st) {
     if (!open || box.w <= 0.0f) return false;
     const Theme& th = impl->theme;
-    const uint64_t id = impl->widget_id("popover", box);
+    const uint64_t id = impl->widget_id("popover", box, 0, st.identity);
     // 层级号取入口处的 seq：触发器和面板都从它往后数。
     const uint64_t z_first = impl->seq + 1;
     // Popover 触发器使用按钮圆角，面板圆角为 12px。
@@ -9188,9 +9774,91 @@ inline bool Ui::popover(const std::string& label, bool* open, const Rect& box,
     return true;
 }
 
+void Ui::color_picker(Color* value, bool* open, const Rect& box,
+                      const std::function<void(Color)>& on_change, const Style& st) {
+    if (!value || !open || box.empty()) return;
+    const uint64_t id = impl->widget_id("colorpicker", box,
+        uint64_t(reinterpret_cast<uintptr_t>(value)), st.identity);
+    Style trigger_style = st;
+    if (trigger_style.variant < 0) trigger_style.secondary();
+    const Vec2 content(std::min(288.0f, std::max(1.0f, width() - 52.0f)),
+                       std::min(282.0f, std::max(1.0f, height() - 52.0f)));
+    popover("", open, box, content, [this, value, open, on_change, st, id](const Rect& area) {
+        auto scope = state_scope(id);
+        auto sc = scroll(area, 282.0f);
+        const Rect r(area.x, area.y - sc.offset, area.w, 282.0f);
+        const Theme& th = theme();
+        Style controls;
+        controls.disabled = st.disabled;
+        draw_text("颜色", Rect(r.x, r.y, r.w - 72, 26), th.label,
+                  Style().font(16).semi_bold());
+        if (button("完成", Rect(r.right() - 56, r.y, 56, 26),
+                   Style(controls).primary().font(12).corner(13)))
+            *open = false;
+
+        bool changed = false;
+        const char* names[] = {"R", "G", "B"};
+        const Color fills[] = {th.red, th.green, th.blue};
+        for (int i = 0; i < 3; ++i) {
+            const float y = r.y + 112 + i * 36.0f;
+            draw_text(names[i], Rect(r.x, y, 20, 32), th.label, Style().font(12).semi_bold());
+            float channel = float(i == 0 ? value->r : i == 1 ? value->g : value->b);
+            if (slider(&channel, 0, 255, Rect(r.x + 24, y, r.w - 68, 32),
+                       Style(controls).background(fills[i]).id(uint64_t(i + 1)))) {
+                const auto next = uint8_t(std::lround(channel));
+                uint8_t& target = i == 0 ? value->r : i == 1 ? value->g : value->b;
+                changed |= target != next;
+                target = next;
+            }
+            draw_text(std::to_string(int(std::lround(channel))), Rect(r.right() - 36, y, 36, 32),
+                      th.label2, Style().font(12).right());
+        }
+
+        draw_text("预设颜色", Rect(r.x, r.y + 228, r.w, 18), th.label2, Style().font(11));
+        const Color colors[] = {th.blue, th.indigo, th.purple, th.pink, th.red, th.orange, th.green, th.teal};
+        const char* color_names[] = {"Blue", "Indigo", "Purple", "Pink", "Red", "Orange", "Green", "Teal"};
+        for (int i = 0; i < 8; ++i) {
+            const Rect cell(r.x + 3 + i * (r.w - 30) / 7, r.y + 254, 24, 24);
+            if (color_well(colors[i], cell, Style(controls).corner(12))) {
+                *value = colors[i];
+                *open = false;
+                changed = true;
+            }
+            if (value->rgb24() == colors[i].rgb24() && value->a == colors[i].a)
+                stroke_rect(cell.outset(3), colors[i], 15, 1.5f);
+            tooltip(cell, color_names[i]);
+        }
+
+        const Rect preview(r.x, r.y + 40, r.w, 56);
+        fill_rect(preview, *value, 8);
+        char hex[10];
+        if (value->a == 255)
+            std::snprintf(hex, sizeof(hex), "#%02X%02X%02X", value->r, value->g, value->b);
+        else
+            std::snprintf(hex, sizeof(hex), "#%02X%02X%02X%02X", value->r, value->g, value->b, value->a);
+        const Color foreground = value->over(th.popover_bg).luminance() > .55f
+                                     ? Color(0, 0, 0, 217) : Color::white();
+        draw_text(hex, preview.inset(14, 0), foreground, Style().font(18).semi_bold().right());
+        if (changed) {
+            if (on_change) on_change(*value);
+            request_animation_frame();
+        }
+    }, trigger_style);
+    fill_circle(box.x + 15, box.cy(), 6, st.disabled ? value->scaled_alpha(.45f) : *value);
+    char hex[10];
+    if (value->a == 255)
+        std::snprintf(hex, sizeof(hex), "#%02X%02X%02X", value->r, value->g, value->b);
+    else
+        std::snprintf(hex, sizeof(hex), "#%02X%02X%02X%02X", value->r, value->g, value->b, value->a);
+    const Color foreground = st.fg.is_none() ? theme().label : st.fg;
+    draw_text(hex, Rect(box.x + 30, box.y, std::max(0.0f, box.w - 60), box.h),
+              st.disabled ? foreground.scaled_alpha(.45f) : foreground,
+              Style().font(st.font_size > 0 ? st.font_size : theme().font_size));
+}
+
 // Hover Card —— 悬停弹卡片。和 tooltip 一样不 claim 输入：
 // 它只是"看"的，抢了点击反而会挡住下面的控件。
-inline void Ui::hover_card(const Rect& anchor, Vec2 content,
+void Ui::hover_card(const Rect& anchor, Vec2 content,
                            const std::function<void(const Rect&)>& draw, const Style& st) {
     if (!draw || content.x <= 0.0f || content.y <= 0.0f) return;
     const Input& kin = impl->input;
@@ -9229,7 +9897,7 @@ inline void Ui::hover_card(const Rect& anchor, Vec2 content,
 //  dialog() 返回"本帧是否打开"（因为按钮由调用方自己画），
 //  这里返回"本帧是否点了确认" —— 危险操作要的就是这一个布尔。
 // -----------------------------------------------------------------------------
-inline bool Ui::alert_dialog(const std::string& title, const std::string& body,
+bool Ui::alert_dialog(const std::string& title, const std::string& body,
                              const std::string& confirm, const std::string& cancel,
                              bool* open, const Rect& box, const Style& st) {
     if (!open || !*open) return false;
@@ -9253,8 +9921,8 @@ inline bool Ui::alert_dialog(const std::string& title, const std::string& body,
     const Rect cancel_r(box.x + pad, box.bottom() - pad_v - btn_h, inner_w, btn_h);
     const Rect ok_r(box.x + pad, cancel_r.y - 16.0f - btn_h, inner_w, btn_h);
 
-    const uint64_t ok_id = impl->widget_id("alert_ok", box);
-    const uint64_t no_id = impl->widget_id("alert_no", box, 1u);
+    const uint64_t ok_id = impl->widget_id("alert_ok", box, 0, st.identity);
+    const uint64_t no_id = impl->widget_id("alert_no", box, 1u, st.identity);
     detail::Interact ok_in = detail::interact(impl, ok_id, ok_r, true);
     detail::Interact no_in = detail::interact(impl, no_id, cancel_r, true);
     if (ok_in.hovered || no_in.hovered) set_cursor(Cursor::Arrow);
@@ -9329,7 +9997,7 @@ inline bool Ui::alert_dialog(const std::string& title, const std::string& body,
 //
 //  面板位置由 box 指定，内容回调在裁剪区内绘制，不做隐式位移动画。
 // -----------------------------------------------------------------------------
-inline bool Ui::drawer(const std::string& title, bool* open, int side, const Rect& box,
+bool Ui::drawer(const std::string& title, bool* open, int side, const Rect& box,
                        const std::function<void(const Rect&)>& draw, const Style& st) {
     if (!open || box.w <= 0.0f || box.h <= 0.0f) return false;
     const Theme& th = impl->theme;
@@ -9379,11 +10047,11 @@ inline bool Ui::drawer(const std::string& title, bool* open, int side, const Rec
 //  位置记在 flags 里（打开那一刻的鼠标坐标）。为什么不每帧读鼠标：
 //  弹出来以后手一动菜单就会跟着跑，那没法用。
 // -----------------------------------------------------------------------------
-inline bool Ui::context_menu(const Rect& area, const std::vector<std::string>& items,
+bool Ui::context_menu(const Rect& area, const std::vector<std::string>& items,
                              int* clicked_index, const Style& st) {
     if (items.empty()) return false;
     const Theme& th = impl->theme;
-    const uint64_t id = impl->widget_id("ctxmenu", area, uint64_t(items.size()));
+    const uint64_t id = impl->widget_id("ctxmenu", area, uint64_t(items.size()), st.identity);
     const float fs  = st.font_size > 0.0f ? st.font_size : th.font_size;
     const float item_h = std::max(fs + 10.0f, 24.0f);   // kit Menu/Height Medium = 24
     const Input& kin = impl->input;
@@ -9419,7 +10087,7 @@ inline bool Ui::context_menu(const Rect& area, const std::vector<std::string>& i
     for (size_t i = 0; i < items.size(); ++i) {
         const Rect r(list.x + 4.0f, list.y + 4.0f + item_h * float(i), list.w - 8.0f, item_h);
         rects.push_back(r);
-        ids.push_back(impl->widget_id("ctx_item", r, id + uint64_t(i)));
+        ids.push_back(impl->widget_id("ctx_item", r, id + uint64_t(i), st.identity ? id + uint64_t(i) : 0));
         hov.push_back(0);
     }
 
@@ -9466,11 +10134,11 @@ inline bool Ui::context_menu(const Rect& area, const std::vector<std::string>& i
 //  绘制全部丢进 deferred()：列表是浮层，帧内画会被后面调用的组件压住。
 //  交互仍在帧内做完，把"这一帧该长什么样"用值捕获带进 lambda。
 // -----------------------------------------------------------------------------
-inline bool Ui::combobox(const std::vector<std::string>& items, int* index,
+bool Ui::combobox(const std::vector<std::string>& items, int* index,
                          const Rect& box, const Style& st) {
     if (!index || items.empty() || box.w <= 0.0f) return false;
     const Theme& th = impl->theme;
-    const uint64_t id = impl->widget_id("combobox", box);
+    const uint64_t id = impl->widget_id("combobox", box, 0, st.identity);
     const uint64_t z_first = impl->seq + 1;
     const float rad = st.radius >= 0.0f ? st.radius : th.radius;
     const float fs  = st.font_size > 0.0f ? st.font_size : th.font_size;
@@ -9583,7 +10251,7 @@ inline bool Ui::combobox(const std::vector<std::string>& items, int* index,
     Impl::SeqFrameEnd guard(impl);
     for (int r = 0; r < rows; ++r) {
         const Rect rr(list.x + 4.0f, sr.bottom() + 4.0f + item_h * float(r), list.w - 8.0f, item_h);
-        const uint64_t iid = impl->widget_id("cb_item", rr, id + uint64_t(vis[size_t(r)]));
+        const uint64_t iid = impl->widget_id("cb_item", rr, id + uint64_t(vis[size_t(r)]), st.identity ? id + uint64_t(vis[size_t(r)]) : 0);
         detail::Interact ii = detail::interact(impl, iid, rr, true);
         if (ii.hovered) { set_cursor(Cursor::Arrow); hi = r; }
         if (ii.clicked) chosen_now = vis[size_t(r)];
@@ -9673,11 +10341,11 @@ inline bool Ui::combobox(const std::vector<std::string>& items, int* index,
 //  拖拽状态放 flags：不能靠 "按下 + 在热区" 判断，因为鼠标一动就离开热区了。
 //  vertical=true 表示分隔条是竖的（左右两块），和参数名的方位一致。
 // -----------------------------------------------------------------------------
-inline bool Ui::split_pane(float* ratio, const Rect& box, Rect* first, Rect* second,
-                           bool vertical, float min_ratio, const Style&) {
+bool Ui::split_pane(float* ratio, const Rect& box, Rect* first, Rect* second,
+                           bool vertical, float min_ratio, const Style& st) {
     if (!ratio || box.w <= 0.0f || box.h <= 0.0f) return false;
     const Theme& th = impl->theme;
-    const uint64_t id = impl->widget_id("split_pane", box, vertical ? 1u : 2u);
+    const uint64_t id = impl->widget_id("split_pane", box, vertical ? 1u : 2u, st.identity);
     const float bar = 7.0f;                    // 热区宽度（视觉只有 1px）
     float r = detail::clampf(*ratio, min_ratio, 1.0f - min_ratio);
 
@@ -9720,7 +10388,7 @@ inline bool Ui::split_pane(float* ratio, const Rect& box, Rect* first, Rect* sec
 }
 
 // =============================================================================
-//  8.17  滚动
+//  8.16  滚动
 //  实现方式是把"视口"翻译成布局语义：压一个负向偏移的 group + 一个裁剪区，
 //  于是内部的 row()/column() 自动吃到那个偏移，不用逐个组件改坐标。
 //
@@ -9750,20 +10418,18 @@ inline ScrollbarGeom scrollbar_geom(const Rect& box, float offset, float max_off
 
 // macOS 的滚动条是 **overlay**：只在滚动 / 悬停时出现，停手约 0.9 秒后淡出。
 // 常驻的细条是 Windows 与浏览器的习惯 —— 一条永远挂在那里的 3px 竖线，是
-// "这是个网页控件"最直白的提示。activity 记在 flags 里（按 box 区分）。
-inline uint64_t scrollbar_id(Ui::Impl* ui, const char* kind, const Rect& box) {
-    uint64_t owner = ui->widget_id("scroll", box);
-    if (!ui->scroll_stack.empty()) {
-        const auto& current = ui->scroll_stack.back();
-        if (current.box.x == box.x && current.box.y == box.y
-            && current.box.w == box.w && current.box.h == box.h) owner = current.id;
-    }
-    return hash_combine(owner, hash_string(kind));
+// "这是个网页控件"最直白的提示。activity 记在 flags 里（按滚动区 id 区分）。
+//
+// 四个状态槽（偏移 / 激活时刻 / 上次偏移 / 拖动抓点）全部从**滚动区自己的 id**
+// 派生。早先 alpha / prev / grab 走 scrollbar_id()（它会在"栈顶 box 相同"时
+// 悄悄换成滚动区 id），而 end_scroll() 又自己拼一套 hash_combine —— 两套键只是
+// 碰巧相等，改任一处的键名就会漂。
+inline uint64_t scrollbar_slot(uint64_t id, const char* kind) {
+    return hash_combine(id, hash_string(kind));
 }
 
-inline float scrollbar_alpha(Ui::Impl* ui, const Rect& box, bool hot, bool moved) {
-    const uint64_t aid = scrollbar_id(ui, "scrollact", box);
-    float& act = ui->flags[aid];
+inline float scrollbar_alpha(Ui::Impl* ui, uint64_t id, bool hot, bool moved) {
+    float& act = ui->flags[scrollbar_slot(id, "scrollact")];
     if (hot || moved) act = ui->clock;
     if (act <= 0.0f) return 0.0f;                 // 还没滚过：一帧都不画
     const float age = ui->clock - act;
@@ -9775,19 +10441,20 @@ inline float scrollbar_alpha(Ui::Impl* ui, const Rect& box, bool hot, bool moved
 // 滚动条交互：按下滑块 → 拖动；按下轨道 → 滑块中心跳到点击处（Windows 传统行为，
 // 比"翻一页"更好预测，也少一次点击）。拖动时鼠标可以离开视口 —— 后端已经
 // SetCapture，down[0] 仍然成立。返回鼠标是否在热区上（用来加深颜色）。
-inline bool scrollbar_interact(Ui::Impl* ui, const Rect& box, float max_offset, float& offset) {
+inline bool scrollbar_interact(Ui::Impl* ui, uint64_t id, const Rect& box, float max_offset, float& offset) {
     const ScrollbarGeom g = scrollbar_geom(box, offset, max_offset);
     const Input& kin = ui->input;
     const bool on_track = g.track.contains(kin.mouse.x, kin.mouse.y);
     ui->hover_region(g.track);        // 悬停要变亮，时钟靠帧推进
     if (ui->gate_blocked_pointer()) return on_track;   // 浮层打开时不许动下层滚动条
 
-    const uint64_t sid = scrollbar_id(ui, "scrollbar-grab", box);
+    const uint64_t sid = scrollbar_slot(id, "scrollgrab");
     float& grab = ui->flags[sid];       // 按下时鼠标在滑块内的相对位置
     const float travel = std::max(g.travel, 1.0f);
 
     if (kin.pressed[0] && on_track) {
         ui->active = sid;
+        ui->active_scope_id = ui->state_scope_id;
         if (g.thumb.contains(kin.mouse.x, kin.mouse.y)) {
             grab = kin.mouse.y - g.thumb.y;
         } else {
@@ -9806,14 +10473,44 @@ inline bool scrollbar_interact(Ui::Impl* ui, const Rect& box, float max_offset, 
     if (kin.released[0] && ui->active == sid) ui->active = 0;
     return on_track;
 }
+
+// 画一次滚动条：夹偏移 → 吃交互 → 判"刚动过" → 淡出。
+// end_scroll() 和 scroll_bar() 走同一份实现（早先两处各写一遍，连 prev 的键都不同）。
+struct ScrollbarDraw {
+    float offset = 0.0f;
+    bool  need_frame = false;   // 淡出中途，需要下一帧继续推进
+};
+
+inline ScrollbarDraw scrollbar_draw(Ui& ui, uint64_t id, const Rect& box, float max_offset) {
+    Ui::Impl* im = ui.impl;
+    ScrollbarDraw out;
+    float& off = im->flags[id];
+    off = clampf(off, 0.0f, max_offset);
+    const bool hot = scrollbar_interact(im, id, box, max_offset, off);
+    off = clampf(off, 0.0f, max_offset);
+    out.offset = off;
+
+    // "刚才滚过没有"：和上一帧的偏移比。滚轮、拖动、程序调用都算。
+    float& prev = im->flags[scrollbar_slot(id, "scrollprev")];
+    const bool moved = std::fabs(off - prev) > 0.01f;
+    prev = off;
+
+    const float a = scrollbar_alpha(im, id, hot, moved);
+    if (a <= 0.01f) return out;
+    const ScrollbarGeom g = scrollbar_geom(box, off, max_offset);
+    ui.fill_rect(g.thumb, ui.theme().scrollbar.scaled_alpha(a), 3.5f);
+    out.need_frame = (a < 0.79f);
+    return out;
+}
 } // namespace detail
 
-inline ScrollScope Ui::scroll(const Rect& box, float content_h) {
+ScrollScope Ui::scroll(const Rect& box, float content_h) {
     // 测量模式：滚动区按**视口**占高度（内容多高跟布局无关，那是滚动条的事）
     if (impl->measure_on) impl->measure_add(box);
     ScrollScope sc;
     sc.ui         = this;
     sc.id         = impl->widget_id("scroll", box);
+    sc.state_scope_id = impl->state_scope_id;
     sc.box        = box;
     sc.content_h  = content_h;
     sc.max_offset = std::max(0.0f, content_h - box.h);
@@ -9839,6 +10536,7 @@ inline ScrollScope Ui::scroll(const Rect& box, float content_h) {
 
     Ui::Impl::ScrollCtx ctx;
     ctx.id = sc.id;
+    ctx.state_scope_id = sc.state_scope_id;
     ctx.box = box;
     ctx.offset = off;
     ctx.max_offset = sc.max_offset;
@@ -9855,7 +10553,7 @@ inline ScrollScope Ui::scroll(const Rect& box, float content_h) {
 
 // 收尾：画滚动条（放在收尾而不是开头，才能盖在内容之上）、弹裁剪与偏移。
 // 幂等 —— RAII 析构和手工 end_scroll() 同时存在也不会弹两次。
-inline void ScrollScope::close() {
+void ScrollScope::close() {
     if (!active || !ui) return;
     active = false;
     if (ui->impl && !ui->impl->scroll_stack.empty() &&
@@ -9863,12 +10561,13 @@ inline void ScrollScope::close() {
         ui->end_scroll();
 }
 
-inline ScrollScope::~ScrollScope() { close(); }
+ScrollScope::~ScrollScope() { close(); }
 
-inline void ScrollScope::content(float h) {
+void ScrollScope::content(float h) {
     content_h  = h;
     max_offset = std::max(0.0f, h - box.h);
     if (!ui || !ui->impl) return;
+    auto state = ui->state_scope(state_scope_id);
     float& off = ui->impl->flags[id];
     off = detail::clampf(off, 0.0f, max_offset);
     offset = off;
@@ -9880,8 +10579,9 @@ inline void ScrollScope::content(float h) {
     }
 }
 
-inline void ScrollScope::to(float v) {
+void ScrollScope::to(float v) {
     if (!ui || !ui->impl) return;
+    auto state = ui->state_scope(state_scope_id);
     float& off = ui->impl->flags[id];
     const float nv = detail::clampf(v, 0.0f, max_offset);
     if (nv != off) { off = nv; ui->repaint(); }
@@ -9896,33 +10596,23 @@ inline void ScrollScope::to(float v) {
 
 // 老写法：开区但不交还句柄 —— 收尾交给 end_scroll()，和 0.1.0 的语义一致。
 // （句柄的 active 置 false 是刻意的：否则这个临时对象一析构就把区关了。）
-inline void Ui::begin_scroll(const Rect& box, float content_h) {
+void Ui::begin_scroll(const Rect& box, float content_h) {
     ScrollScope sc = scroll(box, content_h);
     sc.active = false;
 }
 
-inline void Ui::end_scroll() {
+void Ui::end_scroll() {
     if (impl->scroll_stack.empty()) return;
     const Ui::Impl::ScrollCtx ctx = impl->scroll_stack.back();
+    auto state = state_scope(ctx.state_scope_id);
 
     // 滚动条在内容之上（所以放在 end_scroll 里，而不是 begin_scroll）。
     // 先吃交互再画：同一帧里拖动要立刻反映到滑块位置上，晚一帧会明显发黏。
     if (ctx.max_offset > 0.0f) {
-        float& off = impl->flags[ctx.id];
-        off = detail::clampf(off, 0.0f, ctx.max_offset);
-        const bool hot = detail::scrollbar_interact(impl, ctx.box, ctx.max_offset, off);
-        off = detail::clampf(off, 0.0f, ctx.max_offset);
-        // "刚才滚过没有"：和上一帧的偏移比。滚轮、拖动、程序调用都算。
-        float& prev = impl->flags[detail::hash_combine(ctx.id, detail::hash_string("scrollprev"))];
-        const bool moved = std::fabs(off - prev) > 0.01f;
-        prev = off;
-        const float a = detail::scrollbar_alpha(impl, ctx.box, hot, moved);
-        if (a > 0.01f) {
-            const detail::ScrollbarGeom g = detail::scrollbar_geom(ctx.box, off, ctx.max_offset);
-            fill_rect(g.thumb, impl->theme.scrollbar.scaled_alpha(a), 3.5f);
-            if (a < 0.79f) repaint();      // 淡出要帧推进，否则停在半透明上
-        }
-        impl->last_scroll = off;
+        const detail::ScrollbarDraw sb =
+            detail::scrollbar_draw(*this, ctx.id, ctx.box, ctx.max_offset);
+        impl->last_scroll = sb.offset;
+        if (sb.need_frame) repaint();      // 淡出要帧推进，否则停在半透明上
     }
 
     impl->last_scroll = ctx.offset;
@@ -9936,13 +10626,14 @@ inline void Ui::end_scroll() {
 
 // 滚动区开启期间返回内层的偏移；已经 end_scroll() 之后返回最近一次的值，
 // 这样"滚完再读一下滚到哪了"也是成立的（一开始只在栈里可取，是个坑）。
-inline float Ui::scroll_y() const {
+float Ui::scroll_y() const {
     return impl->scroll_stack.empty() ? impl->last_scroll : impl->scroll_stack.back().offset;
 }
 
-inline void Ui::scroll_to(float offset) {
+void Ui::scroll_to(float offset) {
     if (impl->scroll_stack.empty()) return;
     const Ui::Impl::ScrollCtx& ctx = impl->scroll_stack.back();
+    auto state = state_scope(ctx.state_scope_id);
     const float nv = detail::clampf(offset, 0.0f, ctx.max_offset);
     if (nv != ctx.offset) { impl->flags[ctx.id] = nv; repaint(); }
 }
@@ -9952,7 +10643,7 @@ inline void Ui::scroll_to(float offset) {
 //  只算可见区间，其余项**不构建、不绘制**。这是"一万行列表"和"一万行布局 +
 //  一万次绘制"的区别：后者的成本随数据量线性增长，前者与数据量无关。
 // -----------------------------------------------------------------------------
-inline float Ui::scroll_visible(const Rect& box, int count, float item_h, int* first, int* last) {
+float Ui::scroll_visible(const Rect& box, int count, float item_h, int* first, int* last) {
     if (first) *first = 0;
     if (last)  *last  = -1;
     if (count < 0) count = 0;
@@ -9982,29 +10673,20 @@ inline float Ui::scroll_visible(const Rect& box, int count, float item_h, int* f
     return off;
 }
 
-inline void Ui::scroll_bar(const Rect& box, float content_h) {
+void Ui::scroll_bar(const Rect& box, float content_h) {
     const float max_off = std::max(0.0f, content_h - box.h);
     if (max_off <= 0.0f) return;
-    float& off = impl->flags[impl->widget_id("scroll", box)];
-    off = detail::clampf(off, 0.0f, max_off);
-    const bool hot = detail::scrollbar_interact(impl, box, max_off, off);
-    off = detail::clampf(off, 0.0f, max_off);
-    float& prev = impl->flags[detail::scrollbar_id(impl, "scrollprev", box)];
-    const bool moved = std::fabs(off - prev) > 0.01f;
-    prev = off;
-    const float a = detail::scrollbar_alpha(impl, box, hot, moved);
-    if (a <= 0.01f) return;
-    const detail::ScrollbarGeom g = detail::scrollbar_geom(box, off, max_off);
-    fill_rect(g.thumb, impl->theme.scrollbar.scaled_alpha(a), 3.5f);
-    if (a < 0.79f) repaint();
+    const detail::ScrollbarDraw sb =
+        detail::scrollbar_draw(*this, impl->widget_id("scroll", box), box, max_off);
+    if (sb.need_frame) repaint();
 }
 
-inline float Ui::scroll_offset(const Rect& box) const {
-    auto it = impl->flags.find(impl->widget_id("scroll", box));
-    return it == impl->flags.end() ? 0.0f : it->second;
+float Ui::scroll_offset(const Rect& box) const {
+    const float* off = impl->flags.get_if(impl->widget_id("scroll", box));
+    return off ? *off : 0.0f;
 }
 
-inline void Ui::scroll_to_index(const Rect& box, int index, float item_h, int count) {
+void Ui::scroll_to_index(const Rect& box, int index, float item_h, int count) {
     const float max_off = std::max(0.0f, float(std::max(count, 0)) * item_h - box.h);
     const float target  = detail::clampf(float(std::max(index, 0)) * item_h, 0.0f, max_off);
     float& off = impl->flags[impl->widget_id("scroll", box)];
@@ -10014,6 +10696,93 @@ inline void Ui::scroll_to_index(const Rect& box, int index, float item_h, int co
 // =============================================================================
 //  8.17  Window 内部状态
 // =============================================================================
+namespace detail {
+// 后台通知只接触事件/管道，不调用窗口系统。pending 保留 drain 期间到达的请求。
+class WakeSignal {
+public:
+    WakeSignal() {
+#ifdef AINO_PLATFORM_WINDOWS
+        event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+#else
+        if (::pipe(pipe_) == 0) {
+            for (int fd : pipe_) {
+                const int flags = fcntl(fd, F_GETFL);
+                const int descriptor = fcntl(fd, F_GETFD);
+                if (flags < 0 || descriptor < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 ||
+                    fcntl(fd, F_SETFD, descriptor | FD_CLOEXEC) < 0) {
+                    ::close(pipe_[0]); ::close(pipe_[1]);
+                    pipe_[0] = pipe_[1] = -1;
+                    break;
+                }
+            }
+        }
+#endif
+    }
+    ~WakeSignal() {
+#ifdef AINO_PLATFORM_WINDOWS
+        if (event_) CloseHandle(event_);
+#else
+        for (int fd : pipe_) if (fd >= 0) ::close(fd);
+#endif
+    }
+    WakeSignal(const WakeSignal&) = delete;
+    WakeSignal& operator=(const WakeSignal&) = delete;
+    bool valid() const {
+#ifdef AINO_PLATFORM_WINDOWS
+        return event_ != nullptr;
+#else
+        return pipe_[0] >= 0;
+#endif
+    }
+    void notify() {
+        if (pending_.exchange(true)) return;
+#ifdef AINO_PLATFORM_WINDOWS
+        if (event_) SetEvent(event_);
+#else
+        if (pipe_[1] >= 0) {
+            const char byte = 1;
+            while (::write(pipe_[1], &byte, 1) < 0 && errno == EINTR) {}
+        }
+#endif
+    }
+    bool consume() {
+        const bool requested = pending_.exchange(false);
+#ifdef AINO_PLATFORM_WINDOWS
+        if (event_) WaitForSingleObject(event_, 0);
+#else
+        char bytes[128];
+        if (pipe_[0] >= 0) {
+            while (true) {
+                const auto n = ::read(pipe_[0], bytes, sizeof bytes);
+                if (n > 0 || (n < 0 && errno == EINTR)) continue;
+                break;
+            }
+        }
+#endif
+        return requested;
+    }
+    void wait(int timeout_ms = -1, int native_fd = -1) {
+        if (pending_.load()) return;
+#ifdef AINO_PLATFORM_WINDOWS
+        (void)native_fd;
+        const DWORD timeout = timeout_ms < 0 ? INFINITE : DWORD(timeout_ms);
+        MsgWaitForMultipleObjects(event_ ? 1 : 0, event_ ? &event_ : nullptr,
+                                  FALSE, timeout, QS_ALLINPUT);
+#else
+        pollfd fds[2] = {{pipe_[0], POLLIN, 0}, {native_fd, POLLIN, 0}};
+        ::poll(fds, 2, timeout_ms);
+#endif
+    }
+private:
+    std::atomic<bool> pending_{false};
+#ifdef AINO_PLATFORM_WINDOWS
+    HANDLE event_ = nullptr;
+#else
+    int pipe_[2] = {-1, -1};
+#endif
+};
+} // namespace detail
+
 struct Window::Impl {
     Ui ui;
     Theme theme = Theme::light();
@@ -10022,7 +10791,8 @@ struct Window::Impl {
     // 最小 / 最大尺寸的**物理像素**版本，由后端在创建时算好（含边框）。
     // WM_GETMINMAXINFO 里只有它、没有逻辑坐标换算的余量可算。
     int min_pw = 0, min_ph = 0, max_pw = 0, max_ph = 0;
-    bool running = true;
+    std::atomic<bool> running{true};
+    detail::WakeSignal wake_signal;
     bool need_frame = true;
     // 上一帧的时刻（毫秒）。每窗口独立 —— 见 render() 里的说明。
     uint64_t last_frame_ms = 0;
@@ -10049,7 +10819,7 @@ struct Window::Impl {
     // 值是文件路径时写文件 —— WIN32 子系统的程序没有控制台，stderr 是无效句柄，
     // 重定向到文件也拿不到任何输出（实测：0 字节），而示例程序全是 WIN32 子系统。
     bool frame_log = false;
-    std::FILE* frame_log_out = nullptr;
+    std::unique_ptr<std::FILE, decltype(&std::fclose)> frame_log_out{nullptr, &std::fclose};
     uint32_t frame_log_n = 0;
     uint64_t frame_log_sum = 0;     // µs
     uint32_t frame_log_worst = 0;   // µs
@@ -10082,10 +10852,23 @@ inline void x11_set_ime_pos(X11State* s, float caret_x, float top, float bottom)
 } // namespace detail
 #endif
 
-inline Window::Window(int w, int h, const std::string& title)
-    : Window(WindowConfig{ w, h, title }) {}
+// 老的两参构造：集中填一次，避免 WindowConfig{ w, h, title } 这种聚合初始化
+// 在 -Wextra 下报一串 missing-field-initializers（新增字段时还会悄悄漏填）。
+namespace detail {
+inline WindowConfig legacy_window_config(int w, int h, const std::string& title) {
+    WindowConfig cfg;
+    cfg.width = w;
+    cfg.height = h;
+    cfg.title = title;
+    return cfg;
+}
+} // namespace detail
 
-inline Window::Window(const WindowConfig& cfg) : impl(new Impl()) {
+Window::Window(int w, int h, const std::string& title)
+    : Window(detail::legacy_window_config(w, h, title)) {}
+
+Window::Window(const WindowConfig& cfg) : impl(new Impl()) {
+    if (!impl->wake_signal.valid()) return;
     impl->cfg = cfg;
     impl->theme = Theme::light();
     // 字体家族名先进主题，再交给后端建文本渲染器 —— 渲染器和主题必须用同一个
@@ -10133,13 +10916,13 @@ inline Window::Window(const WindowConfig& cfg) : impl(new Impl()) {
         if (fl && fl[0] && fl[0] != '0') {
             impl->frame_log = true;
             if (!(fl[0] == '1' && fl[1] == 0))          // 不是 "1" 就当输出路径
-                impl->frame_log_out = std::fopen(fl, "w");
+                impl->frame_log_out.reset(std::fopen(fl, "w"));
         } }
     {   const char* pf = std::getenv("AINO_PROF");
         if (pf && pf[0] && pf[0] != '0') {
             impl->ui.impl->prof_on = true;              // 分项计时，帧日志里多打一行
             impl->frame_log = true;
-            if (!(pf[0] == '1' && pf[1] == 0)) impl->frame_log_out = std::fopen(pf, "w");
+            if (!(pf[0] == '1' && pf[1] == 0)) impl->frame_log_out.reset(std::fopen(pf, "w"));
         } }
 #if defined(_MSC_VER)
 #  pragma warning(pop)
@@ -10154,7 +10937,7 @@ inline Window::Window(const WindowConfig& cfg) : impl(new Impl()) {
 #endif
 }
 
-inline Window::~Window() {
+Window::~Window() {
 #ifdef AINO_PLATFORM_WINDOWS
     detail::w32_destroy(this);
 #elif defined(AINO_PLATFORM_X11)
@@ -10166,9 +10949,20 @@ inline Window::~Window() {
     impl = nullptr;
 }
 
-inline bool  Window::ok() const { return impl && impl->native != nullptr; }
-inline Ui&   Window::ui() { return impl->ui; }
-inline void  Window::set_theme(const Theme& t) {
+bool  Window::ok() const { return impl && impl->native != nullptr; }
+void Window::render(const std::function<void(Ui&)>& frame) {
+    if (!ok() || impl->ui.impl->frame_open) return;
+    // 回调只借用到本次同步绘制结束；异常退出也恢复原主循环回调。
+    struct Restore {
+        std::function<void()>& target;
+        std::function<void()> previous;
+        ~Restore() { target = std::move(previous); }
+    } restore{impl->frame_cb_ptr, std::move(impl->frame_cb_ptr)};
+    impl->frame_cb_ptr = [&] { frame(impl->ui); };
+    render();
+}
+Ui&   Window::ui() { return impl->ui; }
+void  Window::set_theme(const Theme& t) {
     // 与"渲染实际在用的那份主题"比较（不是 Window 自己的副本，否则用户直接改
     // ui.set_theme() 之后这里会误判成"没变"）。
     // 少了这一步，在帧回调里每帧调用 set_theme 会让 need_frame 永远为真，
@@ -10178,15 +10972,15 @@ inline void  Window::set_theme(const Theme& t) {
     impl->ui.set_theme(t);
     impl->need_frame = true;
 }
-inline int   Window::width() const { return int(float(impl->client_w) / impl->scale + 0.5f); }
-inline int   Window::height() const { return int(float(impl->client_h) / impl->scale + 0.5f); }
-inline float Window::dpi_scale() const { return impl->scale; }
-inline bool  Window::should_close() const { return !impl->running; }
-inline void  Window::request_repaint() {
+int   Window::width() const { return int(float(impl->client_w) / impl->scale + 0.5f); }
+int   Window::height() const { return int(float(impl->client_h) / impl->scale + 0.5f); }
+float Window::dpi_scale() const { return impl->scale; }
+bool  Window::should_close() const { return !impl->running; }
+void  Window::request_repaint() {
     if (!impl->ui.impl->frame_open) impl->need_frame = true;
 }
 
-inline void  Window::set_anim_fps(float fps) {
+void  Window::set_anim_fps(float fps) {
     if (fps < 1.0f) fps = 1.0f;
     if (fps > 240.0f) fps = 240.0f;
     impl->anim_budget_ms = uint32_t(1000.0f / fps + 0.5f);
@@ -10194,20 +10988,41 @@ inline void  Window::set_anim_fps(float fps) {
     impl->move_budget_ms = impl->anim_budget_ms;
 }
 
-inline void  Window::set_move_fps(float fps) {
+void  Window::set_move_fps(float fps) {
     if (fps < 1.0f) fps = 1.0f;
     if (fps > 240.0f) fps = 240.0f;
     impl->move_budget_ms = uint32_t(1000.0f / fps + 0.5f);
     if (impl->move_budget_ms < 1) impl->move_budget_ms = 1;
 }
 
-inline void  Window::set_hover_skip(bool on) { impl->hover_skip = on; }
+void  Window::set_hover_skip(bool on) { impl->hover_skip = on; }
+
+// 调用方须保证窗口存活；后台线程必须在 Window 析构前结束。
+void Window::wake() { if (impl) impl->wake_signal.notify(); }
+void Window::close() {
+    if (!impl) return;
+    impl->running.store(false);
+    impl->wake_signal.notify();
+}
 
 #ifdef AINO_PLATFORM_WINDOWS
 // =============================================================================
-//  8.13  Windows 后端
+//  8.18  Windows 后端
 // =============================================================================
 namespace detail {
+
+// 从 DLL 取函数指针。直接 reinterpret_cast<Fn>(GetProcAddress(...)) 在
+// -Wextra 下会报 -Wcast-function-type（FARPROC 的签名与目标类型不兼容），
+// 而那是动态加载的常规写法。经 void* 中转一次，语义不变、告警消灭。
+// 两条 static_assert 保证平台上的指针尺寸一致，不会在奇怪的 ABI 上悄悄出错。
+template <class Fn>
+inline Fn dll_proc(HMODULE module, const char* name) {
+    static_assert(sizeof(Fn) == sizeof(FARPROC), "function pointer size mismatch");
+    FARPROC raw = GetProcAddress(module, name);
+    Fn fn = nullptr;
+    std::memcpy(&fn, &raw, sizeof(fn));
+    return fn;
+}
 
 // 显式用宽字符版资源 ID —— IDC_* 会随 UNICODE 宏在 A/W 之间切换，
 // 而我们要的是一个不依赖调用方编译开关的库
@@ -10268,8 +11083,7 @@ inline void win_sync_caption_theme(Win32State* state, bool dark) {
     static SetAttribute set_attribute = []() -> SetAttribute {
         // 函数指针在进程存续期间复用，因此系统模块也保留至进程退出。
         HMODULE module = LoadLibraryW(L"dwmapi.dll");
-        return module ? reinterpret_cast<SetAttribute>(GetProcAddress(module, "DwmSetWindowAttribute"))
-                      : nullptr;
+        return module ? dll_proc<SetAttribute>(module, "DwmSetWindowAttribute") : nullptr;
     }();
     if (set_attribute) {
         const BOOL enabled = dark ? TRUE : FALSE;
@@ -10286,7 +11100,7 @@ inline UINT win_dpi_of(HWND hwnd) {
     if (!tried) {
         tried = true;
         HMODULE u = GetModuleHandleW(L"user32.dll");
-        if (u) fn = reinterpret_cast<PFN_GetDpiForWindow>(GetProcAddress(u, "GetDpiForWindow"));
+        if (u) fn = dll_proc<PFN_GetDpiForWindow>(u, "GetDpiForWindow");
     }
     if (fn && hwnd) { UINT d = fn(hwnd); if (d) return d; }
     HDC dc = GetDC(nullptr);
@@ -10302,8 +11116,7 @@ inline void win_enable_dpi_awareness() {
     done = true;
     HMODULE u = GetModuleHandleW(L"user32.dll");
     if (u) {
-        auto fn = reinterpret_cast<PFN_SetProcessDpiAwarenessContext>(
-            GetProcAddress(u, "SetProcessDpiAwarenessContext"));
+        auto fn = dll_proc<PFN_SetProcessDpiAwarenessContext>(u, "SetProcessDpiAwarenessContext");
         if (fn && fn(reinterpret_cast<void*>(static_cast<intptr_t>(-4)))) return;   // PER_MONITOR_AWARE_V2
     }
     SetProcessDPIAware();
@@ -10470,14 +11283,13 @@ struct ImmApi {
     ImmApi() {
         HMODULE h = LoadLibraryW(L"imm32.dll");
         if (!h) return;
-        get_ctx  = reinterpret_cast<HIMC (WINAPI*)(HWND)>(GetProcAddress(h, "ImmGetContext"));
-        rel_ctx  = reinterpret_cast<BOOL (WINAPI*)(HWND, HIMC)>(GetProcAddress(h, "ImmReleaseContext"));
-        set_comp = reinterpret_cast<BOOL (WINAPI*)(HIMC, const AinoCompositionFormW*)>(
-                       GetProcAddress(h, "ImmSetCompositionWindow"));
-        set_cand = reinterpret_cast<BOOL (WINAPI*)(HIMC, const AinoCandidateFormW*)>(
-                       GetProcAddress(h, "ImmSetCandidateWindow"));
-        get_str  = reinterpret_cast<LONG (WINAPI*)(HIMC, DWORD, void*, DWORD)>(
-                       GetProcAddress(h, "ImmGetCompositionStringW"));
+        get_ctx  = dll_proc<HIMC (WINAPI*)(HWND)>(h, "ImmGetContext");
+        rel_ctx  = dll_proc<BOOL (WINAPI*)(HWND, HIMC)>(h, "ImmReleaseContext");
+        set_comp = dll_proc<BOOL (WINAPI*)(HIMC, const AinoCompositionFormW*)>(
+                       h, "ImmSetCompositionWindow");
+        set_cand = dll_proc<BOOL (WINAPI*)(HIMC, const AinoCandidateFormW*)>(
+                       h, "ImmSetCandidateWindow");
+        get_str  = dll_proc<LONG (WINAPI*)(HIMC, DWORD, void*, DWORD)>(h, "ImmGetCompositionStringW");
         ok = get_ctx && rel_ctx && set_comp && set_cand && get_str;
     }
 };
@@ -10826,9 +11638,9 @@ inline LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
 
     case WM_CLOSE:
+        // WM_QUIT 属于整个线程；关闭本窗口不能结束同线程的其它窗口。
         if (s->owner->cfg.close_requested && !s->owner->cfg.close_requested()) return 0;
         s->owner->running = false;
-        PostQuitMessage(0);
         return 0;
 
     case WM_DESTROY:
@@ -10962,11 +11774,21 @@ inline void w32_destroy(Window* self) {
     Win32State* s = reinterpret_cast<Win32State*>(o->native);
     if (!s) return;
     if (s->mem_dc) {
-        // 先把位图换出再删 DC，避免句柄泄漏
+        // 顺序有讲究：DeleteObject 对"仍被选进 DC 的位图"会失败，而 DC 又要
+        // 在没有位图选着的时候删。所以：
+        //   换入 1×1 替身 → 删被换出的后备位图 → 删 DC（顺带释放替身）→ 删替身。
+        // 旧写法只做了第一步和 DeleteDC，那个替身一直删不掉（每窗口漏一个 GDI 位图）。
         HBITMAP tmp = CreateCompatibleBitmap(s->mem_dc, 1, 1);
-        if (tmp) { SelectObject(s->mem_dc, tmp); DeleteObject(tmp); }
+        if (tmp) {
+            HBITMAP old = reinterpret_cast<HBITMAP>(SelectObject(s->mem_dc, tmp));
+            if (old && old != tmp) {
+                DeleteObject(old);
+                if (s->hbmp == old) s->hbmp = nullptr;   // 已经删过，别再删第二次
+            }
+        }
         DeleteDC(s->mem_dc);
         s->mem_dc = nullptr;
+        if (tmp) DeleteObject(tmp);
     }
     if (s->hbmp) { DeleteObject(s->hbmp); s->hbmp = nullptr; }
     if (s->hwnd && IsWindow(s->hwnd)) DestroyWindow(s->hwnd);
@@ -11066,7 +11888,7 @@ inline void win_frame_log(Window::Impl* o, uint64_t render_us) {
     // 60 帧一块：交互驱动的帧是零散的（拖着鼠标扫过一排控件才有几帧），
     // 攒到 120 帧往往要等很久，探针还没采到样进程就被关掉了。
     if (o->frame_log_n >= 60) {
-        std::FILE* out = o->frame_log_out ? o->frame_log_out : stderr;
+        std::FILE* out = o->frame_log_out ? o->frame_log_out.get() : stderr;
         const double n = double(o->frame_log_n);
         std::fprintf(out,
             "[aino] 60 帧  渲染均 %.2f ms  最差 %.2f ms  (预算 %.0f ms)\n"
@@ -11107,10 +11929,11 @@ inline void win_frame_log(Window::Impl* o, uint64_t render_us) {
 
 } // namespace detail
 
-inline bool Window::poll() {
+bool Window::poll() {
     Window::Impl* o = impl;
     detail::Win32State* s = reinterpret_cast<detail::Win32State*>(o->native);
     if (!s || !o->running) return false;
+    if (o->wake_signal.consume()) o->need_frame = true;
 
     MSG msg;
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -11129,7 +11952,7 @@ inline bool Window::poll() {
     return o->running;
 }
 
-inline void Window::render() {
+void Window::render() {
     Window::Impl* o = impl;
     detail::Win32State* s = reinterpret_cast<detail::Win32State*>(o->native);
     if (!s || !s->has_backbuffer) return;
@@ -11141,7 +11964,10 @@ inline void Window::render() {
     // 变成两帧之和。表现是子窗口的 spinner / 光标闪烁顿得没有规律。
     uint64_t now = detail::win_ticks_ms();
     float dt = o->last_frame_ms ? float(now - o->last_frame_ms) / 1000.0f : (1.0f / 60.0f);
-    if (dt > 0.25f) dt = 0.25f;
+    if (dt > 0.25f) {
+        o->ui.impl->caret_blink += dt - 0.25f; // 闪烁按真实时间推进，动画仍限制大步长。
+        dt = 0.25f;
+    }
     o->last_frame_ms = now;
 
     const bool prof = o->frame_log;
@@ -11190,7 +12016,7 @@ inline void Window::render() {
     }
 }
 
-inline void Window::run(const std::function<void(Ui&)>& frame) {
+void Window::run(const std::function<void(Ui&)>& frame) {
     Window::Impl* o = impl;
     detail::Win32State* s = reinterpret_cast<detail::Win32State*>(o->native);
     if (!s) return;
@@ -11204,7 +12030,7 @@ inline void Window::run(const std::function<void(Ui&)>& frame) {
         if (!poll()) break;
 
         const bool anim = o->ui.animating();
-        if (o->need_frame || anim) {
+        if (o->need_frame || anim || o->ui.impl->repaint_timeout_ms() == 0) {
             o->self_repaint = false;                 // 本轮"自请求"标记清零
             const uint64_t t0 = detail::win_ticks_us();
             render();
@@ -11222,20 +12048,20 @@ inline void Window::run(const std::function<void(Ui&)>& frame) {
             if (el_us < budget_us) detail::win_timer().wait_us(budget_us - el_us);
         } else {
             // 没有待办 → 阻塞在内核里等消息。这就是空闲 0% CPU 的来源。
-            WaitMessage();
+            o->wake_signal.wait(o->ui.impl->repaint_timeout_ms());
         }
     }
     o->frame_cb_ptr = nullptr;
     o->render_fn = nullptr;
 }
 
-inline void Window::set_title(const std::string& title) {
+void Window::set_title(const std::string& title) {
     Window::Impl* o = impl;
     if (!o) return;
     detail::Win32State* s = reinterpret_cast<detail::Win32State*>(o->native);
     if (s && s->hwnd) SetWindowTextW(s->hwnd, detail::to_wide(title).c_str());
 }
-inline void Window::activate() {
+void Window::activate() {
     if (!impl) return;
     auto* s = reinterpret_cast<detail::Win32State*>(impl->native);
     if (!s || !s->hwnd) return;
@@ -11246,7 +12072,7 @@ inline void Window::activate() {
     }
 }
 
-inline void Window::set_size(int w, int h) {
+void Window::set_size(int w, int h) {
     Window::Impl* o = impl;
     detail::Win32State* s = reinterpret_cast<detail::Win32State*>(o->native);
     if (!s || !s->hwnd) return;
@@ -11256,26 +12082,6 @@ inline void Window::set_size(int w, int h) {
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
-// 跨线程叫醒主循环：置标志 + 投一条 WM_NULL（对窗口自身零副作用，close() 用的同一招）。
-// 主循环空闲时阻塞在 WaitMessage()，只改标志位叫不醒它。
-inline void Window::wake() {
-    Window::Impl* o = impl;
-    if (!o) return;
-    o->need_frame = true;
-    detail::Win32State* s = reinterpret_cast<detail::Win32State*>(o->native);
-    if (s && s->hwnd) PostMessageW(s->hwnd, WM_NULL, 0, 0);
-}
-
-inline void Window::close() {
-    Window::Impl* o = impl;
-    if (!o) return;
-    o->running = false;
-    // 主循环多数时间阻塞在 WaitMessage() 里 —— 只置标志位叫不醒它，得投一条
-    // 消息把阻塞打断。从别的线程（后台任务、自动化探针）调 close() 时这条是
-    // 必须的，否则进程会一直挂着不退出。WM_NULL 对窗口本身没有任何副作用。
-    detail::Win32State* s = reinterpret_cast<detail::Win32State*>(o->native);
-    if (s && s->hwnd) PostMessageW(s->hwnd, WM_NULL, 0, 0);
-}
 
 // OpenClipboard 可能因其它进程占用而失败；最多重试 8 次，每次间隔 1ms。
 namespace detail {
@@ -11288,7 +12094,7 @@ inline bool clipboard_open_retry() {
 }
 } // namespace detail
 
-inline void Window::set_clipboard(const std::string& text) {
+void Window::set_clipboard(const std::string& text) {
     if (!detail::clipboard_open_retry()) return;
     EmptyClipboard();
     const std::wstring w = detail::to_wide(text);
@@ -11304,7 +12110,7 @@ inline void Window::set_clipboard(const std::string& text) {
     CloseClipboard();
 }
 
-inline std::string Window::clipboard() const {
+std::string Window::clipboard() const {
     std::string out;
     if (!detail::clipboard_open_retry()) return out;
     if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
@@ -11337,7 +12143,7 @@ inline std::string Window::clipboard() const {
 #endif // AINO_PLATFORM_WINDOWS
 
 // =============================================================================
-//  8.14  Linux / X11 后端
+//  8.19  Linux / X11 后端
 //        文字走 FreeType + fontconfig（运行时 dlopen，不要开发包），字形在
 //        **客户端**光栅化成灰度位图，逐像素 blend 进缓冲 —— 零 X 往返。
 //        两者都加载不到时，退回核心 X 的 XLFD 点阵字体（能跑，只是没抗锯齿）。
@@ -11664,7 +12470,7 @@ public:
             size_t i = 0;
             while (i < utf8.size()) {
                 uint32_t cp = 0;
-                const int n = utf8_decode(utf8.c_str() + i, &cp);
+                const int n = utf8_decode_n(utf8.c_str() + i, utf8.size() - i, &cp);
                 i += size_t(n < 1 ? 1 : n);
                 w += float(glyph(*f, cp).adv) * (1.0f / 64.0f);
             }
@@ -11704,7 +12510,7 @@ public:
             size_t i = 0;
             while (i < utf8.size()) {
                 uint32_t cp = 0;
-                const int n = utf8_decode(utf8.c_str() + i, &cp);
+                const int n = utf8_decode_n(utf8.c_str() + i, utf8.size() - i, &cp);
                 i += size_t(n < 1 ? 1 : n);
                 w += float(glyph(*f, cp).adv) * (1.0f / 64.0f);
             }
@@ -12042,7 +12848,7 @@ private:
         size_t i = 0;
         while (i < s.size()) {
             uint32_t cp = 0;
-            const int n = utf8_decode(s.c_str() + i, &cp);
+            const int n = utf8_decode_n(s.c_str() + i, s.size() - i, &cp);
             i += size_t(n < 1 ? 1 : n);
             const Glyph& g = glyph(*f, cp);
             const int gx = (pen >> 6) + g.left;
@@ -12791,10 +13597,11 @@ inline uint64_t x11_ticks_ms() {
 
 } // namespace detail
 
-inline bool Window::poll() {
+bool Window::poll() {
     Window::Impl* o = impl;
     detail::X11State* s = reinterpret_cast<detail::X11State*>(o->native);
     if (!s || !o->running) return false;
+    if (o->wake_signal.consume()) o->need_frame = true;
     while (XPending(s->dpy)) {
         XEvent e;
         XNextEvent(s->dpy, &e);
@@ -12803,18 +13610,17 @@ inline bool Window::poll() {
     return o->running;
 }
 
-inline void Window::render() {
+void Window::render() {
     Window::Impl* o = impl;
     detail::X11State* s = reinterpret_cast<detail::X11State*>(o->native);
     if (!s || !s->img) return;
 
-    static uint64_t last = 0;
     timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
     uint64_t now = uint64_t(ts.tv_sec) * 1000u + uint64_t(ts.tv_nsec / 1000000);
-    float dt = last ? float(now - last) / 1000.0f : (1.0f / 60.0f);
-    if (dt > 0.25f) dt = 0.25f;
-    last = now;
+    float dt = o->last_frame_ms ? float(now - o->last_frame_ms) / 1000.0f : (1.0f / 60.0f);
+    if (dt > 0.25f) { o->ui.impl->caret_blink += dt - 0.25f; dt = 0.25f; }
+    o->last_frame_ms = now;
 
     detail::x11_feed_input(s);
     o->need_frame = false;   // 同 Windows：帧前清，帧内 repaint() 可再次置位
@@ -12828,7 +13634,7 @@ inline void Window::render() {
     detail::x11_apply_cursor(s);
 }
 
-inline void Window::run(const std::function<void(Ui&)>& frame) {
+void Window::run(const std::function<void(Ui&)>& frame) {
     Window::Impl* o = impl;
     detail::X11State* s = reinterpret_cast<detail::X11State*>(o->native);
     if (!s) return;
@@ -12837,7 +13643,7 @@ inline void Window::run(const std::function<void(Ui&)>& frame) {
     while (o->running) {
         if (!poll()) break;
         const bool anim = o->ui.animating();
-        if (o->need_frame || anim) {
+        if (o->need_frame || anim || o->ui.impl->repaint_timeout_ms() == 0) {
             o->self_repaint = false;
             const uint64_t t0 = detail::x11_ticks_ms();
             render();
@@ -12846,26 +13652,22 @@ inline void Window::run(const std::function<void(Ui&)>& frame) {
             const uint64_t el = detail::x11_ticks_ms() - t0;
             if (el < o->anim_budget_ms) usleep(useconds_t((o->anim_budget_ms - el) * 1000));
         } else {
-            // 阻塞等事件（XNextEvent 会睡在内核里）
-            XEvent e;
-            XNextEvent(s->dpy, &e);
-            detail::x11_handle(s, e);
+            o->wake_signal.wait(o->ui.impl->repaint_timeout_ms(), ConnectionNumber(s->dpy));
         }
     }
     o->frame_cb_ptr = nullptr;
 }
 
-inline void Window::set_title(const std::string& title) {
+void Window::set_title(const std::string& title) {
     detail::X11State* s = reinterpret_cast<detail::X11State*>(impl->native);
     if (s && s->dpy && s->win) detail::x11_set_title(s->dpy, s->win, title);
 }
-inline void Window::set_size(int w, int h) {
+void Window::set_size(int w, int h) {
     detail::X11State* s = reinterpret_cast<detail::X11State*>(impl->native);
     if (s && s->dpy && s->win) XResizeWindow(s->dpy, s->win, unsigned(std::max(1, int(w * impl->scale + .5f))), unsigned(std::max(1, int(h * impl->scale + .5f))));
 }
-inline void Window::close() { if (impl) impl->running = false; }
 
-inline void Window::activate() {
+void Window::activate() {
     if (!impl) return;
     auto* s = reinterpret_cast<detail::X11State*>(impl->native);
     if (!s || !s->dpy || !s->win) return;
@@ -12878,28 +13680,7 @@ inline void Window::activate() {
     XFlush(s->dpy);
 }
 
-// X11 的主循环阻塞在 XNextEvent。往自己窗口投一条 ClientMessage（data.l[0]=0，
-// 不会命中 wm_delete）就能把它捅醒；x11_handle 里这条消息落到 default 分支，
-// 除了让循环再空转一圈之外没有别的效果。
-//
-// 提醒：这是"同一个 Xlib 连接被两个线程碰"。Xlib 在 XInitThreads() 之前不是
-// 线程安全的，aino 的 X11 后端没有调它 —— 所以 Linux 上后台线程只改标志，
-// wake() 留给主线程调；要直接从后台线程调，请在建窗前自己 XInitThreads()。
-inline void Window::wake() {
-    Window::Impl* o = impl;
-    if (!o) return;
-    detail::X11State* s = reinterpret_cast<detail::X11State*>(o->native);
-    if (!s || !s->dpy || !s->win) return;
-    XEvent e{};
-    e.type = ClientMessage;
-    e.xclient.window = s->win;
-    e.xclient.message_type = None;
-    e.xclient.format = 32;
-    XSendEvent(s->dpy, s->win, False, 0, &e);
-    XFlush(s->dpy);
-}
-
-inline void Window::set_clipboard(const std::string& text) {
+void Window::set_clipboard(const std::string& text) {
     detail::X11State* s = reinterpret_cast<detail::X11State*>(impl->native);
     if (!s || !s->dpy) return;
     Atom sel = XInternAtom(s->dpy, "CLIPBOARD", False);
@@ -12907,12 +13688,12 @@ inline void Window::set_clipboard(const std::string& text) {
     XSetSelectionOwner(s->dpy, sel, s->win, CurrentTime);
     XFlush(s->dpy);
 }
-inline std::string Window::clipboard() const { return std::string(); }
+std::string Window::clipboard() const { return std::string(); }
 
 #endif // AINO_PLATFORM_X11
 
 // =============================================================================
-//  8.15  macOS 后端
+//  8.20  macOS 后端
 //        纯 C++ 通过 objc runtime 调 AppKit（不写 Objective-C 语法，
 //        这样头文件在普通 .cpp 里也能编译）；绘制用 CoreGraphics，
 //        文字用 CoreText。同样未经真机验证。
@@ -12990,14 +13771,12 @@ private:
         auto it = fonts_.find(key);
         if (it != fonts_.end()) return it->second;
         CFStringRef name = CFStringCreateWithCString(kCFAllocatorDefault, family_.c_str(), kCFStringEncodingUTF8);
-        CGFloat w = CGFloat(weight < 0 ? 400 : weight) / 400.0;
         const CTFontSymbolicTraits traits = (weight >= 600) ? kCTFontBoldTrait : 0;
         CTFontRef base = CTFontCreateWithName(name, CGFloat(float(q) / 2.0f), nullptr);
         CTFontRef f = traits ? CTFontCreateCopyWithSymbolicTraits(base, 0.0, nullptr, traits, traits) : base;
         if (f != base) CFRelease(base);
         if (!f) f = CTFontCreateWithName(CFSTR("Helvetica"), CGFloat(float(q) / 2.0f), nullptr);
         CFRelease(name);
-        (void)w;
         fonts_[key] = f;
         return f;
     }
@@ -13126,9 +13905,8 @@ inline void cocoa_view_draw(id self, SEL, id) {
     if (!s) return;
     id ctx_obj = oc_send<id>(objc_getClass("NSGraphicsContext"), sel_registerName("currentContext"));
     CGContextRef cg = oc_send<CGContextRef>(ctx_obj, sel_registerName("CGContext"));
-    if (!cg || !s->ctx) return;
-    CGImageRef img = CGBitmapContextCreateImage(s->ctx);
-    if (!img) return;
+    if (!cg || !s->pending_image) return;
+    CGImageRef img = s->pending_image;
     CGRect r = CGRectMake(0, 0, s->pw, s->ph);
     // NSView 默认原点在左下，图片需要翻转
     CGContextSaveGState(cg);
@@ -13136,7 +13914,6 @@ inline void cocoa_view_draw(id self, SEL, id) {
     CGContextScaleCTM(cg, 1, -1);
     CGContextDrawImage(cg, r, img);
     CGContextRestoreGState(cg);
-    CGImageRelease(img);
 }
 
 inline void cocoa_mouse_moved(id self, SEL, id ev) {
@@ -13187,7 +13964,6 @@ inline void cocoa_key_down(id self, SEL, id ev) {
             }
         }
     }
-    s->key_down[KEY_BACKSPACE] = false;
     s->owner->need_frame = true;
     (void)ev;
 }
@@ -13302,10 +14078,11 @@ inline void cocoa_destroy(Window* self) {
 
 using detail::oc_send;   // 下面 Window::xxx 在 aino 命名空间里，别每次都写 detail::
 
-inline bool Window::poll() {
+bool Window::poll() {
     Window::Impl* o = impl;
     detail::CocoaState* s = reinterpret_cast<detail::CocoaState*>(o->native);
     if (!s) return false;
+    if (o->wake_signal.consume()) o->need_frame = true;
     // 抽干一次 runloop
     id distant = oc_send<id>(oc_send<id>(objc_getClass("NSDate"), sel_registerName("alloc")),
                              sel_registerName("init"));
@@ -13325,17 +14102,16 @@ inline bool Window::poll() {
     return o->running;
 }
 
-inline void Window::render() {
+void Window::render() {
     Window::Impl* o = impl;
     detail::CocoaState* s = reinterpret_cast<detail::CocoaState*>(o->native);
     if (!s || !s->ctx) return;
-    static uint64_t last = 0;
     timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
     uint64_t now = uint64_t(ts.tv_sec) * 1000u + uint64_t(ts.tv_nsec / 1000000);
-    float dt = last ? float(now - last) / 1000.0f : (1.0f / 60.0f);
-    if (dt > 0.25f) dt = 0.25f;
-    last = now;
+    float dt = o->last_frame_ms ? float(now - o->last_frame_ms) / 1000.0f : (1.0f / 60.0f);
+    if (dt > 0.25f) { o->ui.impl->caret_blink += dt - 0.25f; dt = 0.25f; }
+    o->last_frame_ms = now;
 
     detail::cocoa_feed_input(s);
     o->need_frame = false;   // 同 Windows：帧前清
@@ -13347,7 +14123,7 @@ inline void Window::render() {
     detail::cocoa_present(s);
 }
 
-inline void Window::run(const std::function<void(Ui&)>& frame) {
+void Window::run(const std::function<void(Ui&)>& frame) {
     Window::Impl* o = impl;
     detail::CocoaState* s = reinterpret_cast<detail::CocoaState*>(o->native);
     if (!s) return;
@@ -13355,7 +14131,7 @@ inline void Window::run(const std::function<void(Ui&)>& frame) {
     while (o->running) {
         if (!poll()) break;
         const bool anim = o->ui.animating();
-        if (o->need_frame || anim) {
+        if (o->need_frame || anim || o->ui.impl->repaint_timeout_ms() == 0) {
             o->self_repaint = false;
             timespec t0{}; clock_gettime(CLOCK_MONOTONIC, &t0);
             const uint64_t s0 = uint64_t(t0.tv_sec) * 1000000u + uint64_t(t0.tv_nsec / 1000);
@@ -13374,21 +14150,19 @@ inline void Window::run(const std::function<void(Ui&)>& frame) {
     o->frame_cb_ptr = nullptr;
 }
 
-inline void Window::set_title(const std::string& title) {
+void Window::set_title(const std::string& title) {
     detail::CocoaState* s = reinterpret_cast<detail::CocoaState*>(impl->native);
     if (!s || !s->window) return;
     CFStringRef t = CFStringCreateWithCString(kCFAllocatorDefault, title.c_str(), kCFStringEncodingUTF8);
     oc_send<void>(s->window, sel_registerName("setTitle:"), t);
     CFRelease(t);
 }
-inline void Window::set_size(int w, int h) {
+void Window::set_size(int w, int h) {
     detail::CocoaState* s = reinterpret_cast<detail::CocoaState*>(impl->native);
     if (s && s->window)
         oc_send<void>(s->window, sel_registerName("setContentSize:"), CGSizeMake(CGFloat(w), CGFloat(h)));
 }
-inline void Window::close() { if (impl) impl->running = false; }
-
-inline void Window::activate() {
+void Window::activate() {
     if (!impl) return;
     auto* s = reinterpret_cast<detail::CocoaState*>(impl->native);
     if (!s || !s->window) return;
@@ -13397,15 +14171,8 @@ inline void Window::activate() {
     oc_send<void>(s->window, sel_registerName("makeKeyAndOrderFront:"), (id)nullptr);
 }
 
-// macOS 的 run() 是 usleep(2000) 轮询（没有真阻塞），所以只改标志就够了，
-// 后台线程直接调也不会碰 UIKit/AppKit。
-inline void Window::wake() {
-    Window::Impl* o = impl;
-    if (!o) return;
-    o->need_frame = true;
-}
-inline void Window::set_clipboard(const std::string&) {}
-inline std::string Window::clipboard() const { return std::string(); }
+void Window::set_clipboard(const std::string&) {}
+std::string Window::clipboard() const { return std::string(); }
 
 #endif // AINO_PLATFORM_MACOS
 
@@ -13828,7 +14595,7 @@ inline SystemIconMask load_system_icon(SystemIcon icon, int size) {
 }
 } // namespace detail
 
-inline int system_icon_worker_entry(int argc, char** argv) {
+int system_icon_worker_entry(int argc, char** argv) {
 #if defined(AINO_PLATFORM_X11) && defined(__linux__)
     if (argc > 1 && std::strcmp(argv[1], "--aino-system-icons-v1") == 0) {
         if (argc != 4 || !argv[2] || !*argv[2]) return 2;
@@ -13855,7 +14622,7 @@ inline int system_icon_worker_entry(int argc, char** argv) {
     return -1;
 }
 
-inline bool Ui::system_icon(SystemIcon icon, const Rect& box, const Color& color) {
+bool Ui::system_icon(SystemIcon icon, const Rect& box, const Color& color) {
     if (impl->measure_on) { impl->measure_add(box); return true; }
     if (!impl->canvas || box.empty() || color.a == 0) return false;
 #if defined(AINO_PLATFORM_WINDOWS) || defined(AINO_PLATFORM_MACOS) || defined(AINO_PLATFORM_X11)
@@ -13878,12 +14645,29 @@ inline bool Ui::system_icon(SystemIcon icon, const Rect& box, const Color& color
     if (mask.alpha.empty()) return false;
     const int left = int(std::floor(physical.cx() - mask.width * .5f));
     const int top = int(std::floor(physical.cy() - mask.height * .5f));
-    push_clip(box);
-    for (int y = 0; y < mask.height; ++y)
-        for (int x = 0; x < mask.width; ++x)
-            impl->canvas->blend(left + x, top + y, color,
-                                mask.alpha[size_t(y) * mask.width + x] / 255.f);
-    pop_clip();
+    // 掩膜本身就在 box 之内（size ≤ min(w,h) 且居中），所以只需要裁到画布和
+    // 当前裁剪区；把裁剪算成一次区间，循环里就不再逐像素判边界。
+    // 早先是 push_clip(box) + 逐像素 blend：一枚 24×24 图标要 576 次边界判断、
+    // 两次裁剪栈重算（实测 2.1 µs），而它每帧的形状和颜色都没变。
+    Canvas& cv = *impl->canvas;
+    int x0 = left, x1 = left + mask.width;
+    int y0 = top,  y1 = top + mask.height;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > cv.w) x1 = cv.w;
+    if (y1 > cv.h) y1 = cv.h;
+    if (cv.clipped) {
+        if (x0 < cv.clip_x0) x0 = cv.clip_x0;
+        if (y0 < cv.clip_y0) y0 = cv.clip_y0;
+        if (x1 > cv.clip_x1) x1 = cv.clip_x1;
+        if (y1 > cv.clip_y1) y1 = cv.clip_y1;
+    }
+    if (x1 <= x0) return true;
+    for (int y = y0; y < y1; ++y) {
+        const uint8_t* row = mask.alpha.data() + size_t(y - top) * size_t(mask.width)
+                           + size_t(x0 - left);
+        cv.blend_mask_row8(y, x0, x1, color, row);
+    }
     return true;
 #else
     return false;
