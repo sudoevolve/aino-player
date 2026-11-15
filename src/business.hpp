@@ -2274,7 +2274,7 @@ void set_source_smart_switch(bool enabled) {
     request_frame();
 }
 std::string source_routing_status() {
-    if (g_ui.settings.source_smart_switch) return "仅在歌曲原平台内选源；跳过样本失败及冷却中的源，单曲失败不判定整个源失效";
+    if (g_ui.settings.source_smart_switch) return "仅在歌曲原平台内选源；优先可用且快的源，双样本失败暂时冷却，单曲失败不判定整个平台失效";
     const auto fixed = lx::Engine::instance().fixed_source();
     if (fixed.file.empty()) return "拖动左侧手柄调整顺序；固定使用首个已加载音源，不自动换源";
     return "固定使用：" + fixed.name + "；拖动左侧手柄调整优先顺序，播放失败不换源";
@@ -2328,8 +2328,26 @@ static void maintain_source_checks() {
             }
             const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
             if (remaining <= 0) break;
-            engine.check_sources({{key, music::lx_music_info(sample, key)}},
-                [&] { return cancelled() || std::chrono::steady_clock::now() >= deadline; }, [] { request_frame(); }, settings.quality, int(std::min<long long>(6000, remaining)), only_file);
+            struct AlternateSample { std::timed_mutex mutex; bool fetched = false; std::string info; };
+            auto alternate = std::make_shared<AlternateSample>();
+            lx::Engine::Check check{key, music::lx_music_info(sample, key)};
+            // 仅首样本确定失败时反查另一首；同轮不同脚本共享结果，不增加常驻检测任务。
+            check.alternate_info = [source, settings, primary_id = sample.id, alternate] {
+                std::unique_lock<std::timed_mutex> lock(alternate->mutex, std::defer_lock);
+                while (!lock.try_lock_for(std::chrono::milliseconds(20))) if (net::cancelled()) return std::string();
+                if (alternate->fetched || net::cancelled()) return alternate->info;
+                std::string error;
+                const auto songs = music::search_platform(source, "十年 陈奕迅", 3, 2000, error, settings);
+                for (const auto& song : songs) {
+                    if (song.id.empty() || song.id == primary_id || ((source == music::Source::Kugou || source == music::Source::Migu) && song.native_id.empty())) continue;
+                    const auto info = music::lx_music_info(song, music::lx_platform_key(source));
+                    alternate->info = info; break;
+                }
+                if (!net::cancelled()) alternate->fetched = true;
+                return alternate->info;
+            };
+            engine.check_sources({std::move(check)},
+                [&] { return cancelled() || std::chrono::steady_clock::now() >= deadline; }, [] { request_frame(); }, settings.quality, int(std::min<long long>(8000, remaining)), only_file);
             ++completed;
         }
         {
@@ -2392,7 +2410,7 @@ const std::vector<LxSourceView>& lx_source_status() {
     cached_smart = g_ui.settings.source_smart_switch;
     cached_platform = int(platform); cached_quality = g_ui.settings.quality; cached_until = now + 60000;
     const auto order = lx::Engine::instance().selection_order(music::lx_platform_key(platform), g_ui.settings.quality);
-    if (std::any_of(order.begin(), order.end(), [](const auto& item) { return item.availability == 4; })) cached_until = now + 1000;
+    if (std::any_of(order.begin(), order.end(), [](const auto& item) { return item.availability == 2 || item.availability == 4; })) cached_until = now + 1000;
     std::vector<LxSourceView> out;
     const auto errors = lx::Engine::instance().runtime_errors();
     const auto checks = lx::Engine::instance().health();
@@ -2401,7 +2419,7 @@ const std::vector<LxSourceView>& lx_source_status() {
     std::array<std::vector<lx::Engine::Selection>, 5> platform_orders;
     for (size_t i = 0; i < platforms.size(); ++i) {
         platform_orders[i] = lx::Engine::instance().selection_order(music::lx_platform_key(platforms[i]), g_ui.settings.quality);
-        if (std::any_of(platform_orders[i].begin(), platform_orders[i].end(), [](const auto& item) { return item.availability == 4; })) cached_until = now + 1000;
+        if (std::any_of(platform_orders[i].begin(), platform_orders[i].end(), [](const auto& item) { return item.availability == 2 || item.availability == 4; })) cached_until = now + 1000;
     }
     for (const auto& e : lx::Engine::instance().entries()) {
         LxSourceView v;
@@ -2438,8 +2456,9 @@ const std::vector<LxSourceView>& lx_source_status() {
             status.state = selected == candidates.end() || selected->availability == 3 ? 4 :
                 selected->availability == 4 ? 6 : selected->availability == 2 ? 3 :
                 selected->availability == 0 ? 2 : h && (h->state == 1 || h->state == 5) ? h->state : 0;
-            status.status = status.state == 2 ? "可用" : status.state == 3 ? "样本失败" : status.state == 4 ? "不支持" :
-                status.state == 6 ? "冷却中" : status.state == 1 ? "检测中" : status.state == 5 ? "未完成" : "未检测";
+            const bool cooldown_expired = h && h->state == 3 && now >= h->retry_at;
+            status.status = status.state == 2 ? "可用" : status.state == 3 ? "样本冷却" : status.state == 4 ? "不支持" :
+                status.state == 6 ? "冷却中" : status.state == 1 ? "检测中" : status.state == 5 ? "未完成" : cooldown_expired ? "待验证" : "未检测";
             status.detail = label + " · " + status.status;
             if (selected == candidates.end()) status.detail += "\n脚本未声明支持该平台取流";
             if (selected != candidates.end()) {
@@ -2447,7 +2466,8 @@ const std::vector<LxSourceView>& lx_source_status() {
                 if (!selected->quality.empty()) status.detail += " · " + selected->quality;
                 if (selected->latency_ms < 300001) status.detail += " · " + std::to_string(selected->latency_ms) + "ms" + (selected->estimated ? "（估算）" : "");
             }
-            if (h && !h->reason.empty()) status.detail += "\n" + h->reason;
+            const auto reason = cooldown_expired ? "之前两个样本失败；冷却已结束，可尝试播放或手动重新检测" : h ? h->reason : std::string();
+            if (!reason.empty()) status.detail += "\n" + reason;
             v.health += label + " ";
             v.health += status.status;
             if (h && h->state == 2) {
@@ -2455,9 +2475,9 @@ const std::vector<LxSourceView>& lx_source_status() {
                     v.health += " " + std::to_string(h->load_ms) + "ms";
                 }
             }
-            if (h && !h->reason.empty()) {
+            if (!reason.empty()) {
                 if (!v.error.empty()) v.error += "\n";
-                v.error += label + " 样本：" + h->reason;
+                v.error += label + " 样本：" + reason;
                 if (h->state == 2) v.error += "；音质 " + h->quality + "；取址 " + std::to_string(h->resolve_ms) + "ms；取址与样本加载共 " + std::to_string(h->load_ms) + "ms";
             }
         }

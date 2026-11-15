@@ -317,7 +317,14 @@ int main(int argc, char** argv) {
             lx::Engine::Timing timing;
             timing.verified = true; timing.verified_revision = 10; timing.load_ms = 80;
             auto score = lx::Engine::selection_score("320k", &health, &timing, nullptr, 1000);
-            check(score.availability == 2, "failed recheck overrides historical source success");
+            check(score.availability == 0, "one failed sample cannot invalidate historical source success");
+            health.failed_samples = 2; health.retry_at = 2000;
+            score = lx::Engine::selection_score("320k", &health, &timing, nullptr, 1000);
+            check(score.availability == 2, "two failed samples temporarily override historical source success");
+            check(lx::Engine::selection_score("320k", &health, &timing, nullptr, 2000).availability == 1,
+                "expired sample cooldown permits a fresh playback attempt without claiming verified health");
+            check(lx::Engine::selection_score("128k", &health, nullptr, nullptr, 1000).availability == 1,
+                "failed samples only cool down the tested quality");
             timing.verified_revision = 21;
             check(lx::Engine::selection_score("320k", &health, &timing, nullptr, 1000).availability == 0,
                 "new audio verification recovers a previously failed source");

@@ -1288,14 +1288,19 @@ inline std::string default_dir() {
 // 一个目录里的音源脚本；运行时逐个串行执行，集合支持后台热替换与应用内移除。
 class Engine {
 public:
-    struct Check { std::string platform, info; };
+    struct Check {
+        std::string platform, info;
+        std::function<std::string()> alternate_info;
+    };
     struct Health {
-        // 0 等待检测，1 检测中，2 样本通过，3 样本失败，4 未声明支持，5 超时未完成。
+        // 0 等待检测，1 检测中，2 样本通过，3 双样本失败暂时冷却，4 未声明支持，5 检测未完成。
         int state = 0;
         std::string reason;
         int resolve_ms = 0, load_ms = 0;
         std::string quality;
         unsigned long long checked_revision = 0;
+        unsigned failed_samples = 0;
+        unsigned long long retry_at = 0;
     };
     struct Timing {
         int resolve_ms = 0, load_ms = 0, ready_ms = 0;
@@ -1304,6 +1309,7 @@ public:
         unsigned long long verified_revision = 0;
         bool verified = false;
         bool cached = false;
+        std::set<std::string> failed_songs;
     };
     // 消费方只报告“已收到有效音频 / 首段可播”，不把整首下载或转码耗时当加载速度。
     struct LoadTiming { int ready_ms = 0; bool verified = false; };
@@ -1330,15 +1336,14 @@ public:
     // 排序与界面共用。历史成功不能覆盖更新的失败；不同音质的样本只作明确标注的估算。
     static Selection selection_score(const std::string& quality, const Health* health,
                                      const Timing* exact, const Timing* fallback, unsigned long long now) {
-        (void)now;
         Selection out;
         out.quality = quality;
         if (quality.empty()) { out.availability = 3; return out; }
         // 样本失败影响平台排名；单曲错误和未完成检测不能判定整个平台失效。
-        const bool failed_check = health && health->state == 3 &&
+        const bool failed_check = health && health->state == 3 && health->failed_samples >= 2 &&
             health->quality == quality && (!exact || exact->verified_revision <= health->checked_revision);
-        const bool passed = (exact && exact->verified) || (health && health->state == 2 && health->quality == quality);
-        out.availability = failed_check ? 2 : passed ? 0 : 1;
+        const bool passed = !failed_check && ((exact && exact->verified) || (health && health->state == 2 && health->quality == quality));
+        out.availability = failed_check && now < health->retry_at ? 2 : passed ? 0 : 1;
         // 先比较同一口径的样本延迟，不能把一个源的首段解码时间与另一个的 64 KiB 下载直接混排。
         if (exact && exact->load_ms > 0) { out.latency_ms = exact->load_ms; out.estimated = exact->cached; }
         else if (health && health->state == 2 && health->load_ms > 0) {
@@ -1676,6 +1681,7 @@ public:
                     bool playable = false;
                     std::atomic<bool> preempted{false};
                     bool timed_out = false;
+                    unsigned failed_samples = 0;
                     int resolve_ms = 0, load_ms = 0;
                     const auto begin = std::chrono::steady_clock::now();
                     {
@@ -1693,6 +1699,24 @@ public:
                             load_ms = elapsed_ms(begin);
                             if (!playable) error = probe.reason;
                         }
+                        if (!playable && !net::cancelled()) {
+                            failed_samples = 1;
+                            if (sample.alternate_info && !transient_error(error)) {
+                                const auto primary_error = error;
+                                const auto alternative = sample.alternate_info();
+                                if (!alternative.empty() && alternative != sample.info && !net::cancelled()) {
+                                    url.clear(); error.clear();
+                                    const auto alternate_begin = std::chrono::steady_clock::now();
+                                    if (s->music_url(sample.platform, q, alternative, url, error, true)) {
+                                        resolve_ms = elapsed_ms(alternate_begin);
+                                        const auto probe = net::probe_audio(url, {"User-Agent: Mozilla/5.0"}, 2500, 64 * 1024);
+                                        playable = probe.playable; load_ms = elapsed_ms(alternate_begin);
+                                        if (!playable) error = probe.reason;
+                                    }
+                                    if (!playable) { ++failed_samples; error = primary_error + "；备用样本：" + error; }
+                                }
+                            }
+                        }
                     }
                     if (stopped()) {
                         std::lock_guard<std::mutex> lock(mu_);
@@ -1709,8 +1733,17 @@ public:
                     }
                     timed_out = timed_out || transient_error(error);
                     if (preempted.load() || s->playback_waiting()) publish({0, "检测让位于播放，需要时可手动重新检测"});
-                    else publish({playable ? 2 : timed_out ? 5 : 3, playable ? "静默加载音频样本有效（最多 64 KiB）" : error.empty() ? "样本请求失败" : error,
-                                  resolve_ms, load_ms, quality});
+                    else {
+                        Health result{playable ? 2 : timed_out || failed_samples < 2 ? 5 : 3,
+                            playable ? "静默加载音频样本有效（最多 64 KiB）" : error.empty() ? "样本请求未完成" : error,
+                            resolve_ms, load_ms, quality};
+                        result.failed_samples = failed_samples;
+                        if (result.state == 3) {
+                            result.retry_at = platform::ticks() + 30000;
+                            result.reason = "两个不同样本均失败，临时排除 30 秒：" + result.reason;
+                        } else if (!playable && failed_samples < 2) result.reason = "单个样本未通过，不判定整个平台失效：" + result.reason;
+                        publish(std::move(result));
+                    }
                 }
             }
         };
@@ -1735,12 +1768,19 @@ private:
             if (error.find(word) != std::string::npos) return true;
         return false;
     }
+    static bool song_specific_error(std::string error) {
+        std::transform(error.begin(), error.end(), error.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        for (const auto* word : {"版权", "会员", "试听", "vip", "not found", "http 404", "无此歌曲"})
+            if (error.find(word) != std::string::npos) return true;
+        return false;
+    }
     static int elapsed_ms(std::chrono::steady_clock::time_point begin) {
         return int(std::clamp<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count(), 1, 300000));
     }
     // mu_ 已持有；平滑波动，取消不调用此入口，单曲失败不覆盖样本状态。
     void record_timing(const std::string& file, const std::string& platform, const std::string& quality,
-                       int resolve_ms, int load_ms, bool success, int ready_ms = 0, bool verified = false) {
+                       int resolve_ms, int load_ms, bool success, int ready_ms = 0, bool verified = false,
+                       const std::string& failed_song = {}) {
         auto& value = timings_[file][platform][quality];
         const auto smooth = [](int previous, int current) { return previous > 0 ? (previous * 3 + current + 2) / 4 : current; };
         if (success) {
@@ -1753,10 +1793,16 @@ private:
                 value.cached = false;
                 value.verified_revision = ++outcome_revision_;
                 value.failures = 0; value.failed_at = 0;
+                value.failed_songs.clear();
             }
         } else {
-            if (platform::ticks() >= value.failed_at + 60000) value.failures = 0;
+            if (platform::ticks() >= value.failed_at + 60000) { value.failures = 0; value.failed_songs.clear(); }
             value.failures = std::min(value.failures + 1, 3u); value.failed_at = platform::ticks();
+            if (!failed_song.empty() && value.failed_songs.size() < 3) value.failed_songs.insert(failed_song);
+            if (value.failed_songs.size() >= 3) {
+                platform_retry_at_[file][platform] = platform::ticks() + 60000;
+                value.failed_songs.clear();
+            }
             // 一首歌的版权、试听或格式问题不撤销已验证的其它歌曲/样本。
         }
     }
@@ -2063,7 +2109,8 @@ public:
                     song_failures_[failure_key] = {file, key, platform::ticks() + (transient ? 30000 : 600000)};
                     if (transient) platform_retry_at_[file][key] = platform::ticks() + 30000;
                 }
-                record_timing(file, key, quality, resolve_ms, 0, error.empty(), ready_ms, verified);
+                record_timing(file, key, quality, resolve_ms, 0, error.empty(), ready_ms, verified,
+                    !error.empty() && !song_specific_error(error) ? detail::md5_hex(info_json) : std::string());
                 ++revision_;
             }
         };
@@ -2145,7 +2192,7 @@ public:
         if (last.empty()) {
             if (cooling_down) last = "当前平台部分音源因临时网络错误冷却中，可稍后再播或手动重新检测";
             else if (skipped_song) last = "已跳过近期无法播放这首歌曲的音源，可稍后重试或手动重新检测";
-            else if (excluded_failed) last = "当前平台或音质的样本失败音源已排除，请手动重新检测";
+            else if (excluded_failed) last = "当前平台或音质的两个样本均失败，音源暂时冷却；可稍后重试或手动重新检测";
             else if (!smart_switch) last = fixed.file.empty() ? "没有可固定使用的音源" :
                 "固定音源「" + fixed.name + "」不支持当前平台或音质；可手动重新检测或开启智能切换";
         }
