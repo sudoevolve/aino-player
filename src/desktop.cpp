@@ -153,6 +153,7 @@ public:
         if (!settings.enabled) { close(); first_.clear(); second_.clear(); return moved; }
         if (!handle_ && ticks() < retry_at_) return moved;
         if (!create()) { retry_at_ = ticks() + 5000; return moved; }
+        set_restack_waker(settings.topmost || settings.placement);
         scale_ = std::clamp(scale, 0.75f, 4.0f);
 #ifdef _WIN32
         // 歌词可独立于主窗口移动，使用歌词所在显示器的有效 DPI。
@@ -233,6 +234,7 @@ public:
         return moved;
     }
     void close(bool final = false) {
+        set_restack_waker(false);
 #ifdef _WIN32
         if (handle_) DestroyWindow(handle_); handle_ = nullptr;
         if (bitmap_) { SelectObject(dc_, original_); DeleteObject(bitmap_); bitmap_ = nullptr; }
@@ -269,16 +271,38 @@ private:
     float scale_ = 1;
     bool moved_ = false, exposed_ = true;
     std::atomic<bool> dragging_{false};
-    unsigned long long layout_at_ = 0, retry_at_ = 0;
+    unsigned long long layout_at_ = 0, retry_at_ = 0, restack_at_ = 0;
     std::string first_, second_;
     LyricOverlayProgress progress_;
 #ifdef _WIN32
+    static constexpr UINT_PTR kRestackTimerHint = 0xA10;
+    inline static LyricWindow* restack_target_ = nullptr;
     HWND handle_ = nullptr;
+    UINT_PTR restack_timer_ = 0;
     HDC dc_ = nullptr;
     HBITMAP bitmap_ = nullptr;
     HGDIOBJ original_ = nullptr;
     uint8_t* pixels_ = nullptr;
     int buffer_w_ = 0, buffer_h_ = 0;
+    static VOID CALLBACK restack_timer_proc(HWND, UINT, UINT_PTR timer_id, DWORD) {
+        auto* self = restack_target_;
+        if (!self || timer_id != self->restack_timer_ || !self->handle_ ||
+            (!self->settings.topmost && !self->settings.placement)) return;
+        SetWindowPos(self->handle_, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        self->restack_at_ = ticks();
+    }
+    void set_restack_waker(bool enabled) {
+        if (enabled && !restack_timer_) {
+            restack_target_ = this;
+            restack_timer_ = SetTimer(nullptr, kRestackTimerHint, 300, restack_timer_proc);
+            if (!restack_timer_) restack_target_ = nullptr;
+        } else if (!enabled && restack_timer_) {
+            KillTimer(nullptr, restack_timer_);
+            restack_timer_ = 0;
+            if (restack_target_ == this) restack_target_ = nullptr;
+        }
+    }
     static LRESULT CALLBACK procedure(HWND window, UINT message, WPARAM w, LPARAM l) {
         auto* self = reinterpret_cast<LyricWindow*>(GetWindowLongPtrW(window, GWLP_USERDATA));
         if (message == WM_NCCREATE) {
@@ -303,6 +327,7 @@ private:
         return DefWindowProcW(window, message, w, l);
     }
 #else
+    void set_restack_waker(bool) {}
     Display* display_ = nullptr;
     ::Window handle_ = 0;
     GC gc_ = nullptr;
@@ -364,7 +389,7 @@ private:
         }
         fd_.store(ConnectionNumber(display_));
 #endif
-        error.clear(); exposed_ = true; layout_at_ = 0; width_ = height_ = 0; return true;
+        error.clear(); exposed_ = true; layout_at_ = 0; restack_at_ = 0; width_ = height_ = 0; return true;
     }
     struct Bounds { int x = 0, y = 0, w = 0, h = 0, panel_x = 0, panel_y = 0, panel_w = 0, panel_h = 0, anchor = 0; };
     Bounds cached_bounds_;
@@ -447,20 +472,33 @@ private:
         y = std::clamp(y, area.y, area.y + std::max(0, area.h - h));
         const bool resized = w != width_ || h != height_;
         if (resized) exposed_ = true;
+        const auto now = ticks();
+        const bool keep_above = settings.topmost || settings.placement;
+        const bool restack = keep_above && now >= restack_at_ + 300;
         bool stack_changed = false;
 #ifdef _WIN32
         stack_changed = bool(GetWindowLongPtrW(handle_, GWL_EXSTYLE) & WS_EX_TOPMOST) != (settings.topmost || settings.placement);
 #endif
-        if (x != x_ || y != y_ || resized || stack_changed) {
+        const bool geometry_changed = x != x_ || y != y_ || resized || stack_changed;
+        if (geometry_changed) {
             x_ = x; y_ = y; width_ = w; height_ = h;
 #ifdef _WIN32
-            SetWindowPos(handle_, (settings.topmost || settings.placement) ? HWND_TOPMOST : HWND_NOTOPMOST, x, y, w, h, SWP_NOACTIVATE);
+            SetWindowPos(handle_, keep_above ? HWND_TOPMOST : HWND_NOTOPMOST, x, y, w, h,
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER);
 #else
             XMoveResizeWindow(display_, handle_, x, y, w, h);
-            if (settings.topmost || settings.placement) XRaiseWindow(display_, handle_);
             XFlush(display_);
 #endif
         }
+        if (restack) {
+#ifdef _WIN32
+            SetWindowPos(handle_, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+#else
+            XRaiseWindow(display_, handle_); XFlush(display_);
+#endif
+            restack_at_ = now;
+        } else if (!keep_above) restack_at_ = now;
         return resized;
     }
     void begin_drag(int x, int y) {
