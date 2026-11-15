@@ -5,6 +5,7 @@
 #include <fstream>
 #include <sstream>
 #include <tuple>
+#include <set>
 #ifdef _WIN32
 #include <malloc.h>
 #include <winsock2.h>
@@ -22,6 +23,7 @@
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 #include <X11/Xutil.h>
+#include <X11/keysym.h>
 #include <dlfcn.h>
 #include <poll.h>
 #ifdef __GLIBC__
@@ -538,8 +540,10 @@ private:
 // 拖拽源可随时关闭窗口；只忽略独立拖放连接上的 BadWindow，其他连接仍使用原处理器。
 std::atomic<Display*> drop_error_display{nullptr};
 std::atomic<XErrorHandler> previous_x_error{nullptr};
+std::atomic<bool> shortcut_conflict{false};
 int drop_x_error(Display* display, XErrorEvent* event) {
     if (display == drop_error_display.load() && event->error_code == BadWindow) return 0;
+    if (display == drop_error_display.load() && event->error_code == BadAccess) { shortcut_conflict.store(true); return 0; }
     const auto previous = previous_x_error.load();
     return previous ? previous(display, event) : 0;
 }
@@ -584,6 +588,14 @@ struct Desktop::Impl {
     static LRESULT CALLBACK procedure(HWND window, UINT message, WPARAM w, LPARAM l) {
         auto* self = static_cast<Impl*>(GetPropW(window, L"AinoPlayerDesktop"));
         if (!self) return DefWindowProcW(window, message, w, l);
+        if (message == WM_HOTKEY && w >= 0xA100 && w < 0xA104) {
+            const MediaAction actions[]{MediaAction::Toggle, MediaAction::Previous, MediaAction::Next, MediaAction::ToggleLyrics};
+            self->queue->push({actions[w - 0xA100]}); return 0;
+        }
+        if (message == WM_POWERBROADCAST) {
+            if (w == PBT_APMSUSPEND) self->queue->push({MediaAction::Suspend});
+            else if (w == PBT_APMRESUMEAUTOMATIC) self->queue->push({MediaAction::ResumeSystem});
+        }
         if (message == WM_DROPFILES) {
             const auto drop = reinterpret_cast<HDROP>(w);
             std::vector<std::string> files;
@@ -723,6 +735,7 @@ struct Desktop::Impl {
     unsigned long long drop_deadline = 0;
     int drop_version = 0;
     bool drop_supported = false, drop_waiting = false;
+    std::set<unsigned int> held_shortcuts;
     void drop_reply(Atom message, bool accepted) {
         if (!drops || !drop_source) return;
         XEvent reply{}; reply.xclient.type = ClientMessage; reply.xclient.display = drops;
@@ -732,6 +745,17 @@ struct Desktop::Impl {
         if (message == xdnd_status) reply.xclient.data.l[4] = accepted ? copy_action : 0;
         else if (drop_version >= 5) reply.xclient.data.l[2] = accepted ? copy_action : 0;
         XSendEvent(drops, drop_source, False, NoEventMask, &reply); XFlush(drops);
+    }
+    void poll_power() {
+        if (!power_bus) return;
+        dbus_connection_read_write(power_bus, 0);
+        while (auto* message = dbus_connection_pop_message(power_bus)) {
+            if (dbus_message_is_signal(message, "org.freedesktop.login1.Manager", "PrepareForSleep")) {
+                dbus_bool_t sleeping = false;
+                if (dbus_message_get_args(message, nullptr, DBUS_TYPE_BOOLEAN, &sleeping, DBUS_TYPE_INVALID)) queue->push({sleeping ? MediaAction::Suspend : MediaAction::ResumeSystem});
+            }
+            dbus_message_unref(message);
+        }
     }
     void start_drops() {
         drops = XOpenDisplay(nullptr); if (!drops) return;
@@ -746,12 +770,34 @@ struct Desktop::Impl {
         XChangeProperty(drops, window, proxy, XA_WINDOW, 32, PropModeReplace, reinterpret_cast<const unsigned char*>(&drop_proxy), 1);
         XChangeProperty(drops, window, aware, XA_ATOM, 32, PropModeReplace, reinterpret_cast<const unsigned char*>(&version), 1);
         XChangeProperty(drops, drop_proxy, aware, XA_ATOM, 32, PropModeReplace, reinterpret_cast<const unsigned char*>(&version), 1);
+        if (env("XDG_SESSION_TYPE") != "wayland") {
+            const KeySym keys[]{XK_space, XK_Left, XK_Right, XK_l};
+            const unsigned int modifiers[]{0, LockMask, Mod2Mask, LockMask | Mod2Mask};
+            for (auto key : keys) for (unsigned int extra : modifiers)
+                XGrabKey(drops, XKeysymToKeycode(drops, key), ControlMask | Mod1Mask | extra, DefaultRootWindow(drops), False, GrabModeAsync, GrabModeAsync);
+            XSync(drops, False);
+            if (shortcut_conflict.exchange(false)) queue->push({MediaAction::ShortcutError, 0, "部分全局快捷键被其他程序占用，可使用系统媒体键"});
+        }
         XFlush(drops);
     }
     void poll_drops() {
+        poll_power();
         while (drops && XPending(drops)) {
             XEvent event{}; XNextEvent(drops, &event);
-            if (event.type == ClientMessage) {
+            if (event.type == KeyRelease) {
+                XEvent following{};
+                if (XPending(drops)) { XPeekEvent(drops, &following); if (following.type == KeyPress && following.xkey.keycode == event.xkey.keycode && following.xkey.time == event.xkey.time) continue; }
+                held_shortcuts.erase(event.xkey.keycode);
+            } else if (event.type == KeyPress) {
+                if (!held_shortcuts.insert(event.xkey.keycode).second) continue;
+                const auto key = XLookupKeysym(&event.xkey, 0);
+                if ((event.xkey.state & (ControlMask | Mod1Mask | ShiftMask | Mod4Mask)) == (ControlMask | Mod1Mask)) {
+                    if (key == XK_space) queue->push({MediaAction::Toggle});
+                    else if (key == XK_Left) queue->push({MediaAction::Previous});
+                    else if (key == XK_Right) queue->push({MediaAction::Next});
+                    else if (key == XK_l || key == XK_L) queue->push({MediaAction::ToggleLyrics});
+                }
+            } else if (event.type == ClientMessage) {
                 const auto& data = event.xclient.data.l;
                 if (event.xclient.format != 32) continue;
                 if (event.xclient.message_type == xdnd_enter) {
@@ -804,6 +850,7 @@ struct Desktop::Impl {
         XCloseDisplay(drops); drops = nullptr;
         XSetErrorHandler(previous_x_error.load()); drop_error_display.store(nullptr);
     }
+    DBusConnection* power_bus = nullptr;
     DBusConnection* bus = nullptr; // 只由 worker 使用和关闭。
     std::string bus_name, watcher;
     bool registered = false;
@@ -1099,9 +1146,14 @@ struct Desktop::Impl {
         if (!available && tray.exchange(available) && hidden.load()) queue->push({MediaAction::Show}); else tray.store(available);
     }
     void run() {
-        start_drops();
-        struct Cleanup { Impl* self; ~Cleanup() { self->stop_drops(); } } cleanup{this};
         dbus_threads_init_default();
+        power_bus = dbus_bus_get_private(DBUS_BUS_SYSTEM, nullptr);
+        if (power_bus) {
+            dbus_connection_set_exit_on_disconnect(power_bus, false);
+            dbus_bus_add_match(power_bus, "type='signal',sender='org.freedesktop.login1',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'", nullptr);
+        }
+        start_drops();
+        struct Cleanup { Impl* self; ~Cleanup() { self->stop_drops(); if (self->power_bus) { dbus_connection_close(self->power_bus); dbus_connection_unref(self->power_bus); self->power_bus = nullptr; } } } cleanup{this};
         bus = dbus_bus_get_private(DBUS_BUS_SESSION, nullptr);
         if (!bus) { while (!stopping.load()) { poll_drops(); if (lyrics.event_ready()) queue->notify(); sleep_ms(lyrics.event_wait_ms()); } return; }
         dbus_connection_set_exit_on_disconnect(bus, false);
@@ -1409,6 +1461,10 @@ void Desktop::start(void* window, void* display, unsigned long xid, std::functio
     impl_->previous = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(impl_->window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(Impl::procedure)));
     if (!impl_->previous) { RemovePropW(impl_->window, L"AinoPlayerDesktop"); RemovePropW(impl_->window, widen("AinoPlayerScope" + instance_scope()).c_str()); return; }
     DragAcceptFiles(impl_->window, TRUE);
+    const UINT shortcut_keys[]{VK_SPACE, VK_LEFT, VK_RIGHT, 'L'};
+    bool conflict = false;
+    for (int i = 0; i < 4; ++i) if (!RegisterHotKey(impl_->window, 0xA100 + i, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, shortcut_keys[i])) conflict = true;
+    if (conflict) impl_->queue->push({MediaAction::ShortcutError, 0, "部分全局快捷键被其他程序占用，可使用系统媒体键"});
     impl_->taskbar_created = RegisterWindowMessageW(L"TaskbarCreated"); impl_->sync_tray(); impl_->start_media();
 #else
     impl_->display = static_cast<Display*>(display); impl_->window = xid;
@@ -1419,6 +1475,7 @@ void Desktop::stop() {
     if (!impl_) return;
     { std::lock_guard<std::mutex> lock(impl_->queue->mutex); impl_->queue->closed = true; impl_->queue->wake = {}; }
 #ifdef _WIN32
+    if (impl_->window) for (int i = 0; i < 4; ++i) UnregisterHotKey(impl_->window, 0xA100 + i);
     if (impl_->controls) {
         try { impl_->controls.ButtonPressed(impl_->button_token); impl_->controls.PlaybackPositionChangeRequested(impl_->seek_token); impl_->controls.IsEnabled(false); } catch (...) {}
         impl_->controls = nullptr;

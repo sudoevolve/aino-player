@@ -71,13 +71,14 @@ public:
     bool open_stream(std::shared_ptr<Stream> stream);
     /** @brief 为当前音频预备本地下一曲，在音频回调内跨越边界，无需等待 UI 帧。 */
     bool queue_next(const std::string& path);
+    bool queue_next_stream(std::shared_ptr<Stream> stream);
     void cancel_next();
     bool take_transition();
     void close();
     /** @brief 在所属线程退出 COM 前释放声音及音频引擎；普通切歌仍使用 close。 */
     void shutdown();
     bool play();
-    void pause();
+    void pause(bool fade = true);
     void resume();
     bool is_playing() const;
     bool is_ended() const;
@@ -89,6 +90,9 @@ public:
     void seek_ms(long long ms);
     void set_volume(int volume);
     void set_normalization(bool enabled);
+    void set_smoothing(bool enabled);
+    void set_sleep_gain(float gain);
+    void set_device_pause(bool enabled);
     void set_equalizer(const EqualizerSettings& settings);
     /** @brief 离线引擎按 48 kHz 双声道 float 输出；普通设备模式不能调用。 */
     bool render(float* samples, size_t frames);

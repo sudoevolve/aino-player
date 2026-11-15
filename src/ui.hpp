@@ -1834,9 +1834,13 @@ static void storage_settings(Ctx& c, float x, float w, float y) {
     c.ui.subheading("收藏与歌单备份", {x, data.bottom() + 64, w, 24});
     c.ui.input(&c.model.ui.library_transfer_path, {x, data.bottom() + 102, w, 30}, Style().font(11).hint("JSON 备份或本地 M3U / M3U8 完整路径"));
     if (c.ui.button("导出全部", {x, data.bottom() + 144, 90, 28}, Style().font(11))) library_export(false);
-    if (c.ui.button("合并恢复", {x + 104, data.bottom() + 144, 90, 28}, Style().font(11))) library_restore();
+    if (c.ui.button("预览恢复", {x + 104, data.bottom() + 144, 90, 28}, Style().font(11))) library_restore();
     if (c.ui.toggle(&c.model.ui.watch_folders, {x + w - 42, data.bottom() + 196, 38, 22})) c.model.ui.config_dirty = true;
     c.ui.muted_text("自动刷新文件夹歌单（每 30 秒检查，未变化的标签不重读）", {x, data.bottom() + 196, w - 58, 36}, Style().font(10.5f).wrap_text());
+    c.ui.draw_text("自动轮换备份（最多 8 份）", {x, data.bottom() + 250, w - 60, 24}, c.th.label, Style().font(11));
+    if (c.ui.toggle(&c.model.ui.auto_backup, {x + w - 42, data.bottom() + 250, 38, 22})) c.model.ui.config_dirty = true;
+    if (c.ui.button("打开备份目录", {x, data.bottom() + 286, 120, 28}, Style().font(11))) show_backup_directory();
+    c.ui.muted_text("自动备份不包含账号凭据；恢复前可选择内容。", {x, data.bottom() + 324, w, 24}, Style().font(10.5f));
 }
 
 static void clear_data_dialog(Ctx& c) {
@@ -1952,9 +1956,15 @@ static void tab_downloads(Ctx& c) {
         if (c.ui.button(d.done ? "文件位置" : d.failed ? "重试" : "取消", action, Style().font(10.5f))) {
             if (d.done) reveal_download(entry.first); else if (d.failed) retry_download(entry.first); else cancel_download(entry.first);
         }
+        if (d.done && !d.publishing) {
+            const float by = row.y + 53;
+            if (c.ui.button("播放", {row.x + 4, by, 52, 21}, Style().ghost().font(10))) play_download(entry.first);
+            if (c.ui.button("加入队列", {row.x + 62, by, 70, 21}, Style().ghost().font(10))) play_download(entry.first, true);
+            if (c.ui.button("保存歌单", {row.x + 138, by, 70, 21}, Style().ghost().font(10))) save_download_playlist(entry.first);
+        }
         const float tw = std::max(20.0f, row.w - 100);
         c.ui.draw_text(ellipsize(c.ui, d.name, tw, 12), {row.x + 4, row.y + 9, tw, 20}, c.th.label, Style().font(12));
-        const std::string status = d.done ? "已完成" : d.failed ? d.err : d.publishing ? "正在保存" : d.queued ? "等待下载" : "正在下载 " + std::to_string(d.percent) + "%";
+        const std::string status = d.publishing ? "正在保存文件与标签" : d.done ? (d.preview ? "试听片段（不作为完整离线版本）" : "已完成") : d.failed ? d.err : d.queued ? "等待下载" : "正在下载 " + std::to_string(d.percent) + "%";
         c.ui.draw_text(ellipsize(c.ui, status, tw, 10.5f), {row.x + 4, row.y + 34, tw, 18}, d.failed ? c.th.destructive : c.th.label2, Style().font(10.5f));
         c.ui.tooltip({row.x, row.y + 30, tw, 23}, status);
         if (!d.done && !d.failed) { c.ui.fill_rect({row.x + 4, row.y + 60, tw, 3}, c.th.fill3, 1); c.ui.fill_rect({row.x + 4, row.y + 60, tw * std::clamp(d.percent, 0, 100) / 100.0f, 3}, c.th.tint, 1); }
@@ -2186,7 +2196,7 @@ static void tab_settings(Ctx& c) {
     auto& selected = c.model.ui.settings_tab;
     const bool changed = c.ui.segmented({"通用", "账号", "播放", "下载", "数据", "关于"}, &selected, {x, 78, w, 32}, Style().font(11.5f));
     if (changed) c.model.ui.update_settings = false;
-    const float content_height = selected == 4 ? 744.0f : selected == 5 ? 510.0f : selected == 3 ? 350.0f : selected == 2 ? (c.model.ui.audio_effects_open ? 720.0f : 760.0f) : selected == 1 ? 360.0f : c.model.ui.overlay_settings ? 1090.0f : c.model.ui.update_settings ? 410.0f + update_notes(c, x, w, 0, false) : 752.0f;
+    const float content_height = selected == 4 ? 880.0f : selected == 5 ? 510.0f : selected == 3 ? 500.0f : selected == 2 ? (c.model.ui.audio_effects_open ? 720.0f : 1210.0f) : selected == 1 ? 360.0f : c.model.ui.overlay_settings ? 1090.0f : c.model.ui.update_settings ? 410.0f + update_notes(c, x, w, 0, false) : 752.0f;
     const Rect viewport{x, 132, w, c.bar_y - 148};
     if (changed) c.ui.scroll_to_index(viewport, 0, content_height, 1);
     c.ui.scroll(viewport, 1, content_height, [&](int, const Rect& area) {
@@ -2217,6 +2227,16 @@ static void tab_settings(Ctx& c) {
             settings_rule(c, metadata, metadata.y + 62);
             settings_label(c, "内嵌歌词", {x, metadata.y + 62, w, 62});
             if (c.ui.toggle(&c.model.ui.settings.embed_lyrics, {x + w - 54, metadata.y + 82, 38, 22})) c.model.ui.config_dirty = true;
+            const float target_y = metadata.bottom() + 40;
+            c.ui.draw_text("下载完成后保存到", {x, target_y, 150, 28}, c.th.label, Style().font(12));
+            std::vector<std::string> names{"不自动保存", "已下载音乐"}, keys{"", "downloads"};
+            for (const auto& playlist : c.model.library.playlists)
+                if (playlist.key != "favorites" && playlist.key != "downloads" && playlist.local_folder.empty() && !playlist.online()) { names.push_back(playlist.name); keys.push_back(playlist.key); }
+            int target = 0;
+            for (size_t i = 0; i < keys.size(); ++i) if (keys[i] == c.model.ui.download_playlist_key) target = int(i);
+            if (c.ui.select(names, &target, {x + w - 200, target_y, 184, 28}, Style().font(11))) { c.model.ui.download_playlist_key = keys[size_t(target)]; c.model.ui.config_dirty = true; }
+            if (c.ui.toggle(&c.model.ui.prefer_downloaded, {x + w - 54, target_y + 58, 38, 22})) c.model.ui.config_dirty = true;
+            c.ui.draw_text("在线播放优先使用已下载的完整文件", {x + 16, target_y + 54, w - 82, 30}, c.th.label, Style().font(11));
             return;
         }
         if (selected == 2) {
@@ -2263,6 +2283,17 @@ static void tab_settings(Ctx& c) {
             c.ui.muted_text(audio::decoder_info(), {x + 2, dy + 152, w - 4, 36}, Style().font(10.5f).wrap_text().top());
             if (c.ui.button("播放诊断", {x, dy + 210, 94, 30}, Style().font(11))) error_details = {true, "播放诊断", playback_diagnostics()};
             c.ui.muted_text("查看播放阶段和缓冲情况，可复制用于反馈。报告不含链接、Cookie 或本地路径。", {x + 110, dy + 210, w - 110, 40}, Style().font(10.5f).wrap_text().top());
+            const Rect behavior{x, y + 730, w, 372};
+            settings_group(c, "播放行为", behavior);
+            bool* fields[]{&c.model.ui.smooth_playback, &c.model.ui.sleep_fade, &c.model.ui.pause_on_disconnect, &c.model.ui.pause_on_suspend, &c.model.ui.resume_after_suspend};
+            const char* labels[]{"播放 / 暂停短淡入淡出（100 毫秒）", "定时停止前 5 秒淡出", "耳机断开或输出变化时暂停", "系统休眠时暂停", "唤醒后恢复此前的播放"};
+            for (int i = 0; i < 5; ++i) {
+                const float top = behavior.y + i * 62;
+                settings_label(c, labels[i], {x, top, w - 60, 62});
+                if (c.ui.toggle(fields[i], {x + w - 54, top + 20, 38, 22})) c.model.ui.config_dirty = true;
+                settings_rule(c, behavior, top + 62);
+            }
+            if (c.ui.button("快捷键说明", {x + 16, behavior.y + 326, 118, 28}, Style().font(11))) c.model.ui.shortcuts_open = true;
             return;
         }
         if (c.model.ui.overlay_settings) { floating_lyrics_settings(c, x, w, y); return; }
@@ -2494,17 +2525,24 @@ static void draw_toast(Ctx& c) {
     }
     Style s;
     s.font_size = 11.5f;
-    const float max_w = 560.0f;
+    const auto undo = undo_action_label();
+    const float action_w = undo.empty() ? 0.0f : 66.0f;
+    const float max_w = std::max(60.0f, std::min(560.0f, c.W - 72.0f - action_w));
     const float tw = std::min(max_w, c.ui.text_width(c.model.ui.toast, 11.5f));
-    const float w = tw + 32.0f;
+    const float w = tw + 32.0f + action_w;
     const Rect box{c.W * 0.5f - w * 0.5f, c.bar_y - 52.0f, w, 34.0f};
     c.ui.drop_shadow(box, 8.0f, 6.0f, Color(0, 0, 0, 60), 0.5f);
     const bool dk = c.model.ui.dark;
     c.ui.fill_rect(box, dk ? Color(236, 236, 240, 242) : Color(28, 28, 30, 235), 8.0f);
     s.align = Align::Center;
     s.valign = VAlign::Middle;
-    c.ui.draw_text(ellipsize(c.ui, c.model.ui.toast, max_w, 11.5f), box,
+    c.ui.draw_text(ellipsize(c.ui, c.model.ui.toast, max_w, 11.5f), {box.x, box.y, box.w - action_w, box.h},
                    dk ? Color(24, 24, 26, 245) : Color(255, 255, 255, 240), s);
+    if (!undo.empty()) {
+        const Rect action{box.right() - 68, box.y + 4, 60, 26};
+        if (c.ui.button("撤销", action, Style().font(11))) undo_last_action();
+        c.ui.tooltip(action, undo + " · Ctrl+Z");
+    }
 }
 
 // =============================================================================
@@ -2577,11 +2615,11 @@ static void lyrics_panel(Ctx& c, const Rect& box) {
     if (has_translation && c.ui.button(show_translation ? "译文：开" : "译文：关", {box.right() - 140, box.bottom() - 28, 72, 24}, Style().ghost().font(10))) show_translation = !show_translation;
     const Rect tools_button{box.right() - 64, box.bottom() - 28, 54, 24};
     if (c.ui.button(c.model.ui.lyric_tools ? "收起" : "校准", tools_button, Style().ghost().font(10))) c.model.ui.lyric_tools = !c.model.ui.lyric_tools;
-    const float extra = c.model.ui.lyric_tools ? 126.0f : 0.0f;
+    const float extra = c.model.ui.lyric_tools ? 162.0f : 0.0f;
     const Rect area{box.x + 8, box.y + 38, box.w - 16, std::max(20.0f, box.h - 70 - extra)};
     const int offset = lyric_offset();
     if (c.model.ui.lyric_tools) {
-        const float x = box.x + 16, y = box.bottom() - 150, w = box.w - 32;
+        const float x = box.x + 16, y = box.bottom() - 186, w = box.w - 32;
         char label[80]; std::snprintf(label, sizeof label, "歌词偏移 %+.1f 秒（正数延后）", offset / 1000.0);
         c.ui.muted_text(label, {x, y, w, 20}, Style().font(10));
         if (c.ui.button("提前", {x, y + 26, 62, 25}, Style().font(10))) change_lyric_offset(-500);
@@ -2593,6 +2631,10 @@ static void lyrics_panel(Ctx& c, const Rect& box) {
         if (c.ui.button("恢复默认", {x + 118, y + 94, 80, 25}, Style().font(10))) use_local_lyrics(true);
         auto refresh = Style().ghost().font(10); refresh.disabled = loading;
         if (c.ui.button("刷新", {x + 206, y + 94, w - 206, 25}, refresh)) request_current_lyrics(true);
+        if (c.ui.button("搜索并匹配歌词…", {x, y + 128, w, 25}, Style().font(10))) {
+            c.model.ui.lyric_match_open = true; c.model.ui.lyric_match_query = c.s.now_title + " " + c.s.now_artist;
+            c.model.ui.lyric_match_candidates.clear(); search_lyric_matches();
+        }
     }
 
     // 歌词属于"当前正在播的这首"才算数；切歌瞬间新旧对不上时先显示加载态
@@ -2819,10 +2861,120 @@ static void notifications_dialog(Ctx& c) {
     if (c.ui.button("清空", {box.right() - 96, box.bottom() - 44, 76, 28}, Style().ghost().font(11))) clear_notifications();
 }
 
+static void lyric_match_dialog(Ctx& c) {
+    auto& state = c.model.ui;
+    const Rect box = Rect::centered(c.W / 2, c.H / 2, std::min(620.0f, c.W - 40), std::min(520.0f, c.H - 44));
+    c.ui.dialog("手动匹配歌词", "选择正确录音版本；此选择保存在当前歌曲上", &state.lyric_match_open, box);
+    if (!state.lyric_match_open) return;
+    if (state.lyric_match_uid != c.s.now_uid) { state.lyric_match_open = false; return; }
+    c.ui.search_field(&state.lyric_match_query, {box.x + 20, box.y + 84, box.w - 124, 30}, Style().font(11));
+    auto search = Style().font(11); search.disabled = state.lyric_match_loading;
+    if (c.ui.button("搜索", {box.right() - 96, box.y + 84, 76, 30}, search)) search_lyric_matches();
+    if (!state.lyric_match_error.empty()) c.ui.muted_text(ellipsize(c.ui, state.lyric_match_error, box.w - 40, 10.5f), {box.x + 20, box.y + 120, box.w - 40, 24}, Style().font(10.5f));
+    std::string chosen;
+    c.ui.scroll({box.x + 20, box.y + 148, box.w - 40, box.h - 210}, int(state.lyric_match_candidates.size()), 54, [&](int i, const Rect& row) {
+        const auto& v = state.lyric_match_candidates[size_t(i)];
+        const auto detail = v.artist + " · " + v.album + " · " + music::version_label(v.title) + " · " + std::to_string(v.duration_ms / 1000) + " 秒";
+        if (c.ui.item(ellipsize(c.ui, v.title, row.w - 20, 12), ellipsize(c.ui, detail, row.w - 20, 10), "", row, Style().font(12))) chosen = v.id;
+        c.ui.tooltip(row, v.title + "\n" + detail);
+    });
+    if (!chosen.empty()) select_lyric_match(chosen);
+    if (c.ui.button("恢复自动匹配", {box.x + 20, box.bottom() - 46, 128, 28}, Style().font(11))) select_lyric_match("");
+    if (state.lyric_match_loading) c.ui.spinner({box.right() - 44, box.bottom() - 44, 22, 22});
+}
+static void restore_preview_dialog(Ctx& c) {
+    auto& state = c.model.ui;
+    const Rect box = Rect::centered(c.W / 2, c.H / 2, std::min(560.0f, c.W - 40), 438);
+    c.ui.dialog("恢复备份", "确认内容后再写入本机资料库", &state.restore_preview_open, box);
+    if (!state.restore_preview_open) return;
+    c.ui.draw_text(state.restore_preview, {box.x + 20, box.y + 88, box.w - 40, 86}, c.th.label2, Style().font(11).wrap_text().top());
+    bool* flags[] = {&state.restore_favorites, &state.restore_playlists, &state.restore_settings, &state.restore_equalizer, &state.restore_sources};
+    const char* labels[] = {"收藏（与现有内容合并）", "歌单和歌词偏好（覆盖相同标识的歌单）", "播放与界面设置", "均衡器", "已安装音源的手动顺序"};
+    for (int i = 0; i < 5; ++i) c.ui.checkbox(flags[i], labels[i], {box.x + 20, box.y + 184 + i * 32, box.w - 40, 26}, Style().font(11));
+    if (c.ui.button("确认恢复", {box.right() - 124, box.bottom() - 48, 104, 30}, Style().primary().font(11))) confirm_library_restore();
+    if (c.ui.button("取消", {box.x + 20, box.bottom() - 48, 80, 30}, Style().font(11))) state.restore_preview_open = false;
+}
+static void shortcuts_dialog(Ctx& c) {
+    const Rect box = Rect::centered(c.W / 2, c.H / 2, std::min(580.0f, c.W - 40), 454);
+    c.ui.dialog("快捷键", "输入框内保留系统文字编辑快捷键", &c.model.ui.shortcuts_open, box);
+    if (!c.model.ui.shortcuts_open) return;
+    const char* rows[] = {"Ctrl+K     快速查找本机歌曲、歌单、歌手 / 转到在线搜索", "Ctrl+F     当前歌单筛选 / 在线搜索框", "Ctrl+O     打开本地音乐", "Ctrl+Z     撤销最近的队列、收藏或歌单操作（输入框外）", "Esc          依次关闭输入焦点、选择、面板或详情页", "Ctrl+Alt+Space / Left / Right     全局播放暂停 / 上一曲 / 下一曲", "Ctrl+Alt+L     显示或隐藏悬浮歌词"};
+    for (int i = 0; i < 7; ++i) c.ui.draw_text(rows[i], {box.x + 20, box.y + 90 + i * 38, box.w - 40, 32}, c.th.label2, Style().font(11).wrap_text());
+#ifndef _WIN32
+    c.ui.muted_text("X11 支持全局组合键；Wayland 可在桌面键盘设置中绑定 MPRIS 媒体控制。", {box.x + 20, box.bottom() - 96, box.w - 40, 34}, Style().font(10).wrap_text());
+#endif
+    if (c.ui.button("关闭", {box.right() - 100, box.bottom() - 44, 80, 28}, Style().font(11))) c.model.ui.shortcuts_open = false;
+}
+struct QuickResult { music::Track track; size_t playlist = 0; int kind = 0; std::string title, detail; };
+static void quick_search_dialog(Ctx& c) {
+    auto& state = c.model.ui;
+    const Rect box = Rect::centered(c.W / 2, c.H / 2, std::min(620.0f, c.W - 40), std::min(520.0f, c.H - 44));
+    c.ui.dialog("快速查找", "↑↓ 选择，Enter 打开；Ctrl+Enter 搜索在线歌曲", &state.quick_open, box);
+    if (!state.quick_open) return;
+    c.ui.search_field(&state.quick_query, {box.x + 20, box.y + 84, box.w - 40, 32}, Style().font(12).hint("歌曲、歌单或歌手"));
+    static std::string query;
+    static unsigned long long library_revision = ~0ULL, queue_revision = ~0ULL;
+    static std::vector<QuickResult> results;
+    static int cursor = 0;
+    if (query != state.quick_query || library_revision != c.model.library_revision || queue_revision != c.s.tracks_version) {
+        query = state.quick_query; library_revision = c.model.library_revision; queue_revision = c.s.tracks_version; results.clear(); cursor = 0;
+        const auto q = music::text::lower_ascii(music::text::trim(query));
+        const auto match = [&](const std::string& text) { return q.empty() || music::text::lower_ascii(text).find(q) != std::string::npos; };
+        std::set<std::string> seen, artists;
+        for (size_t i = 0; i < c.model.library.playlists.size() && results.size() < 60; ++i) {
+            const auto& p = c.model.library.playlists[i]; if (match(p.name)) results.push_back({{}, i, 1, p.name, "本地歌单 · " + std::to_string(p.tracks.size()) + " 首"});
+        }
+        const auto take = [&](const music::Track& t) {
+            if (results.size() >= 60 || t.variants.empty()) return;
+            if (match(t.title + " " + t.artist + " " + t.album) && seen.insert(track_uid(t)).second) results.push_back({t, 0, 0, t.title, t.artist + " · " + t.album});
+            if (results.size() < 60 && !t.artist.empty() && match(t.artist) && artists.insert(t.artist).second) results.push_back({t, 0, 2, t.artist, "歌手"});
+        };
+        for (const auto& t : c.s.tracks) take(t);
+        for (const auto& p : c.model.library.playlists) { for (const auto& t : p.tracks) { take(t); if (results.size() >= 60) break; } if (results.size() >= 60) break; }
+        for (const auto& t : c.model.library.recent) take(t);
+    }
+    int chosen = -1;
+    const Rect list{box.x + 20, box.y + 128, box.w - 40, box.h - 190};
+    if (!results.empty() && c.ui.focused_id() == &state.quick_query) {
+        const auto& input = c.ui.input();
+        if (input.key_hit(KEY_DOWN) || input.key_hit(KEY_UP)) {
+            cursor = std::clamp(cursor + (input.key_hit(KEY_DOWN) ? 1 : -1), 0, int(results.size()) - 1);
+            c.ui.scroll_to_index(list, cursor, 48, int(results.size()));
+        }
+        if (input.key_pressed[KEY_ENTER] && !input.ctrl_of(KEY_ENTER)) chosen = cursor;
+    }
+    c.ui.scroll(list, int(results.size()), 48, [&](int i, const Rect& row) {
+        const auto& item = results[size_t(i)];
+        if (i == cursor) c.ui.fill_rect(row, c.th.tint.scaled_alpha(0.10f), 6);
+        if (c.ui.item(ellipsize(c.ui, item.title, row.w - 16, 12), ellipsize(c.ui, item.detail, row.w - 16, 10.5f), "", row, Style().font(12))) chosen = i;
+    });
+    if (chosen >= 0) {
+        const auto item = results[size_t(chosen)]; state.quick_open = false; c.ui.set_focus(nullptr);
+        if (item.kind == 1) library_open(item.playlist);
+        else if (item.kind == 2) open_track_artist(item.track);
+        else play_track(item.track);
+        return;
+    }
+    const auto online = [&] { state.query = state.quick_query; state.tab = 0; state.quick_open = false; c.ui.set_focus(&state.query); if (state.search_kind) search_playlists(); else start_search(); };
+    if (c.ui.button("搜索在线歌曲", {box.x + 20, box.bottom() - 46, 132, 30}, Style().primary().font(11))) { state.search_kind = 0; online(); }
+    if (c.ui.button("搜索在线歌单", {box.x + 164, box.bottom() - 46, 132, 30}, Style().font(11))) { state.search_kind = 1; online(); }
+    if (c.ui.focused_id() == &state.quick_query && c.ui.input().key_pressed[KEY_ENTER] && (results.empty() || c.ui.input().ctrl_of(KEY_ENTER))) { state.search_kind = 0; online(); }
+}
+
 static void compose(aino::Ui& ui, Ctx& c) {
     row_selection = nullptr;
-    if (ui.pointer_available() && !song_menu.active && !c.model.ui.close_dialog && !artist_chooser.open && !error_details.open && !c.model.ui.notifications_open &&
-        c.model.ui.remove_playlist_key.empty() && c.model.ui.clear_action == ClearAction::None && ui.input().ctrl_of('O')) choose_local_audio();
+    const bool modal = c.model.ui.close_dialog || artist_chooser.open || error_details.open || c.model.ui.notifications_open || c.model.ui.restore_preview_open || c.model.ui.lyric_match_open || c.model.ui.shortcuts_open || !c.model.ui.remove_playlist_key.empty() || c.model.ui.clear_action != ClearAction::None;
+    if (!modal && !song_menu.active && ui.input().ctrl_of('K')) { c.model.ui.quick_open = true; ui.set_focus(&c.model.ui.quick_query); }
+    if (!modal && !c.model.ui.quick_open && !song_menu.active) {
+        if (ui.input().ctrl_of('F')) { if (c.model.ui.tab == 3 && c.model.playlist.open) ui.set_focus(&c.model.ui.playlist_filter); else { c.model.ui.tab = 0; ui.set_focus(&c.model.ui.query); } }
+        if (!ui.focused_id() && ui.input().ctrl_of('Z')) undo_last_action();
+        if (!ui.focused_id() && ui.input().key_pressed[KEY_F1]) c.model.ui.shortcuts_open = true;
+        if (!ui.focused_id() && ui.input().key_pressed[KEY_ESC] && (!focused_selection || focused_selection->ids.empty())) {
+            if (c.model.ui.queue_open || c.model.ui.lyrics_open) c.model.ui.queue_open = c.model.ui.lyrics_open = false;
+            else if (c.model.ui.tab == 3 && c.model.playlist.open) playlist_close();
+        }
+    }
+    if (!modal && !c.model.ui.quick_open && ui.pointer_available() && !song_menu.active && ui.input().ctrl_of('O')) choose_local_audio();
     if (!c.model.ui.lyrics_open && g_lyr_layout.owner) { g_lyr_layout = {}; g_lyr_scroll = 0; g_lyr_cur = -1; }
     if (c.model.ui.tab == 2) { c.model.ui.tab = 1; c.model.ui.queue_open = true; c.model.ui.lyrics_open = false; }
     ui.fill_rect({0, 0, c.W, c.H}, c.th.window_bg);
@@ -2844,6 +2996,10 @@ static void compose(aino::Ui& ui, Ctx& c) {
     draw_song_menu(c);
     draw_toast(c);
     if (c.model.ui.close_dialog) close_window_dialog(c);
+    else if (c.model.ui.lyric_match_open) lyric_match_dialog(c);
+    else if (c.model.ui.restore_preview_open) restore_preview_dialog(c);
+    else if (c.model.ui.quick_open) quick_search_dialog(c);
+    else if (c.model.ui.shortcuts_open) shortcuts_dialog(c);
     else if (artist_chooser.open) artist_chooser_dialog(c);
     else if (!c.model.ui.remove_playlist_key.empty()) remove_playlist_dialog(c);
     else if (error_details.open) error_details_dialog(c);

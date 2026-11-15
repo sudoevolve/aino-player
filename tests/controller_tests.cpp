@@ -457,6 +457,13 @@ int main(int argc, char** argv) {
         check(queue_save(), "multipart queue save"); queue_load(); tick();
         check(model.playback.tracks.size() == 2 && model.playback.tracks[1].current().native_id == "202" &&
             track_uid(model.playback.tracks[0]) != track_uid(model.playback.tracks[1]), "queue reload retains part identity and current-song highlighting");
+        g_undo.clear(); queue_remove(1); undo_last_action(); tick();
+        check(model.playback.tracks.size() == 2 && model.playback.tracks[1].current().native_id == "202", "queue removal undo retains part identity and order");
+        queue_move(0, 1); undo_last_action(); tick();
+        check(model.playback.tracks[0].current().native_id == "101", "queue reorder can be undone");
+        queue_clear(); undo_last_action(); tick();
+        check(model.playback.tracks.size() == 2, "queue clear can be undone");
+        g_undo.clear();
         queue_clear(); tick();
         track.title = "业务分层回归";
         music::Variant first; first.id = "fixture";
@@ -571,6 +578,19 @@ int main(int argc, char** argv) {
         check(platform::file_size(model.ui.library_transfer_path) == backup_size, "existing backup cannot be overwritten");
         favorite_toggle(track); favorite_toggle(track); wait_library();
         check(view_model().library.contains(track), "coalesced edits apply in order without dropping toggles");
+        library_open(1); model.ui.playlist_rename = "预览期间的名称"; playlist_rename_local(); wait_library();
+        library_restore();
+        const auto restore_deadline = platform::ticks() + 4000;
+        while (!model.ui.restore_preview_open && platform::ticks() < restore_deadline) { tick(); platform::sleep_ms(5); }
+        check(model.ui.restore_preview_open && view_model().library.playlists[1].name == "预览期间的名称", "restore preview cannot write before confirmation");
+        model.ui.restore_favorites = false; model.ui.restore_playlists = true;
+        confirm_library_restore(); wait_library();
+        check(view_model().library.playlists[1].name == "重命名歌单" && view_model().library.contains(track), "selective restore replaces playlists and preserves unselected favorites");
+        model.ui.pause_on_disconnect = false; model.ui.resume_after_suspend = true;
+        check(config::save(model.ui), "new playback policies save");
+        UiState policies; config::load(policies);
+        check(!policies.pause_on_disconnect && policies.resume_after_suspend && policies.smooth_playback && policies.prefer_downloaded, "portable playback policies survive restart");
+        model.ui.pause_on_disconnect = true; model.ui.resume_after_suspend = false;
         model.ui.query = "独立的在线搜索词";
         { std::lock_guard<std::mutex> lock(g_mu); g_as.results = {track}; ++g_as.results_version; }
         tick();

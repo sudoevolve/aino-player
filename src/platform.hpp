@@ -46,7 +46,7 @@ extern char** environ;
 namespace platform {
 inline constexpr const char* audio_extensions[]{".mp3", ".flac", ".wav", ".wave", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".webm"};
 inline constexpr const char* audio_mimes[]{"audio/mpeg", "audio/flac", "audio/x-flac", "audio/wav", "audio/x-wav", "audio/mp4", "audio/x-m4a", "audio/aac", "audio/x-aac", "audio/ogg", "audio/x-vorbis+ogg", "application/ogg", "audio/opus", "audio/webm"};
-enum class MediaAction { Toggle, Play, Pause, Stop, Next, Previous, SeekRelative, SeekAbsolute, Volume, Show, Quit, Shuffle, Loop, OpenFiles, Search };
+enum class MediaAction { Toggle, Play, Pause, Stop, Next, Previous, SeekRelative, SeekAbsolute, Volume, Show, Quit, Shuffle, Loop, OpenFiles, Search, ToggleLyrics, Suspend, ResumeSystem, ShortcutError };
 struct MediaEvent { MediaAction action; long long value = 0; std::string track; std::vector<std::string> files; };
 // 系统打开与拖放只接受本地路径 / file URI，不把外部地址当音乐搜索词或执行命令。
 std::string local_file_path(const std::string& value);

@@ -717,6 +717,8 @@ struct Player::Impl {
     std::atomic<bool> transitioned{false}, normalization{false};
     std::atomic<int> read_failure{MA_SUCCESS};
     std::atomic<int> volume{100};
+    std::atomic<bool> smooth{false}, pause_on_device{true}, safety_mute{false}, device_changed{false};
+    std::atomic<float> sleep_gain{1.0f};
     std::atomic<unsigned> eq_revision{0};
     std::array<std::atomic<int>, 10> eq_values{};
     std::atomic<int> eq_preamp{0};
@@ -845,7 +847,7 @@ struct Player::Impl {
         }
         const auto smoothing = float(1.0 - std::exp(-double(frames) / (48000.0 * (target < self.gain ? 0.08 : 2.0))));
         const float final_gain = enabled ? self.gain + smoothing * (target - self.gain) : 1.0f;
-        const float volume_target = self.volume.load(std::memory_order_relaxed) / 100.0f;
+        const float volume_target = self.safety_mute.load(std::memory_order_relaxed) ? 0.0f : self.volume.load(std::memory_order_relaxed) / 100.0f * self.sleep_gain.load(std::memory_order_relaxed);
         for (ma_uint64 f = 0; f < frames; ++f) {
             const float progress = float(f + 1) / float(frames);
             const float level = (self.gain + (final_gain - self.gain) * progress) * (self.output_volume + (volume_target - self.output_volume) * progress);
@@ -862,6 +864,12 @@ struct Player::Impl {
         auto config = ma_engine_config_init();
         config.channels = 2; config.sampleRate = 48000; config.noDevice = offline;
         config.onProcess = process; config.pProcessUserData = this;
+        config.notificationCallback = [](const ma_device_notification* event) {
+            if (event->type != ma_device_notification_type_stopped && event->type != ma_device_notification_type_rerouted && event->type != ma_device_notification_type_interruption_began) return;
+            auto* engine = static_cast<ma_engine*>(event->pDevice->pUserData);
+            auto* self = engine ? static_cast<Impl*>(engine->pProcessUserData) : nullptr;
+            if (self) { if (self->pause_on_device.load()) self->safety_mute.store(true); self->device_changed.store(true); }
+        };
         if (!offline && !context_ready) {
             const auto rc = ma_context_init(nullptr, 0, nullptr, &context);
             if (rc != MA_SUCCESS) { error = std::string("音频后端初始化失败：") + ma_result_description(rc); return false; }
@@ -886,7 +894,7 @@ struct Player::Impl {
         auto rc = ma_engine_init(&config, &engine);
         if (rc != MA_SUCCESS && config.pPlaybackDeviceID) { device_fallback = true; config.pPlaybackDeviceID = nullptr; rc = ma_engine_init(&config, &engine); }
         if (rc != MA_SUCCESS) { error = std::string("音频后端初始化失败：") + ma_result_description(rc); return false; }
-        engine_ready = true;
+        engine_ready = true; device_changed.store(false); safety_mute.store(false);
         static const ma_data_source_vtable vtable{read, seek, format, cursor, length, nullptr, 0};
         auto source_config = ma_data_source_config_init(); source_config.vtable = &vtable; sequence.owner = this;
         if (ma_data_source_init(&source_config, &sequence.base) != MA_SUCCESS) { error = "无法创建连续播放数据源"; return false; }
@@ -955,6 +963,13 @@ bool Player::queue_next(const std::string& path) {
     auto* pointer = segment.get(); p.segments.push_back(std::move(segment));
     p.next.store(pointer, std::memory_order_seq_cst); return true;
 }
+bool Player::queue_next_stream(std::shared_ptr<Stream> stream) {
+    auto& p = *impl_;
+    if (!p.sound_ready || p.transitioned.load() || !stream || stream->failed() || stream->buffered_ms() < 200) return false;
+    cancel_next(); auto segment = std::make_unique<Impl::Segment>(); segment->stream = std::move(stream);
+    auto* pointer = segment.get(); p.segments.push_back(std::move(segment));
+    p.next.store(pointer, std::memory_order_seq_cst); return true;
+}
 void Player::cancel_next() { impl_->next.store(nullptr, std::memory_order_seq_cst); impl_->collect_segments(); }
 bool Player::take_transition() { const bool changed = impl_->transitioned.exchange(false, std::memory_order_acq_rel); impl_->collect_segments(); return changed; }
 void Player::close() {
@@ -972,11 +987,18 @@ void Player::shutdown() {
 }
 bool Player::play() {
     if (!impl_->sound_ready) return false;
+    impl_->safety_mute.store(false);
+    ma_sound_set_stop_time_in_pcm_frames(&impl_->sound, ~(ma_uint64)0);
+    ma_sound_set_fade_in_milliseconds(&impl_->sound, impl_->smooth.load() ? 0.0f : 1.0f, 1.0f, impl_->smooth.load() ? 100 : 0);
     const auto rc = ma_sound_start(&impl_->sound);
     if (rc != MA_SUCCESS) impl_->error = std::string("启动播放失败：") + ma_result_description(rc);
     return rc == MA_SUCCESS;
 }
-void Player::pause() { if (impl_->sound_ready) ma_sound_stop(&impl_->sound); }
+void Player::pause(bool fade) {
+    if (!impl_->sound_ready) return;
+    if (fade && impl_->smooth.load() && !impl_->safety_mute.load()) ma_sound_stop_with_fade_in_milliseconds(&impl_->sound, 100);
+    else ma_sound_stop(&impl_->sound);
+}
 void Player::resume() { play(); }
 bool Player::is_playing() const { return impl_->sound_ready && ma_sound_is_playing(&impl_->sound); }
 bool Player::is_ended() const { return impl_->sound_ready && !stream_failed() && ma_sound_at_end(&impl_->sound); }
@@ -1004,6 +1026,9 @@ void Player::seek_ms(long long ms) {
     ma_sound_seek_to_pcm_frame(&impl_->sound, ma_uint64(ms) * 48000 / 1000);
 }
 void Player::set_volume(int volume) { impl_->volume.store(std::clamp(volume, 0, 100)); }
+void Player::set_smoothing(bool enabled) { impl_->smooth.store(enabled); }
+void Player::set_sleep_gain(float gain) { impl_->sleep_gain.store(std::clamp(gain, 0.0f, 1.0f)); }
+void Player::set_device_pause(bool enabled) { impl_->pause_on_device.store(enabled); }
 void Player::set_normalization(bool enabled) { impl_->normalization.store(enabled); }
 void Player::set_equalizer(const EqualizerSettings& settings) {
     auto& p = *impl_; p.eq_revision.fetch_add(1, std::memory_order_acq_rel);
@@ -1015,7 +1040,8 @@ bool Player::render(float* samples, size_t frames) { return impl_->offline && im
 void Player::set_device(const std::string& id) { shutdown(); impl_->selected_device = id; impl_->device_fallback = false; }
 bool Player::take_device_change() {
     const auto* device = impl_->engine_ready && !impl_->offline ? ma_engine_get_device(&impl_->engine) : nullptr;
-    return device && ma_device_get_state(device) == ma_device_state_stopped && impl_->sound_ready;
+    const bool notified = impl_->device_changed.exchange(false);
+    return impl_->sound_ready && (notified || (device && ma_device_get_state(device) == ma_device_state_stopped));
 }
 bool Player::take_device_fallback() { const bool value = impl_->device_fallback; impl_->device_fallback = false; return value; }
 const std::string& Player::error() const {

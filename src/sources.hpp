@@ -428,6 +428,36 @@ inline std::string core_title(const std::string& raw) {
     return text::fold_width(raw);
 }
 
+// 保留会改变录音身份的版本标记，不能被括号清洗吞掉。
+inline unsigned version_signature(const std::string& title) {
+    const auto folded = text::lower_ascii(text::fold_width(title));
+    const auto word = [&](const char* value) {
+        const std::string token(value); size_t at = 0;
+        const auto letter = [](unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'); };
+        while ((at = folded.find(token, at)) != std::string::npos) {
+            const auto end = at + token.size();
+            if ((!at || !letter((unsigned char)folded[at - 1])) && (end == folded.size() || !letter((unsigned char)folded[end]))) return true;
+            at = end;
+        }
+        return false;
+    };
+    unsigned bits = 0;
+    if (word("live") || text::has_any(folded, {"现场", "演唱会"})) bits |= 1;
+    if (word("cover") || text::has_any(folded, {"翻唱", "翻奏"})) bits |= 2;
+    if (word("instrumental") || word("karaoke") || text::has_any(folded, {"伴奏", "纯音乐", "纯音版"})) bits |= 4;
+    if (word("remaster") || word("remastered") || text::has_any(folded, {"重制", "重製", "重录", "重錄"})) bits |= 8;
+    if (word("remix") || word("mix") || text::has_any(folded, {"混音", "混音版"})) bits |= 16;
+    if (word("acoustic") || text::has_any(folded, {"不插电", "不插電"})) bits |= 32;
+    if (word("demo") || text::has_any(folded, {"试听版", "試聽版"})) bits |= 64;
+    return bits;
+}
+inline std::string version_label(const std::string& title) {
+    const auto bits = version_signature(title); std::string result;
+    const char* names[] = {"现场", "翻唱", "伴奏", "重制", "混音", "不插电", "Demo"};
+    for (int i = 0; i < 7; ++i) if (bits & (1u << i)) { if (!result.empty()) result += " / "; result += names[i]; }
+    return result.empty() ? "录音室 / 未标注版本" : result;
+}
+
 inline int duration_bucket(int ms) { return int((ms + 1500) / 3000); }
 
 // 指纹 = 归一化标题 | 首位歌手 | 3 秒时长桶
@@ -435,11 +465,12 @@ inline std::string fingerprint(const std::string& title, const std::string& arti
     std::string first_artist;
     const auto artists = text::split_artists(artist);
     if (!artists.empty()) first_artist = artists.front();
-    return core_title(title) + "|" + first_artist + "|" + std::to_string(duration_bucket(duration_ms));
+    return core_title(title) + "|" + first_artist + "|" + std::to_string(duration_bucket(duration_ms)) + "|" + std::to_string(version_signature(title));
 }
 
 // 二次校验：时长差 ≤ 4s 且歌手集合有交集（指纹只用了首位歌手，这里补一层）
 inline bool same_song(const Track& t, const Variant& v) {
+    if (version_signature(t.title) != version_signature(v.title) || core_title(t.title) != core_title(v.title)) return false;
     if (std::abs(t.duration_ms - v.duration_ms) > 4000) return false;
     const auto a = text::split_artists(t.artist);
     const auto b = text::split_artists(v.artist);

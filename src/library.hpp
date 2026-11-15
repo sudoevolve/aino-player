@@ -73,6 +73,7 @@ public:
     SharedTracks(std::initializer_list<music::Track> tracks) : SharedTracks(Container(tracks)) {}
     operator const Container&() const { return *data_; }
     size_t size() const { return data_->size(); }
+    size_t capacity() const { return data_->capacity(); }
     bool empty() const { return data_->empty(); }
     bool shares_storage_with(const SharedTracks& other) const { return data_ == other.data_; }
     const music::Track& operator[](size_t i) const { return (*data_)[i]; }
@@ -395,7 +396,7 @@ inline bool write_m3u(const Playlist& playlist, const std::string& path, std::st
 class Library {
 public:
     std::vector<Playlist> playlists;
-    struct LyricPreference { int offset_ms = 0; std::string path; };
+    struct LyricPreference { int offset_ms = 0; std::string path, netease_id; };
     std::vector<music::Track> recent;
     std::map<std::string, LyricPreference> lyric_preferences;
     Library() { reset(); }
@@ -421,7 +422,7 @@ public:
         for (auto& p : playlists) if (p.key == playlist.key) { p = std::move(playlist); return; }
         playlists.push_back(std::move(playlist));
     }
-    bool save(const std::string& path, std::string& err) const {
+    bool save(const std::string& path, std::string& err, const std::string& preferences = {}) const {
         std::string out = "{\"version\":1,\"playlists\":[";
         bool first = true;
         for (const auto& p : playlists) {
@@ -450,9 +451,15 @@ public:
         out += "],\"lyrics\":["; first = true;
         for (const auto& entry : lyric_preferences) {
             if (!first) out += ','; first = false;
-            out += "{\"uid\":" + quote(entry.first) + ",\"offset\":" + std::to_string(entry.second.offset_ms) + ",\"path\":" + quote(entry.second.path) + "}";
+            out += "{\"uid\":" + quote(entry.first) + ",\"offset\":" + std::to_string(entry.second.offset_ms) + ",\"path\":" + quote(entry.second.path) + ",\"netease_id\":" + quote(entry.second.netease_id) + "}";
         }
-        out += "]}\n";
+        out += "]";
+        if (!preferences.empty()) {
+            js::Value parsed;
+            if (preferences.size() > 1024 * 1024 || !js::parse(preferences, parsed) || !parsed.is_object()) { err = "备份设置格式无效"; return false; }
+            out += ",\"aino_preferences\":" + preferences;
+        }
+        out += "}\n";
         if (out.size() > 64 * 1024 * 1024) { err = "本地资料库超过 64 MiB，原文件已保留"; return false; }
         const auto tmp = path + ".tmp";
         auto* f = platform::fopen(tmp, "wb");
@@ -520,7 +527,9 @@ public:
         for (const auto& row : root["lyrics"].array) {
             const auto uid = row["uid"].str(), path = row["path"].str();
             if (uid.empty() || uid.size() > 8192 || path.size() > 8192 || !std::isfinite(row["offset"].num())) { err = "歌词配置损坏"; return false; }
-            loaded.lyric_preferences[uid] = {int(std::clamp(row["offset"].num(), -60000.0, 60000.0)), path};
+            const auto id = row["netease_id"].str();
+            if (id.size() > 32 || id.find_first_not_of("0123456789") != std::string::npos) { err = "歌词匹配标识损坏"; return false; }
+            loaded.lyric_preferences[uid] = {int(std::clamp(row["offset"].num(), -60000.0, 60000.0)), path, id};
         }
         *this = std::move(loaded); return true;
     }

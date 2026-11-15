@@ -305,6 +305,15 @@ int main(int argc, char** argv) {
             player.close(); check(!player.is_playing(), "audio close");
             std::cout << "Audio device checks passed\n"; return 0;
         }
+        {
+            check(music::version_signature("Song (Live)") != music::version_signature("Song"), "live versions remain distinct");
+            check(music::version_signature("Song (Instrumental)") == music::version_signature("Song【伴奏】"), "English and Chinese instrumental markers agree");
+            check(music::version_signature("Alive") == 0 && music::version_signature("Covergirl") == 0, "version markers respect word boundaries");
+            check(music::fingerprint("Song (Remastered)", "Artist", 180000) != music::fingerprint("Song", "Artist", 180000), "remastered version has separate fingerprint");
+            music::Track studio; studio.title = "Song"; studio.artist = "Artist"; studio.duration_ms = 180000;
+            music::Variant live; live.title = "Song (Live)"; live.artist = "Artist"; live.duration_ms = 180000;
+            check(!music::same_song(studio, live), "same artist and duration cannot merge live and studio");
+        }
         music::Track track;
         track.title = "中文标题\t\"引号\"\n换行"; track.artist = "歌手"; track.duration_ms = 1000;
         music::Variant v; v.id = "123"; v.source = music::Source::Netease; v.title = track.title;
@@ -440,11 +449,25 @@ int main(int argc, char** argv) {
             eq.gains_db.fill(0); equalized.set_equalizer(eq);
             check(flat.render(reference.data(), 4800) && equalized.render(samples.data(), 4800), "flat reset renders");
             check(std::abs(samples[8000] - reference[8000]) < 0.001f, "reset equalizer is transparent after transition");
+            audio::Player smooth(true); smooth.set_smoothing(true);
+            check(smooth.open(loud) && smooth.play(), "smooth playback fixture");
+            check(smooth.render(samples.data(), 4800), "fade-in renders");
+            check(std::abs(samples[20]) < std::abs(samples[9000]) * 0.15f, "fade-in rises over initial hundred milliseconds");
+            smooth.pause(); const auto before_fade = smooth.position_ms();
+            check(smooth.render(samples.data(), 9600), "fade-out renders");
+            check(smooth.position_ms() >= before_fade && smooth.position_ms() <= before_fade + 120, "fade-out stops without consuming the rest of the song");
+            check(std::all_of(samples.end() - 1000, samples.end(), [](float value) { return std::abs(value) < 0.001f; }), "scheduled pause ends in silence");
+            smooth.resume(); smooth.set_sleep_gain(0);
+            check(smooth.render(samples.data(), 4800) && smooth.render(samples.data(), 4800), "independent timer gain renders");
+            check(std::abs(samples[9000]) < 0.001f, "timer fade does not require changing stored volume");
+            smooth.set_sleep_gain(1); smooth.pause(false);
+            const auto stopped_at = smooth.position_ms();
+            check(smooth.render(samples.data(), 4800) && smooth.position_ms() == stopped_at, "device safety pause is immediate");
         }
         const auto file = platform::join(dir, "资料库.json");
         std::string err;
         lib.remember(track); lib.remember(track);
-        lib.lyric_preferences["test-song"] = {1250, "中文歌词.lrc"};
+        lib.lyric_preferences["test-song"] = {1250, "中文歌词.lrc", "123456"};
         check(lib.save(file, err), "library save");
         library::Library loaded;
         check(loaded.load(file, err), "library load");
@@ -452,7 +475,10 @@ int main(int argc, char** argv) {
         check(saved.title == track.title && saved.chosen == 1 && saved.variants.size() == 2, "roundtrip metadata");
         check(loaded.recent.size() == 1 && loaded.recent.front().chosen == 1, "recent history deduplicates and preserves variants");
         check(loaded.lyric_preferences.at("test-song").offset_ms == 1250 &&
-            loaded.lyric_preferences.at("test-song").path == "中文歌词.lrc", "lyric preferences persist with history");
+            loaded.lyric_preferences.at("test-song").path == "中文歌词.lrc" && loaded.lyric_preferences.at("test-song").netease_id == "123456", "lyric preferences persist with history");
+        check(lib.save(file, err, "{\"dark\":true,\"eq\":[0,0,0,0,0,0,0,0,0,0]}"), "backup includes portable preferences");
+        check(loaded.load(file, err) && loaded.playlists.front().tracks.size() == 1, "preferences do not change library compatibility");
+        check(!lib.save(file, err, "[]") && loaded.load(file, err) && loaded.playlists.front().tracks.size() == 1, "invalid backup metadata preserves original file");
         check(!loaded.toggle(track) && loaded.playlists.front().tracks.empty(), "favorite remove");
         library::Playlist playlist;
         playlist.key = "netease#99"; playlist.name = "在线歌单"; playlist.remote_id = "99"; playlist.tracks.push_back(track);

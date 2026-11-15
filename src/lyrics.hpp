@@ -348,12 +348,13 @@ inline std::string search_netease_id(const music::Track& t, const music::Setting
     const auto got = music::search_netease(t.title + " " + t.artist, 16, 6000, err, st);
     std::string best_id; double best_score = -1;
     for (const auto& v : got) {
-        if (v.id.empty() || music::text::normalize_title(v.title) != title) continue;
+        if (v.id.empty() || music::text::normalize_title(v.title) != title || music::version_signature(v.title) != music::version_signature(t.title)) continue;
         const auto candidates = music::text::split_artists(v.artist);
         bool same_artist = false;
         for (const auto& a : artists) for (const auto& b : candidates) if (!a.empty() && a == b) same_artist = true;
         if (!same_artist) continue;
         double score = 100;
+        if (!t.album.empty() && music::core_title(t.album) == music::core_title(v.album)) score += 8;
         if (t.duration_ms > 0 && v.duration_ms > 0) {
             const double delta = std::abs(double(t.duration_ms) - v.duration_ms);
             if (delta > 5000) continue;
