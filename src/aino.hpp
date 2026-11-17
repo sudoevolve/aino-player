@@ -11949,6 +11949,8 @@ bool Window::poll() {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    // 托盘菜单／系统回调可在派发消息时提交业务事件；本轮就消费唤醒，避免延后执行。
+    if (o->wake_signal.consume()) o->need_frame = true;
     return o->running;
 }
 

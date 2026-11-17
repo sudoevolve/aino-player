@@ -1,4 +1,4 @@
-// 默认不创建窗口；平台窗口检查通过 --linux-backend / --ime-backend 显式启用。
+// 默认不创建窗口；平台窗口检查通过 --linux-backend / --windows-events / --ime-backend 显式启用。
 #define AINO_IMPLEMENTATION
 #include "../src/aino.hpp"
 #include <iostream>
@@ -268,6 +268,56 @@ static void menu_checks() {
     }
 }
 #ifdef _WIN32
+static void windows_event_wakeup_checks() {
+    using namespace aino;
+    Window window(320, 200, "Windows desktop event wakeup");
+    check(window.ok(), "desktop wakeup fixture window");
+    const auto handle = static_cast<detail::Win32State*>(window.impl->native)->hwnd;
+    window.poll(); window.render(); window.poll();
+    struct Context {
+        Window& window;
+        WNDPROC previous = nullptr;
+        std::vector<int> pending;
+    } context{window};
+    check(SetPropW(handle, L"AinoEventWakeTest", &context) != FALSE, "attach desktop wakeup fixture");
+    const auto procedure = +[](HWND target, UINT message, WPARAM w, LPARAM l) -> LRESULT {
+        auto* value = static_cast<Context*>(GetPropW(target, L"AinoEventWakeTest"));
+        if (message == WM_APP + 211) {
+            value->pending.push_back(int(w));
+            value->window.wake();
+            return 0;
+        }
+        return CallWindowProcW(value->previous, target, message, w, l);
+    };
+    context.previous = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(handle, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(procedure)));
+    struct Restore {
+        HWND handle;
+        WNDPROC previous;
+        ~Restore() { if (previous) SetWindowLongPtrW(handle, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(previous)); RemovePropW(handle, L"AinoEventWakeTest"); }
+    } restore{handle, context.previous};
+    check(context.previous != nullptr, "subclass desktop wakeup fixture");
+    std::vector<int> applied;
+    const auto render_events = [&] {
+        window.render([&](Ui&) {
+            applied.insert(applied.end(), context.pending.begin(), context.pending.end());
+            context.pending.clear();
+        });
+    };
+    for (const int direction : {1, -1}) {
+        window.impl->wake_signal.consume(); window.impl->need_frame = false;
+        check(PostMessageW(handle, WM_APP + 211, WPARAM(direction), 0) != FALSE, "post one desktop navigation event");
+        check(window.poll() && window.impl->need_frame, "event delivered during message dispatch requests a frame in the same poll");
+        const auto before = applied.size();
+        render_events();
+        check(applied.size() == before + 1 && applied.back() == direction && context.pending.empty(),
+              "first desktop navigation event is consumed without another click");
+        window.poll(); render_events();
+        check(applied.size() == before + 1, "a later frame cannot replay the previous desktop navigation event");
+    }
+    check(PostMessageW(handle, WM_APP + 211, 1, 0) && PostMessageW(handle, WM_APP + 211, 1, 0), "post intentional rapid navigation events");
+    window.poll(); render_events();
+    check(applied == std::vector<int>({1, -1, 1, 1}), "intentional repeated navigation preserves each command in order");
+}
 static void ime_backend_checks() {
     using namespace aino;
     Window window(320,200,"IME candidate position"); check(window.ok(),"IME probe window");
@@ -297,6 +347,7 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::string(argv[1]) == "--linux-backend") linux_backend_checks();
 #endif
 #ifdef _WIN32
+        if (argc > 1 && std::string(argv[1]) == "--windows-events") windows_event_wakeup_checks();
         if (argc > 1 && std::string(argv[1]) == "--ime-backend") ime_backend_checks();
 #endif
         aino::Ui ui;

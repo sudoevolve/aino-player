@@ -46,6 +46,8 @@ python tools/build_installer.py --exe build/Release/aino_player.exe --output bui
 
 内置 UI 库基于 [aino 0.5.2](https://github.com/sudoevolve/aino/releases/tag/v0.5.2)，核对上游 main 提交 `28c601c77f3aadf042b7d1adfe8a83e5062043a8`，其头文件与该标签一致。保留播放器扩展：封面位图、系统字体、菜单选中／禁用及箭头控制、完整提示、主题色选择、关闭回调、窗口激活和 X11 剪贴板发送。Windows 原生 IME、候选定位及文字提交保持用户确认版本；上游本次跨窗口 UTF-16 代理对状态改动暂不合入。更新时须用三方差异核对这些扩展，不能直接覆盖头文件。没有新增运行依赖。
 
+Windows 消息泵另有播放器修补：`Window::poll` 在原生消息派发后再次消费 wake 请求，保证托盘／媒体回调提交的业务事件在本轮可触发帧回调，不修改输入法分支。
+
 自有代码使用 `.editorconfig` 和 `.clang-format` 约定，只整理正在修改的范围。上游 `aino.hpp`、miniaudio、vendor、资源和构建产物排除在格式化之外；纯格式修改独立提交，不对整个仓库自动格式化。`python tools/check_file_associations.py` 静态核对扫描器公共格式清单、Windows 安装器和 Linux desktop 的文件关联声明，安装器构建与下次 Linux 发布都会执行它。
 
 日常 Linux 编译可手动运行 `desktop-build.yml`，仅在 Ubuntu 22.04 / 24.04 编译 `aino_player`，明确关闭测试，不执行发布和桌面交互。回归仍只在用户明确要求发布时运行。
@@ -65,6 +67,7 @@ Windows 使用 Ninja 时须确认 `/showIncludes` 本地化前缀被正确识别
 | --- | --- |
 | 全部四项 | UI 生命周期、player 核心回归、包仓库元数据、嵌入解码、浏览器登录 HTTP、无窗口控制器 |
 | windows、linux | 另需已安装 Chromium 浏览器及官网交接测试；可用 `AINO_TEST_BROWSER` 指定路径 |
+| windows | 另需消息派发期间唤醒检查 `windows_event_wakeup`（原生窗口，不操作用户托盘） |
 | linux、rpm、arch | 另需 Xvfb、Linux 窗口及 DPI/字体缓存检查 |
 
 RPM/Arch 不声称执行了完整浏览器交接验收，该项由 Windows/Ubuntu 任务承担。Arch 的普通 `makepkg` 关闭测试；发布任务显式传入 `AINO_RELEASE_VALIDATION=1` 才开启 profile 和 `check()`。不要为了日常编译设置该变量。

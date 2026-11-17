@@ -698,6 +698,7 @@ struct Desktop::Impl {
     WNDPROC previous = nullptr;
     UINT taskbar_created = 0;
     NOTIFYICONDATAW notify{};
+    bool tray_version4 = false, tray_menu_open = false;
     winrt::Windows::Media::SystemMediaTransportControls controls{nullptr};
     winrt::event_token button_token{}, seek_token{};
     MediaState published;
@@ -745,10 +746,15 @@ struct Desktop::Impl {
         if (message == self->taskbar_created) { self->tray.store(false); self->sync_tray(); return 0; }
         if (message == WM_APP + 117) {
             const auto action = LOWORD(l);
-            if (action == WM_LBUTTONUP || action == NIN_SELECT || action == NIN_KEYSELECT)
+            if ((self->tray_version4 && (action == NIN_SELECT || action == NIN_KEYSELECT)) ||
+                (!self->tray_version4 && action == WM_LBUTTONUP))
                 self->queue->push({MediaAction::Show});
-            if (action == WM_RBUTTONUP || action == WM_CONTEXTMENU) {
+            if (action == (self->tray_version4 ? WM_CONTEXTMENU : WM_RBUTTONUP) && !self->tray_menu_open) {
+                // TrackPopupMenu 会运行嵌套消息泵；同一次 Shell 通知不能重入另一层菜单。
+                self->tray_menu_open = true;
+                struct MenuGuard { bool& open; ~MenuGuard() { open = false; } } guard{self->tray_menu_open};
                 HMENU menu = CreatePopupMenu();
+                if (!menu) return 0;
                 AppendMenuW(menu, MF_STRING, 1, L"显示播放器");
                 AppendMenuW(menu, MF_STRING, 2, self->state.playing ? L"暂停" : L"播放");
                 AppendMenuW(menu, MF_STRING, 3, L"下一首");
@@ -756,10 +762,13 @@ struct Desktop::Impl {
                 AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
                 AppendMenuW(menu, MF_STRING, 5, L"退出");
                 POINT point{}; GetCursorPos(&point); SetForegroundWindow(window);
-                const auto id = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, window, nullptr);
-                DestroyMenu(menu); PostMessageW(window, WM_NULL, 0, 0);
+                // 只使用返回的命令 ID，禁止再发送 WM_COMMAND 通知。
+                const auto id = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, point.x, point.y, 0, window, nullptr);
+                DestroyMenu(menu);
                 const MediaAction actions[]{MediaAction::Show, MediaAction::Show, MediaAction::Toggle, MediaAction::Next, MediaAction::Previous, MediaAction::Quit};
                 if (id >= 1 && id <= 5) self->queue->push({actions[id]});
+                // 命令入队后再结束 Shell 菜单交接，不能等待下一次托盘操作来唤醒。
+                PostMessageW(window, WM_NULL, 0, 0);
             }
             return 0;
         }
@@ -785,8 +794,11 @@ struct Desktop::Impl {
             if (!notify.hIcon) notify.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
             wcscpy_s(notify.szTip, L"Aino Player");
             tray.store(Shell_NotifyIconW(NIM_ADD, &notify) != 0);
-            if (tray.load()) { notify.uVersion = NOTIFYICON_VERSION_4; Shell_NotifyIconW(NIM_SETVERSION, &notify); }
-        } else if (!enabled.load() && tray.exchange(false)) Shell_NotifyIconW(NIM_DELETE, &notify);
+            tray_version4 = false;
+            if (tray.load()) { notify.uVersion = NOTIFYICON_VERSION_4; tray_version4 = Shell_NotifyIconW(NIM_SETVERSION, &notify) != FALSE; }
+        } else if (!enabled.load() && tray.exchange(false)) {
+            Shell_NotifyIconW(NIM_DELETE, &notify); tray_version4 = false;
+        }
     }
     void start_media() {
         using namespace winrt::Windows::Media;
