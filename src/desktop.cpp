@@ -210,10 +210,11 @@ public:
             }
             paint(pixels_, width_, height_, scale_, dc_);
             GdiFlush();
-            POINT destination{x_, y_}, origin{}; SIZE size{width_, height_};
+            POINT origin{}; SIZE size{width_, height_};
             BLENDFUNCTION blend{AC_SRC_OVER, 0, BYTE(std::clamp(settings.opacity, 10, 100) * 255 / 100), AC_SRC_ALPHA};
-            if (!UpdateLayeredWindow(handle_, nullptr, &destination, &size, dc_, &origin, 0, &blend, ULW_ALPHA)) error = "提交悬浮歌词图像失败";
-            else error.clear();
+            // 位置统一由 layout 设置；停靠子窗口使用任务栏客户区坐标，不能再传屏幕坐标。
+            if (!UpdateLayeredWindow(handle_, nullptr, nullptr, &size, dc_, &origin, 0, &blend, ULW_ALPHA)) error = "提交悬浮歌词图像失败";
+            else if (!dock_failed_) error.clear();
             if (!IsWindowVisible(handle_)) ShowWindow(handle_, SW_SHOWNOACTIVATE);
 #else
             pixels_.resize(size_t(width_) * height_ * 4);
@@ -236,7 +237,11 @@ public:
     }
     void close(bool final = false) {
 #ifdef _WIN32
+        stop_shell_watch();
+        closing_ = true;
         if (handle_) DestroyWindow(handle_); handle_ = nullptr;
+        closing_ = false;
+        dock_parent_ = nullptr; dock_failed_ = false;
         if (bitmap_) { SelectObject(dc_, original_); DeleteObject(bitmap_); bitmap_ = nullptr; }
         // 共享 GDI 字体渲染器会缓存 HDC 状态；保留小型 DC，防止句柄复用后误用已缓存字体。
         if (final && dc_) { DeleteDC(dc_); dc_ = nullptr; }
@@ -277,12 +282,60 @@ private:
     std::string first_, second_;
     LyricOverlayProgress progress_;
 #ifdef _WIN32
+    static constexpr UINT kShellLayoutMessage = WM_APP + 143;
+    inline static LyricWindow* shell_target_ = nullptr;
     HWND handle_ = nullptr;
+    HWND dock_parent_ = nullptr;
+    HWINEVENTHOOK shell_hook_ = nullptr;
+    bool shell_layout_pending_ = false, dock_failed_ = false, closing_ = false;
     HDC dc_ = nullptr;
     HBITMAP bitmap_ = nullptr;
     HGDIOBJ original_ = nullptr;
     uint8_t* pixels_ = nullptr;
     int buffer_w_ = 0, buffer_h_ = 0;
+    static void CALLBACK shell_event(HWINEVENTHOOK hook, DWORD event, HWND window, LONG object, LONG child, DWORD, DWORD) {
+        auto* self = shell_target_;
+        if (!self || hook != self->shell_hook_ || !self->handle_ || !self->dock_parent_ ||
+            (event != EVENT_OBJECT_REORDER && event != EVENT_OBJECT_LOCATIONCHANGE) ||
+            object != OBJID_WINDOW || child != CHILDID_SELF || window == self->handle_) return;
+        if (window != self->dock_parent_ && GetAncestor(window, GA_ROOT) != self->dock_parent_) return;
+        if (!self->shell_layout_pending_)
+            self->shell_layout_pending_ = PostMessageW(self->handle_, kShellLayoutMessage, 0, 0) != FALSE;
+    }
+    void stop_shell_watch() {
+        if (shell_hook_) UnhookWinEvent(shell_hook_);
+        shell_hook_ = nullptr; shell_layout_pending_ = false;
+        if (shell_target_ == this) shell_target_ = nullptr;
+    }
+    bool set_dock_parent(HWND parent) {
+        if (parent == dock_parent_) {
+            if (!settings.placement) dock_failed_ = false;
+            return false;
+        }
+        // 只在相同 DPI awareness 下嵌入，避免跨进程 SetParent 重置播放器的 DPI 模式。
+        if (parent && !AreDpiAwarenessContextsEqual(GetWindowDpiAwarenessContext(handle_), GetWindowDpiAwarenessContext(parent))) {
+            error = "任务栏与播放器 DPI 模式不一致，无法嵌入；可使用自由悬浮"; dock_failed_ = true; return false;
+        }
+        const auto style = GetWindowLongPtrW(handle_, GWL_STYLE);
+        // SetParent 不自动切换 WS_CHILD / WS_POPUP；始终保留分层与不激活的扩展样式。
+        SetWindowLongPtrW(handle_, GWL_STYLE, parent ? (style & ~LONG_PTR(WS_POPUP)) | WS_CHILD : (style & ~LONG_PTR(WS_CHILD)) | WS_POPUP);
+        SetLastError(ERROR_SUCCESS);
+        const auto old = SetParent(handle_, parent);
+        if (!old && GetLastError() != ERROR_SUCCESS) {
+            SetWindowLongPtrW(handle_, GWL_STYLE, style);
+            error = "无法嵌入任务栏，请使用自由悬浮或重试"; dock_failed_ = true; return false;
+        }
+        stop_shell_watch();
+        dock_parent_ = parent; dock_failed_ = false;
+        if (parent) {
+            shell_target_ = this;
+            DWORD process = 0; GetWindowThreadProcessId(parent, &process);
+            shell_hook_ = SetWinEventHook(EVENT_OBJECT_REORDER, EVENT_OBJECT_LOCATIONCHANGE, nullptr,
+                shell_event, process, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        }
+        exposed_ = true;
+        return true;
+    }
     static LRESULT CALLBACK procedure(HWND window, UINT message, WPARAM w, LPARAM l) {
         auto* self = reinterpret_cast<LyricWindow*>(GetWindowLongPtrW(window, GWLP_USERDATA));
         if (message == WM_NCCREATE) {
@@ -291,12 +344,27 @@ private:
         }
         if (!self) return DefWindowProcW(window, message, w, l);
         if (message == WM_NCDESTROY) {
-            // Explorer 重启会销毁所属浮层，下一次 update 按新的任务栏重建。
+            // Explorer 重启可销毁任务栏子窗口；暂停时也唤醒主循环按新任务栏重建。
+            self->stop_shell_watch(); self->dock_parent_ = nullptr;
             self->handle_ = nullptr;
             self->dragging_ = false; self->drag_started_ = false;
             self->bounds_at_ = 0; self->exposed_ = true;
             SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+            if (!self->closing_ && self->settings.enabled && self->wake) self->wake();
             return DefWindowProcW(window, message, w, l);
+        }
+        if (message == kShellLayoutMessage) {
+            self->shell_layout_pending_ = false;
+            self->bounds_at_ = 0;
+            self->layout();
+            if (self->dock_parent_ && GetWindow(window, GW_HWNDPREV))
+                SetWindowPos(window, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            if (self->exposed_ && self->wake) self->wake();
+            return 0;
+        }
+        if (message == WM_WINDOWPOSCHANGING && self->dock_parent_) {
+            auto* position = reinterpret_cast<WINDOWPOS*>(l);
+            if (!(position->flags & SWP_NOZORDER)) position->hwndInsertAfter = HWND_TOP;
         }
         if (message == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
         if (message == WM_NCHITTEST && self->settings.locked) return HTTRANSPARENT;
@@ -469,21 +537,17 @@ private:
         const bool keep_above = settings.topmost || settings.placement;
         bool stack_changed = false;
 #ifdef _WIN32
-        const auto owner = settings.placement ? monitor_taskbar() : nullptr;
-        if (GetWindow(handle_, GW_OWNER) != owner) {
-            // Owned popup 始终位于任务栏上方；保持顶层坐标与 NOACTIVATE，避免与 Shell 争抢前台。
-            SetLastError(ERROR_SUCCESS);
-            const auto previous = SetWindowLongPtrW(handle_, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(owner));
-            if (previous || GetLastError() == ERROR_SUCCESS) stack_changed = true;
-        }
-        stack_changed = stack_changed || bool(GetWindowLongPtrW(handle_, GWL_EXSTYLE) & WS_EX_TOPMOST) != keep_above;
+        stack_changed = set_dock_parent(settings.placement ? monitor_taskbar() : nullptr);
+        stack_changed = stack_changed || (!dock_parent_ && bool(GetWindowLongPtrW(handle_, GWL_EXSTYLE) & WS_EX_TOPMOST) != keep_above);
 #endif
         const bool geometry_changed = x != x_ || y != y_ || resized || stack_changed;
         if (geometry_changed) {
             x_ = x; y_ = y; width_ = w; height_ = h;
 #ifdef _WIN32
-            SetWindowPos(handle_, keep_above ? HWND_TOPMOST : HWND_NOTOPMOST, x, y, w, h,
-                SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+            POINT destination{x, y};
+            if (dock_parent_) ScreenToClient(dock_parent_, &destination);
+            SetWindowPos(handle_, dock_parent_ ? HWND_TOP : keep_above ? HWND_TOPMOST : HWND_NOTOPMOST,
+                destination.x, destination.y, w, h, SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
 #else
             XMoveResizeWindow(display_, handle_, x, y, w, h);
             XFlush(display_);
