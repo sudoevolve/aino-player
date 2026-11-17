@@ -19,9 +19,15 @@ def compiler():
     candidates = [shutil.which("ISCC"), ROOT / "build/tools/inno/ISCC.exe",
                   Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)")) / "Inno Setup 6/ISCC.exe"]
     found = next((Path(p) for p in candidates if p and Path(p).is_file()), None)
-    if found:
+    if found and os.environ.get("AINO_ALLOW_SYSTEM_ISCC") == "1":
         return found
     directory = ROOT / "build/tools/inno"
+    result = directory / "ISCC.exe"
+    marker = directory / "verified-compiler.sha256"
+    if result.is_file() and marker.is_file():
+        expected = COMPILER_VERSION + ":" + hashlib.sha256(result.read_bytes()).hexdigest()
+        if marker.read_text(encoding="ascii").strip() == expected:
+            return result
     package = ROOT / "build/tools" / f"innosetup-{COMPILER_VERSION}.exe"
     package.parent.mkdir(parents=True, exist_ok=True)
     if not package.exists() or hashlib.sha256(package.read_bytes()).hexdigest() != COMPILER_SHA256:
@@ -45,6 +51,7 @@ def compiler():
     result = directory / "ISCC.exe"
     if not result.is_file():
         raise RuntimeError("Inno Setup compiler was not installed")
+    marker.write_text(COMPILER_VERSION + ":" + hashlib.sha256(result.read_bytes()).hexdigest() + "\n", encoding="ascii")
     return result
 
 

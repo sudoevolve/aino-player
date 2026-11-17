@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Build prerequisites
@@ -66,7 +66,7 @@ jobs:
           done
           xvfb-run -a -s '-screen 0 3200x2000x24' python3 tools/profile_memory.py run build/icons-only/aino_player build/memory-results/icons-only-scale1 --scale 1 --fixtures build/fixtures
           python3 tools/profile_memory.py report build/memory-results | tee -a "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: linux-memory-improvement

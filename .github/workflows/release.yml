@@ -24,12 +24,12 @@ concurrency:
 jobs:
   windows:
     if: github.event_name != 'workflow_dispatch' || inputs.platform != 'linux'
-    runs-on: windows-latest
+    runs-on: windows-2025
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ inputs.tag || github.ref_name }}
-      - uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         with:
           msystem: UCRT64
           install: mingw-w64-ucrt-x86_64-gcc make
@@ -38,7 +38,7 @@ jobs:
         run: |
           $env:Path = "C:\msys64\ucrt64\bin;C:\msys64\usr\bin;$env:Path"
           python tools/build_ffmpeg.py --jobs 2
-      - run: cmake -S . -B build -A x64 -DAINO_BUILD_TESTS=ON
+      - run: cmake -S . -B build -A x64 -DAINO_BUILD_TESTS=ON -DAINO_RELEASE_PROFILE=windows
       - run: cmake --build build --config Release --parallel 2
       - run: ctest --test-dir build -C Release --output-on-failure --no-tests=error
       - name: Prepare Windows executable
@@ -59,7 +59,7 @@ jobs:
           shutil.copy2("build/codec/FFmpeg-BUILD.txt", "dist/FFmpeg-BUILD-windows.txt")
       - name: Build compressed per-user Windows installer
         run: python tools/build_installer.py --exe build/Release/aino_player.exe --output dist
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-exe
           path: |
@@ -70,7 +70,7 @@ jobs:
     if: github.event_name != 'workflow_dispatch' || inputs.platform != 'windows'
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ inputs.tag || github.ref_name }}
       - run: sudo apt-get update && sudo apt-get install -y build-essential python3 libx11-dev libdbus-1-dev pkg-config libgdk-pixbuf-2.0-0 librsvg2-common adwaita-icon-theme libcurl4-openssl-dev libfreetype6 libfontconfig1 fonts-noto-cjk libasound2 xvfb xdg-utils dpkg-dev appstream
@@ -78,7 +78,7 @@ jobs:
       - run: python3 tools/build_ffmpeg.py --jobs 2
       # 只调整临时 CI 虚拟机的 userns 策略，不给浏览器添加 --no-sandbox。
       - run: if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; fi
-      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DAINO_BUILD_TESTS=ON -DAINO_TEST_BROWSER=/usr/bin/google-chrome
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DAINO_BUILD_TESTS=ON -DAINO_RELEASE_PROFILE=linux -DAINO_TEST_BROWSER=/usr/bin/google-chrome
       - run: cmake --build build --parallel 2
       - run: ctest --test-dir build --output-on-failure --no-tests=error
       - name: Report Linux DPI and resident memory
@@ -113,7 +113,7 @@ jobs:
           cp build/codec-build/ffmpeg-*.tar.xz dist/
           cp build/codec/FFmpeg-BUILD.txt dist/FFmpeg-BUILD-linux.txt
           cp vendor/LICENSE.FFmpeg.txt dist/
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-deb
           path: |
@@ -124,17 +124,17 @@ jobs:
           if-no-files-found: error
   rpm:
     if: github.event_name != 'workflow_dispatch' || inputs.platform != 'windows'
-    runs-on: ubuntu-latest
-    container: fedora:44
+    runs-on: ubuntu-24.04
+    container: fedora:44@sha256:15da97ed9aa94dd3d92c3925eb89520f6c80e07ea7ee24cba848d1f8b6912b3e
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ inputs.tag || github.ref_name }}
       - name: Install build dependencies
         run: dnf install -y git cmake gcc gcc-c++ make python3 pkgconf-pkg-config libX11-devel dbus-devel libcurl-devel rpm-build xorg-x11-server-Xvfb xdg-utils google-noto-sans-cjk-ttc-fonts adwaita-icon-theme gdk-pixbuf2 librsvg2 dbus-libs alsa-lib curl ca-certificates fontconfig freetype
       - run: python3 tools/check_file_associations.py
       - run: python3 tools/build_ffmpeg.py --jobs 2
-      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DAINO_BUILD_TESTS=ON
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DAINO_BUILD_TESTS=ON -DAINO_RELEASE_PROFILE=rpm
       - run: cmake --build build --parallel 2
       - run: ctest --test-dir build --output-on-failure --no-tests=error
       - name: Build and verify RPM package
@@ -149,17 +149,17 @@ jobs:
           test -f /usr/share/metainfo/io.github.sudoevolve.AinoPlayer.metainfo.xml
           test "$(/usr/bin/aino_player --version)" = "aino player ${RELEASE_TAG#v}"
           xvfb-run -a /usr/bin/aino_player --smoke-test
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-rpm
           path: dist/*.rpm
           if-no-files-found: error
   arch:
     if: github.event_name != 'workflow_dispatch' || inputs.platform != 'windows'
-    runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel@sha256:fa2d4ce3310ddd90a4208e5168be8ad367da5129af1245f38fd2d803bcbe3239
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ inputs.tag || github.ref_name }}
       - name: Install build dependencies
@@ -177,10 +177,12 @@ jobs:
           useradd -m builder
           chown -R builder: /tmp/pkgbuild
       - name: Build and verify Arch package
+        env:
+          AINO_RELEASE_VALIDATION: "1"
         shell: bash
         run: |
           cd /tmp/pkgbuild
-          sudo -u builder makepkg -f
+          sudo -u builder env AINO_RELEASE_VALIDATION="$AINO_RELEASE_VALIDATION" makepkg -f
           test "$(ls aino-player-*.pkg.tar.zst | wc -l)" -eq 1
           pacman -U --noconfirm aino-player-*.pkg.tar.zst
           test "$(/usr/bin/aino_player --version)" = "aino player ${RELEASE_TAG#v}"
@@ -189,21 +191,21 @@ jobs:
           xvfb-run -a /usr/bin/aino_player --smoke-test
           mkdir -p "$GITHUB_WORKSPACE/dist"
           cp aino-player-*.pkg.tar.zst "$GITHUB_WORKSPACE/dist/"
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-arch
           path: dist/*.pkg.tar.zst
           if-no-files-found: error
   publish:
     needs: [windows, linux, rpm, arch]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ inputs.tag || github.ref_name }}
-      - uses: actions/download-artifact@v8.0.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           merge-multiple: true

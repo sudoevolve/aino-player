@@ -24,7 +24,7 @@ jobs:
     steps:
       - name: Install repository tools
         run: sudo apt-get update && sudo apt-get install -y apt-utils gnupg
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: master
           persist-credentials: false
@@ -52,7 +52,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           LC_ALL: C.UTF-8
         run: python3 tools/build_apt_repository.py --output build/site --fingerprint "$SIGNING_FINGERPRINT" --verify-apt
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pages-apt
           path: build/site
@@ -68,13 +68,13 @@ jobs:
               shutil.rmtree(home)
   rpm:
     if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
-    container: fedora:44
+    container: fedora:44@sha256:15da97ed9aa94dd3d92c3925eb89520f6c80e07ea7ee24cba848d1f8b6912b3e
     steps:
       - name: Install repository tools
         run: dnf install -y git python3 createrepo_c rpm-sign gnupg2
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: master
           persist-credentials: false
@@ -101,7 +101,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 tools/build_rpm_repository.py --output build/site --fingerprint "$SIGNING_FINGERPRINT" --verify-dnf
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pages-rpm
           path: build/site
@@ -117,13 +117,13 @@ jobs:
               shutil.rmtree(home)
   arch:
     if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
-    container: archlinux:base-devel
+    container: archlinux:base-devel@sha256:fa2d4ce3310ddd90a4208e5168be8ad367da5129af1245f38fd2d803bcbe3239
     steps:
       - name: Install repository tools
         run: pacman -Syu --noconfirm --needed git gnupg python
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: master
           persist-credentials: false
@@ -150,7 +150,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 tools/build_arch_repository.py --output build/site --fingerprint "$SIGNING_FINGERPRINT" --verify-pacman
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pages-arch
           path: build/site
@@ -167,7 +167,7 @@ jobs:
   deploy:
     if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
     needs: [apt, rpm, arch]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       pages: write
@@ -176,19 +176,19 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/download-artifact@v8.0.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: build/site
           merge-multiple: true
           pattern: pages-*
-      - uses: actions/configure-pages@v5
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
       - name: Publish installer entry points
         run: |
           cp build/site/rpm/install-rpm.sh build/site/install-rpm.sh
           cp build/site/arch/install-arch.sh build/site/install-arch.sh
-      - uses: actions/upload-pages-artifact@v4
+      - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
         with:
           path: build/site
       - name: Deploy repository
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

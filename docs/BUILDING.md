@@ -19,7 +19,7 @@ python3 tools/build_ffmpeg.py
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 
-# 需要回归时显式开启；普通构建默认只编译播放器
+# 仅在用户明确要求发布新版本时开启并运行回归；普通构建默认只编译播放器
 cmake -S . -B build -DAINO_BUILD_TESTS=ON
 cmake --build build --config Release --parallel 2
 # Linux 可加装 xvfb 运行窗口、DPI 与字体缓存检查
@@ -34,7 +34,7 @@ Windows 安装器使用构建时的 Inno Setup 6，不作为播放器运行依�
 python tools/build_installer.py --exe build/Release/aino_player.exe --output build/installer
 ```
 
-脚本优先使用本机 ISCC；缺失时下载固定的官方编译器并校验 SHA-256，准备到 `build/tools/inno`。安装器版本来自 CMake，资源及压缩安装器由发布工作流一并打包。图标源文件为 `assets/aino.svg`；正常构建直接使用已生成资源，只有重生成时才需 Pillow 并运行 `python tools/build_icon.py`。
+脚本默认使用固定版本的官方编译器：校验下载包 SHA-256 后安装到 `build/tools/inno`，并检查缓存编译器的版本标识和二进制摘要。只有显式设置 `AINO_ALLOW_SYSTEM_ISCC=1` 才使用本机已有 ISCC；该覆盖用于开发，不能据此声称使用了固定工具链。安装器版本来自 CMake，资源及压缩安装器由发布工作流一并打包。图标源文件为 `assets/aino.svg`；正常构建直接使用已生成资源，只有重生成时才需 Pillow 并运行 `python tools/build_icon.py`。
 
 仅更新本地 Windows 安装时，可配置 `-DAINO_LOCAL_REVISION=1 -DAINO_BUILD_TESTS=OFF`。正式项目版本保持不变，程序显示、Windows 文件属性及安装器增加第四段（例如 `0.5.1.1`）；更新检查仍比较三段正式版本。安装器从待打包 EXE 读取并核对版本。准备正式发布前用 `-DAINO_LOCAL_REVISION=0` 恢复默认；该值只存于本机构建缓存，不创建标签或发布。
 
@@ -50,10 +50,26 @@ python tools/build_installer.py --exe build/Release/aino_player.exe --output bui
 
 日常 Linux 编译可手动运行 `desktop-build.yml`，仅在 Ubuntu 22.04 / 24.04 编译 `aino_player`，明确关闭测试，不执行发布和桌面交互。回归仍只在用户明确要求发布时运行。
 
+自有应用目标显式启用 MSVC `/W4` 或 GCC/Clang `-Wall -Wextra -Wpedantic`，现有告警逐步清理，不对 vendor 一刀切 `-Werror`。需要静态分析时可在独立构建目录配置 `-DAINO_STATIC_ANALYSIS=ON -DAINO_BUILD_TESTS=OFF`：MSVC 使用 `/analyze`，其他编译器要求本机安装 clang-tidy。启用选项不会运行回归或安装新工具。
+
+Windows 使用 Ninja 时须确认 `/showIncludes` 本地化前缀被正确识别；如果改了头文件却出现 `no work to do`，不能把旧产物当作本轮编译通过，应使用干净的独立目录重新构建。日常构建和发布构建建议使用不同目录，避免缓存中的测试选项相互影响。
+
 
 ## 发布流程
 
-`CMakeLists.txt` 中的项目版本是版本号来源。仅在明确要求发布新版本时运行回归，普通提交不触发 CI。推送对应 `v*` 标签后，`release.yml` 分别在 Windows 和 Ubuntu 编译精简 FFmpeg、嵌入播放器并运行无系统解码器的回归；Linux 生成 deb 后验证安装与 Xvfb 启动。两端成功后发布 exe、deb、FFmpeg 官方原始源码包、构建信息、许可及 `SHA256SUMS.txt`。项目版本如 `0.2.9` 对应标签 `v0.2.9`，标签与程序版本不符或缺少内置解码器会中止发布；不会覆盖旧版标签或安装包。
+`CMakeLists.txt` 中的项目版本是版本号来源。仅在明确要求发布新版本时运行回归，普通提交不触发 CI。推送对应 `v*` 标签后，`release.yml` 执行 Windows、Ubuntu/Debian、Fedora/RPM、Arch 四项验证；四项成功后发布 Windows 安装器、deb、rpm、Arch 包、FFmpeg 官方原始源码包、构建信息、许可及 `SHA256SUMS.txt`。各任务使用嵌入解码器，Linux 包还验证安装和 Xvfb 启动。项目版本如 `0.2.9` 对应标签 `v0.2.9`，标签与程序版本不符或缺少内置解码器会中止发布；不会覆盖旧版标签或安装包。
+
+发布配置显式设置 `AINO_RELEASE_PROFILE=windows|linux|rpm|arch`，同时要求 `AINO_BUILD_TESTS=ON` 和 `AINO_BUNDLE_FFMPEG=ON`。配置阶段生成 `release-test-manifest.txt`，必需依赖或测试缺失即失败，不再只靠 `ctest --no-tests=error` 判断集合完整。验收职责如下：
+
+| Profile | 必须注册的验收 |
+| --- | --- |
+| 全部四项 | UI 生命周期、player 核心回归、包仓库元数据、嵌入解码、浏览器登录 HTTP、无窗口控制器 |
+| windows、linux | 另需已安装 Chromium 浏览器及官网交接测试；可用 `AINO_TEST_BROWSER` 指定路径 |
+| linux、rpm、arch | 另需 Xvfb、Linux 窗口及 DPI/字体缓存检查 |
+
+RPM/Arch 不声称执行了完整浏览器交接验收，该项由 Windows/Ubuntu 任务承担。Arch 的普通 `makepkg` 关闭测试；发布任务显式传入 `AINO_RELEASE_VALIDATION=1` 才开启 profile 和 `check()`。不要为了日常编译设置该变量。
+
+`repositories.yml` 在发行完成后汇总现有产物，生成由独立 GPG 密钥签名的 APT、RPM、pacman 软件源并一起部署 Pages，不重新构建播放器或执行音频回归。这种仓库签名不等于 Windows Authenticode；本仓库没有因此获得 Windows 代码签名证书。第三方 Actions 固定提交，容器固定摘要；托管 runner 的安全更新及系统仓库包仍是变化的外部输入。
 
 发布工作流手动执行时可选择单个平台，仅构建、验证并上传产物，不自动发布。可用于只恢复失败的平台；复用另一平台的产物前须确认同一标签、同一提交且其验证任务成功。
 
@@ -61,8 +77,10 @@ python tools/build_installer.py --exe build/Release/aino_player.exe --output bui
 
 ```bash
 python3 tools/build_ffmpeg.py
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DAINO_BUILD_TESTS=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DAINO_BUILD_TESTS=ON -DAINO_RELEASE_PROFILE=linux
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure --no-tests=error
 cpack --config build/CPackConfig.cmake -G DEB -B dist
 ```
+
+上面的本地 Debian 验收同样只适用于获准发布时，并要求安装 Chrome/Chromium 和 Xvfb。`tools/probe_*.cpp` 是手动诊断工具，不属于自动发布测试，也不是无用源码；部分探针会读本机配置、访问真实音乐服务并下载文件，普通编译检查不要运行它们。

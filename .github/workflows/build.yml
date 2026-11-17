@@ -5,7 +5,7 @@ jobs:
   linux:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y build-essential python3 libx11-dev libdbus-1-dev pkg-config libgdk-pixbuf-2.0-0 librsvg2-common adwaita-icon-theme libcurl4-openssl-dev libfreetype6 libfontconfig1 fonts-noto-cjk libasound2t64 xvfb
       - run: python3 tools/build_ffmpeg.py --jobs 2
       # 临时 CI 虚拟机允许 Chrome 创建沙箱 userns；浏览器沙箱仍保持启用。
@@ -16,10 +16,10 @@ jobs:
       - name: Report Linux DPI and resident memory
         run: xvfb-run -a build/aino_player --diagnostics
   windows:
-    runs-on: windows-latest
+    runs-on: windows-2025
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: msys2/setup-msys2@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         with:
           msystem: UCRT64
           install: mingw-w64-ucrt-x86_64-gcc make

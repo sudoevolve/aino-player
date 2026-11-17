@@ -18,12 +18,22 @@ source=()
 sha256sums=()
 
 prepare() {
+  local acceptance=(-DAINO_BUILD_TESTS=OFF)
+  if [[ "${AINO_RELEASE_VALIDATION:-0}" == 1 ]]; then
+    acceptance=(-DAINO_BUILD_TESTS=ON -DAINO_RELEASE_PROFILE=arch)
+  fi
   cmake -S "$srcdir/$pkgname" -B "$srcdir/build" -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX=/usr
+    -DCMAKE_INSTALL_PREFIX=/usr "${acceptance[@]}"
 }
 
 build() {
   cmake --build "$srcdir/build" --parallel 2
+}
+
+check() {
+  if [[ "${AINO_RELEASE_VALIDATION:-0}" == 1 ]]; then
+    ctest --test-dir "$srcdir/build" --output-on-failure --no-tests=error
+  fi
 }
 
 package() {
