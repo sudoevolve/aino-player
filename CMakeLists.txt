@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(aino_player VERSION 0.5.2 LANGUAGES CXX C)
+project(aino_player VERSION 0.5.3 LANGUAGES CXX C)
 set(AINO_LOCAL_REVISION "0" CACHE STRING "Local Windows build revision; zero uses the official version")
 if(NOT AINO_LOCAL_REVISION MATCHES "^[0-9]+$" OR AINO_LOCAL_REVISION GREATER 65535)
   message(FATAL_ERROR "AINO_LOCAL_REVISION must be an integer from 0 to 65535")
