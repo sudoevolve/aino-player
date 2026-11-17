@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <array>
 #include <optional>
+#include <cstdint>
 namespace audio {
 struct EqualizerSettings {
     bool enabled = false;
@@ -50,6 +51,8 @@ public:
     ~Stream();
     void cancel();
     bool failed() const;
+    /** @brief 已取消的管线不能重新打开；取消与解码失败分别记录。 */
+    bool cancelled() const;
     bool buffering() const;
     long long buffered_ms() const;
     std::string error() const;
@@ -69,11 +72,12 @@ public:
     Player& operator=(const Player&) = delete;
     bool open(const std::string& path);
     bool open_stream(std::shared_ptr<Stream> stream);
-    /** @brief 为当前音频预备本地下一曲，在音频回调内跨越边界，无需等待 UI 帧。 */
-    bool queue_next(const std::string& path);
-    bool queue_next_stream(std::shared_ptr<Stream> stream);
+    /** @brief 预备下一曲；非零 token 由 take_transition 原样返回，未认领换段前拒绝覆盖。 */
+    bool queue_next(const std::string& path, uint64_t token = 1);
+    bool queue_next_stream(std::shared_ptr<Stream> stream, uint64_t token = 1);
     void cancel_next();
-    bool take_transition();
+    /** @brief 认领实际发生的换段；返回 false 时输出 token 为零。 */
+    bool take_transition(uint64_t* token = nullptr);
     void close();
     /** @brief 在所属线程退出 COM 前释放声音及音频引擎；普通切歌仍使用 close。 */
     void shutdown();

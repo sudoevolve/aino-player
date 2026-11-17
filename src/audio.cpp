@@ -654,6 +654,7 @@ std::shared_ptr<Stream> Stream::open(StreamSpec spec, std::function<bool()> canc
 }
 void Stream::cancel() { impl_->stop_pipeline(); }
 bool Stream::failed() const { return impl_->broken.load(); }
+bool Stream::cancelled() const { return impl_->stop.load(); }
 bool Stream::buffering() const { return impl_->waiting.load() && !impl_->decoded.load(); }
 long long Stream::buffered_ms() const {
     const auto consumed = impl_->consumed.load(std::memory_order_acquire);
@@ -697,11 +698,13 @@ std::vector<OutputDevice> output_devices(std::string& error) {
 struct Player::Impl {
     // 所有权由 UI 线程持有；回调只读已发布的 Segment，退出读取后才回收旧段。
     struct Segment {
+        uint64_t token = 0;
         ma_resource_manager_data_source file{};
         bool file_ready = false;
         std::shared_ptr<Stream> stream;
         ma_data_source* source() { return stream ? reinterpret_cast<ma_data_source*>(&stream->impl_->source.base) : reinterpret_cast<ma_data_source*>(&file); }
-        ~Segment() { if (file_ready) ma_resource_manager_data_source_uninit(&file); if (stream) stream->cancel(); }
+        // 预加载缓存也可能持有这条流；撤下 Segment 只释放引用，最后一个引用由 Stream 回收器取消。
+        ~Segment() { if (file_ready) ma_resource_manager_data_source_uninit(&file); }
     };
     struct Sequence { ma_data_source_base base{}; Impl* owner = nullptr; } sequence;
     ma_context context{};
@@ -713,8 +716,10 @@ struct Player::Impl {
     std::string selected_device, error;
     std::vector<std::unique_ptr<Segment>> segments;
     std::atomic<Segment*> current{nullptr}, next{nullptr};
+    Segment* staged = nullptr; // UI 线程；撤回失败时保留，直到认领已发生的换段。
     std::atomic<unsigned> readers{0};
-    std::atomic<bool> transitioned{false}, normalization{false};
+    std::atomic<uint64_t> transitioned{0};
+    std::atomic<bool> normalization{false};
     std::atomic<int> read_failure{MA_SUCCESS};
     std::atomic<int> volume{100};
     std::atomic<bool> smooth{false}, pause_on_device{true}, safety_mute{false}, device_changed{false};
@@ -765,7 +770,7 @@ struct Player::Impl {
                 // 在本次读取内部换段，剩余帧直接接下一曲，无 UI 调度间隙。
                 if (auto* queued = self.next.exchange(nullptr, std::memory_order_seq_cst)) {
                     self.current.store(queued, std::memory_order_seq_cst);
-                    self.transitioned.store(true, std::memory_order_release);
+                    self.transitioned.store(queued->token, std::memory_order_release);
                     continue;
                 }
                 return *read_count ? MA_SUCCESS : MA_AT_END;
@@ -949,33 +954,49 @@ bool Player::open(const std::string& path) {
 }
 bool Player::open_stream(std::shared_ptr<Stream> stream) {
     close(); auto& p = *impl_; p.error.clear();
-    if (!stream) { p.error = "流式音频为空"; return false; }
+    if (!stream || stream->cancelled()) { p.error = "流式音频为空或已取消"; return false; }
     if (!p.ensure_engine()) return false;
     auto segment = std::make_unique<Impl::Segment>(); segment->stream = std::move(stream);
     return p.attach(std::move(segment));
 }
-bool Player::queue_next(const std::string& path) {
+bool Player::queue_next(const std::string& path, uint64_t token) {
     auto& p = *impl_;
     if (!p.sound_ready || p.transitioned.load()) return false;
     cancel_next();
+    if (p.staged) return false;
     auto segment = p.file_segment(path);
-    if (!segment) return false;
-    auto* pointer = segment.get(); p.segments.push_back(std::move(segment));
+    if (!segment || p.transitioned.load()) return false;
+    segment->token = token ? token : 1;
+    auto* pointer = segment.get(); p.segments.push_back(std::move(segment)); p.staged = pointer;
     p.next.store(pointer, std::memory_order_seq_cst); return true;
 }
-bool Player::queue_next_stream(std::shared_ptr<Stream> stream) {
+bool Player::queue_next_stream(std::shared_ptr<Stream> stream, uint64_t token) {
     auto& p = *impl_;
-    if (!p.sound_ready || p.transitioned.load() || !stream || stream->failed() || stream->buffered_ms() < 200) return false;
-    cancel_next(); auto segment = std::make_unique<Impl::Segment>(); segment->stream = std::move(stream);
-    auto* pointer = segment.get(); p.segments.push_back(std::move(segment));
+    if (!p.sound_ready || p.transitioned.load() || !stream || stream->failed() || stream->cancelled() || stream->buffered_ms() < 200) return false;
+    cancel_next();
+    if (p.staged) return false;
+    auto segment = std::make_unique<Impl::Segment>(); segment->stream = std::move(stream);
+    if (p.transitioned.load()) return false;
+    segment->token = token ? token : 1;
+    auto* pointer = segment.get(); p.segments.push_back(std::move(segment)); p.staged = pointer;
     p.next.store(pointer, std::memory_order_seq_cst); return true;
 }
-void Player::cancel_next() { impl_->next.store(nullptr, std::memory_order_seq_cst); impl_->collect_segments(); }
-bool Player::take_transition() { const bool changed = impl_->transitioned.exchange(false, std::memory_order_acq_rel); impl_->collect_segments(); return changed; }
+void Player::cancel_next() {
+    auto& p = *impl_;
+    // exchange 决定撤回与换段谁先发生；回调已取走时禁止覆盖尚未认领的媒体。
+    if (p.next.exchange(nullptr, std::memory_order_seq_cst)) p.staged = nullptr;
+    p.collect_segments();
+}
+bool Player::take_transition(uint64_t* token) {
+    const auto changed = impl_->transitioned.exchange(0, std::memory_order_acq_rel);
+    if (token) *token = changed;
+    if (changed) impl_->staged = nullptr;
+    impl_->collect_segments(); return changed != 0;
+}
 void Player::close() {
     auto& p = *impl_;
     if (p.sound_ready) { ma_sound_uninit(&p.sound); p.sound_ready = false; }
-    p.next.store(nullptr); p.current.store(nullptr); p.transitioned.store(false); p.segments.clear();
+    p.next.store(nullptr); p.current.store(nullptr); p.transitioned.store(0); p.staged = nullptr; p.segments.clear();
     p.read_failure.store(MA_SUCCESS);
 }
 void Player::shutdown() {
@@ -1001,8 +1022,17 @@ void Player::pause(bool fade) {
 }
 void Player::resume() { play(); }
 bool Player::is_playing() const { return impl_->sound_ready && ma_sound_is_playing(&impl_->sound); }
-bool Player::is_ended() const { return impl_->sound_ready && !stream_failed() && ma_sound_at_end(&impl_->sound); }
-bool Player::stream_failed() const { auto* current = impl_->current.load(); return impl_->read_failure.load() != MA_SUCCESS || (current && current->stream && current->stream->failed()); }
+bool Player::is_ended() const {
+    if (!impl_->sound_ready || !ma_sound_at_end(&impl_->sound) || stream_failed()) return false;
+    // 仅预备下一曲不能掩盖真正结束（例如预备时设备已到 EOF）；已被回调取走则等 UI 认领。
+    return !impl_->transitioned.load() && (!impl_->staged || impl_->next.load() == impl_->staged);
+}
+bool Player::stream_failed() const {
+    auto* current = impl_->current.load();
+    // 新段的错误须等 UI 认领其身份后处理，不能作为上一曲的故障恢复或跳过。
+    if (impl_->staged && (current == impl_->staged || impl_->transitioned.load())) return false;
+    return impl_->read_failure.load() != MA_SUCCESS || (current && current->stream && current->stream->failed());
+}
 bool Player::buffering() const { auto* current = impl_->current.load(); return current && current->stream && current->stream->buffering(); }
 long long Player::buffered_ms() const { auto* current = impl_->current.load(); return current && current->stream ? current->stream->buffered_ms() : 0; }
 long long Player::position_ms() const {

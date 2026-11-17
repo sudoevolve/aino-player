@@ -378,14 +378,18 @@ int main(int argc, char** argv) {
         queue_push(nav_a); queue_push(nav_b); queue_push(nav_c);
         auto mark_current = [&](const music::Track& value, int index) {
             std::lock_guard<std::mutex> lock(g_mu); g_as.now_uid = track_uid(value); g_as.playing = index;
+            g_as.queue_cursor_known = index >= 0;
         };
         mark_current(nav_a, 0); set_play_mode(PlayMode::RepeatOne);
         check(next_queue_index(1, true) == 0 && next_queue_index(1, false) == 1, "repeat one only affects natural end");
         queue_play_next(nav_c); tick();
         check(model.playback.tracks.size() == 3 && model.playback.playing == 0 &&
               track_uid(model.playback.tracks[1]) == track_uid(nav_c), "play next moves without duplicating or interrupting current");
-        check(next_queue_index(1, true, false) == 1 && next_queue_index(1, true, false) == 1 &&
-              next_queue_index(1, true) == 1, "preload peek preserves explicit next and overrides repeat one");
+        auto navigation_trigger = PlaybackTrigger::NaturalEnd;
+        check(next_queue_index(1, true, false, nullptr, &navigation_trigger) == 1 &&
+              navigation_trigger == PlaybackTrigger::NaturalEnd && next_queue_index(1, true, false) == 1 &&
+              next_queue_index(1, true, true, nullptr, &navigation_trigger) == 1 && navigation_trigger == PlaybackTrigger::PriorityNext,
+              "preload peek preserves explicit next and only actual selection records its priority override");
         set_play_mode(PlayMode::Sequential); mark_current(nav_b, 2);
         check(next_queue_index(1, true) == -1, "sequential mode stops at queue end");
         set_play_mode(PlayMode::RepeatAll);
@@ -425,6 +429,78 @@ int main(int argc, char** argv) {
         check(next_queue_index(1, false, true, &failed) == -1, "failed sequential tail does not wrap");
         set_play_mode(PlayMode::RepeatAll);
         check(next_queue_index(1, false, true, &failed) == 1, "repeat all wraps past failed candidates");
+        {
+            library::SharedTracks saved_tracks;
+            std::string saved_uid;
+            int saved_index;
+            {
+                std::lock_guard<std::mutex> lock(g_mu);
+                saved_tracks = g_as.tracks; saved_uid = g_as.now_uid; saved_index = g_as.playing;
+            }
+            std::vector<music::Track> long_queue;
+            for (int i = 0; i < 587; ++i) {
+                const auto id = "long-queue-" + std::to_string(i);
+                long_queue.push_back(navigation_track(id.c_str()));
+            }
+            // 后半段重复早先的歌曲，也必须按条目位置继续，不能回到早先的 ID。
+            long_queue[199] = long_queue[2]; long_queue[400] = long_queue[0];
+            { std::lock_guard<std::mutex> lock(g_mu); g_as.tracks = long_queue; ++g_as.tracks_version; }
+            set_play_mode(PlayMode::Sequential);
+            for (int i = 0; i < int(long_queue.size()); ++i) {
+                mark_current(long_queue[size_t(i)], i);
+                const int expected = i + 1 < int(long_queue.size()) ? i + 1 : -1;
+                check(next_queue_index(1, true, false) == expected && next_queue_index(1, true) == expected &&
+                    next_queue_index(1, false) == expected, "587-entry sequential queue follows every position and stops only at the tail");
+            }
+            mark_current(long_queue[199], 199);
+            check(next_queue_index(-1, false) == 198, "previous uses the current occurrence of a repeated song");
+            set_play_mode(PlayMode::RepeatOne);
+            check(next_queue_index(1, true) == 199, "repeat one retains the current occurrence of a repeated song");
+            std::set<std::string> long_failed{track_uid(long_queue[199]), track_uid(long_queue[200])};
+            set_play_mode(PlayMode::Sequential);
+            check(next_queue_index(1, false, true, &long_failed) == 201, "failure skipping continues after the current duplicate instead of rewinding");
+            mark_current(long_queue.back(), int(long_queue.size()) - 1); set_play_mode(PlayMode::RepeatAll);
+            check(next_queue_index(1, true) == 0, "long repeat-all queue wraps at its actual tail");
+            mark_current(navigation_track("removed-current"), -1); set_play_mode(PlayMode::Sequential);
+            check(next_queue_index(1, true) == -1 && next_queue_index(1, false, true, &long_failed) == -1,
+                "lost current queue position cannot restart sequential playback or failure skipping at the head");
+            { std::lock_guard<std::mutex> lock(g_mu); g_as.now_uid.clear(); }
+            check(next_queue_index(1, true) == 0, "a fresh queue without a current track can start at its head");
+            mark_current(long_queue[400], 400);
+            queue_move(450, 451);
+            check(g_as.playing == 400 && next_queue_index(1, true) == 401,
+                "moving another row cannot relocate a repeated current song to its first occurrence");
+            undo_last_action();
+            check(g_as.playing == 400 && next_queue_index(1, true) == 401,
+                "undo preserves the exact current occurrence");
+            queue_play_next(long_queue[450]);
+            check(g_as.playing == 400 && next_queue_index(1, true) == 401,
+                "explicit next is inserted after the current occurrence of a repeated song");
+            { std::lock_guard<std::mutex> lock(g_mu); g_as.tracks = long_queue; g_play_next.clear(); ++g_as.tracks_version; }
+            mark_current(long_queue.front(), 0); queue_remove(0);
+            check(g_as.playing == -1 && next_queue_index(1, true) == 0,
+                "deleting the playing first row continues with its original successor even if its ID appears later");
+            undo_last_action();
+            check(g_as.playing == 0 && next_queue_index(1, true) == 1, "undo first-row removal restores its exact cursor");
+            mark_current(long_queue[400], 400); queue_remove(400);
+            check(g_as.playing == 399 && next_queue_index(1, true) == 400,
+                "deleting a later duplicate continues at its successor instead of the earlier occurrence");
+            undo_last_action();
+            set_play_mode(PlayMode::Sequential);
+            media_action({platform::MediaAction::Shuffle, 0});
+            check(g_ui.play_mode == PlayMode::Sequential, "system shuffle-off preserves sequential mode");
+            set_play_mode(PlayMode::RepeatOne);
+            media_action({platform::MediaAction::Shuffle, 0});
+            check(g_ui.play_mode == PlayMode::RepeatOne, "system shuffle-off preserves repeat-one mode");
+            set_play_mode(PlayMode::Shuffle);
+            media_action({platform::MediaAction::Shuffle, 0});
+            check(g_ui.play_mode == PlayMode::Sequential, "leaving system shuffle selects sequential mode");
+            {
+                std::lock_guard<std::mutex> lock(g_mu);
+                g_as.tracks = saved_tracks; g_as.now_uid = saved_uid; g_as.playing = saved_index; ++g_as.tracks_version;
+                g_as.queue_cursor_known = saved_index >= 0;
+            }
+        }
         int pending_gen;
         { std::lock_guard<std::mutex> lock(g_mu); pending_gen = g_as.gen; g_as.ps = PlayState::Buffering; g_play_ready_paused = false; }
         toggle_pause();
@@ -737,7 +813,16 @@ int main(int argc, char** argv) {
         check(!restored.gapless && restored.normalize_volume && restored.output_device == "fixture-device" && restored.close_behavior == 2 && !restored.tray_enabled,
             "playback enhancements and desktop choices survive reload");
         check(restored.equalizer.enabled && restored.equalizer.gains_db[5] == -4 && restored.equalizer.preamp_db == -2, "equalizer gains survive reload");
+        std::deque<QueueTransition> saved_transitions;
+        {
+            std::lock_guard<std::mutex> lock(g_mu);
+            saved_transitions = g_queue_transitions;
+            record_queue_transition_locked(199, 0, PlaybackTrigger::FailureSkip);
+        }
         const auto diagnosis = playback_diagnostics();
+        check(diagnosis.find("失败跳过 / 200→1 / ") != std::string::npos &&
+            diagnosis.find("播放模式：") != std::string::npos, "diagnostics expose the trigger and positions of an actual rewind");
+        { std::lock_guard<std::mutex> lock(g_mu); g_queue_transitions = std::move(saved_transitions); }
         check(diagnosis.find("MUSIC_U") == std::string::npos && diagnosis.find("qm_keyst") == std::string::npos &&
             diagnosis.find(original) == std::string::npos && diagnosis.find("http://") == std::string::npos,
             "playback diagnostics exclude credentials, paths and links");

@@ -243,6 +243,11 @@ int main(int argc, char** argv) {
                 auto stream = audio::Stream::open(spec, [&] { return cancelled.load(); }, error);
                 check(stream && !stream->failed(), error.c_str());
                 audio::Player player(true);
+                if (offset == 0) {
+                    check(player.open_stream(stream), "preloaded stream attaches before release");
+                    player.close();
+                    check(!stream->cancelled(), "releasing a segment cannot cancel a stream retained by the preload cache");
+                }
                 check(player.open_stream(stream) && player.play(), "decoded stream attaches to offline engine");
                 std::array<float, 960> pcm{};
                 const auto playback_deadline = platform::ticks() + 5000;
@@ -251,7 +256,9 @@ int main(int argc, char** argv) {
                 }
                 check(player.is_ended() && !player.stream_failed() && player.position_ms() >= 900, "stream consumes complete decoded audio including offset");
                 player.close();
-                const auto began = platform::ticks(); stream->cancel(); stream.reset();
+                const auto began = platform::ticks(); stream->cancel();
+                check(stream->cancelled() && !player.open_stream(stream), "cancelled cached stream cannot be reopened as valid audio");
+                stream.reset();
                 check(platform::ticks() - began < 2500, "cancel hands off a full or partially full ring without joining on the caller");
                 audio::wait_for_stream_cleanup();
             }
@@ -405,7 +412,7 @@ int main(int argc, char** argv) {
             };
             const auto first = wave("first.wav", 8192, 4800), second = wave("second.wav", -8192, 4800);
             audio::Player player(true);
-            check(player.open(first) && player.queue_next(second) && player.play(), player.error().c_str());
+            check(player.open(first) && player.queue_next(second, 581) && player.play(), player.error().c_str());
             std::vector<float> samples(9600 * 2);
             for (size_t at = 0; at < 9600;) {
                 const size_t count = std::min<size_t>(137, 9600 - at);
@@ -416,11 +423,17 @@ int main(int argc, char** argv) {
                 check(std::abs(samples[i * 2]) > 0.20f, "no silent frames between preloaded tracks");
                 check((i < 4800 ? samples[i * 2] > 0 : samples[i * 2] < 0), "transition stays on exact PCM boundary");
             }
-            check(player.take_transition() && !player.take_transition(), "one transition event per audio boundary");
+            uint64_t transition = 0;
+            player.cancel_next();
+            check(!player.is_ended(), "unacknowledged boundary is not the previous track ending");
+            check(!player.queue_next(first, 582), "unacknowledged audio boundary cannot be overwritten by a different queued track");
+            check(player.take_transition(&transition) && transition == 581 && !player.take_transition(), "audio boundary preserves the exact queued track token once");
             check(player.position_ms() == 100, "position belongs to next track without UI polling");
             check(player.open(first) && player.queue_next(second), "queue cancellation fixture");
             player.cancel_next(); check(player.play() && player.render(samples.data(), 9600), "cancelled queue renders current only");
             check(!player.take_transition() && std::none_of(samples.begin(), samples.end(), [](float v) { return v < -0.01f; }), "cancelled next track never plays");
+            check(player.is_ended() && player.queue_next(second) && player.is_ended(),
+                "queuing after EOF cannot hide natural completion or stall queue advancement");
             const auto loud = wave("loud.wav", 30000, 96000);
             player.set_normalization(true);
             check(player.open(loud) && player.play(), "normalization fixture");
