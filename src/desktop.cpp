@@ -155,7 +155,6 @@ public:
         if (!settings.enabled) { close(); first_.clear(); second_.clear(); return moved; }
         if (!handle_ && ticks() < retry_at_) return moved;
         if (!create()) { retry_at_ = ticks() + 5000; return moved; }
-        set_restack_waker(settings.topmost || settings.placement);
         scale_ = std::clamp(scale, 0.75f, 4.0f);
 #ifdef _WIN32
         // 歌词可独立于主窗口移动，使用歌词所在显示器的有效 DPI。
@@ -215,7 +214,7 @@ public:
             BLENDFUNCTION blend{AC_SRC_OVER, 0, BYTE(std::clamp(settings.opacity, 10, 100) * 255 / 100), AC_SRC_ALPHA};
             if (!UpdateLayeredWindow(handle_, nullptr, &destination, &size, dc_, &origin, 0, &blend, ULW_ALPHA)) error = "提交悬浮歌词图像失败";
             else error.clear();
-            ShowWindow(handle_, SW_SHOWNOACTIVATE);
+            if (!IsWindowVisible(handle_)) ShowWindow(handle_, SW_SHOWNOACTIVATE);
 #else
             pixels_.resize(size_t(width_) * height_ * 4);
             paint(pixels_.data(), width_, height_, scale_, nullptr);
@@ -236,7 +235,6 @@ public:
         return moved;
     }
     void close(bool final = false) {
-        set_restack_waker(false);
 #ifdef _WIN32
         if (handle_) DestroyWindow(handle_); handle_ = nullptr;
         if (bitmap_) { SelectObject(dc_, original_); DeleteObject(bitmap_); bitmap_ = nullptr; }
@@ -255,7 +253,7 @@ public:
         std::vector<uint8_t>().swap(pixels_);
         if (extension_) dlclose(extension_); extension_ = nullptr; shape_ = nullptr;
 #endif
-        dragging_ = false; exposed_ = true;
+        dragging_ = false; drag_started_ = false; exposed_ = true;
     }
     bool event_ready() const {
 #ifndef _WIN32
@@ -270,41 +268,21 @@ public:
 private:
     int x_ = 0, y_ = 0, width_ = 0, height_ = 0;
     int grab_x_ = 0, grab_y_ = 0;
+    int press_x_ = 0, press_y_ = 0;
     float scale_ = 1;
     bool moved_ = false, exposed_ = true;
+    bool drag_started_ = false;
     std::atomic<bool> dragging_{false};
     unsigned long long layout_at_ = 0, retry_at_ = 0, restack_at_ = 0;
     std::string first_, second_;
     LyricOverlayProgress progress_;
 #ifdef _WIN32
-    static constexpr UINT_PTR kRestackTimerHint = 0xA10;
-    inline static LyricWindow* restack_target_ = nullptr;
     HWND handle_ = nullptr;
-    UINT_PTR restack_timer_ = 0;
     HDC dc_ = nullptr;
     HBITMAP bitmap_ = nullptr;
     HGDIOBJ original_ = nullptr;
     uint8_t* pixels_ = nullptr;
     int buffer_w_ = 0, buffer_h_ = 0;
-    static VOID CALLBACK restack_timer_proc(HWND, UINT, UINT_PTR timer_id, DWORD) {
-        auto* self = restack_target_;
-        if (!self || timer_id != self->restack_timer_ || !self->handle_ ||
-            (!self->settings.topmost && !self->settings.placement)) return;
-        SetWindowPos(self->handle_, HWND_TOPMOST, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-        self->restack_at_ = ticks();
-    }
-    void set_restack_waker(bool enabled) {
-        if (enabled && !restack_timer_) {
-            restack_target_ = this;
-            restack_timer_ = SetTimer(nullptr, kRestackTimerHint, 300, restack_timer_proc);
-            if (!restack_timer_) restack_target_ = nullptr;
-        } else if (!enabled && restack_timer_) {
-            KillTimer(nullptr, restack_timer_);
-            restack_timer_ = 0;
-            if (restack_target_ == this) restack_target_ = nullptr;
-        }
-    }
     static LRESULT CALLBACK procedure(HWND window, UINT message, WPARAM w, LPARAM l) {
         auto* self = reinterpret_cast<LyricWindow*>(GetWindowLongPtrW(window, GWLP_USERDATA));
         if (message == WM_NCCREATE) {
@@ -312,6 +290,14 @@ private:
             SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
         }
         if (!self) return DefWindowProcW(window, message, w, l);
+        if (message == WM_NCDESTROY) {
+            // Explorer 重启会销毁所属浮层，下一次 update 按新的任务栏重建。
+            self->handle_ = nullptr;
+            self->dragging_ = false; self->drag_started_ = false;
+            self->bounds_at_ = 0; self->exposed_ = true;
+            SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+            return DefWindowProcW(window, message, w, l);
+        }
         if (message == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
         if (message == WM_NCHITTEST && self->settings.locked) return HTTRANSPARENT;
         if (message == WM_ERASEBKGND) return 1;
@@ -325,11 +311,10 @@ private:
         if (message == WM_LBUTTONUP && self->dragging_) {
             POINT point{}; GetCursorPos(&point); self->end_drag(point.x, point.y); ReleaseCapture(); return 0;
         }
-        if (message == WM_CAPTURECHANGED) self->dragging_ = false;
+        if (message == WM_CAPTURECHANGED) { self->dragging_ = false; self->drag_started_ = false; }
         return DefWindowProcW(window, message, w, l);
     }
 #else
-    void set_restack_waker(bool) {}
     Display* display_ = nullptr;
     ::Window handle_ = 0;
     GC gc_ = nullptr;
@@ -391,11 +376,23 @@ private:
         }
         fd_.store(ConnectionNumber(display_));
 #endif
-        error.clear(); exposed_ = true; layout_at_ = 0; restack_at_ = 0; width_ = height_ = 0; return true;
+        error.clear(); exposed_ = true; layout_at_ = 0; restack_at_ = 0; bounds_at_ = 0; width_ = height_ = 0; return true;
     }
     struct Bounds { int x = 0, y = 0, w = 0, h = 0, panel_x = 0, panel_y = 0, panel_w = 0, panel_h = 0, anchor = 0; };
     Bounds cached_bounds_;
     unsigned long long bounds_at_ = 0;
+#ifdef _WIN32
+    HWND monitor_taskbar() const {
+        POINT position{settings.x == -32000 ? 0 : settings.x, settings.y == -32000 ? 0 : settings.y};
+        const auto monitor = MonitorFromPoint(position, MONITOR_DEFAULTTOPRIMARY);
+        auto bar = FindWindowW(L"Shell_TrayWnd", nullptr);
+        if (bar && MonitorFromWindow(bar, MONITOR_DEFAULTTOPRIMARY) == monitor) return bar;
+        bar = nullptr;
+        while ((bar = FindWindowExW(nullptr, bar, L"Shell_SecondaryTrayWnd", nullptr)))
+            if (MonitorFromWindow(bar, MONITOR_DEFAULTTOPRIMARY) == monitor) return bar;
+        return nullptr;
+    }
+#endif
     Bounds bounds() {
         const auto now = ticks();
         if (now < bounds_at_ + 1000 && cached_bounds_.w > 0 && (settings.placement || settings.x == -32000 ||
@@ -403,15 +400,10 @@ private:
              settings.y >= cached_bounds_.y && settings.y < cached_bounds_.y + cached_bounds_.h))) return cached_bounds_;
         Bounds out;
 #ifdef _WIN32
-        RECT bar{}; HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+        RECT bar{}; const auto taskbar = monitor_taskbar();
         MONITORINFO monitor{sizeof(MONITORINFO)};
         POINT position{settings.x == -32000 ? 0 : settings.x, settings.y == -32000 ? 0 : settings.y};
         const auto target = MonitorFromPoint(position, MONITOR_DEFAULTTOPRIMARY);
-        if (taskbar && MonitorFromWindow(taskbar, MONITOR_DEFAULTTOPRIMARY) != target) {
-            taskbar = nullptr;
-            while ((taskbar = FindWindowExW(nullptr, taskbar, L"Shell_SecondaryTrayWnd", nullptr)))
-                if (MonitorFromWindow(taskbar, MONITOR_DEFAULTTOPRIMARY) == target) break;
-        }
         const bool has_bar = taskbar && GetWindowRect(taskbar, &bar);
         GetMonitorInfoW(target, &monitor);
         out.x = monitor.rcMonitor.left; out.y = monitor.rcMonitor.top;
@@ -474,12 +466,17 @@ private:
         y = std::clamp(y, area.y, area.y + std::max(0, area.h - h));
         const bool resized = w != width_ || h != height_;
         if (resized) exposed_ = true;
-        const auto now = ticks();
         const bool keep_above = settings.topmost || settings.placement;
-        const bool restack = keep_above && now >= restack_at_ + 300;
         bool stack_changed = false;
 #ifdef _WIN32
-        stack_changed = bool(GetWindowLongPtrW(handle_, GWL_EXSTYLE) & WS_EX_TOPMOST) != (settings.topmost || settings.placement);
+        const auto owner = settings.placement ? monitor_taskbar() : nullptr;
+        if (GetWindow(handle_, GW_OWNER) != owner) {
+            // Owned popup 始终位于任务栏上方；保持顶层坐标与 NOACTIVATE，避免与 Shell 争抢前台。
+            SetLastError(ERROR_SUCCESS);
+            const auto previous = SetWindowLongPtrW(handle_, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(owner));
+            if (previous || GetLastError() == ERROR_SUCCESS) stack_changed = true;
+        }
+        stack_changed = stack_changed || bool(GetWindowLongPtrW(handle_, GWL_EXSTYLE) & WS_EX_TOPMOST) != keep_above;
 #endif
         const bool geometry_changed = x != x_ || y != y_ || resized || stack_changed;
         if (geometry_changed) {
@@ -492,28 +489,37 @@ private:
             XFlush(display_);
 #endif
         }
-        if (restack) {
-#ifdef _WIN32
-            SetWindowPos(handle_, HWND_TOPMOST, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-#else
+#ifndef _WIN32
+        const auto now = ticks();
+        if (keep_above && now >= restack_at_ + 300) {
             XRaiseWindow(display_, handle_); XFlush(display_);
-#endif
             restack_at_ = now;
         } else if (!keep_above) restack_at_ = now;
+#endif
         return resized;
     }
     void begin_drag(int x, int y) {
         dragging_ = true; grab_x_ = x - x_; grab_y_ = y - y_;
-        settings.x = x_; settings.y = y_; settings.placement = 0; moved_ = true;
-        if (wake) wake();
+        press_x_ = x; press_y_ = y; drag_started_ = false;
     }
     void drag(int x, int y) {
+        if (!drag_started_) {
+#ifdef _WIN32
+            const int threshold_x = std::max(1, GetSystemMetrics(SM_CXDRAG) / 2);
+            const int threshold_y = std::max(1, GetSystemMetrics(SM_CYDRAG) / 2);
+#else
+            const int threshold_x = std::max(2, int(4 * scale_)), threshold_y = threshold_x;
+#endif
+            if (std::abs(x - press_x_) < threshold_x && std::abs(y - press_y_) < threshold_y) return;
+            drag_started_ = true; settings.placement = 0;
+        }
         settings.x = x - grab_x_; settings.y = y - grab_y_; moved_ = true;
         layout(); if (wake) wake();
     }
     void end_drag(int x, int y) {
         drag(x, y); dragging_ = false;
+        if (!drag_started_) return;
+        drag_started_ = false;
         const auto area = bounds(); const int margin = int(12 * scale_);
         if (x >= area.panel_x - margin && x <= area.panel_x + area.panel_w + margin && y >= area.panel_y - margin && y <= area.panel_y + area.panel_h + margin) settings.placement = 1;
         moved_ = true; exposed_ = true; layout(); if (wake) wake();
