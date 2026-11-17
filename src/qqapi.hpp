@@ -36,17 +36,7 @@ struct Profile {
 // ---------------------------------------------------------------- 小工具
 
 inline std::string cookie_value(const std::string& jar, const char* key) {
-    const std::string k = std::string(key) + "=";
-    size_t pos = 0;
-    while (pos < jar.size()) {
-        while (pos < jar.size() && (jar[pos] == ' ' || jar[pos] == ';')) ++pos;
-        const size_t end = jar.find(';', pos);
-        const std::string item = jar.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
-        if (item.rfind(k, 0) == 0) return item.substr(k.size());
-        if (end == std::string::npos) break;
-        pos = end + 1;
-    }
-    return std::string();
+    return net::cookie_value(jar, key);
 }
 
 // QQ 的 g_tk：djb2 变体，取低 31 位
@@ -109,7 +99,7 @@ inline Profile fetch_profile(const std::string& cookie, const std::string& uin_r
         p.error = "歌单返回不是 JSON：" + snippet(r.body);
         return p;
     }
-    const int code = int(root["code"].integer());
+    const int code = root["code"].int_value();
     if (code != 0) {
         p.error = "歌单接口返回 code " + std::to_string(code) + "（多半是登录过期，重新登录一次）";
         return p;
@@ -127,8 +117,8 @@ inline Profile fetch_profile(const std::string& cookie, const std::string& uin_r
         }
         pl.name = music::text::decode_entities(list[i]["diss_name"].str(list[i]["dissname"].str()));
         pl.cover = list[i]["diss_cover"].str(list[i]["logo"].str());
-        pl.count = int(list[i]["song_cnt"].integer());
-        if (pl.count == 0) pl.count = int(list[i]["songnum"].integer());
+        pl.count = list[i]["song_cnt"].int_value();
+        if (pl.count == 0) pl.count = list[i]["songnum"].int_value();
         if (pl.dirid.empty() || pl.name.empty()) continue;
         if (pl.count <= 0) continue;   // QZone背景音乐 / 本地上传 这类空占位
         p.playlists.push_back(std::move(pl));
@@ -196,7 +186,7 @@ inline std::vector<music::Track> fetch_playlist(const std::string& cookie, const
             metadata->dirid = dirid;
             metadata->name = music::text::decode_entities(data["dirinfo"]["title"].str(data["dissinfo"]["dissname"].str()));
             metadata->cover = data["dirinfo"]["picurl"].str(data["dissinfo"]["logo"].str());
-            metadata->count = int(data["total_song_num"].integer());
+            metadata->count = data["total_song_num"].int_value();
         }
         if (list.size() == 0) break;
 
@@ -214,7 +204,7 @@ inline std::vector<music::Track> fetch_playlist(const std::string& cookie, const
             }
             t.artist = artists;
             t.album = music::text::decode_entities(s["album"]["name"].str());
-            const long long interval = s["interval"].integer();
+            const long long interval = std::clamp<long long>(s["interval"].integer(), 0, std::numeric_limits<int>::max()/1000);
             t.duration_ms = int(interval > 0 ? interval * 1000 : 0);
             const std::string album_mid = s["album"]["mid"].str();
             if (!album_mid.empty())

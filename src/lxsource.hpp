@@ -33,6 +33,8 @@
 #include <thread>
 #include <vector>
 #include <tuple>
+#include <cstddef>
+#include <limits>
 
 #include "background.hpp"
 #include "json.hpp"
@@ -105,28 +107,7 @@ inline thread_local Script* current = nullptr;  // 供 C 回调取回当前脚�
 
 inline std::string from_js(JSContext* ctx, JSValueConst v);
 
-inline std::string js_quote(const std::string& s) {
-    std::string out = "\"";
-    for (unsigned char c : s) {
-        switch (c) {
-            case '"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if (c < 0x20) {
-                    char tmp[8];
-                    std::snprintf(tmp, sizeof(tmp), "\\u%04x", c);
-                    out += tmp;
-                } else {
-                    out += char(c);
-                }
-        }
-    }
-    out += '"';
-    return out;
-}
+inline std::string js_quote(const std::string& text) { return js::quote(text); }
 
 inline std::string from_js(JSContext* ctx, JSValueConst v) {
     const char* s = JS_ToCString(ctx, v);
@@ -507,9 +488,12 @@ inline JSValue to_js_value(JSContext* ctx, const js::Value& v) {
 inline bool http_request(JSContext* ctx, int argc, JSValueConst* argv, net::Request& request) {
     if (argc < 2) return false;
     js::Value options;
-    if (!js::parse(from_js(ctx, argv[1]), options) || !options.is_object()) return false;
+    const auto json = from_js(ctx, argv[1]);
+    if (!js::parse(json, options) || !options.is_object()) return false;
     std::string method = options["method"].str("GET");
     for (char& c : method) if (c >= 'a' && c <= 'z') c = char(c - 'a' + 'A');
+    // 脚本自定义请求保持既有 HTTP/重定向契约；不向 LX 注入宿主账号 Cookie。
+    request.script_transport_compatibility = true;
     request.url = from_js(ctx, argv[0]);
     request.method = method;
     request.body = options["body"].str();
@@ -573,9 +557,12 @@ inline JSValue http_response(JSContext* ctx, const net::Response& r) {
 
 // 平台目录仍提供同步 ctx.http；LX 的 request 单独使用异步桥接，支持 Promise.any / all。
 inline JSValue cb_http(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
-    net::Request request;
-    if (!http_request(ctx, argc, argv, request)) return JS_ThrowTypeError(ctx, "invalid HTTP options");
-    return http_response(ctx, net::execute(request));
+    try {
+        net::Request request;
+        if (!http_request(ctx, argc, argv, request)) return JS_ThrowTypeError(ctx, "invalid HTTP options");
+        return http_response(ctx, net::execute(request));
+    } catch (const std::bad_alloc&) { return JS_ThrowOutOfMemory(ctx); }
+    catch (const std::exception&) { return JS_ThrowTypeError(ctx, "HTTP host operation failed"); }
 }
 inline JSValue cb_http_start(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
     net::Request request;
@@ -1404,7 +1391,7 @@ public:
         std::FILE* output = path.empty() ? nullptr : platform::fopen(path + ".tmp", "wb");
         bool ok = false;
         if (output) {
-            const bool written = std::fwrite(text.data(), 1, text.size(), output) == text.size();
+            const bool written = std::fwrite(text.data(), 1, text.size(), output) == text.size() && platform::flush_file(output);
             const bool closed = std::fclose(output) == 0;
             ok = written && closed && platform::replace_file(path + ".tmp", path);
         }
@@ -1482,7 +1469,7 @@ public:
         const auto path = platform::join(platform::config_dir(), "source-timings.json"), temporary = path + ".tmp";
         auto* output = platform::fopen(temporary, "wb");
         if (!output) return;
-        const bool written = std::fwrite(text.data(), 1, text.size(), output) == text.size();
+        const bool written = std::fwrite(text.data(), 1, text.size(), output) == text.size() && platform::flush_file(output);
         const bool closed = std::fclose(output) == 0;
         if (!written || !closed || !platform::replace_file(temporary, path)) platform::remove(temporary);
     }
@@ -1911,7 +1898,7 @@ private:
         std::FILE* output = path.empty() ? nullptr : platform::fopen(path + ".tmp", "wb");
         bool ok = false;
         if (output) {
-            const bool written = std::fwrite(text.data(), 1, text.size(), output) == text.size();
+            const bool written = std::fwrite(text.data(), 1, text.size(), output) == text.size() && platform::flush_file(output);
             const bool closed = std::fclose(output) == 0;
             ok = written && closed && platform::replace_file(path + ".tmp", path);
         }

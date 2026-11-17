@@ -56,7 +56,7 @@ struct DecodeApartment {
 
 // 解码并在解码阶段就缩放到长边 ≤ max_side：一次到位，避免每帧缩放开销
 inline bool decode(const std::vector<uint8_t>& bytes, int max_side, Image& out) {
-    if (bytes.size() < 16) return false;
+    if (bytes.size() < 16 || bytes.size() > 16u*1024*1024 || max_side <= 0 || max_side > 8192) return false;
     DecodeApartment apartment;
     // 已有 STA 时返回 RPC_E_CHANGED_MODE，WIC 可在原 apartment 内使用，不能为失败调用 CoUninitialize。
     if (FAILED(apartment.result) && apartment.result != RPC_E_CHANGED_MODE) return false;
@@ -72,6 +72,14 @@ inline bool decode(const std::vector<uint8_t>& bytes, int max_side, Image& out) 
     IWICBitmapFrameDecode* frame = nullptr;
     IWICBitmapScaler* scaler = nullptr;
     IWICFormatConverter* conv = nullptr;
+    struct Release {
+        IWICImagingFactory*& factory; IWICStream*& stream; IWICBitmapDecoder*& decoder;
+        IWICBitmapFrameDecode*& frame; IWICBitmapScaler*& scaler; IWICFormatConverter*& conv;
+        ~Release() {
+            if (conv) conv->Release(); if (scaler) scaler->Release(); if (frame) frame->Release();
+            if (decoder) decoder->Release(); if (stream) stream->Release(); if (factory) factory->Release();
+        }
+    } release{factory, stream, decoder, frame, scaler, conv};
 
     do {
         if (FAILED(factory->CreateStream(&stream))) break;
@@ -85,8 +93,8 @@ inline bool decode(const std::vector<uint8_t>& bytes, int max_side, Image& out) 
 
         UINT sw = 0, sh = 0;
         if (FAILED(frame->GetSize(&sw, &sh)) || sw == 0 || sh == 0) break;
-        const double k = double(max_side) / double(sw > sh ? sw : sh);
-        const UINT dw = UINT(sw * k + 0.5), dh = UINT(sh * k + 0.5);
+        const double k = std::min(1.0, double(max_side) / double(sw > sh ? sw : sh));
+        const UINT dw = std::max(1u, UINT(sw * k + 0.5)), dh = std::max(1u, UINT(sh * k + 0.5));
 
         if (FAILED(factory->CreateBitmapScaler(&scaler))) break;
         if (FAILED(scaler->Initialize(frame, dw, dh, WICBitmapInterpolationModeFant))) break;
@@ -104,12 +112,6 @@ inline bool decode(const std::vector<uint8_t>& bytes, int max_side, Image& out) 
         ok = true;
     } while (false);
 
-    if (conv) conv->Release();
-    if (scaler) scaler->Release();
-    if (frame) frame->Release();
-    if (decoder) decoder->Release();
-    if (stream) stream->Release();
-    factory->Release();
     return ok;
 }
 
@@ -124,7 +126,7 @@ public:
     static constexpr size_t pixel_budget = 12u * 1024u * 1024u;
     struct Stats { size_t entries, pixel_bytes; };
     Stats stats() { std::lock_guard<std::mutex> lock(m_); return {map_.size(), pixel_bytes_}; }
-    void set_notifier(std::function<void()> fn) { notify_ = std::move(fn); }
+    void set_notifier(std::function<void()> fn) { std::lock_guard<std::mutex> lock(m_); notify_ = std::move(fn); }
     void clear() { std::lock_guard<std::mutex> lock(m_); ++generation_; map_.clear(); pending_.clear(); pixel_bytes_ = 0; }
     void trim_idle(unsigned long long now) {
         std::lock_guard<std::mutex> lock(m_);
@@ -158,25 +160,51 @@ public:
             if (entry.state == 2) return entry.img;
             if (entry.state == 1 || (entry.state == 3 && !retry_allowed(entry.attempts, entry.retry_at, platform::ticks()))) return nullptr;
             if (pending_.size() >= 32) { if (!entry.state) map_.erase(url); return nullptr; }
-            entry.state = 1;
             pending_.push_back({url, generation_});
+            entry.state = 1;
             if (workers_ < 2) { ++workers_; launch = true; }
         }
-        if (launch) background::start([this] { drain(); });
+        if (launch) {
+            try { background::start([this] { drain(); }); }
+            catch (const std::exception& error) { worker_failed(); background::report_error(error.what()); }
+            catch (...) { worker_failed(); background::report_error("Cover worker launch failed"); }
+        }
         return nullptr;
     }
 
 private:
+    void failed_locked(const std::string& url, unsigned generation) {
+        const auto it = map_.find(url);
+        if (generation != generation_ || it == map_.end() || it->second.state != 1) return;
+        auto& entry = it->second; entry.state = 3; ++entry.attempts;
+        entry.retry_at = platform::ticks() + (entry.attempts == 1 ? 5000 : 30000);
+    }
+    void worker_failed() {
+        std::lock_guard<std::mutex> lock(m_);
+        --workers_;
+        if (!workers_) {
+            for (const auto& item : pending_) failed_locked(item.first, item.second);
+            pending_.clear();
+        }
+    }
     void drain() {
+        struct Worker { Store& store; bool active = true; ~Worker() { if (active) store.worker_failed(); } } worker{*this};
         for (;;) {
             std::pair<std::string, unsigned> next;
             {
                 std::lock_guard<std::mutex> lock(m_);
-                if (pending_.empty()) { --workers_; return; }
+                if (pending_.empty()) { --workers_; worker.active = false; return; }
                 next = std::move(pending_.front()); pending_.pop_front();
                 if (next.second != generation_) continue;
             }
-            load(next.first, next.second);
+            try { load(next.first, next.second); }
+            catch (const std::exception& error) {
+                { std::lock_guard<std::mutex> lock(m_); failed_locked(next.first, next.second); }
+                background::report_error(error.what());
+            } catch (...) {
+                { std::lock_guard<std::mutex> lock(m_); failed_locked(next.first, next.second); }
+                background::report_error("Cover decode failed");
+            }
         }
     }
     struct Entry {
@@ -223,12 +251,15 @@ private:
             ok = detail::decode(bytes, 192, *img);
         }
         }
+        std::function<void()> notify;
         {
             std::lock_guard<std::mutex> lk(m_);
             if (generation != generation_) return;
-            Entry& e = map_[url];
+            const auto found = map_.find(url); if (found == map_.end()) return;
+            Entry& e = found->second;
             e.state = ok ? 2 : 3;
             if (!ok) { ++e.attempts; e.retry_at = platform::ticks() + (e.attempts == 1 ? 5000 : 30000); } else e.attempts = 0;
+            if (e.img) { pixel_bytes_ -= e.img->rgba.size(); e.img.reset(); }
             if (ok) { e.img = img; pixel_bytes_ += img->rgba.size(); }
             // 按实际像素字节和访问时间回收，而不是按 URL 字典序保留最多 160 张完整封面。
             while (map_.size() > 160 || pixel_bytes_ > pixel_budget) {
@@ -241,8 +272,9 @@ private:
                 if (victim->second.img) pixel_bytes_ -= victim->second.img->rgba.size();
                 map_.erase(victim);
             }
+            notify = notify_;
         }
-        if (notify_) notify_();
+        if (notify) notify();
     }
 
     std::mutex m_;

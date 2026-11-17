@@ -31,6 +31,7 @@
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <bcrypt.h>
+#include <io.h>
 #else
 #include <spawn.h>
 #include <pthread.h>
@@ -169,11 +170,36 @@ inline bool exists(const std::string& path) {
     return fs::exists(fs::u8path(path), ec);
 }
 inline void remove(const std::string& path) { std::error_code ec; fs::remove(fs::u8path(path), ec); }
+/** @brief 提交 stdio 和操作系统写缓存；调用方仍须检查 fclose 的结果。 */
+inline bool flush_file(std::FILE* file) {
+    if (!file || std::fflush(file) != 0) return false;
+#ifdef _WIN32
+    return ::_commit(::_fileno(file)) == 0;
+#else
+    int result;
+    do { result = ::fsync(::fileno(file)); } while (result < 0 && errno == EINTR);
+    return result == 0;
+#endif
+}
+inline std::atomic<bool> directory_sync_failed{false};
 inline bool replace_file(const std::string& from, const std::string& to) {
 #ifdef _WIN32
     return MoveFileExW(widen(from).c_str(), widen(to).c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 #else
-    return ::rename(from.c_str(), to.c_str()) == 0;
+    const auto directory = fs::u8path(to).parent_path();
+    const int parent = ::open(directory.empty() ? "." : directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    const bool renamed = ::rename(from.c_str(), to.c_str()) == 0;
+    if (renamed) {
+        int synced = -1;
+        if (parent >= 0) do { synced = ::fsync(parent); } while (synced < 0 && errno == EINTR);
+        if (synced < 0) {
+            directory_sync_failed.store(true);
+            std::fprintf(stderr, "File published, but parent directory sync failed; power-loss durability is not guaranteed\n");
+        }
+    }
+    if (parent >= 0) ::close(parent);
+    // rename 后无法安全回滚；返回发布结果，持久性降级另行报告。
+    return renamed;
 #endif
 }
 /** @brief 发布同目录临时文件，目标已存在时绝不覆盖；调用方可换名重试。 */

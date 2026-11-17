@@ -76,7 +76,7 @@ inline Page playlists(music::Source source, int page, int limit, const std::stri
         Card c; c.source = source; c.id = row["id"].str();
         c.name = music::text::decode_entities(row["name"].str()); c.cover = row["cover"].str();
         c.creator = music::text::decode_entities(row["creator"].str()); c.official = row["official"].truthy();
-        c.plays = row["plays"].integer(); c.count = int(row["count"].integer());
+        c.plays = row["plays"].integer(); c.count = row["count"].int_value();
         if (!c.id.empty() && !c.name.empty()) out.cards.push_back(std::move(c));
     }
     return out;

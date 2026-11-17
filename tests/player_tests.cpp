@@ -7,6 +7,7 @@
 #include <stdexcept>
 
 static void check(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
+#include "audit_safety.hpp"
 int main(int argc, char** argv) {
     try {
         if (argc > 1 && std::string(argv[1]) == "--codec-info") {
@@ -571,6 +572,7 @@ int main(int argc, char** argv) {
         platform::remove(cache_root);
         const auto utf16 = tag::utf16le_bom("中😀");
         check(utf16.size() == 8 && uint8_t(utf16[2]) == 0x2d && uint8_t(utf16[3]) == 0x4e, "UTF16 tags and surrogate pairs");
+        audit_safety_checks(dir);
         {
             auto write_metadata = [&](const std::string& name, const std::string& bytes) {
                 const auto path = platform::join(dir, name);

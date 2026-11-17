@@ -573,11 +573,13 @@ inline ResolveResult parse_netease_audio(const js::Value& root) {
 
 inline ResolveResult resolve_netease(const Variant& v, const Settings& st) {
     ResolveResult rr;
-    std::vector<std::string> headers = {"Referer: https://music.163.com/",
-                                        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                                        "Cookie: appver=2.0.2; os=pc" +
+    // CDN 可能返回 HTTP 地址；账号 Cookie 只交给官方 HTTPS API，不随音频请求转发。
+    const std::vector<std::string> audio_headers = {"Referer: https://music.163.com/",
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)"};
+    auto headers = audio_headers;
+    headers.push_back("Cookie: appver=2.0.2; os=pc" +
                                             (st.netease_cookie.empty() ? std::string()
-                                                                       : "; " + st.netease_cookie)};
+                                                                       : "; " + st.netease_cookie));
 
     // 标准档同样需要携带账号权限，不能仅因音质设置而跳过登录态取流。
     std::string account_error;
@@ -592,7 +594,7 @@ inline ResolveResult resolve_netease(const Variant& v, const Settings& st) {
             if (js::parse(r.body, root, true)) {
                 rr = parse_netease_audio(root);
                 if (rr.ok) {
-                    rr.headers = headers;
+                    rr.headers = audio_headers;
                     return rr;
                 }
                 account_error = rr.reason;
@@ -603,8 +605,8 @@ inline ResolveResult resolve_netease(const Variant& v, const Settings& st) {
 
     // 免费外链：对 free / fee=8 的曲目直出 mp3；会员曲会跳到 404 页面
     rr.url = "https://music.163.com/song/media/outer/url?id=" + v.id + ".mp3";
-    rr.headers = headers;
-    const net::AudioProbe p = net::probe_audio(rr.url, headers, 6000);
+    rr.headers = audio_headers;
+    const net::AudioProbe p = net::probe_audio(rr.url, audio_headers, 6000);
     if (p.playable) {
         rr.ok = true;
         rr.reason = "ok";
@@ -629,17 +631,7 @@ inline std::vector<Variant> search_qq(const std::string& keyword, int limit, int
 
 // 从 cookie 里取一个键（QQ 的 uin / authst 都靠它）
 inline std::string cookie_value(const std::string& jar, const char* key) {
-    const std::string k = std::string(key) + "=";
-    size_t pos = 0;
-    while (pos < jar.size()) {
-        while (pos < jar.size() && (jar[pos] == ' ' || jar[pos] == ';')) ++pos;
-        const size_t end = jar.find(';', pos);
-        const std::string item = jar.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
-        if (item.rfind(k, 0) == 0) return item.substr(k.size());
-        if (end == std::string::npos) break;
-        pos = end + 1;
-    }
-    return std::string();
+    return net::cookie_value(jar, key);
 }
 
 namespace detail {
@@ -833,12 +825,14 @@ inline void merge_into(std::vector<Track>& tracks, std::map<std::string, size_t>
     if (it != index.end()) {
         Track& t = tracks[it->second];
         if (same_song(t, v)) {
-            for (const auto& existing : t.variants) {
+            for (auto& existing : t.variants) {
                 if (existing.source != v.source) continue;
                 // 同一个源只留一条：接口常把同曲的不同合辑/版本各返回一次，
                 // 全塞进来会让一行里出现两枚一模一样的来源药丸
                 if (existing.id == v.id) return;
                 if (double(v.bitrate) <= double(existing.bitrate)) return;
+                existing = std::move(v);
+                return;
             }
             t.variants.push_back(std::move(v));
             return;
@@ -1064,82 +1058,7 @@ inline int clock_ms(const std::string& text) {
     const auto seconds = total * 60 + part;
     return seconds <= 2147483 ? int(seconds * 1000) : 0;
 }
-namespace detail {
-
-inline uint32_t Rotl32(uint32_t x, int c) { return (x << c) | (x >> (32 - c)); }
-
-inline void Md5Block(uint32_t st[4], const unsigned char* p) {
-    static const uint32_t K[64] = {
-        0xd76aa478u, 0xe8c7b756u, 0x242070dbu, 0xc1bdceeeu, 0xf57c0fafu, 0x4787c62au,
-        0xa8304613u, 0xfd469501u, 0x698098d8u, 0x8b44f7afu, 0xffff5bb1u, 0x895cd7beu,
-        0x6b901122u, 0xfd987193u, 0xa679438eu, 0x49b40821u, 0xf61e2562u, 0xc040b340u,
-        0x265e5a51u, 0xe9b6c7aau, 0xd62f105du, 0x02441453u, 0xd8a1e681u, 0xe7d3fbc8u,
-        0x21e1cde6u, 0xc33707d6u, 0xf4d50d87u, 0x455a14edu, 0xa9e3e905u, 0xfcefa3f8u,
-        0x676f02d9u, 0x8d2a4c8au, 0xfffa3942u, 0x8771f681u, 0x6d9d6122u, 0xfde5380cu,
-        0xa4beea44u, 0x4bdecfa9u, 0xf6bb4b60u, 0xbebfbc70u, 0x289b7ec6u, 0xeaa127fau,
-        0xd4ef3085u, 0x04881d05u, 0xd9d4d039u, 0xe6db99e5u, 0x1fa27cf8u, 0xc4ac5665u,
-        0xf4292244u, 0x432aff97u, 0xab9423a7u, 0xfc93a039u, 0x655b59c3u, 0x8f0ccc92u,
-        0xffeff47du, 0x85845dd1u, 0x6fa87e4fu, 0xfe2ce6e0u, 0xa3014314u, 0x4e0811a1u,
-        0xf7537e82u, 0xbd3af235u, 0x2ad7d2bbu, 0xeb86d391u};
-    static const int S[64] = {
-        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
-        5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20,
-        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
-        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21};
-
-    uint32_t m[16];
-    for (int i = 0; i < 16; ++i)
-        m[i] = (uint32_t)p[i * 4] | ((uint32_t)p[i * 4 + 1] << 8) |
-               ((uint32_t)p[i * 4 + 2] << 16) | ((uint32_t)p[i * 4 + 3] << 24);
-
-    uint32_t a = st[0], b = st[1], c = st[2], d = st[3];
-    for (int i = 0; i < 64; ++i) {
-        uint32_t f;
-        int g;
-        if (i < 16)      { f = (b & c) | (~b & d); g = i; }
-        else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) & 15; }
-        else if (i < 48) { f = b ^ c ^ d;          g = (3 * i + 5) & 15; }
-        else             { f = c ^ (b | ~d);       g = (7 * i) & 15; }
-        uint32_t tmp = d;
-        d = c;
-        c = b;
-        b = b + Rotl32(a + f + K[i] + m[g], S[i]);
-        a = tmp;
-    }
-    st[0] += a; st[1] += b; st[2] += c; st[3] += d;
-}
-
-}  // namespace detail
-
-inline std::string Md5Hex(const std::string& input) {
-    uint32_t st[4] = {0x67452301u, 0xefcdab89u, 0x98badcfeu, 0x10325476u};
-    const unsigned char* data = (const unsigned char*)input.data();
-    size_t len = input.size();
-    size_t full = len / 64;
-    for (size_t i = 0; i < full; ++i) detail::Md5Block(st, data + i * 64);
-
-    unsigned char tail[128];
-    size_t rem = len - full * 64;
-    std::memcpy(tail, data + full * 64, rem);
-    tail[rem] = 0x80;
-    size_t padLen = (rem < 56) ? 64 : 128;
-    std::memset(tail + rem + 1, 0, padLen - rem - 1 - 8);
-    uint64_t bits = (uint64_t)len * 8;
-    for (int i = 0; i < 8; ++i) tail[padLen - 8 + i] = (unsigned char)((bits >> (8 * i)) & 0xFF);
-    detail::Md5Block(st, tail);
-    if (padLen == 128) detail::Md5Block(st, tail + 64);
-
-    static const char* kHex = "0123456789abcdef";
-    std::string out;
-    out.resize(32);
-    for (int i = 0; i < 4; ++i)
-        for (int j = 0; j < 4; ++j) {
-            unsigned char byte = (unsigned char)((st[i] >> (8 * j)) & 0xFF);
-            out[(size_t)(i * 8 + j * 2)] = kHex[byte >> 4];
-            out[(size_t)(i * 8 + j * 2 + 1)] = kHex[byte & 0x0F];
-        }
-    return out;
-}
+inline std::string Md5Hex(const std::string& input) { return lx::detail::md5_hex(input); }
 
 
 inline std::string wbi_key(const std::string& img, const std::string& sub) {
@@ -1624,8 +1543,8 @@ inline Track catalog_track(Source source, const js::Value& input) {
         }
         const auto& album = song["al"].is_object() ? song["al"] : song["album"];
         v.album = text::decode_entities(album["name"].str()); v.cover_url = album["picUrl"].str();
-        v.duration_ms = int(song["dt"].integer(song["duration"].integer()));
-        const int fee = int(song["fee"].integer()); v.needs_login = fee == 1 || fee == 4;
+        v.duration_ms = song["dt"].int_value(song["duration"].int_value());
+        const int fee = song["fee"].int_value(); v.needs_login = fee == 1 || fee == 4;
     } else if (source == Source::QQ) {
         v.id = song["mid"].str(song["songmid"].str()); v.native_id = catalog_id(song["id"]);
         v.title = text::decode_entities(song["name"].str(song["songname"].str(song["title"].str())));
@@ -1633,7 +1552,7 @@ inline Track catalog_track(Source source, const js::Value& input) {
             if (!v.artist.empty()) v.artist += " / "; v.artist += text::decode_entities(artist["name"].str());
         }
         v.album = text::decode_entities(song["album"]["name"].str(song["albumname"].str()));
-        v.duration_ms = int(song["interval"].integer()) * 1000;
+        v.duration_ms = int(std::min<long long>(song["interval"].milliseconds(), std::numeric_limits<int>::max()));
         const auto mid = song["album"]["mid"].str(song["albummid"].str());
         if (!mid.empty()) v.cover_url = "https://y.gtimg.cn/music/photo_new/T002R300x300M000" + mid + ".jpg";
         v.needs_login = song["pay"]["pay_play"].integer() != 0;

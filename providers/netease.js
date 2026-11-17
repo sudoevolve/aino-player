@@ -52,7 +52,7 @@ globalThis.provider = {
   name: '网易云',
 
   search: function (keyword, page, limit) {
-    const url = 'http://music.163.com/api/search/get/web?s=' + encodeURIComponent(keyword) +
+    const url = 'https://music.163.com/api/search/get/web?s=' + encodeURIComponent(keyword) +
       '&type=1&limit=' + (limit | 0) + '&offset=' + ((page | 0) * (limit | 0))
     const r = http(url, {
       headers: {

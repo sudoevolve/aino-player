@@ -63,6 +63,8 @@ struct LinuxCoverDecoder {
     bool decode(const std::vector<uint8_t>& bytes, int max_side, Image& out) const {
         void* loader = create();
         if (!loader) return false;
+        const auto cleanup = [this](void* value) { unref(value); };
+        std::unique_ptr<void, decltype(cleanup)> owned(loader, cleanup);
         SizeRequest request{this, max_side};
         connect(loader, "size-prepared", reinterpret_cast<void(*)()>(prepared), &request, nullptr, 0);
         const bool written = write(loader, bytes.data(), bytes.size(), nullptr) != 0;
@@ -85,7 +87,6 @@ struct LinuxCoverDecoder {
                 ok = true;
             }
         }
-        unref(loader);
         return ok;
     }
 };
@@ -102,6 +103,7 @@ bool decode(const std::vector<uint8_t>& bytes, int max_side, Image& out) {
 #endif
     auto* pixels = stbi_load_from_memory(bytes.data(), int(bytes.size()), &sw, &sh, &channels, 4);
     if (!pixels || sw <= 0 || sh <= 0) { stbi_image_free(pixels); return false; }
+    std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> owned(pixels, &stbi_image_free);
     const double scale = std::min(1.0, double(max_side) / std::max(sw, sh));
     out.w = std::max(1, int(sw * scale)); out.h = std::max(1, int(sh * scale));
     out.rgba.resize(size_t(out.w) * out.h * 4);
@@ -114,7 +116,7 @@ bool decode(const std::vector<uint8_t>& bytes, int max_side, Image& out) {
             (1-fy) * ((1-fx) * pixels[(size_t(y0)*sw+x0)*4+c] + fx * pixels[(size_t(y0)*sw+x1)*4+c]) +
             fy * ((1-fx) * pixels[(size_t(y1)*sw+x0)*4+c] + fx * pixels[(size_t(y1)*sw+x1)*4+c]));
     }
-    stbi_image_free(pixels); return true;
+    return true;
 }
 } }
 #endif

@@ -34,6 +34,8 @@ globalThis.provider = {
 
 宿主提供 `ctx.http(url, {method,headers,body,timeout})`、`ctx.cookie('netease'|'qq')`、`ctx.md5`、`ctx.b64encode`、`ctx.b64decode`、`ctx.log`。HTTP 返回 `{statusCode,body,bodyText,headers,error}`；目录方法使用同步 HTTP。可选 `resolve(song, quality)` 仅供平台自带直链，不得反向调用第三方源冒充自带渠道。
 
+Provider 覆盖目录属于本地可信代码边界：覆盖脚本沿用既有 `ctx.cookie` 登录权限，不能把 QuickJS 当作账号权限沙箱。只安装自己信任的 Provider；配置文件中的登录态仍为本地明文。LX 音源不注入这些宿主账号 Cookie。两类脚本的自定义 HTTP/重定向契约保持兼容，不通过新进程总配额或静默收回权限改变现有音源行为；后续如引入凭据授权或总内存预算，应另做显式迁移及真实音源验证。网易云默认搜索使用 HTTPS；原生取流只向官方 HTTPS API 发送账号 Cookie，不把它继续转给音频 CDN。
+
 集合锁只用于取得 `shared_ptr` 或交换列表；各平台独立运行时锁覆盖参数创建、JS 执行和释放。等待可取消，网络期间不持集合锁；调用线程持有自己的凭据快照。搜索和取流等待时可取消低优先级的榜单、推荐、热搜及歌词请求，让交互先取得运行时；被取消的目录读取保留已有结果并显示可重试错误，不复制额外的 JS 运行时。重载不释放仍被请求持有的旧运行时。歌曲转换只保留模型需要的字段，文本字段限制为 8 KiB、参与歌手最多 32 项，避免每首曲目完整 JSON 的重复编解码和保留。
 
 ## 第三方音源

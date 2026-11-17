@@ -24,7 +24,49 @@
 #include <atomic>
 #include <algorithm>
 #include <utility>
+#include <vector>
+#include <memory>
 namespace net {
+inline std::string ascii_lower(std::string value) {
+    for (auto& c : value) if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+    return value;
+}
+inline std::string cookie_value(const std::string& jar, const char* key) {
+    const std::string prefix = std::string(key) + "=";
+    for (size_t pos = 0; pos < jar.size();) {
+        while (pos < jar.size() && (jar[pos] == ' ' || jar[pos] == ';')) ++pos;
+        const auto end = jar.find(';', pos);
+        const auto item = jar.substr(pos, end == std::string::npos ? std::string::npos : end-pos);
+        if (item.rfind(prefix, 0) == 0) return item.substr(prefix.size());
+        if (end == std::string::npos) break;
+        pos = end+1;
+    }
+    return {};
+}
+inline bool secure_url(const std::string& url) { return ascii_lower(url.substr(0, 8)) == "https://"; }
+inline bool sensitive_request_headers(const std::vector<std::string>& headers) {
+    for (const auto& header : headers) {
+        const auto key = ascii_lower(header.substr(0, header.find(':')));
+        if (key == "cookie" || key == "authorization" || key == "proxy-authorization") return true;
+    }
+    return false;
+}
+/** @brief 检查请求头；宿主凭据要求 TLS，脚本请求保留原有传输契约。 */
+inline bool safe_request_headers(const std::string& url, const std::vector<std::string>& headers,
+                                 bool script_transport_compatibility = false) {
+    for (const auto& header : headers) {
+        if (header.find_first_of("\r\n") != std::string::npos || header.find('\0') != std::string::npos) return false;
+        const auto colon = header.find(':');
+        if (colon == std::string::npos || colon == 0) return false;
+        for (size_t i = 0; i < colon; ++i) {
+            const auto c = static_cast<unsigned char>(header[i]);
+            const bool token = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') || std::strchr("!#$%&'*+-.^_`|~", c);
+            if (!token) return false;
+        }
+    }
+    return script_transport_compatibility || secure_url(url) || !sensitive_request_headers(headers);
+}
 inline const std::atomic<bool>* shutdown_signal = nullptr;
 inline thread_local std::function<bool()> cancel_current;
 inline bool cancelled() { return (shutdown_signal && shutdown_signal->load()) || (cancel_current && cancel_current()); }
@@ -150,6 +192,7 @@ struct Request {
     bool follow_redirects = true;
     size_t max_body = 8u * 1024 * 1024;
     std::string method;              // 空值保留原来的 GET / 非空 body POST 推断。
+    bool script_transport_compatibility = false; // 仅脚本桥设置，保留脚本自有凭据的传输契约。
 };
 
 namespace detail {
@@ -252,6 +295,7 @@ inline std::string last_error_text(const char* where) {
 // 建连接 + 请求 + 发送，成功时返回 request 句柄（连接句柄由调用方负责关闭）
 inline HINTERNET send(HINTERNET session, const Request& req, const wchar_t* verb, HINTERNET* out_conn,
                       const void* body, DWORD body_len, std::string& err) {
+    if (!safe_request_headers(req.url, req.headers, req.script_transport_compatibility)) { err = "拒绝不安全的凭据传输或请求头"; return nullptr; }
     URL_COMPONENTS uc = {};
     uc.dwStructSize = sizeof uc;
     uc.dwSchemeLength = (DWORD)-1;
@@ -286,9 +330,14 @@ inline HINTERNET send(HINTERNET session, const Request& req, const wchar_t* verb
         err = "已取消"; WinHttpCloseHandle(conn); return nullptr;
     }
 
-    DWORD redirect = req.follow_redirects ? WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS
+    const bool protect_credentials = !req.script_transport_compatibility && sensitive_request_headers(req.headers);
+    DWORD redirect = req.follow_redirects ? (protect_credentials ? WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP
+                                                                : WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS)
                                           : WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
-    WinHttpSetOption(hreq, WINHTTP_OPTION_REDIRECT_POLICY, &redirect, sizeof redirect);
+    if (!WinHttpSetOption(hreq, WINHTTP_OPTION_REDIRECT_POLICY, &redirect, sizeof redirect)) {
+        err = last_error_text("WinHttp redirect policy");
+        detail::close_request(hreq); WinHttpCloseHandle(conn); return nullptr;
+    }
 
     // 超时：解析/连接/发送/接收四段分别设，接收超时是"卡死"的主要防线
     const int t = req.timeout_ms;

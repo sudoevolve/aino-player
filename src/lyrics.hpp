@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <functional>
 #include <map>
+#include <limits>
 #include <set>
 #include <string>
 #include <vector>
@@ -39,37 +40,33 @@ struct Doc {
 
 // 取 [mm:ss.xx] / [mm:ss:xx] / [mm:ss] 的时间，返回毫秒；失败返回 -1
 inline long long parse_stamp(const std::string& s, size_t from, size_t to) {
-    long long mm = 0, ss = 0, ms = 0;
-    int part = 0;
-    size_t digits = 0;
-    long long* dst[3] = {&mm, &ss, &ms};
-    for (size_t i = from; i < to; ++i) {
-        const char c = s[i];
-        if (c >= '0' && c <= '9') {
-            *dst[part] = *dst[part] * 10 + (c - '0');
-            ++digits;
-        } else if (c == ':' || c == '.') {
-            if (part < 2) ++part;
-        } else {
-            return -1;  // [ti:xxx] 这类元信息标签会走到这里
+    if (from >= to || to > s.size()) return -1;
+    size_t at = from;
+    const auto number = [&](long long limit, long long& value) {
+        const auto begin = at; value = 0;
+        while (at < to && s[at] >= '0' && s[at] <= '9') {
+            const int digit = s[at++] - '0';
+            if (value > (limit-digit)/10) return false;
+            value = value*10 + digit;
         }
-    }
-    if (digits == 0) return -1;
-    // 小数位按位数换算：.5 → 500ms，.53 → 530ms，.532 → 532ms
-    if (part == 2) {
-        int scale = 1;
-        for (size_t i = from; i < to; ++i) {
-            if (s[i] == '.') {
-                size_t n = 0;
-                for (size_t k = i + 1; k < to; ++k)
-                    if (s[k] >= '0' && s[k] <= '9') ++n;
-                for (size_t k = 0; k < n; ++k) scale *= 10;
-                break;
-            }
+        return at != begin;
+    };
+    long long minutes = 0, seconds = 0, fraction = 0;
+    constexpr auto maximum = std::numeric_limits<long long>::max();
+    if (!number(maximum/60000, minutes) || at == to || s[at++] != ':' || !number(59, seconds)) return -1;
+    if (at < to) {
+        if (s[at] != '.' && s[at] != ':') return -1;
+        ++at; const auto begin = at; int scale = 100;
+        while (at < to && s[at] >= '0' && s[at] <= '9') {
+            // 两种分隔符均按十进制小数解释，超过毫秒精度的位只校验。
+            if (scale) { fraction += (s[at]-'0')*scale; scale /= 10; }
+            ++at;
         }
-        ms = scale > 0 ? (ms * 1000) / scale : ms;
+        if (at == begin) return -1;
     }
-    return mm * 60000 + ss * 1000 + ms;
+    const auto rest = seconds*1000 + fraction;
+    if (at != to || minutes > (maximum-rest)/60000) return -1;
+    return minutes*60000 + rest;
 }
 
 inline std::string trim_copy(const std::string& s) {
@@ -453,13 +450,12 @@ inline std::string to_lrc(const Doc& d) {
 
 // 给定播放位置，返回当前行（最后一个 time <= pos 的行）；没有就 -1
 inline int current_line(const std::vector<Line>& lines, long long pos_ms) {
-    int idx = -1;
-    for (int i = 0; i < int(lines.size()); ++i) {
-        if (lines[size_t(i)].ms < 0) continue;
-        if (lines[size_t(i)].ms <= pos_ms) idx = i;
-        else break;
-    }
-    return idx;
+    if (pos_ms < 0) return -1;
+    // parse 按 max(ms,0) 稳定排序；相同时间取最后一行，未同步文本不参与定位。
+    auto it = std::upper_bound(lines.begin(), lines.end(), pos_ms,
+        [](long long time, const Line& line) { return time < std::max(0LL, line.ms); });
+    while (it != lines.begin()) { --it; if (it->ms >= 0) return int(it-lines.begin()); }
+    return -1;
 }
 
 }  // namespace lyr

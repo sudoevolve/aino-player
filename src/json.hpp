@@ -11,8 +11,31 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <cmath>
+#include <limits>
+#include <locale>
+#include <sstream>
 
 namespace js {
+
+inline std::string quote(const std::string& text) {
+    std::string out = "\""; const char* hex = "0123456789abcdef";
+    for (unsigned char c : text) {
+        if (c == '"' || c == '\\') { out += '\\'; out += char(c); }
+        else if (c < 32) { out += "\\u00"; out += hex[c >> 4]; out += hex[c & 15]; }
+        else out += char(c);
+    }
+    return out + '"';
+}
+
+inline bool finite_number(const std::string& text, double& value) {
+    std::istringstream input(text); input.imbue(std::locale::classic());
+    double parsed = 0;
+    if (!(input >> parsed) || !std::isfinite(parsed)) return false;
+    input >> std::ws;
+    if (!input.eof()) return false;
+    value = parsed; return true;
+}
 
 enum class Type { Null, Bool, Number, String, Array, Object };
 
@@ -56,16 +79,27 @@ struct Value {
         return type == Type::String ? string : fallback;
     }
     double num(double fallback = 0.0) const {
-        if (type == Type::Number) return number;
+        if (type == Type::Number) return std::isfinite(number) ? number : fallback;
         if (type == Type::String) {  // 有些接口把数字写成字符串
-            try { return std::stod(string); } catch (...) { return fallback; }
+            double value = 0; return finite_number(string, value) ? value : fallback;
         }
         if (type == Type::Bool) return boolean ? 1.0 : 0.0;
         return fallback;
     }
     long long integer(long long fallback = 0) const {
-        const double d = num(double(fallback));
-        return (long long)(d < 0 ? d - 0.5 : d + 0.5);
+        const double d = num(std::numeric_limits<double>::quiet_NaN());
+        const double rounded = std::round(d);
+        // LLONG_MAX 转成 double 会向上舍入到 2^63，故上界必须用严格小于。
+        if (!std::isfinite(rounded) || rounded < -9223372036854775808.0 || rounded >= 9223372036854775808.0) return fallback;
+        return static_cast<long long>(rounded);
+    }
+    int int_value(int fallback = 0) const {
+        const auto value = integer(fallback);
+        return value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max() ? fallback : int(value);
+    }
+    long long milliseconds(long long fallback = 0) const {
+        const auto seconds = integer(-1);
+        return seconds < 0 || seconds > std::numeric_limits<long long>::max()/1000 ? fallback : seconds*1000;
     }
     bool truthy() const {
         switch (type) {
@@ -94,7 +128,7 @@ struct Parser {
             const char c = *p;
             if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { ++p; continue; }
             // 兼容接口响应中的 UTF-8 BOM。
-            if ((unsigned char)c == 0xEF && end - p >= 3 && (unsigned char)p[1] == 0xBB &&
+            if ((lenient || p == begin) && (unsigned char)c == 0xEF && end - p >= 3 && (unsigned char)p[1] == 0xBB &&
                 (unsigned char)p[2] == 0xBF) { p += 3; continue; }
             break;
         }
@@ -140,7 +174,7 @@ struct Parser {
     bool parse_string(std::string& out) {
         if (p >= end) return false;
         const char quote = *p;
-        if (quote != '"' && quote != '\'') return fail("string");
+        if (quote != '"' && !(lenient && quote == '\'')) return fail("string");
         ++p;
         out.clear();
         while (p < end) {
@@ -151,7 +185,7 @@ struct Parser {
                 const char e = *p++;
                 switch (e) {
                     case '"': out += '"'; break;
-                    case '\'': out += '\''; break;
+                    case '\'': if (!lenient) return fail("escape"); out += '\''; break;
                     case '\\': out += '\\'; break;
                     case '/': out += '/'; break;
                     case 'b': out += '\b'; break;
@@ -171,12 +205,33 @@ struct Parser {
                             else
                                 p = save;
                         }
+                        if (cp >= 0xD800 && cp <= 0xDFFF) {
+                            if (!lenient) return fail("unpaired surrogate");
+                            cp = 0xFFFD;
+                        }
                         append_utf8(out, cp);
                         break;
                     }
-                    default: out += e; break;  // 宽容：未知转义按字面
+                    default: if (!lenient) return fail("escape"); out += e; break;
                 }
                 continue;
+            }
+            if (!lenient && static_cast<unsigned char>(c) < 32) return fail("control character");
+            if (!lenient && static_cast<unsigned char>(c) >= 128) {
+                const auto first = static_cast<unsigned char>(c); unsigned count = 0; uint32_t cp = 0, minimum = 0;
+                if (first >= 194 && first <= 223) { count = 1; cp = first & 31; minimum = 128; }
+                else if (first >= 224 && first <= 239) { count = 2; cp = first & 15; minimum = 2048; }
+                else if (first >= 240 && first <= 244) { count = 3; cp = first & 7; minimum = 65536; }
+                else return fail("UTF-8 lead");
+                if (size_t(end-p) < count) return fail("UTF-8 truncated");
+                const auto* start = p-1;
+                for (unsigned i = 0; i < count; ++i) {
+                    const auto next = static_cast<unsigned char>(*p++);
+                    if ((next & 192) != 128) return fail("UTF-8 continuation");
+                    cp = (cp << 6) | (next & 63);
+                }
+                if (cp < minimum || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return fail("UTF-8 codepoint");
+                out.append(start, p); continue;
             }
             out += c;
         }
@@ -185,18 +240,19 @@ struct Parser {
 
     bool parse_number(Value& v) {
         const char* start = p;
-        if (p < end && (*p == '-' || *p == '+')) ++p;
-        while (p < end && ((*p >= '0' && *p <= '9') || *p == '.' || *p == 'e' || *p == 'E' ||
-                           ((*p == '-' || *p == '+') && (p[-1] == 'e' || p[-1] == 'E'))))
-            ++p;
-        if (p == start) return fail("number");
-        const std::string text(start, p);
-        try {
-            v.type = Type::Number;
-            v.number = std::stod(text);
-        } catch (...) {
-            return fail("number parse");
+        const auto digit = [&] { return p < end && *p >= '0' && *p <= '9'; };
+        if (p < end && (*p == '-' || (lenient && *p == '+'))) ++p;
+        if (!digit()) return fail("number");
+        if (*p == '0' && !lenient) ++p;
+        else while (digit()) ++p;
+        if (p < end && *p == '.') { ++p; if (!digit()) return fail("fraction"); while (digit()) ++p; }
+        if (p < end && (*p == 'e' || *p == 'E')) {
+            ++p; if (p < end && (*p == '-' || *p == '+')) ++p;
+            if (!digit()) return fail("exponent"); while (digit()) ++p;
         }
+        if (p < end && (*p == '.' || *p == 'e' || *p == 'E' || (*p >= '0' && *p <= '9'))) return fail("number suffix");
+        if (!finite_number(std::string(start, p), v.number)) return fail("number range");
+        v.type = Type::Number;
         return true;
     }
 
@@ -212,7 +268,8 @@ struct Parser {
         const std::string word(start, p);
         if (word == "true") { v.type = Type::Bool; v.boolean = true; return true; }
         if (word == "false") { v.type = Type::Bool; v.boolean = false; return true; }
-        if (word == "null" || word == "None" || word.empty()) { v.type = Type::Null; return true; }
+        if (word == "null" || (lenient && word == "None")) { v.type = Type::Null; return true; }
+        if (word.empty()) return fail("empty value");
         if (lenient) {  // 裸字符串，当字符串收下
             v.type = Type::String;
             v.string = word;
@@ -300,8 +357,11 @@ inline bool parse(const std::string& text, Value& out, bool lenient = false, std
     ps.end = text.data() + text.size();
     ps.lenient = lenient;
     out = Value();
-    const bool ok = ps.parse_value(out);
-    if (!ok && error) *error = ps.error;
+    bool ok = ps.parse_value(out);
+    ps.skip_ws();
+    if (ok && !lenient && ps.p != ps.end) ok = ps.fail("trailing input");
+    if (!ok) out = Value();
+    if (error) *error = ps.error;
     return ok;
 }
 

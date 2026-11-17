@@ -19,6 +19,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <charconv>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
@@ -321,6 +322,7 @@ struct DlItem {
     long long created_at = 0, finished_at = 0, bytes = 0;
     bool cancelled = false, missing = false;
     music::Track track;
+    std::string source_key; // 空值表示历史记录来源未经验证。
     std::string name;   // 保存的文件名
     std::string err;
 };
@@ -597,6 +599,14 @@ static std::string read_line_value(const std::string& line, const char* key) {
     return line.substr(k.size() + 1);
 }
 
+static int config_integer(const std::string& text, int fallback, int low, int high) {
+    long long value = 0;
+    const auto result = std::from_chars(text.data(), text.data()+text.size(), value);
+    if (result.ec != std::errc() || result.ptr != text.data()+text.size()) return fallback;
+    return int(std::clamp<long long>(value, low, high));
+}
+static float config_volume(double value) { return std::isfinite(value) ? float(std::clamp(value, 0.0, 100.0)) : 70.0f; }
+
 void load(UiState& state) {
     const std::string path = config_path();
     if (path.empty()) return;
@@ -610,11 +620,11 @@ void load(UiState& state) {
         if (line.empty() || line[0] == '#') continue;
         std::string v = read_line_value(line, "shortcuts_enabled"); if (!v.empty()) state.shortcuts.enabled = v != "0";
         for (int i = 0; i < 4; ++i) {
-            v = read_line_value(line, ("shortcut_key_" + std::to_string(i)).c_str()); if (!v.empty()) state.shortcuts.keys[size_t(i)] = std::clamp(std::atoi(v.c_str()), 0, 14);
-            v = read_line_value(line, ("shortcut_mod_" + std::to_string(i)).c_str()); if (!v.empty()) state.shortcuts.modifiers[size_t(i)] = std::clamp(std::atoi(v.c_str()), 0, 3);
+            v = read_line_value(line, ("shortcut_key_" + std::to_string(i)).c_str()); if (!v.empty()) state.shortcuts.keys[size_t(i)] = config_integer(v, state.shortcuts.keys[size_t(i)], 0, 14);
+            v = read_line_value(line, ("shortcut_mod_" + std::to_string(i)).c_str()); if (!v.empty()) state.shortcuts.modifiers[size_t(i)] = config_integer(v, state.shortcuts.modifiers[size_t(i)], 0, 3);
         }
         v = read_line_value(line, "volume");
-        if (!v.empty()) state.volume = float(std::atof(v.c_str()));
+        if (!v.empty()) { double value = 0; if (js::finite_number(v, value)) state.volume = config_volume(value); }
         v = read_line_value(line, "normalize_volume");
         if (!v.empty()) state.normalize_volume = v != "0";
         v = read_line_value(line, "gapless");
@@ -636,7 +646,7 @@ void load(UiState& state) {
         v = read_line_value(line, "close_to_tray");
         if (!v.empty()) state.close_behavior = v == "1" ? 1 : 0;
         v = read_line_value(line, "close_behavior");
-        if (!v.empty()) state.close_behavior = std::clamp(std::atoi(v.c_str()), 0, 2);
+        if (!v.empty()) state.close_behavior = config_integer(v, state.close_behavior, 0, 2);
         v = read_line_value(line, "sources");
         if (!v.empty()) {
             const uint32_t m = uint32_t(std::strtoul(v.c_str(), nullptr, 10));
@@ -665,7 +675,7 @@ void load(UiState& state) {
         for (const auto& flag : overlay_flags) { v = read_line_value(line, flag.first); if (!v.empty()) *flag.second = v != "0"; }
         const auto integer = [&](const char* key, int& field, int low, int high) {
             const auto value = read_line_value(line, key);
-            if (!value.empty()) field = int(std::clamp(std::strtol(value.c_str(), nullptr, 10), long(low), long(high)));
+            if (!value.empty()) field = config_integer(value, field, low, high);
         };
         integer("overlay_opacity", overlay.opacity, 10, 100); integer("overlay_background", overlay.background, 0, 90);
         integer("eq_preamp", state.equalizer.preamp_db, -12, 12);
@@ -685,9 +695,9 @@ void load(UiState& state) {
         v = read_line_value(line, "watch_folders");
         if (!v.empty()) state.watch_folders = v != "0";
         v = read_line_value(line, "quality");
-        if (!v.empty()) state.settings.quality = std::atoi(v.c_str());
+        if (!v.empty()) state.settings.quality = config_integer(v, state.settings.quality, 0, 2);
         v = read_line_value(line, "lane_pref");
-        if (!v.empty()) state.settings.lane_pref = std::atoi(v.c_str()) == 1 ? 1 : 0;
+        if (!v.empty()) state.settings.lane_pref = config_integer(v, state.settings.lane_pref, 0, 1);
         v = read_line_value(line, "source_smart_switch");
         if (!v.empty()) state.settings.source_smart_switch = v != "0";
         v = read_line_value(line, "lane_enable");
@@ -709,7 +719,7 @@ void load(UiState& state) {
             state.play_mode = PlayMode(std::atoi(v.c_str())); has_play_mode = true;
         }
         v = read_line_value(line, "config_version");
-        if (!v.empty()) has_version = std::atoi(v.c_str()) >= 2;
+        if (!v.empty()) has_version = config_integer(v, 0, 0, INT_MAX) >= 2;
     }
     std::fclose(f);
 
@@ -718,6 +728,7 @@ void load(UiState& state) {
 }
 
 bool save(UiState& state) {
+    state.volume = config_volume(state.volume);
     const std::string path = config_path();
     if (path.empty()) return false;
     const auto temporary = path + ".tmp";
@@ -762,7 +773,7 @@ bool save(UiState& state) {
     std::fprintf(f, "embed_lyrics=%d\n", state.settings.embed_lyrics ? 1 : 0);
     std::fprintf(f, "play_mode=%d\n", int(state.play_mode));
     std::fprintf(f, "loop_list=%d\n", state.play_mode == PlayMode::Sequential ? 0 : 1);
-    const bool written = !std::ferror(f);
+    const bool written = !std::ferror(f) && platform::flush_file(f);
     const bool closed = std::fclose(f) == 0;
     if (!written || !closed || !platform::replace_file(temporary, path)) { platform::remove(temporary); return false; }
     state.config_dirty = false;
@@ -1049,7 +1060,7 @@ static std::deque<std::function<void()>> g_download_pending;
 static int g_download_workers = 0;
 static unsigned long long g_download_revision = 0, g_download_snapshot_revision = ~0ULL;
 static std::map<std::string, DlItem> g_dls_snap;   // 主线程快照
-struct DownloadedFile { std::string path; long long bytes = 0; };
+struct DownloadedFile { std::string path; long long bytes = 0; bool exact = false; };
 static std::map<std::string, DownloadedFile> g_downloaded_files; // 精确平台 ID；不以文件名猜测歌曲身份。
 static unsigned long long g_download_saved_revision = 0, g_download_persist_revision = 0;
 static void download_changed() { ++g_download_revision; ++g_download_persist_revision; }
@@ -1060,7 +1071,7 @@ static std::atomic<bool> g_prefer_downloaded{true};
 static bool atomic_json(const std::string& path, const std::string& text) {
     const auto temporary = path + ".tmp";
     auto* file = platform::fopen(temporary, "wb"); if (!file) return false;
-    const bool wrote = std::fwrite(text.data(), 1, text.size(), file) == text.size() && !std::ferror(file);
+    const bool wrote = std::fwrite(text.data(), 1, text.size(), file) == text.size() && !std::ferror(file) && platform::flush_file(file);
     const bool closed = std::fclose(file) == 0;
     const bool saved = wrote && closed && platform::replace_file(temporary, path);
     if (!saved) platform::remove(temporary);
@@ -1090,6 +1101,8 @@ static void downloads_load() {
         if (!library::decode_track(row["track"], item.track) || item.track.variants.empty()) continue;
         const auto uid = track_uid(item.track); if (uid.empty()) continue;
         item.path = row["path"].str(); item.name = row["name"].str(); item.preview = row["preview"].truthy();
+        if (root["provenance_version"].integer() == 2 && row["source_key"].str() == music::variant_uid(item.track.current()))
+            item.source_key = row["source_key"].str();
         item.created_at = bounded_integer(row["created"]); item.finished_at = bounded_integer(row["finished"]);
         item.bytes = bounded_integer(row["bytes"]);
         const auto actual = platform::file_size(item.path);
@@ -1106,8 +1119,10 @@ static void downloads_load() {
         const auto length = row["bytes"].num();
         const auto bytes = std::isfinite(length) && length > 0 && length < 1e15 ? static_cast<long long>(length) : 0;
         if (!key.empty() && key.size() < 8192 && !file.empty() && file.size() < 8192 && bytes > 0)
-            g_downloaded_files.emplace(key, DownloadedFile{file, bytes});
+            g_downloaded_files.emplace(key, DownloadedFile{file, bytes, root["provenance_version"].integer() == 2 && row["exact"].type == js::Type::Bool && row["exact"].boolean});
     }
+    if (root["provenance_version"].integer() != 2)
+        toast("旧下载记录已保留，可本地播放；来源未经验证的记录不再自动匹配在线曲目", 9000);
     download_changed();
 }
 static void downloads_save(bool force = false) {
@@ -1117,11 +1132,11 @@ static void downloads_save(bool force = false) {
     { std::lock_guard<std::mutex> lock(g_dlm);
       if (!g_download_writable || g_download_persist_revision == g_download_saved_revision) return;
       tasks = g_dls; files = g_downloaded_files; revision = g_download_persist_revision; }
-    std::string text = "{\"version\":1,\"tasks\":["; bool first = true;
+    std::string text = "{\"version\":1,\"provenance_version\":2,\"tasks\":["; bool first = true;
     for (const auto& row : tasks) {
         if (!first) text += ','; first = false;
         const auto& item = row.second;
-        text += "{\"track\":" + library::encode_track(item.track) + ",\"path\":" + library::quote(item.path) +
+        text += "{\"track\":" + library::encode_track(item.track) + ",\"source_key\":" + library::quote(item.source_key) + ",\"path\":" + library::quote(item.path) +
             ",\"name\":" + library::quote(item.name) + ",\"done\":" + ((item.done || item.missing) ? "true" : "false") +
             ",\"preview\":" + (item.preview ? "true" : "false") + ",\"created\":" + std::to_string(item.created_at) +
             ",\"finished\":" + std::to_string(item.finished_at) + ",\"bytes\":" + std::to_string(item.bytes) +
@@ -1131,7 +1146,7 @@ static void downloads_save(bool force = false) {
     for (const auto& row : files) {
         if (!first) text += ','; first = false;
         text += "{\"key\":" + library::quote(row.first) + ",\"path\":" + library::quote(row.second.path) +
-            ",\"bytes\":" + std::to_string(row.second.bytes) + "}";
+            ",\"bytes\":" + std::to_string(row.second.bytes) + ",\"exact\":" + (row.second.exact ? "true" : "false") + "}";
     }
     text += "]}";
     if (text.size() > 16 * 1024 * 1024 || !atomic_json(platform::join(platform::config_dir(), "downloads.json"), text)) {
@@ -1143,14 +1158,13 @@ static void downloads_save(bool force = false) {
     { std::lock_guard<std::mutex> lock(g_dlm); g_download_saved_revision = revision; }
 }
 static std::string downloaded_path(const music::Track& track) {
-    std::vector<DownloadedFile> saved;
+    if (track.variants.empty()) return {};
+    DownloadedFile saved;
     { std::lock_guard<std::mutex> lock(g_dlm);
-      for (const auto& variant : track.variants) {
-          const auto found = g_downloaded_files.find(music::variant_uid(variant));
-          if (found != g_downloaded_files.end()) saved.push_back(found->second);
-      } }
-    for (const auto& file : saved) if (!file.path.empty() && platform::file_size(file.path) == file.bytes) return file.path;
-    return {};
+      const auto found = g_downloaded_files.find(music::variant_uid(track.current()));
+      if (found == g_downloaded_files.end() || !found->second.exact) return {};
+      saved = found->second; }
+    return !saved.path.empty() && platform::file_size(saved.path) == saved.bytes ? saved.path : std::string();
 }
 static void add_download_to_library(const music::Track& track, const std::string& path, const std::string& key);
 
@@ -2136,6 +2150,7 @@ void start_download(music::Track track, music::Settings st) {
             item.publishing = !final_path.empty(); download_changed();
             if (!final_path.empty()) {
                 item.name = final_name; item.path = final_path; item.err.clear(); item.preview = saved_preview;
+                item.source_key = music::variant_uid(track.current());
                 item.percent = 100; item.done = true; item.failed = false;
             } else {
                 item.done = false; item.failed = true; item.err = publish_error;
@@ -2168,7 +2183,7 @@ void start_download(music::Track track, music::Settings st) {
                 if (!d.lines.empty()) lrc_text = lyr::to_lrc(d);
             }
             std::string terr;
-            if (!st.cancelled() && !tag::embed(final_path, cover_bytes, is_png, lrc_text, terr) && !terr.empty())
+            if (!st.cancelled() && !tag::embed(final_path, cover_bytes, is_png, lrc_text, terr, [&] { return st.cancelled(); }) && !terr.empty())
                 tag_note = "（内嵌失败：" + terr + "）";
         }
 
@@ -2176,10 +2191,8 @@ void start_download(music::Track track, music::Settings st) {
             const auto bytes = platform::file_size(final_path);
             if (bytes > 0) {
                 std::lock_guard<std::mutex> lock(g_dlm);
-                for (const auto& variant : track.variants) {
-                    const auto key = music::variant_uid(variant);
-                    if (g_downloaded_files.count(key) || g_downloaded_files.size() < 10000) g_downloaded_files[key] = {final_path, bytes};
-                }
+                const auto key = music::variant_uid(track.current());
+                if (g_downloaded_files.count(key) || g_downloaded_files.size() < 10000) g_downloaded_files[key] = {final_path, bytes, true};
                 download_changed();
             }
             if (!playlist_key.empty()) add_download_to_library(track, final_path, playlist_key);
@@ -4141,7 +4154,9 @@ void relocate_download(const std::string& uid) {
         post_ui([uid, item, path, bytes] {
             { std::lock_guard<std::mutex> lock(g_dlm); auto found = g_dls.find(uid); if (found == g_dls.end() || g_download_cancel.count(uid) || found->second.path != item.path) return;
               auto& saved = found->second; saved.path = path; saved.bytes = bytes; saved.done = true; saved.failed = saved.missing = saved.cancelled = false; saved.percent = 100; saved.err.clear();
-              if (!item.preview) for (const auto& v : item.track.variants) { auto key = music::variant_uid(v); if (g_downloaded_files.count(key) || g_downloaded_files.size() < 10000) g_downloaded_files[key] = {path, bytes}; }
+              for (auto& row : g_downloaded_files) if (row.second.path == item.path) row.second.path = path;
+              if (!item.preview && !item.source_key.empty() && (g_downloaded_files.count(item.source_key) || g_downloaded_files.size() < 10000))
+                  g_downloaded_files[item.source_key] = {path, bytes, true};
               download_changed(); }
             { std::lock_guard<std::mutex> lock(g_mu);
               bool changed = false;
@@ -5876,7 +5891,6 @@ void shutdown(bool smoke_test) {
     g_gapless = {}; g_current_media.reset();
     audio::wait_for_stream_cleanup();
     if (!smoke_test) lx::Engine::instance().save_metrics(platform::network_signature());
-    g_current_media.reset();
     if (!smoke_test) {
         save_config();
         queue_save(); // 后台任务全部结束后保存最终队列。

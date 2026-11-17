@@ -38,6 +38,7 @@ struct Request {
     bool follow_redirects = true;
     size_t max_body = 8u * 1024 * 1024;
     std::string method;
+    bool script_transport_compatibility = false; // 仅脚本桥设置，保留脚本自有凭据的传输契约。
 };
 namespace detail {
 struct Transfer {
@@ -53,7 +54,7 @@ struct Transfer {
     }
     ~Transfer() { if (handle) curl_easy_cleanup(handle); if (headers) curl_slist_free_all(headers); }
     bool setup(const Request& req) {
-        if (!handle) return false;
+        if (!handle || !safe_request_headers(req.url, req.headers, req.script_transport_compatibility)) return false;
         // reset 清除上次的回调、凭据和方法，保留同一 easy handle 的连接/DNS 缓存。
         curl_easy_reset(handle);
         if (headers) { curl_slist_free_all(headers); headers = nullptr; }
@@ -64,12 +65,13 @@ struct Transfer {
         curl_easy_setopt(handle, CURLOPT_TIMEOUT_MS, long(req.timeout_ms));
         curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, req.follow_redirects ? 1L : 0L);
         curl_easy_setopt(handle, CURLOPT_MAXREDIRS, 5L);
+        const bool protect_credentials = !req.script_transport_compatibility && sensitive_request_headers(req.headers);
 #if LIBCURL_VERSION_NUM >= 0x075500
         curl_easy_setopt(handle, CURLOPT_PROTOCOLS_STR, "http,https");
-        curl_easy_setopt(handle, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+        curl_easy_setopt(handle, CURLOPT_REDIR_PROTOCOLS_STR, protect_credentials ? "https" : "http,https");
 #else
         curl_easy_setopt(handle, CURLOPT_PROTOCOLS, long(CURLPROTO_HTTP | CURLPROTO_HTTPS));
-        curl_easy_setopt(handle, CURLOPT_REDIR_PROTOCOLS, long(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+        curl_easy_setopt(handle, CURLOPT_REDIR_PROTOCOLS, long(protect_credentials ? CURLPROTO_HTTPS : CURLPROTO_HTTP | CURLPROTO_HTTPS));
 #endif
         curl_easy_setopt(handle, CURLOPT_USERAGENT, "aino-player/1.0");
         curl_easy_setopt(handle, CURLOPT_NOPROGRESS, 0L);

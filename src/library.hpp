@@ -14,16 +14,7 @@
 #include <utility>
 
 namespace library {
-inline std::string quote(const std::string& text) {
-    std::string out = "\"";
-    const char* hex = "0123456789abcdef";
-    for (unsigned char c : text) {
-        if (c == '"' || c == '\\') { out += '\\'; out += char(c); }
-        else if (c < 32) { out += "\\u00"; out += hex[c >> 4]; out += hex[c & 15]; }
-        else out += char(c);
-    }
-    return out + '"';
-}
+inline std::string quote(const std::string& text) { return js::quote(text); }
 inline bool same_track(const music::Track& a, const music::Track& b) {
     for (const auto& x : a.variants) for (const auto& y : b.variants)
         if (music::same_variant(x, y)) return true;
@@ -113,7 +104,7 @@ public:
     }
 private:
     Container& edit() {
-        if (!data_.unique()) data_ = std::make_shared<Container>(*data_);
+        if (data_.use_count() != 1) data_ = std::make_shared<Container>(*data_);
         return *data_;
     }
     std::shared_ptr<Container> data_;
@@ -150,11 +141,11 @@ inline std::string encode_track(const music::Track& t) {
 // 这和"文件损坏"必须区分开 —— 否则一次升级就把用户整个资料库判成损坏。
 inline bool decode_track(const js::Value& value, music::Track& t, bool* dropped = nullptr) {
     t.title = value["title"].str(); t.artist = value["artist"].str(); t.album = value["album"].str();
-    t.cover_url = value["cover"].str(); t.duration_ms = int(value["duration_ms"].integer());
+    t.cover_url = value["cover"].str(); t.duration_ms = value["duration_ms"].int_value();
     const auto& variants = value["variants"];
     if (!variants.is_array() || variants.size() > 12) return false;
     for (const auto& row : variants.array) {
-        const int source = int(row["source"].integer(-1));
+        const int source = row["source"].int_value(-1);
         const auto id = row["id"].str();
         if (!music::is_platform(music::Source(source)) && music::Source(source) != music::Source::Local) continue;
         if (id.empty()) continue;
@@ -170,15 +161,15 @@ inline bool decode_track(const js::Value& value, music::Track& t, bool* dropped 
         }
         v.title = row["title"].str(t.title); v.artist = row["artist"].str(t.artist);
         v.album = row["album"].str(t.album); v.cover_url = row["cover"].str(t.cover_url);
-        v.duration_ms = int(row["duration_ms"].integer(t.duration_ms));
-        v.bitrate = int(row["bitrate"].integer()); v.needs_login = row["needs_login"].truthy();
+        v.duration_ms = row["duration_ms"].int_value(t.duration_ms);
+        v.bitrate = row["bitrate"].int_value(); v.needs_login = row["needs_login"].truthy();
         t.variants.push_back(std::move(v));
     }
     if (t.variants.empty()) {
         if (dropped) *dropped = true;
         return false;
     }
-    t.chosen = std::clamp(int(value["chosen"].integer()), 0, int(t.variants.size()) - 1);
+    t.chosen = std::clamp(value["chosen"].int_value(), 0, int(t.variants.size()) - 1);
     return true;
 }
 struct Playlist {
@@ -468,8 +459,9 @@ public:
         auto* f = platform::fopen(tmp, "wb");
         if (!f) { err = "无法创建本地资料库文件"; return false; }
         const auto written = std::fwrite(out.data(), 1, out.size(), f);
+        const bool flushed = written == out.size() && platform::flush_file(f);
         const bool closed = std::fclose(f) == 0;
-        if (written != out.size() || !closed || !platform::replace_file(tmp, path)) {
+        if (!flushed || !closed || !platform::replace_file(tmp, path)) {
             platform::remove(tmp); err = "本地资料库保存失败，原文件保留"; return false;
         }
         return true;
@@ -491,7 +483,7 @@ public:
             p.remote_owner = row["remote_owner"].str();
             p.local_folder = row["local_folder"].str();
             p.recursive = row["recursive"].is_null() || row["recursive"].truthy();
-            const int source = int(row["source"].integer(-1));
+            const int source = row["source"].int_value(-1);
             if (p.key.empty() || p.name.empty() || !row["tracks"].is_array() ||
                 (!music::is_platform(music::Source(source)) && music::Source(source) != music::Source::Local)) {
                 err = "本地资料库条目损坏，原文件保留"; return false;

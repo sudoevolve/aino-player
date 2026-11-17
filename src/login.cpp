@@ -698,16 +698,20 @@ bool parse_credentials(Site site, const std::string& input, std::string& cookie,
 static void begin_work(Site site, std::function<void()> action) {
     std::lock_guard<std::mutex> lock(worker_mutex);
     auto& s = state(site);
-    if (s.running.load() && !s.done.load()) return;
-    if (s.running.load()) cancelled[int(site)].store(true);
+    // done 允许 UI 提前消费凭据；running 直到浏览器与 profile 清理完成才解除。
+    if (s.running.load()) return;
     if (workers[int(site)].joinable()) workers[int(site)].join();
     s.running.store(true);
     cancelled[int(site)].store(false); s.done.store(false); s.return_requested.store(false);
     { std::lock_guard<std::mutex> guard(s.m); s.cookie.clear(); s.uid.clear(); s.portal_url.clear(); s.note = "正在打开系统默认浏览器官网…"; }
-    workers[int(site)] = std::thread([site, action = std::move(action)] {
-        try { action(); } catch (...) { note(site, "官网登录连接失败，请重试"); }
-        auto& s = state(site); s.running.store(false); s.done.store(true);
-    });
+    try {
+        workers[int(site)] = std::thread([site, action = std::move(action)] {
+            try { action(); } catch (...) { note(site, "官网登录连接失败，请重试"); }
+            auto& current = state(site); current.done.store(true); current.running.store(false);
+        });
+    } catch (...) {
+        note(site, "无法创建登录线程，请稍后重试"); s.done.store(true); s.running.store(false);
+    }
 }
 void start(Site site, bool launch_browser) {
     if (launch_browser) start_browser(site, {});

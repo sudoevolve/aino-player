@@ -683,6 +683,18 @@ int main(int argc, char** argv) {
         check(config::save(model.ui), "new playback policies save");
         UiState policies; config::load(policies);
         check(!policies.pause_on_disconnect && policies.resume_after_suspend && policies.smooth_playback && policies.prefer_downloaded, "portable playback policies survive restart");
+        {
+            auto* invalid = platform::fopen(config::config_path(), "ab");
+            check(invalid != nullptr, "invalid config fixture opens isolated config");
+            const char* values = "\nvolume=nan\nquality=999999999999999999999999\nshortcut_key_0=oops\n";
+            check(std::fputs(values, invalid) >= 0, "invalid config fixture writes");
+            check(std::fclose(invalid) == 0, "invalid config fixture closes");
+            UiState safe; config::load(safe);
+            check(std::isfinite(safe.volume) && safe.volume == policies.volume &&
+                safe.settings.quality == policies.settings.quality && safe.shortcuts.keys[0] == policies.shortcuts.keys[0],
+                "malformed numeric settings preserve prior valid values");
+            check(config::save(model.ui), "valid config restores after malformed input fixture");
+        }
         model.ui.pause_on_disconnect = true; model.ui.resume_after_suspend = false;
         model.ui.query = "独立的在线搜索词";
         { std::lock_guard<std::mutex> lock(g_mu); g_as.results = {track}; ++g_as.results_version; }
@@ -861,6 +873,29 @@ int main(int argc, char** argv) {
                 "moved completed downloads retain identity, timestamps and expected size");
             downloads_save(true); { std::lock_guard<std::mutex> lock(g_dlm); g_dls.clear(); } downloads_load();
             check(g_dls.at(uid).missing, "missing completed download remains relocatable after repeated restarts");
+        }
+        {
+            const auto path = platform::join(model.paths.config, "audit-provenance.audio");
+            auto* output = platform::fopen(path, "wbx");
+            check(output != nullptr, "provenance fixture is exclusively created");
+            check(std::fputs("audio", output) >= 0, "provenance fixture writes");
+            check(std::fclose(output) == 0, "provenance fixture closes");
+            struct Cleanup { std::string path; ~Cleanup() { platform::remove(path); } } cleanup{path};
+            auto selected = track; selected.chosen = 0; selected.variants.resize(1);
+            selected.variants.push_back(selected.variants[0]); selected.variants[1].id += ".other-source";
+            const auto first = music::variant_uid(selected.variants[0]);
+            std::map<std::string, DownloadedFile> saved;
+            { std::lock_guard<std::mutex> lock(g_dlm); saved = g_downloaded_files; g_downloaded_files.clear();
+              g_downloaded_files[first] = {path, 5, true}; }
+            check(downloaded_path(selected) == path, "exact selected variant can use its download");
+            selected.chosen = 1;
+            check(downloaded_path(selected).empty(), "download cannot substitute another selected variant");
+            selected.chosen = 0;
+            { std::lock_guard<std::mutex> lock(g_dlm); g_downloaded_files[first].exact = false; }
+            check(downloaded_path(selected).empty() && platform::exists(path), "unknown legacy provenance preserves the file without automatic substitution");
+            { std::lock_guard<std::mutex> lock(g_dlm); g_downloaded_files[first] = {path, 6, true}; }
+            check(downloaded_path(selected).empty(), "truncated download is not automatically selected");
+            { std::lock_guard<std::mutex> lock(g_dlm); g_downloaded_files = std::move(saved); }
         }
         {
             begin_playlist_add({track, track}); model.ui.playlist_add_name = "审查歌单"; confirm_playlist_add(); wait_library();

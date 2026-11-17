@@ -40,17 +40,7 @@ struct Profile {
 // ---------------------------------------------------------------- 小工具
 
 inline std::string cookie_value(const std::string& jar, const char* key) {
-    const std::string k = std::string(key) + "=";
-    size_t pos = 0;
-    while (pos < jar.size()) {
-        while (pos < jar.size() && (jar[pos] == ' ' || jar[pos] == ';')) ++pos;
-        const size_t end = jar.find(';', pos);
-        const std::string item = jar.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
-        if (item.rfind(k, 0) == 0) return item.substr(k.size());
-        if (end == std::string::npos) break;
-        pos = end + 1;
-    }
-    return std::string();
+    return net::cookie_value(jar, key);
 }
 
 inline std::vector<std::string> ne_headers(const std::string& cookie) {
@@ -138,7 +128,7 @@ inline Profile fetch_profile(const std::string& cookie, const std::string& uid_h
         pl.id = std::to_string(id);
         pl.name = music::text::decode_entities(list[i]["name"].str());
         pl.cover = list[i]["coverImgUrl"].str();
-        pl.count = int(list[i]["trackCount"].integer());
+        pl.count = list[i]["trackCount"].int_value();
         if (pl.name.empty()) continue;
         p.playlists.push_back(std::move(pl));
     }
@@ -179,7 +169,7 @@ inline std::vector<music::Track> fetch_playlist(const std::string& cookie, const
         metadata->id = pid;
         metadata->name = music::text::decode_entities(root["playlist"]["name"].str());
         metadata->cover = root["playlist"]["coverImgUrl"].str();
-        metadata->count = int(root["playlist"]["trackCount"].integer());
+        metadata->count = root["playlist"]["trackCount"].int_value();
     }
     std::map<long long, music::Track> loaded;
     auto read_song = [&](const js::Value& s) {
@@ -193,7 +183,7 @@ inline std::vector<music::Track> fetch_playlist(const std::string& cookie, const
         const js::Value& al = s["al"].is_object() ? s["al"] : s["album"];
         t.album = music::text::decode_entities(al["name"].str());
         const long long dt = s["dt"].integer();
-        t.duration_ms = int(dt > 0 ? dt : s["duration"].integer());
+        t.duration_ms = int(std::clamp<long long>(dt > 0 ? dt : s["duration"].integer(), 0, std::numeric_limits<int>::max()));
         t.cover_url = al["picUrl"].str();
 
         music::Variant v;
@@ -205,7 +195,7 @@ inline std::vector<music::Track> fetch_playlist(const std::string& cookie, const
         v.album = t.album;
         v.duration_ms = t.duration_ms;
         v.cover_url = t.cover_url;
-        const int fee = int(s["fee"].integer(1));
+        const int fee = s["fee"].int_value(1);
         v.bitrate = 128000;
         v.needs_login = (fee == 1 || fee == 4);
         music::attach_catalog_metadata(v, s);

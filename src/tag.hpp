@@ -20,6 +20,9 @@
 #include <vector>
 #include <functional>
 #include <algorithm>
+#include <limits>
+#include <memory>
+#include <stdexcept>
 
 namespace tag {
 
@@ -33,13 +36,13 @@ inline void be32(std::string& s, uint32_t v) {
 }
 
 inline uint32_t rd32(const std::string& s, size_t at) {
-    if (at + 4 > s.size()) return 0;
+    if (at > s.size() || s.size() - at < 4) return 0;
     return (uint32_t(uint8_t(s[at])) << 24) | (uint32_t(uint8_t(s[at + 1])) << 16) |
            (uint32_t(uint8_t(s[at + 2])) << 8) | uint32_t(uint8_t(s[at + 3]));
 }
 
 inline void wr32(std::string& s, size_t at, uint32_t v) {
-    if (at + 4 > s.size()) return;
+    if (at > s.size() || s.size() - at < 4) return;
     s[at] = char((v >> 24) & 0xFF);
     s[at + 1] = char((v >> 16) & 0xFF);
     s[at + 2] = char((v >> 8) & 0xFF);
@@ -61,7 +64,7 @@ inline std::string utf16le_bom(const std::string& utf8) {
     catch (...) { return out; }
     out += char(0xFF);
     out += char(0xFE);
-    for (wchar_t c : w) {
+    for (char16_t c : w) {
         out += char(c & 0xFF);
         out += char((c >> 8) & 0xFF);
     }
@@ -73,9 +76,9 @@ inline std::wstring widen(const std::string& s) { return platform::widen(s); }
 inline bool read_file(const std::string& path, std::string& out) {
     std::FILE* f = platform::fopen(path, "rb");
     if (!f) return false;
-    std::fseek(f, 0, SEEK_END);
+    if (std::fseek(f, 0, SEEK_END) != 0) { std::fclose(f); return false; }
     const long n = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
+    if (std::fseek(f, 0, SEEK_SET) != 0) { std::fclose(f); return false; }
     if (n <= 0) {
         std::fclose(f);
         return false;
@@ -86,40 +89,41 @@ inline bool read_file(const std::string& path, std::string& out) {
     return got == size_t(n);
 }
 
-// 写临时文件再整体替换：中途失败也不会留下半个损坏的音频
-inline bool write_replace(const std::string& path, const std::string& bytes) {
-    const std::string tmp = path + ".tagtmp";
-    std::FILE* f = platform::fopen(tmp, "wb");
-    if (!f) return false;
-    const size_t n = std::fwrite(bytes.data(), 1, bytes.size(), f);
-    std::fclose(f);
-    if (n != bytes.size()) {
-        platform::remove(tmp);
-        return false;
-    }
-    if (!platform::replace_file(tmp, path)) {
-        platform::remove(tmp);
-        return false;
+using File = std::unique_ptr<std::FILE, int(*)(std::FILE*)>;
+using Cancel = std::function<bool()>;
+inline bool seek_file(std::FILE* file, uint64_t at) {
+    if (at > uint64_t(std::numeric_limits<int64_t>::max())) return false;
+#ifdef _WIN32
+    return _fseeki64(file, static_cast<__int64>(at), SEEK_SET) == 0;
+#else
+    return fseeko(file, static_cast<off_t>(at), SEEK_SET) == 0;
+#endif
+}
+inline bool copy_bytes(std::FILE* input, std::FILE* output, uint64_t count, const Cancel& cancel = {}) {
+    char buffer[65536];
+    while (count) {
+        if (cancel && cancel()) return false;
+        const auto n = size_t(std::min<uint64_t>(count, sizeof buffer));
+        if (std::fread(buffer, 1, n, input) != n || std::fwrite(buffer, 1, n, output) != n) return false;
+        count -= n;
     }
     return true;
 }
-
-inline std::string narrow(const std::wstring& s) { return platform::narrow(s); }
-
-inline bool read_file_w(const std::wstring& wpath, std::string& out) {
-    std::FILE* f = platform::fopen(narrow(wpath), "rb");
-    if (!f) return false;
-    std::fseek(f, 0, SEEK_END);
-    const long n = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    if (n <= 0) {
-        std::fclose(f);
-        return false;
-    }
-    out.resize(size_t(n));
-    const size_t got = std::fread(&out[0], 1, size_t(n), f);
-    std::fclose(f);
-    return got == size_t(n);
+// 写完、flush 和 close 均成功才替换。异常或取消会回收本次独占创建的临时文件。
+template<class Writer> inline bool write_replace_stream(const std::string& path, Writer writer, const Cancel& cancel = {}) {
+    static std::atomic<unsigned long long> sequence{0};
+    const auto tmp = path + ".tagtmp." + std::to_string(platform::process_id()) + "." + std::to_string(++sequence);
+    struct Cleanup { const std::string& path; bool owned = false; ~Cleanup() { if (owned) platform::remove(path); } } cleanup{tmp};
+    File output(platform::fopen(tmp, "wbx"), &std::fclose);
+    if (!output) return false;
+    cleanup.owned = true;
+    const bool written = writer(output.get());
+    const bool flushed = written && (!cancel || !cancel()) && platform::flush_file(output.get());
+    const bool closed = std::fclose(output.release()) == 0;
+    return flushed && closed && (!cancel || !cancel()) && platform::replace_file(tmp, path);
+}
+inline bool write_replace(const std::string& path, const std::string& bytes) {
+    return write_replace_stream(path, [&](std::FILE* file) { return std::fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size(); });
 }
 
 // 只读取有界标签块，扫描不把整首音频或 mdat 载入内存。
@@ -380,294 +384,324 @@ inline std::string id3_frame(const char* id, const std::string& payload) {
     return f;
 }
 
+inline constexpr size_t metadata_limit = 16u * 1024u * 1024u;
+inline bool synchsafe(const std::string& bytes, size_t at, uint32_t& value) {
+    if (at > bytes.size() || bytes.size() - at < 4) return false;
+    value = 0;
+    for (size_t i = 0; i < 4; ++i) {
+        const auto c = uint8_t(bytes[at+i]);
+        if (c & 128) return false;
+        value = (value << 7) | c;
+    }
+    return true;
+}
+inline void put_synchsafe(std::string& out, uint32_t n) {
+    for (int i = 21; i >= 0; i -= 7) out += char((n >> i) & 127);
+}
+inline std::string id3_unsync(const std::string& bytes, bool encode) {
+    std::string out;
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        const auto c = uint8_t(bytes[i]); out += char(c);
+        if (c != 255) continue;
+        if (encode) {
+            if (i+1 == bytes.size() || bytes[i+1] == 0 || uint8_t(bytes[i+1]) >= 224) out += '\0';
+        } else if (i+1 < bytes.size() && bytes[i+1] == 0) ++i;
+    }
+    return out;
+}
+inline bool mpeg_audio_header(const std::string& bytes) {
+    if (bytes.size() < 4) return false;
+    const auto a = uint8_t(bytes[0]), b = uint8_t(bytes[1]), c = uint8_t(bytes[2]);
+    // MPEG audio 必须有合法版本、Layer、码率和采样率；ADTS 的 Layer=0 不会命中。
+    return a == 255 && (b & 224) == 224 && (b & 24) != 8 && (b & 6) != 0 &&
+        (c & 240) != 0 && (c & 240) != 240 && (c & 12) != 12;
+}
 inline bool embed_mp3(const std::string& path, const std::string& cover, bool is_png,
-                      const std::string& lyrics, std::string& err) {
-    std::string all;
-    if (!read_file(path, all)) {
-        err = "读文件失败";
-        return false;
+                      const std::string& lyrics, std::string& err, const Cancel& cancel = {}) {
+    File input(platform::fopen(path, "rb"), &std::fclose);
+    const auto length = platform::file_size(path);
+    if (!input || length < 4) { err = "读文件失败"; return false; }
+    std::string head(10, '\0'); head.resize(std::fread(head.data(), 1, head.size(), input.get()));
+    unsigned version = 3, flags = 0; uint64_t audio_at = 0;
+    std::string old, frames;
+    if (head.compare(0, 3, "ID3") == 0) {
+        uint32_t n = 0;
+        if (head.size() != 10 || (version = uint8_t(head[3])) < 2 || version > 4 || head[4] != 0 ||
+            !synchsafe(head, 6, n) || n > metadata_limit) { err = "不支持或损坏的 ID3 标签，保留原文件"; return false; }
+        flags = uint8_t(head[5]);
+        if ((version == 2 && (flags & 127)) || (version == 3 && (flags & 31)) || (version == 4 && (flags & 15))) {
+            err = "不支持的 ID3 标志，保留原文件"; return false;
+        }
+        audio_at = uint64_t(10) + n + ((version == 4 && (flags & 16)) ? 10 : 0);
+        if (audio_at > uint64_t(length)) { err = "ID3 标签或填充无效"; return false; }
+        old.resize(n);
+        if (std::fread(old.data(), 1, n, input.get()) != n) { err = "读取 ID3 标签失败"; return false; }
+        if (version == 4 && (flags & 16)) {
+            std::string footer(10, '\0');
+            if (std::fread(footer.data(), 1, footer.size(), input.get()) != footer.size() ||
+                footer.compare(0, 3, "3DI") != 0 || footer.compare(3, 7, head, 3, 7) != 0) {
+                err = "ID3 footer 无效，保留原文件"; return false;
+            }
+        }
+        if (version < 4 && (flags & 128)) old = id3_unsync(old, false);
+        size_t at = 0;
+        if (flags & 64) {
+            uint32_t extended = 0;
+            if (version == 4) {
+                if (!synchsafe(old, 0, extended) || extended < 6) { err = "ID3 扩展头或长度无效"; return false; }
+                at = extended;
+            } else { at = size_t(rd32(old, 0)) + 4; if (at < 10) { err = "ID3 扩展头或长度无效"; return false; } }
+            if (at > old.size()) { err = "ID3 扩展头或长度无效"; return false; }
+        }
+        const size_t header = version == 2 ? 6 : 10, id_size = version == 2 ? 3 : 4;
+        while (at < old.size()) {
+            if (old[at] == 0) {
+                if (old.find_first_not_of('\0', at) != std::string::npos) { err = "ID3 标签或填充无效"; return false; }
+                break;
+            }
+            if (old.size() - at < header) { err = "ID3 帧截断或越界"; return false; }
+            const auto id = old.substr(at, id_size);
+            if (id.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") != std::string::npos) { err = "ID3 帧 ID 无效"; return false; }
+            uint32_t nframe = 0;
+            if (version == 2) nframe = uint32_t(uint8_t(old[at+3])) << 16 | uint32_t(uint8_t(old[at+4])) << 8 | uint8_t(old[at+5]);
+            else if (version == 3) nframe = rd32(old, at+4);
+            else if (!synchsafe(old, at+4, nframe)) { err = "ID3 扩展头或长度无效"; return false; }
+            if (nframe > old.size()-at-header) { err = "ID3 帧截断或越界"; return false; }
+            const bool replace = (!cover.empty() && (id == "APIC" || id == "PIC")) ||
+                (!lyrics.empty() && (id == "USLT" || id == "ULT"));
+            if (!replace) frames.append(old, at, header+nframe);
+            at += header+nframe;
+        }
     }
-    // 丢掉原来的 ID3v2 标签（否则会出现两个标签，播放器取第一个）
-    size_t audio_at = 0;
-    if (all.size() > 10 && all.compare(0, 3, "ID3") == 0) {
-        const size_t a = size_t(uint8_t(all[6])), b = size_t(uint8_t(all[7]));
-        const size_t c = size_t(uint8_t(all[8])), d = size_t(uint8_t(all[9]));
-        const size_t sz = (a << 21) | (b << 14) | (c << 7) | d;  // synchsafe
-        audio_at = 10 + sz;
-        if ((all[5] & 0x10) != 0) audio_at += 10;  // footer
-        if (audio_at > all.size()) audio_at = 0;
-    }
-
-    std::string frames;
+    if (!seek_file(input.get(), audio_at)) { err = "音频位置无效"; return false; }
+    std::string audio(4, '\0'); audio.resize(std::fread(audio.data(), 1, 4, input.get()));
+    if (!mpeg_audio_header(audio)) { err = "不是受支持的 MPEG 音频，保留原文件"; return false; }
+    input.reset();
+    auto add = [&](const char* id, std::string payload) {
+        if (version == 4 && (flags & 128)) payload = id3_unsync(payload, true);
+        frames.append(id, version == 2 ? 3 : 4);
+        if (version == 2) { frames += char(payload.size() >> 16); frames += char(payload.size() >> 8); frames += char(payload.size()); }
+        else { if (version == 4) put_synchsafe(frames, uint32_t(payload.size())); else be32(frames, uint32_t(payload.size())); frames.append(2, '\0'); }
+        frames += payload;
+    };
     if (!cover.empty()) {
-        std::string apic;
-        apic += char(0);  // encoding: ISO-8859-1（mime/描述都是 ASCII）
-        const char* mime = is_png ? "image/png" : "image/jpeg";
-        apic += mime;
-        apic += char(0);
-        apic += char(3);  // 图片类型：3 = 正面封面
-        apic += char(0);  // 空描述
-        apic += cover;
-        frames += id3_frame("APIC", apic);
+        std::string image(1, '\0');
+        if (version == 2) image += is_png ? "PNG" : "JPG";
+        else { image += is_png ? "image/png" : "image/jpeg"; image += '\0'; }
+        image += char(3); image += '\0'; image += cover; add(version == 2 ? "PIC" : "APIC", std::move(image));
     }
     if (!lyrics.empty()) {
-        std::string uslt;
-        uslt += char(1);  // encoding：UTF-16 with BOM
-        uslt += "chi";
-        uslt += char(0);  // 空描述：UTF-16 下是 4 字节对齐的 0，这里给两个 0 就够
-        uslt += char(0);
-        uslt += utf16le_bom(lyrics);
-        frames += id3_frame("USLT", uslt);
+        const auto text = utf16le_bom(lyrics);
+        if (text.empty()) { err = "歌词不是有效 UTF-8"; return false; }
+        std::string lyric(1, char(1)); lyric += "chi"; lyric.append(2, '\0'); lyric += text;
+        add(version == 2 ? "ULT" : "USLT", std::move(lyric));
     }
-    if (frames.empty()) return true;
-
-    std::string out = "ID3";
-    out += char(3);  // v2.3
-    out += char(0);
-    out += char(0);  // flags
-    const size_t n = frames.size();
-    out += char((n >> 21) & 0x7F);
-    out += char((n >> 14) & 0x7F);
-    out += char((n >> 7) & 0x7F);
-    out += char(n & 0x7F);
-    out += frames;
-    out.append(all, audio_at, std::string::npos);
-
-    if (!write_replace(path, out)) {
-        err = "写回文件失败（被占用？）";
-        return false;
-    }
+    if (version < 4 && (flags & 128)) frames = id3_unsync(frames, true);
+    if (frames.size() > metadata_limit) { err = "标签超过大小上限"; return false; }
+    // 扩展头的 CRC/长度已过期；移除扩展头和 footer，保留其他原帧。
+    std::string out = "ID3"; out += char(version); out += '\0'; out += char(flags & (version == 2 ? 128 : 160));
+    put_synchsafe(out, uint32_t(frames.size())); out += frames;
+    if (!write_replace_stream(path, [&](std::FILE* file) {
+        File source(platform::fopen(path, "rb"), &std::fclose);
+        return source && seek_file(source.get(), audio_at) && std::fwrite(out.data(), 1, out.size(), file) == out.size() &&
+            copy_bytes(source.get(), file, uint64_t(length)-audio_at, cancel);
+    }, cancel)) { err = "写回失败或已取消，原文件保留"; return false; }
     return true;
 }
 
 // ---------------------------------------------------------------- m4a / MP4 atoms
-
-// 在 [begin, end) 里找指定 type 的 atom，返回偏移与大小（注意 size==1 的 64 位变体）
+struct Atom { size_t off = 0, size = 0, header = 0; };
+inline bool read_atom(const std::string& bytes, size_t at, size_t end, Atom& out) {
+    if (end > bytes.size() || at > end || end-at < 8) return false;
+    uint64_t size = rd32(bytes, at); size_t header = 8;
+    if (size == 1) { if (end-at < 16) return false; size = uint64_t(rd32(bytes, at+8)) << 32 | rd32(bytes, at+12); header = 16; }
+    else if (size == 0) size = end-at;
+    if (size < header || size > end-at) return false;
+    out = {at, size_t(size), header}; return true;
+}
 inline bool find_atom(const std::string& s, size_t begin, size_t end, const char* type, size_t& off, size_t& size) {
-    size_t p = begin;
-    while (p + 8 <= end) {
-        uint32_t sz = rd32(s, p);
-        if (s.compare(p + 4, 4, type) == 0) {
-            size_t real = sz;
-            if (sz == 1) {
-                if (p + 16 > end) return false;
-                real = (size_t(rd32(s, p + 8)) << 32) | rd32(s, p + 12);
-            } else if (sz == 0) {
-                real = end - p;
-            }
-            if (real < 8 || p + real > end) return false;
-            off = p;
-            size = real;
-            return true;
-        }
-        if (sz == 0) return false;
-        if (sz == 1) {
-            if (p + 16 > end) return false;
-            p += (size_t(rd32(s, p + 8)) << 32) | rd32(s, p + 12);
-        } else {
-            p += sz;
-        }
+    for (size_t at = begin; at < end;) {
+        Atom a; if (!read_atom(s, at, end, a)) return false;
+        if (s.compare(at+4, 4, type) == 0) { off = at; size = a.size; return true; }
+        at += a.size;
     }
     return false;
 }
-
 inline std::string atom(const char* type, const std::string& body) {
-    std::string a;
-    be32(a, uint32_t(body.size() + 8));
-    a.append(type, 4);
-    a += body;
-    return a;
+    if (body.size() > std::numeric_limits<uint32_t>::max()-8) throw std::length_error("MP4 atom too large");
+    std::string out; be32(out, uint32_t(body.size()+8)); out.append(type, 4); out += body; return out;
 }
-
-// data atom：version/flags(4) + locale(4) + 负载
 inline std::string data_atom(uint32_t type, const std::string& payload) {
-    std::string body;
-    be32(body, type);
-    be32(body, 0);
-    body += payload;
-    return atom("data", body);
+    std::string body; be32(body, type); be32(body, 0); body += payload; return atom("data", body);
 }
-
-inline std::string covr_atom(const std::string& cover, bool is_png) {
-    return atom("covr", data_atom(is_png ? 14u : 13u, cover));
+inline std::string covr_atom(const std::string& cover, bool is_png) { return atom("covr", data_atom(is_png ? 14u : 13u, cover)); }
+inline std::string lyric_atom(const std::string& lyrics) { return atom("\xA9lyr", data_atom(1u, lyrics)); }
+using MediaRanges = std::vector<std::pair<uint64_t, uint64_t>>;
+inline bool media_offset(uint64_t value, const MediaRanges& ranges) {
+    for (const auto& range : ranges) if (value >= range.first && value < range.second) return true;
+    return false;
 }
-
-inline std::string lyric_atom(const std::string& lyrics) {
-    return atom("\xA9lyr", data_atom(1u, lyrics));  // ©lyr
-}
-
-// moov 变大 → 后面的 mdat 整体后移，所有 stco/co64 的 chunk 偏移都要加 delta。
-// 要**递归**找：stco 藏在 trak/mdia/minf/stbl 里，不是 moov 的直接子节点。
-inline void shift_chunk_offsets(std::string& file, size_t begin, size_t end, int64_t delta) {
-    size_t p = begin;
-    while (p + 8 <= end && p + 8 <= file.size()) {
-        uint32_t sz = rd32(file, p);
-        if (sz == 0) sz = uint32_t(end - p);
-        if (sz < 8 || p + sz > end) return;
-        const std::string type = file.substr(p + 4, 4);
-        if ((type == "stco" || type == "co64") && p + 16 <= file.size()) {
-            const uint32_t n = rd32(file, p + 12);
+// 经典 MP4 的绝对 chunk 表限于所属 atom；拒绝碎片化及辅助偏移结构。
+inline bool shift_chunk_offsets(std::string& bytes, size_t begin, size_t end, int64_t delta,
+                                uint64_t moved_from = 0, const MediaRanges* media = nullptr, unsigned depth = 0) {
+    if (depth > 16 || end > bytes.size()) return false;
+    for (size_t p = begin; p < end;) {
+        Atom a; if (!read_atom(bytes, p, end, a)) return false;
+        const auto type = bytes.substr(p+4, 4); const auto body = p+a.header, finish = p+a.size;
+        if (type == "mvex" || type == "cmov" || type == "saio" || type == "iloc") return false;
+        if (type == "stco" || type == "co64") {
+            if (finish-body < 8 || rd32(bytes, body) != 0) return false;
             const size_t step = type == "stco" ? 4 : 8;
-            for (uint32_t i = 0; i < n; ++i) {
-                const size_t at = p + 16 + size_t(i) * step;
-                if (at + step > file.size()) break;
-                if (step == 4) {
-                    wr32(file, at, uint32_t(int64_t(rd32(file, at)) + delta));
-                } else {
-                    const uint64_t v = (uint64_t(rd32(file, at)) << 32) | rd32(file, at + 4);
-                    const uint64_t nv = uint64_t(int64_t(v) + delta);
-                    wr32(file, at, uint32_t(nv >> 32));
-                    wr32(file, at + 4, uint32_t(nv & 0xFFFFFFFFu));
+            const auto count = rd32(bytes, body+4);
+            if (count != (finish-body-8)/step || (finish-body-8)%step) return false;
+            for (size_t i = 0; i < count; ++i) {
+                const auto at = body+8+i*step;
+                const uint64_t value = step == 4 ? rd32(bytes, at) : uint64_t(rd32(bytes, at)) << 32 | rd32(bytes, at+4);
+                if (media && !media_offset(value, *media)) return false;
+                uint64_t updated = value;
+                if (value >= moved_from) {
+                    if (delta >= 0) { if (value > UINT64_MAX-uint64_t(delta)) return false; updated += uint64_t(delta); }
+                    else { const auto n = uint64_t(-(delta+1))+1; if (value < n) return false; updated -= n; }
                 }
+                if (step == 4) { if (updated > UINT32_MAX) return false; wr32(bytes, at, uint32_t(updated)); }
+                else { wr32(bytes, at, uint32_t(updated >> 32)); wr32(bytes, at+4, uint32_t(updated)); }
             }
-        } else if (type == "trak" || type == "mdia" || type == "minf" || type == "stbl" || type == "edts" ||
-                   type == "udta" || type == "moov") {
-            shift_chunk_offsets(file, p + 8, p + sz, delta);
+        } else if (type == "moov" || type == "trak" || type == "mdia" || type == "minf" || type == "stbl" || type == "edts" || type == "udta" || type == "meta") {
+            const size_t prefix = type == "meta" ? 4 : 0;
+            if (finish-body < prefix || (prefix && rd32(bytes, body) != 0) ||
+                !shift_chunk_offsets(bytes, body+prefix, finish, delta, moved_from, media, depth+1)) return false;
         }
-        p += sz;
+        p = finish;
     }
+    return true;
 }
-
-inline const char* kIlstHdlr =
-    "\x00\x00\x00\x00"                    // version/flags
-    "\x00\x00\x00\x00"                    // predefined
-    "mdirappl"                            // handler type
-    "\x00\x00\x00\x00\x00\x00\x00\x00"    // reserved
-    "\x00";                               // name（空，以 0 结尾）
-
-// 把 ilst 条目塞进 moov。结构缺失就补出来（udta / meta / ilst 层层新建）。
+inline bool child_atom(const std::string& parent, const char* type, std::string& child, size_t prefix = 0) {
+    Atom root; if (!read_atom(parent, 0, parent.size(), root) || root.size != parent.size() || root.size-root.header < prefix) return false;
+    for (size_t at = root.header+prefix; at < parent.size();) {
+        Atom a; if (!read_atom(parent, at, parent.size(), a)) return false;
+        if (parent.compare(at+4, 4, type) == 0) { if (!child.empty()) return false; child = parent.substr(at, a.size); }
+        at += a.size;
+    }
+    return true;
+}
+inline bool replace_child(std::string& parent, const char* type, const std::string& child, size_t prefix = 0) {
+    Atom root; if (!read_atom(parent, 0, parent.size(), root) || root.size != parent.size() || root.size-root.header < prefix) return false;
+    std::string body = parent.substr(root.header, prefix); bool replaced = false;
+    for (size_t at = root.header+prefix; at < parent.size();) {
+        Atom a; if (!read_atom(parent, at, parent.size(), a)) return false;
+        if (parent.compare(at+4, 4, type) == 0) { if (replaced) return false; body += child; replaced = true; }
+        else body.append(parent, at, a.size);
+        at += a.size;
+    }
+    if (!replaced) body += child;
+    parent = atom(parent.substr(4,4).c_str(), body); return parent.size() <= metadata_limit;
+}
+inline bool update_moov(std::string& moov, const std::string& items) {
+    std::string udta, meta, ilst;
+    if (!child_atom(moov, "udta", udta)) return false;
+    if (udta.empty()) udta = atom("udta", {});
+    if (!child_atom(udta, "meta", meta)) return false;
+    if (meta.empty()) meta = atom("meta", std::string(4, '\0'));
+    std::string handler;
+    if (!child_atom(meta, "hdlr", handler, 4)) return false;
+    if (handler.empty()) {
+        std::string body(8, '\0'); body += "mdir"; body.append(12, '\0'); body += '\0';
+        if (!replace_child(meta, "hdlr", atom("hdlr", body), 4)) return false;
+    } else {
+        Atom h;
+        if (!read_atom(handler, 0, handler.size(), h) || h.size-h.header < 24 || handler.compare(h.header+8, 4, "mdir") != 0) return false;
+    }
+    if (!child_atom(meta, "ilst", ilst, 4)) return false;
+    if (ilst.empty()) ilst = atom("ilst", {});
+    for (size_t p = 0; p < items.size();) {
+        Atom a; if (!read_atom(items, p, items.size(), a)) return false;
+        if (!replace_child(ilst, items.substr(p+4,4).c_str(), items.substr(p, a.size))) return false;
+        p += a.size;
+    }
+    return replace_child(meta, "ilst", ilst, 4) && replace_child(udta, "meta", meta) && replace_child(moov, "udta", udta);
+}
 inline bool inject_mp4_tags(std::string& file, const std::string& items, std::string& err) {
-    size_t moov_off = 0, moov_size = 0;
-    if (!find_atom(file, 0, file.size(), "moov", moov_off, moov_size)) {
-        err = "没有 moov";
-        return false;
+    size_t off = 0, size = 0; MediaRanges media;
+    if (!find_atom(file, 0, file.size(), "moov", off, size)) { err = "没有有效 moov"; return false; }
+    for (size_t p = 0; p < file.size();) {
+        Atom a; if (!read_atom(file, p, file.size(), a)) { err = "MP4 atom 越界"; return false; }
+        const auto type = file.substr(p+4, 4);
+        if ((type == "moov" && p != off) || type == "moof" || type == "mfra" || type == "sidx") { err = "不支持此 MP4 偏移结构"; return false; }
+        if (type == "mdat") media.emplace_back(p+a.header, p+a.size);
+        p += a.size;
     }
-    const size_t moov_end = moov_off + moov_size;
-
-    size_t udta_off = 0, udta_size = 0;
-    const bool has_udta = find_atom(file, moov_off + 8, moov_end, "udta", udta_off, udta_size);
-
-    size_t insert_at = 0;  // 插入位置
-    if (!has_udta) {
-        // 直接造一个完整的 udta(meta(hdlr, ilst(items))) 追加到 moov 末尾
-        std::string ilst = atom("ilst", items);
-        std::string meta_body;
-        meta_body += "\x00\x00\x00\x00";  // version/flags
-        meta_body.append(kIlstHdlr, 25);
-        meta_body += ilst;
-        std::string udta = atom("udta", atom("meta", meta_body));
-        insert_at = moov_end;
-        file.insert(insert_at, udta);
-        const uint32_t grew = uint32_t(udta.size());
-        wr32(file, moov_off, uint32_t(moov_size + grew));
-        // moov 变大 → 后面的 mdat 位移，chunk 偏移要跟着改
-        if (moov_end <= file.size()) shift_chunk_offsets(file, moov_off, moov_off + moov_size + grew, int64_t(grew));
-        return true;
+    auto moov = file.substr(off, size);
+    if (media.empty() || !shift_chunk_offsets(moov, 0, moov.size(), 0, 0, &media) || !update_moov(moov, items) ||
+        !shift_chunk_offsets(moov, 0, moov.size(), int64_t(moov.size())-int64_t(size), off+size, &media)) {
+        err = "MP4 元数据或偏移校验失败，保留原文件"; return false;
     }
-
-    const size_t udta_end = udta_off + udta_size;
-    size_t meta_off = 0, meta_size = 0;
-    if (!find_atom(file, udta_off + 8, udta_end, "meta", meta_off, meta_size)) {
-        std::string ilst = atom("ilst", items);
-        std::string meta_body;
-        meta_body += "\x00\x00\x00\x00";
-        meta_body.append(kIlstHdlr, 25);
-        meta_body += ilst;
-        const std::string meta = atom("meta", meta_body);
-        insert_at = udta_end;
-        file.insert(insert_at, meta);
-        const uint32_t grew = uint32_t(meta.size());
-        wr32(file, udta_off, uint32_t(udta_size + grew));
-        wr32(file, moov_off, uint32_t(moov_size + grew));
-        shift_chunk_offsets(file, moov_off, moov_off + moov_size + grew, int64_t(grew));
-        return true;
-    }
-
-    // meta 的头 4 字节是 version/flags，子 atom 从 +12 开始
-    const size_t meta_body = meta_off + 12;
-    const size_t meta_end = meta_off + meta_size;
-    size_t ilst_off = 0, ilst_size = 0;
-    if (!find_atom(file, meta_body, meta_end, "ilst", ilst_off, ilst_size)) {
-        insert_at = meta_end;
-        file.insert(insert_at, atom("ilst", items));
-        const uint32_t grew = uint32_t(8 + items.size());
-        wr32(file, meta_off, uint32_t(meta_size + grew));
-        wr32(file, udta_off, uint32_t(udta_size + grew));
-        wr32(file, moov_off, uint32_t(moov_size + grew));
-        shift_chunk_offsets(file, moov_off, moov_off + moov_size + grew, int64_t(grew));
-        return true;
-    }
-
-    insert_at = ilst_off + ilst_size;
-    file.insert(insert_at, items);
-    const uint32_t grew = uint32_t(items.size());
-    wr32(file, ilst_off, uint32_t(ilst_size + grew));
-    wr32(file, meta_off, uint32_t(meta_size + grew));
-    wr32(file, udta_off, uint32_t(udta_size + grew));
-    wr32(file, moov_off, uint32_t(moov_size + grew));
-    shift_chunk_offsets(file, moov_off, moov_off + moov_size + grew, int64_t(grew));
-    return true;
+    file.replace(off, size, moov); return true;
 }
-
-// 落盘前自检：顶层 atom 要首尾相接铺满整个文件。过不了就不写，
-// 宁可放弃内嵌，也不能产出打不开的文件。
 inline bool verify_mp4(const std::string& file) {
-    size_t p = 0;
-    while (p + 8 <= file.size()) {
-        const uint32_t sz = rd32(file, p);
-        if (sz < 8 || p + sz > file.size()) return false;
-        p += sz;
+    MediaRanges media; size_t moov = 0; unsigned count = 0;
+    for (size_t p = 0; p < file.size();) {
+        Atom a; if (!read_atom(file, p, file.size(), a)) return false;
+        const auto type = file.substr(p+4,4);
+        if (type == "mdat") media.emplace_back(p+a.header, p+a.size);
+        if (type == "moov") { moov = p; ++count; }
+        p += a.size;
     }
-    return p == file.size();
+    if (count != 1 || media.empty()) return false;
+    Atom a; if (!read_atom(file, moov, file.size(), a)) return false;
+    auto bytes = file.substr(moov, a.size);
+    return shift_chunk_offsets(bytes, 0, bytes.size(), 0, 0, &media);
 }
-
 inline bool embed_m4a(const std::string& path, const std::string& cover, bool is_png,
-                      const std::string& lyrics, std::string& err) {
-    std::string all;
-    if (!read_file(path, all)) {
-        err = "读文件失败";
-        return false;
+                      const std::string& lyrics, std::string& err, const Cancel& cancel = {}) {
+    const auto size = platform::file_size(path); File input(platform::fopen(path, "rb"), &std::fclose);
+    if (!input || size < 8) { err = "读文件失败"; return false; }
+    uint64_t moov_at = 0, moov_size = 0; std::string moov; MediaRanges media;
+    unsigned count = 0;
+    for (uint64_t at = 0; at < uint64_t(size);) {
+        if (++count > 65536 || (cancel && cancel()) || uint64_t(size)-at < 8 || !seek_file(input.get(), at)) { err = "MP4 结构无效或已取消"; return false; }
+        std::string head(size_t(std::min<uint64_t>(16, uint64_t(size)-at)), '\0');
+        if (std::fread(head.data(),1,head.size(),input.get()) != head.size()) { err = "读取 MP4 失败"; return false; }
+        uint64_t n = rd32(head, 0), header = 8;
+        if (n == 1) { if (head.size() < 16) { err = "MP4 扩展头截断或越界"; return false; } n = uint64_t(rd32(head,8)) << 32 | rd32(head,12); header = 16; }
+        else if (!n) n = uint64_t(size)-at;
+        if (n < header || n > uint64_t(size)-at) { err = "MP4 atom 越界"; return false; }
+        const auto type = head.substr(4,4);
+        if (type == "moof" || type == "mfra" || type == "sidx") { err = "暂不改写碎片化 MP4"; return false; }
+        if (type == "mdat") media.emplace_back(at+header, at+n);
+        if (type == "moov") {
+            if (!moov.empty() || n > metadata_limit || !seek_file(input.get(),at)) { err = "moov 重复或过大"; return false; }
+            moov_at = at; moov_size = n; moov.resize(size_t(n));
+            if (std::fread(moov.data(),1,moov.size(),input.get()) != moov.size()) { err = "moov 截断"; return false; }
+        }
+        at += n;
     }
-    std::string items;
-    if (!cover.empty()) items += covr_atom(cover, is_png);
-    if (!lyrics.empty()) items += lyric_atom(lyrics);
-    if (items.empty()) return true;
-
-    std::string work = all;
-    if (!inject_mp4_tags(work, items, err)) return false;
-    if (!verify_mp4(work)) {
-        err = "m4a 结构校验没过，放弃内嵌";
-        return false;
+    input.reset();
+    std::string items; if (!cover.empty()) items += covr_atom(cover,is_png); if (!lyrics.empty()) items += lyric_atom(lyrics);
+    if (moov.empty() || media.empty() || !shift_chunk_offsets(moov,0,moov.size(),0,0,&media) || !update_moov(moov,items) ||
+        !shift_chunk_offsets(moov,0,moov.size(),int64_t(moov.size())-int64_t(moov_size),moov_at+moov_size,&media)) {
+        err = "MP4 元数据或偏移校验失败，保留原文件"; return false;
     }
-    if (!write_replace(path, work)) {
-        err = "写回文件失败（被占用？）";
-        return false;
-    }
+    if (!write_replace_stream(path, [&](std::FILE* output) {
+        File source(platform::fopen(path,"rb"), &std::fclose);
+        return source && copy_bytes(source.get(),output,moov_at,cancel) &&
+            std::fwrite(moov.data(),1,moov.size(),output) == moov.size() && seek_file(source.get(),moov_at+moov_size) &&
+            copy_bytes(source.get(),output,uint64_t(size)-moov_at-moov_size,cancel);
+    },cancel)) { err = "写回失败或已取消，原文件保留"; return false; }
     return true;
 }
 
-// 按文件内容判格式，别看扩展名（m4a 下载下来也常被存成 .mp3）
+// 内容白名单：ID3 前缀不能证明是 MP3，还需检查标签后的 MPEG 帧头。
 inline bool embed(const std::string& path, const std::string& cover, bool is_png, const std::string& lyrics,
-                  std::string& err) {
+                  std::string& err, const Cancel& cancel = {}) {
+    err.clear();
     if (cover.empty() && lyrics.empty()) return true;
-    std::string head;
-    {
-        std::FILE* f = platform::fopen(path, "rb");
-        if (!f) {
-            err = "读文件失败";
-            return false;
-        }
-        char b[12] = {0};
-        const size_t n = std::fread(b, 1, sizeof b, f);
-        std::fclose(f);
-        head.assign(b, n);
-    }
-    if (head.size() >= 8 && head.compare(4, 4, "ftyp") == 0) return embed_m4a(path, cover, is_png, lyrics, err);
-    if (head.size() >= 4 && head.compare(0, 4, "fLaC") == 0) {
-        err = "flac 暂不支持内嵌";
-        return false;
-    }
-    return embed_mp3(path, cover, is_png, lyrics, err);
+    if (cover.size() > 8u*1024*1024 || lyrics.size() > 4u*1024*1024) { err = "封面或歌词超过内嵌上限"; return false; }
+    File input(platform::fopen(path, "rb"), &std::fclose);
+    if (!input) { err = "读文件失败"; return false; }
+    std::string head(12,'\0'); head.resize(std::fread(head.data(),1,head.size(),input.get())); input.reset();
+    if (head.size() >= 8 && head.compare(4,4,"ftyp") == 0) return embed_m4a(path,cover,is_png,lyrics,err,cancel);
+    if (head.compare(0,3,"ID3") == 0 || mpeg_audio_header(head)) return embed_mp3(path,cover,is_png,lyrics,err,cancel);
+    err = "此音频容器暂不支持内嵌，保留原文件"; return false;
 }
 
 }  // namespace tag
