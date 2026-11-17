@@ -48,7 +48,7 @@ sudo pacman -Syu aino-player
 sudo pacman -Syu
 ```
 
-软件源与 GitHub Release 提供相同的包，升级保留配置、收藏、歌单和下载音乐。Arch 用户通过 pacman 更新；当前应用内 Linux 安装入口面向 DEB，不用于 Arch 包。
+软件源与 GitHub Release 提供相同的包，升级保留配置、收藏、歌单和下载音乐。在「设置 → 通用 → 检查更新」可复制完整的 `sudo pacman -Syu` 更新命令；未配置源或源尚未同步时可直接下载 Arch 包，通过 `sudo pacman -U <包路径>` 安装。应用不会对 Arch 包调用 DEB 安装器，升级后需重新启动播放器。
 
 卸载应用：`sudo pacman -Rs aino-player`。停止使用此软件源：删除 `/etc/pacman.conf` 中的 `[aino-player]` 段落；一键安装用户删除 `Include = /etc/pacman.d/aino-player.conf` 行和对应配置文件。然后移除密钥：
 

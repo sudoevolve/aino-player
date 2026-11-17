@@ -39,7 +39,7 @@ sudo apt update
 sudo apt upgrade
 ```
 
-也可以用系统的软件更新器。软件源与 GitHub Release 提供相同的 deb，升级保留配置、收藏、歌单和下载音乐。当前播放器已有的手动更新入口继续可用；从软件源安装后可统一交给 APT 更新。
+也可以用系统的软件更新器。软件源与 GitHub Release 提供相同的 deb，升级保留配置、收藏、歌单和下载音乐。在「设置 → 通用 → 检查更新」可复制 APT 更新命令；未配置源或源尚未同步时可直接下载新版 deb，通过系统软件安装工具覆盖安装。升级后重新启动播放器。
 
 卸载应用：`sudo apt remove aino-player`。停止使用此软件源：
 
@@ -63,6 +63,7 @@ sudo apt update
 - `InRelease` / `Release.gpg` 使用 SHA-256；索引有效期 30 天，每周重新签发。GitHub 若因仓库长期不活跃而停用定时工作流，需要重新启用并手动运行；签名过期时不应关闭 APT 校验。
 - 部署前用 `gpgv` 验签，并在临时 APT 配置中执行索引读取，确认有安装候选；不改 runner 的软件源，也不安装播放器。
 - GitHub Pages 使用 Actions 部署。根目录主页使用 `packaging/site/index.html`，软件源说明保留在 `/apt/`；发布器注入当前正式版号，并复制项目图标和现有界面截图。不使用前端框架或额外构建依赖。主页更改与已有软件源一起部署，不改播放器版本、已发布标签或 Release 附件。
+- 页面和索引在部署完成后才切换到新版。GitHub Pages 当前响应头为 `Cache-Control: max-age=600`，浏览器或 CDN 可能短暂显示旧内容；先核对部署任务和 GitHub 最新正式 Release，再强制刷新，不因旧页面重复创建版本或重跑播放器回归。
 
 私钥备份位置为维护者本机 `C:/Users/admin/.codex/keys/aino-player-apt/`，包含导出的私钥和撤销证书，应保留至完成有计划的密钥轮换。公钥有效期至 2029-11-12；轮换时需保留旧密钥到用户取得新 keyring，不能直接重生成并静默替换指纹。
 

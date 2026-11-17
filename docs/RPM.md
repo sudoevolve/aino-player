@@ -46,7 +46,7 @@ gpg --show-keys --with-fingerprint aino-player.asc
 sudo dnf upgrade aino-player      # Fedora
 ```
 
-也可以用系统的软件更新器。软件源基于 GitHub Release 的 rpm 添加包内签名，签名后重新生成索引；播放器内容相同，文件摘要随包签名变化。升级保留配置、收藏、歌单和下载音乐。从软件源安装后统一交给包管理器更新。
+也可以用系统的软件更新器。软件源基于 GitHub Release 的 rpm 添加包内签名，签名后重新生成索引；播放器内容相同，文件摘要随包签名变化。升级保留配置、收藏、歌单和下载音乐。在「设置 → 通用 → 检查更新」可复制 DNF 更新命令；未配置源或源尚未同步时可直接下载新版 rpm，通过 `sudo dnf install <包路径>` 安装。升级后重新启动播放器。
 
 卸载应用：`sudo dnf remove aino-player`。停止使用此软件源：
 

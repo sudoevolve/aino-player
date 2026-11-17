@@ -26,7 +26,7 @@ EOF
 sudo pacman -Syu aino-player</pre>
 <p>导入后可用 <code>sudo pacman-key --finger @FINGERPRINT@</code> 核对指纹。仓库数据库和软件包均由此密钥签名，缺失或损坏的签名会让安装失败。</p>
 <p>后续随 <code>sudo pacman -Syu</code> 一并更新，无需先卸载，配置、收藏和歌单会保留。</p>
-<p>卸载应用：<code>sudo pacman -Rs aino-player</code>。停止使用此软件源：删除 <code>/etc/pacman.conf</code> 中的 <code>[aino-player]</code> 段落，并运行 <code>sudo pacman-key --delete @FINGERPRINT@</code>。</p>
+<p>卸载应用：<code>sudo pacman -Rs aino-player</code>。停止使用此软件源：手动配置用户删除 <code>/etc/pacman.conf</code> 中的 <code>[aino-player]</code> 段落；一键安装用户删除其中的 <code>Include = /etc/pacman.d/aino-player.conf</code> 行及对应配置文件。然后运行 <code>sudo pacman-key --delete @FINGERPRINT@</code> 移除密钥。</p>
 <p>这是开发者提供的软件源，不是 AUR 包，也不收录于 Arch 官方仓库。</p>
 <p><a href="https://github.com/sudoevolve/aino-player">项目与截图</a> ·
 <a href="https://github.com/sudoevolve/aino-player/releases/latest">其他下载</a> ·
