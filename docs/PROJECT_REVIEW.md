@@ -474,3 +474,13 @@ Ubuntu CI 的隔离诊断启动记录 RSS 35,848 kB、PSS 25,040 kB；这是 Xvf
 用户明确要求发布，将上述播放列表定位、快捷键入口、主要页面体验与在线更新修复纳入 0.5.3。版本来源为 CMake，发布说明只描述本次变更。没有修改输入法、音源取流接口、配置格式或运行依赖；Win7 缺 DLL 反馈已确认当前安装器要求 Windows 10，用户要求暂不处理，本次不增加旧系统兼容实现。
 
 发布前自动代码审查核对了列表偏移恢复、虚拟可见行、队列身份、歌词请求代次、快捷键保存及更新包选择／校验／取消交接；未发现需阻断发布的新增问题。`git diff --check` 与文件关联静态检查通过。沿用现有标签发布流程，由 Windows、Ubuntu、Fedora、Arch 统一执行发布 profile 的完整验收、原生打包与安装启动检查，不额外重复本机整套回归；正式结果将在工作流完成后补充。Windows 安装器的交互覆盖升级、全部第三方音源和真实账号不在自动验收结论之内。
+
+## 2026-11-17：v0.5.3 正式发布结果
+
+修复提交 `ddb27b7`，版本提交 `183ebfa`，标签 [v0.5.3](https://github.com/sudoevolve/aino-player/releases/tag/v0.5.3) 指向 `183ebfaab736623f895a6d8da10d70caaf5cefee`。用户明确要求先发布，Win7 缺 DLL 的反馈暂不处理；本次没有改变现有 Windows 10 最低要求，也没有修改输入法或音源接口。
+
+[四平台发布工作流 44051357025](https://github.com/sudoevolve/aino-player/actions/runs/44051357025) 全部成功：Windows 7/7（46.54 秒）、Ubuntu 9/9（30.74 秒）、Fedora 8/8（18.06 秒）、Arch 8/8（17.50 秒）。Linux 三种包原生构建、安装及窗口启动通过，Ubuntu 完成 0.5.2 → 0.5.3 覆盖升级。包含嵌入解码器、隔离登录浏览器、业务控制器及软件源元数据验收；没有重复运行本机整套回归。
+
+正式版为 latest、非草稿、非预发行。Windows 安装器 4,754,972 字节、便携 EXE 8,483,840 字节、deb 3,762,374 字节、rpm 3,211,774 字节、Arch 包 3,852,566 字节，FFmpeg 官方源码、两份构建信息、许可与 SHA256SUMS 同时发布。本机下载全部 10 项附件，核对 GitHub SHA-256 和字节数；9 项载荷同时与发布清单摘要匹配。原始验证结果保存在忽略的 `build/release-verification-v053/verification.json`。
+
+[软件源工作流 44052588019](https://github.com/sudoevolve/aino-player/actions/runs/44052588019) 的 APT、RPM、Arch 验签／候选检查与 Pages 部署全部成功。部署后重新读取公开官网、APT Packages、RPM primary 和 Arch 数据库，确认 0.5.3（RPM／Arch 为 0.5.3-1）；读取的 RPM primary 压缩内容 SHA-256 与 repomd 一致。本轮没有安装或替换用户现用播放器，也未以自动验收冒充全部第三方音源、真实账号或 Windows 交互覆盖安装已实机通过。
