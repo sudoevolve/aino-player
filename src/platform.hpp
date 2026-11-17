@@ -753,6 +753,19 @@ inline std::string sha256_file(const std::string& path) {
     for (const auto byte : digest) { result += "0123456789abcdef"[byte >> 4]; result += "0123456789abcdef"[byte & 15]; }
     return result;
 }
+// 只有运行在 Inno 记录的安装位置，才让更新器覆盖安装；复制出去的 EXE 仍按便携版处理。
+inline bool windows_installed_player() {
+    std::array<wchar_t, 32768> executable{}, directory{};
+    const auto length = GetModuleFileNameW(nullptr, executable.data(), DWORD(executable.size()));
+    if (!length || length >= executable.size()) return false;
+    DWORD bytes = DWORD(sizeof directory);
+    const auto status = RegGetValueW(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{0A26A153-1274-493F-95DF-B1D75034851E}_is1",
+        L"InstallLocation", RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, nullptr, directory.data(), &bytes);
+    if (status != ERROR_SUCCESS || directory[0] == L'\0') return false;
+    std::error_code ec;
+    return fs::equivalent(fs::path(executable.data()), fs::path(directory.data()) / L"aino_player.exe", ec) && !ec;
+}
 inline bool launch_installer(const std::string& path) {
     const auto file = widen(path);
     SHELLEXECUTEINFOW info{}; info.cbSize = sizeof info; info.fMask = SEE_MASK_NOCLOSEPROCESS;
@@ -824,7 +837,13 @@ inline PackageChannel package_channel() {
         owned({"/usr/bin/pacman", "-Qqo", executable}, "aino-player")) return PackageChannel::Pacman;
     return PackageChannel::Portable;
 }
-inline const char* package_suffix() {
+inline const char* package_suffix(PackageChannel channel = PackageChannel::Portable) {
+    switch (channel) {
+        case PackageChannel::Apt: return "_amd64.deb";
+        case PackageChannel::Dnf: return ".x86_64.rpm";
+        case PackageChannel::Pacman: return "-x86_64.pkg.tar.zst";
+        default: break;
+    }
     if (::access("/usr/bin/pacman", X_OK) == 0) return "-x86_64.pkg.tar.zst";
     if (::access("/usr/bin/dnf", X_OK) == 0) return ".x86_64.rpm";
     if (::access("/usr/bin/apt-get", X_OK) == 0) return "_amd64.deb";

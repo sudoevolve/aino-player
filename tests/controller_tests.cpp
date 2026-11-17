@@ -123,6 +123,23 @@ int main(int argc, char** argv) {
         static_assert(std::is_const_v<std::remove_reference_t<decltype(ViewModel::playback)>>);
         check(initialize(false), "initialize isolated business state");
         auto model = view_model();
+        {
+            const auto saved_snapshot = g_snapshot;
+            const auto saved_ui = model.ui;
+            const auto generation = g_lyric_match_generation.load();
+            g_snapshot.now_uid = "new-lyric-match";
+            model.ui.lyric_match_uid = "previous-lyric-match";
+            model.ui.lyric_match_loading = true;
+            model.ui.lyric_match_query = " \t ";
+            model.ui.lyric_match_candidates.resize(1);
+            model.ui.lyric_match_scroll_to_top = false;
+            search_lyric_matches();
+            check(model.ui.lyric_match_uid == g_snapshot.now_uid && !model.ui.lyric_match_loading &&
+                model.ui.lyric_match_candidates.empty() && model.ui.lyric_match_scroll_to_top &&
+                !model.ui.lyric_match_error.empty() && g_lyric_match_generation.load() > generation,
+                "empty lyric query clears stale candidates, reports a reason and invalidates the previous track request without network work");
+            g_snapshot = saved_snapshot; model.ui = saved_ui;
+        }
         auto wait_library = [&] {
             const auto deadline = platform::ticks() + 4000;
             for (;;) {
@@ -200,10 +217,12 @@ int main(int argc, char** argv) {
             net::Response value; value.status = 200;
             const std::string version = tag[0] == 'v' ? tag + 1 : tag;
             const std::string name = std::string(suffix) == "_amd64.deb" ? "aino-player_" + version + suffix :
+                std::string(suffix) == ".x86_64.rpm" || std::string(suffix) == "-x86_64.pkg.tar.zst" ? "aino-player-" + version + "-1" + suffix :
                 std::string("aino-player-") + tag + suffix;
             value.body = "{\"tag_name\":" + library::quote(tag) + ",\"draft\":false,\"prerelease\":false,\"html_url\":" +
                 library::quote(std::string(updates::kReleases) + "/tag/" + tag) + ",\"assets\":[{\"name\":" + library::quote(name) +
-                ",\"browser_download_url\":" + library::quote(std::string(updates::kReleases) + "/download/" + tag + "/" + name) + "}]}";
+                ",\"browser_download_url\":" + library::quote(std::string(updates::kReleases) + "/download/" + tag + "/" + name) +
+                ",\"size\":123456,\"digest\":\"sha256:" + std::string(64, 'a') + "\"}]}";
             return value;
         };
         for (const auto* suffix : {"-windows-x64.exe", "_amd64.deb"}) {
@@ -226,7 +245,6 @@ int main(int argc, char** argv) {
         check(bounded_notes.substr(0, 65535) == std::string(65535, 'a') && bounded_notes[65535] == '\n' &&
             bounded_notes.size() < 66000, "long release notes are bounded without splitting UTF-8 characters");
         auto deb = response("v2.0.0", "_amd64.deb");
-        deb.body.insert(deb.body.rfind("}]"), ",\"size\":123456,\"digest\":\"sha256:" + std::string(64, 'a') + "\"");
         const auto deb_update = updates::parse_release(deb, "1.0.0", "_amd64.deb");
         check(deb_update.installer && deb_update.asset_url.find("aino-player_2.0.0_amd64.deb") != std::string::npos &&
             deb_update.asset_size == 123456 && deb_update.digest.size() == 71, "Debian update uses exact package name and integrity metadata");
@@ -263,14 +281,56 @@ int main(int argc, char** argv) {
         const auto asset_start = portable_json.find("[{\"") + 1;
         installers.body.insert(installers.body.rfind(']'), "," + portable_json.substr(asset_start, portable_json.rfind(']') - asset_start));
         check(updates::parse_release(installers, "1.0.0", "windows-x64.exe").installer, "installer choice independent of API ordering");
+        const auto portable = updates::parse_release(installers, "1.0.0", "windows-x64.exe", false);
+        check(!portable.installer && portable.asset_url.find("aino-player-v2.0.0-windows-x64.exe") != std::string::npos,
+            "portable Windows updates select the portable executable even when setup is listed first");
+        check(updates::parse_release(response("v2.0.0", "-setup-windows-x64.exe"), "1.0.0", "windows-x64.exe", false).asset_url.empty(),
+            "portable Windows cannot silently switch into installer mode when the portable asset is absent");
         for (const auto* suffix : {".x86_64.rpm", "-x86_64.pkg.tar.zst"}) {
             const auto package = updates::parse_release(response("v2.0.0", suffix), "1.0.0", suffix);
             check(package.status == UpdateStatus::Available && package.asset_url.find(suffix) != std::string::npos,
                 "Linux update selects the requested distro package");
         }
+        for (const auto* suffix : {"-windows-x64.exe", "_amd64.deb", ".x86_64.rpm", "-x86_64.pkg.tar.zst"}) {
+            auto wrong_version = response("v2.0.0", suffix);
+            const auto marker = wrong_version.body.find("\"assets\"");
+            for (size_t at = wrong_version.body.find("2.0.0", marker); at != std::string::npos; at = wrong_version.body.find("2.0.0", at + 5))
+                wrong_version.body.replace(at, 5, "1.9.9");
+            const auto old_tag = wrong_version.body.find("/download/v1.9.9/");
+            wrong_version.body.replace(old_tag, std::string("/download/v1.9.9/").size(), "/download/v2.0.0/");
+            const auto result = updates::parse_release(wrong_version, "1.0.0", suffix);
+            check(result.status == UpdateStatus::Available && result.asset_url.empty() && !result.message.empty(),
+                "a release cannot select another version's package solely by a matching platform suffix");
+        }
+        for (const auto* invalid : {"0", "-1", "123.5", "67108865"}) {
+            auto value = response("v2.0.0", "_amd64.deb");
+            value.body.replace(value.body.find("123456"), 6, invalid);
+            const auto result = updates::parse_release(value, "1.0.0", "_amd64.deb");
+            check(!result.installer && !updates::verified_asset(result) && !result.asset_url.empty(),
+                "invalid or fractional asset sizes disable automatic installation while retaining manual download");
+        }
+        auto missing_digest = response("v2.0.0", "_amd64.deb");
+        missing_digest.body.replace(missing_digest.body.find("sha256:"), 7, "sha512:");
+        check(!updates::parse_release(missing_digest, "1.0.0", "_amd64.deb").installer,
+            "an unsupported package digest cannot advertise automatic installation");
+        {
+            const auto saved_update = g_update.view;
+            const bool saved_cancel = g_update.cancel.load();
+            g_update.view.status = UpdateStatus::Installing; g_update.cancel.store(false);
+            cancel_update_download();
+            check(!g_update.cancel.load(), "download cancel cannot interrupt a package installation");
+            g_update.view.status = UpdateStatus::Downloading;
+            cancel_update_download();
+            check(g_update.cancel.load() && !g_update.view.message.empty(), "download cancel records its request and user feedback");
+            g_update.view = saved_update; g_update.cancel.store(saved_cancel);
+        }
 #ifdef __linux__
         check(std::string(platform::package_update_command(platform::PackageChannel::Pacman)) == "sudo pacman -Syu",
             "Arch update performs a full upgrade instead of a partial upgrade");
+        check(std::string(platform::package_suffix(platform::PackageChannel::Apt)) == "_amd64.deb" &&
+            std::string(platform::package_suffix(platform::PackageChannel::Dnf)) == ".x86_64.rpm" &&
+            std::string(platform::package_suffix(platform::PackageChannel::Pacman)) == "-x86_64.pkg.tar.zst",
+            "actual installation ownership wins over other package managers present on the machine");
 #endif
 
         {
@@ -355,6 +415,19 @@ int main(int argc, char** argv) {
             value.variants.push_back(variant); return value;
         };
         nav_a = navigation_track("a"); nav_b = navigation_track("b"); nav_c = navigation_track("c");
+        {
+            Snapshot queue;
+            queue.tracks = {nav_a, nav_b, nav_a}; queue.now_uid = track_uid(nav_a); queue.playing = 2;
+            check(current_queue_index(queue) == 2, "queue locator prefers the actual cursor for repeated songs");
+            queue.playing = 1;
+            check(current_queue_index(queue) == 0, "queue locator verifies identity instead of trusting a shifted cursor");
+            queue.tracks = {nav_b, nav_c};
+            check(current_queue_index(queue) == -1, "removing the current song cannot highlight its preceding row");
+            queue.tracks = {music::Track{}, nav_a}; queue.playing = 0;
+            check(current_queue_index(queue) == 1, "queue locator skips entries without variants");
+            queue.now_uid.clear();
+            check(current_queue_index(queue) == -1, "idle queue has no current song to reveal");
+        }
         auto local_a = navigation_track("/music/one/a.mp3");
         local_a.artist = "Artist"; local_a.album = "Same title";
         local_a.variants[0].artist = local_a.artist; local_a.variants[0].album = local_a.album;
@@ -369,11 +442,20 @@ int main(int argc, char** argv) {
         const auto local_album = local_catalog(local_albums.albums.front(), catalog_library, {}, {}, false);
         check(local_album.tracks.size() == 1, "local album browsing is scoped to its folder");
         g_ui.tab = 0; g_playlist_view = {}; g_detail_history.clear();
+        g_ui.search_scroll_to_top = true;
         detail_begin(); g_playlist_view.playlist.name = "First page";
+        check(g_ui.playlist_scroll_to_top && !g_ui.playlist_restore_scroll && g_ui.playlist_scroll_offset == 0,
+            "new detail starts at its own top without inheriting the previous page offset");
         g_ui.playlist_filter = "saved filter";
+        g_ui.playlist_scroll_offset = 640.5f;
         detail_begin(); g_playlist_view.playlist.name = "Second page";
+        g_ui.playlist_scroll_offset = 128;
         playlist_close();
         check(g_playlist_view.playlist.name == "First page" && g_ui.playlist_filter == "saved filter", "detail back restores its page and filter");
+        check(g_ui.playlist_restore_scroll && !g_ui.playlist_scroll_to_top && g_ui.playlist_scroll_offset == 640.5f,
+            "detail back restores the exact scroll position instead of forcing its first song");
+        check(g_ui.search_scroll_to_top, "detail navigation cannot consume an independent search scroll request");
+        g_ui.search_scroll_to_top = false;
         playlist_close(); check(!g_playlist_view.open && g_ui.tab == 0, "detail back returns to original search page");
         queue_push(nav_a); queue_push(nav_b); queue_push(nav_c);
         auto mark_current = [&](const music::Track& value, int index) {
@@ -942,11 +1024,17 @@ int main(int argc, char** argv) {
             }); wait_library();
             const auto await_quick = [&] { const auto limit = platform::ticks() + 3000; do { tick(); platform::sleep_ms(2); } while (model.ui.quick_loading && platform::ticks() < limit); check(!model.ui.quick_loading, "background quick search completes"); };
             model.ui.quick_open = true; model.ui.quick_query = "Quota"; refresh_quick_search(); await_quick();
+            check(model.ui.quick_cursor == 0 && model.ui.quick_scroll_to_top, "new quick results reveal their first selection");
             std::array<int, 3> counts{}; for (const auto& r : model.ui.quick_results) ++counts[size_t(r.kind)];
             check(counts[0] == 20 && counts[1] == 20 && counts[2] == 20 && model.ui.quick_results.front().title == "Quota", "quick search ranks exact titles and reserves each category quota");
-            model.ui.quick_query = "Quota song"; refresh_quick_search(); model.ui.quick_query = "does-not-exist"; refresh_quick_search(); await_quick();
+            model.ui.quick_cursor = 35; model.ui.quick_scroll_to_top = false;
+            model.ui.quick_query = "Quota song"; refresh_quick_search();
+            check(model.ui.quick_cursor == 0 && model.ui.quick_scroll_to_top, "changing quick query resets both selection and scroll");
+            model.ui.quick_query = "does-not-exist"; refresh_quick_search(); await_quick();
             check(model.ui.quick_results.empty(), "superseded quick query cannot publish stale results");
+            model.ui.quick_cursor = 12; model.ui.quick_scroll_to_top = false;
             model.ui.quick_open = false; refresh_quick_search(); check(!g_quick_index && model.ui.quick_results.empty(), "closing quick search releases its index");
+            check(model.ui.quick_cursor == 0 && model.ui.quick_scroll_to_top, "reopening the same quick query starts with a visible first result");
         }
         model.ui.shortcuts.enabled = false; model.ui.shortcuts.keys = {{8, 9, 10, 14}}; model.ui.shortcuts.modifiers = {{1, 2, 3, 0}};
         check(config::save(model.ui), "custom global shortcuts save"); UiState shortcut_reload; config::load(shortcut_reload);

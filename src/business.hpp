@@ -130,7 +130,12 @@ inline bool version_parts(std::string text, std::array<unsigned, 3>& parts) {
     }
     return at == text.size();
 }
-inline UpdateView parse_release(const net::Response& response, const std::string& current, const std::string& suffix) {
+inline bool verified_asset(const UpdateView& view) {
+    return view.asset_size > 0 && view.asset_size <= 64 * 1024 * 1024 && view.digest.size() == 71 &&
+        view.digest.rfind("sha256:", 0) == 0 && view.digest.find_first_not_of("0123456789abcdef", 7) == std::string::npos;
+}
+inline UpdateView parse_release(const net::Response& response, const std::string& current, const std::string& suffix,
+                                bool prefer_installer = true) {
     UpdateView view;
     view.status = UpdateStatus::Failed;
     if (!response.error.empty()) { view.message = "无法连接 GitHub，请检查网络后重试"; return view; }
@@ -159,20 +164,31 @@ inline UpdateView parse_release(const net::Response& response, const std::string
     view.status = latest > installed ? UpdateStatus::Available : UpdateStatus::Current;
     view.message = latest > installed ? "发现新版，可下载后更新" : "当前已是最新正式版";
     const auto prefix = std::string(kReleases) + "/download/" + tag + "/";
+    const auto version = tag.front() == 'v' ? tag.substr(1) : tag;
+    const bool windows = suffix == "windows-x64.exe" || suffix == "-windows-x64.exe";
+    const auto installer_name = windows ? "aino-player-" + tag + "-setup-windows-x64.exe" :
+        suffix == "_amd64.deb" ? "aino-player_" + version + "_amd64.deb" : std::string();
+    const auto download_name = windows ? "aino-player-" + tag + "-windows-x64.exe" :
+        suffix == ".x86_64.rpm" ? "aino-player-" + version + "-1.x86_64.rpm" :
+        suffix == "-x86_64.pkg.tar.zst" ? "aino-player-" + version + "-1-x86_64.pkg.tar.zst" : std::string();
     for (const auto& asset : release["assets"].array) {
         const auto name = asset["name"].str(), url = asset["browser_download_url"].str();
-        if (!suffix.empty() && name.size() > suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0 &&
-            name.rfind("aino-player", 0) == 0 && name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") == std::string::npos &&
-            url == prefix + name) {
-            const auto version = tag.front() == 'v' ? tag.substr(1) : tag;
-            const bool installer = name == "aino-player-" + tag + "-setup-windows-x64.exe" ||
-                                   name == "aino-player_" + version + "_amd64.deb";
+        const bool installer = !installer_name.empty() && name == installer_name;
+        if ((installer || (!download_name.empty() && name == download_name)) && url == prefix + name) {
+            if (windows && installer && !prefer_installer) continue;
             if (!view.asset_url.empty() && (!installer || view.installer)) continue;
             view.asset_url = url; view.installer = installer;
             view.digest = asset["digest"].str();
             const double size = asset["size"].num();
-            view.asset_size = std::isfinite(size) && size > 0 && size <= 64 * 1024 * 1024 ? (long long)size : 0;
+            view.asset_size = std::isfinite(size) && size > 0 && size <= 64 * 1024 * 1024 && std::floor(size) == size ? (long long)size : 0;
         }
+    }
+    if (view.status == UpdateStatus::Available) {
+        if (view.asset_url.empty()) view.message = "发现新版，但没有当前平台的安装包，请查看发布页";
+        else if (view.installer && !verified_asset(view)) {
+            view.installer = false;
+            view.message = "发现新版；安装包缺少有效校验信息，请在浏览器中下载并核对";
+        } else if (windows && !prefer_installer) view.message = "发现新版便携 EXE；下载后退出播放器并替换原文件，配置和歌单会保留";
     }
     return view;
 }
@@ -223,6 +239,8 @@ struct UiState {
     bool pause_on_disconnect = true, pause_on_suspend = true, resume_after_suspend = false;
     bool auto_backup = true;
     bool shortcuts_open = false, quick_open = false;
+    int quick_cursor = 0;
+    bool quick_scroll_to_top = true;
     platform::ShortcutSettings shortcuts;
     std::string shortcut_error;
     std::string quick_query, download_playlist_key;
@@ -246,7 +264,10 @@ struct UiState {
     float dur_ms = 0.0f;
     float frame_ms = 0.0f;
     int seek_to = -1;
-    bool scroll_to_top = false;
+    bool search_scroll_to_top = false, playlist_scroll_to_top = false;
+    bool discover_scroll_to_top = true, playlist_search_scroll_to_top = true;
+    float playlist_scroll_offset = 0;
+    bool playlist_restore_scroll = false;
     bool config_dirty = false;   // 音量 / 音源开关 / Cookie 变了，等合适时机落盘
     double last_save_s = 0.0;
 
@@ -262,7 +283,7 @@ struct UiState {
     std::string output_device, lyric_file_path;
     int download_filter = 0, download_sort = 0;
     bool lyric_tools = false, device_loading = false;
-    bool lyric_match_open = false, lyric_match_loading = false;
+    bool lyric_match_open = false, lyric_match_loading = false, lyric_match_scroll_to_top = true;
     std::string lyric_match_query, lyric_match_uid, lyric_match_error;
     std::vector<music::Variant> lyric_match_candidates;
     int search_kind = 0, playlist_search_site = 0;
@@ -398,6 +419,17 @@ inline std::string track_uid(const music::Track& track) {
     const auto& variant = track.current();
     return music::variant_uid(variant);
 }
+/** @brief 查找队列中真正的当前歌曲；播放游标可能已因移除当前行而指向前一首。 */
+inline int current_queue_index(const Snapshot& snapshot) {
+    if (snapshot.now_uid.empty()) return -1;
+    const auto matches = [&](int index) {
+        return index >= 0 && index < int(snapshot.tracks.size()) &&
+            !snapshot.tracks[size_t(index)].variants.empty() && track_uid(snapshot.tracks[size_t(index)]) == snapshot.now_uid;
+    };
+    if (matches(snapshot.playing)) return snapshot.playing;
+    for (int i = 0; i < int(snapshot.tracks.size()); ++i) if (matches(i)) return i;
+    return -1;
+}
 } // namespace player
 
 namespace player {
@@ -528,6 +560,8 @@ void begin_login(int site);
 void clear_data(ClearAction action);
 void check_updates(bool notify = true);
 void open_update(bool download);
+void download_update_package();
+void cancel_update_download();
 void open_project(ProjectLink link);
 const cover::Image& brand_icon();
 std::string default_download_dir();
@@ -897,6 +931,7 @@ struct DetailHistory {
     std::string filter, rename;
     int sort = 0, section = 0;
     bool manage = false;
+    float scroll_offset = 0;
 };
 static std::vector<DetailHistory> g_detail_history;
 static std::atomic<bool> g_folder_cancel{false};
@@ -1345,7 +1380,7 @@ static void dispatch_search(SearchRequest request) {
 void start_search() {
     if (music::text::trim(g_ui.query).empty()) { toast("请输入搜索关键词"); return; }
     if (!g_ui.src_mask) { toast("请至少开启一个音源"); return; }
-    g_ui.scroll_to_top = true;
+    g_ui.search_scroll_to_top = true;
     SearchRequest request; request.keyword = g_ui.query; request.settings = g_ui.settings;
     for (int i = 0; i < music::kSourceCount; ++i) request.settings.enable[i] = (g_ui.src_mask >> i) & 1u;
     { std::lock_guard<std::mutex> lock(g_mu); g_search.keyword = request.keyword; g_search.pages = {}; g_search.continuation = {}; g_search.page_input = {}; }
@@ -2554,6 +2589,10 @@ static void request_cards(DiscState& state, int site, std::string query, bool ap
         page = append && same ? state.page : 0;
         state.loading = true; state.site = site; state.query = query; state.err.clear();
         request = ++state.request; ++state.version;
+    }
+    if (!append) {
+        if (with_heats) g_ui.discover_scroll_to_top = true;
+        else g_ui.playlist_search_scroll_to_top = true;
     }
     auto* owner = &state;
     const auto settings = g_ui.settings;
@@ -4256,9 +4295,13 @@ void search_lyric_matches() {
     const auto uid = g_snapshot.now_uid;
     if (uid.empty() || (g_ui.lyric_match_loading && g_ui.lyric_match_uid == uid)) return;
     const auto query = music::text::trim(g_ui.lyric_match_query);
-    if (query.empty()) return;
-    g_ui.lyric_match_uid = uid; g_ui.lyric_match_loading = true; g_ui.lyric_match_error.clear();
-    const auto settings = g_ui.settings; const auto generation = ++g_lyric_match_generation;
+    const auto generation = ++g_lyric_match_generation;
+    g_ui.lyric_match_uid = uid;
+    g_ui.lyric_match_loading = false;
+    g_ui.lyric_match_candidates.clear(); g_ui.lyric_match_scroll_to_top = true;
+    if (query.empty()) { g_ui.lyric_match_error = "请输入歌名或歌手后搜索"; return; }
+    g_ui.lyric_match_loading = true; g_ui.lyric_match_error.clear();
+    const auto settings = g_ui.settings;
     run_task([uid, query, settings, generation] {
         net::CancelScope cancel([uid, generation] { std::lock_guard<std::mutex> lock(g_mu); return g_shutdown.load() || generation != g_lyric_match_generation.load() || g_as.now_uid != uid; });
         std::string error; auto candidates = music::search_netease(query, 20, 7000, error, settings);
@@ -4266,9 +4309,15 @@ void search_lyric_matches() {
             if (generation != g_lyric_match_generation.load()) return;
             g_ui.lyric_match_loading = false;
             if (g_ui.lyric_match_uid != uid || g_snapshot.now_uid != uid) return;
-            g_ui.lyric_match_candidates = std::move(candidates); g_ui.lyric_match_error = error;
+            g_ui.lyric_match_candidates = std::move(candidates);
+            g_ui.lyric_match_error = error.empty() && g_ui.lyric_match_candidates.empty() ? "没有找到匹配版本，请调整歌名或歌手后重试" : error;
         });
-    }, [generation] { if (generation == g_lyric_match_generation.load()) g_ui.lyric_match_loading = false; });
+    }, [generation] {
+        if (generation == g_lyric_match_generation.load()) {
+            g_ui.lyric_match_loading = false;
+            g_ui.lyric_match_error = "搜索失败，请重试；完整原因见通知";
+        }
+    });
 }
 void select_lyric_match(const std::string& id) {
     const auto uid = g_snapshot.now_uid;
@@ -4614,11 +4663,12 @@ static void detail_begin() {
         if (g_detail_history.size() >= 8) g_detail_history.erase(g_detail_history.begin());
         auto old = std::move(g_playlist_view); old.loading_more = false;
         g_detail_history.push_back({std::move(old), g_ui.playlist_filter, g_ui.playlist_rename,
-            g_ui.playlist_sort, g_ui.catalog_section, g_ui.playlist_manage});
+            g_ui.playlist_sort, g_ui.catalog_section, g_ui.playlist_manage, g_ui.playlist_scroll_offset});
     } else if (g_ui.tab != 3 || !g_playlist_view.open) g_detail_history.clear();
     ++g_playlist_generation;
     g_playlist_view = {}; g_playlist_view.open = true; g_playlist_view.return_tab = return_tab;
-    g_ui.tab = 3; g_ui.scroll_to_top = true; g_ui.catalog_section = 0;
+    g_ui.tab = 3; g_ui.playlist_scroll_to_top = true; g_ui.catalog_section = 0;
+    g_ui.playlist_scroll_offset = 0; g_ui.playlist_restore_scroll = false;
     g_ui.playlist_filter.clear(); g_ui.playlist_sort = 0; g_ui.playlist_manage = false;
 }
 
@@ -4630,14 +4680,16 @@ void library_open(size_t index) {
     g_playlist_view.open = true; g_playlist_view.saved = true;
     g_playlist_view.playlist = g_library->playlists[index];
     g_playlist_view.library_revision = g_library_revision;
-    g_ui.tab = 3; g_ui.scroll_to_top = true;
+    g_ui.tab = 3; g_ui.playlist_scroll_to_top = true;
+    g_ui.playlist_scroll_offset = 0; g_ui.playlist_restore_scroll = false;
     g_ui.playlist_filter.clear(); g_ui.playlist_rename = g_playlist_view.playlist.name;
     g_ui.playlist_manage = false; g_ui.playlist_sort = 0;
     playlist_filter_rows();
 }
 void playlist_home() {
     ++g_playlist_generation; g_detail_history.clear(); g_playlist_view = {};
-    g_ui.scroll_to_top = true;
+    g_ui.playlist_scroll_to_top = true;
+    g_ui.playlist_scroll_offset = 0; g_ui.playlist_restore_scroll = false;
 }
 void playlist_close() {
     ++g_playlist_generation;
@@ -4646,7 +4698,8 @@ void playlist_close() {
         g_playlist_view = std::move(old.view); g_ui.playlist_filter = std::move(old.filter);
         g_ui.playlist_rename = std::move(old.rename); g_ui.playlist_sort = old.sort;
         g_ui.catalog_section = old.section; g_ui.playlist_manage = old.manage;
-        g_ui.tab = 3; g_ui.scroll_to_top = true;
+        g_ui.tab = 3; g_ui.playlist_scroll_to_top = false;
+        g_ui.playlist_scroll_offset = old.scroll_offset; g_ui.playlist_restore_scroll = true;
         return;
     }
     const auto tab = g_playlist_view.return_tab;
@@ -4689,7 +4742,7 @@ void playlist_open_remote(library::Playlist playlist) {
             if (!more && total >= 0 && g_playlist_view.playlist.tracks.size() < size_t(total))
                 g_playlist_view.more_error = "平台返回曲目不足，保存时会重新读取完整歌单";
             playlist_filter_rows();
-            g_ui.scroll_to_top = true;
+            g_ui.playlist_scroll_to_top = true;
         });
     }, [generation] {
         if (generation == g_playlist_generation.load()) { g_playlist_view.loading = false; g_playlist_view.error = "加载失败，请重试；完整原因见通知"; }
@@ -4846,7 +4899,7 @@ static void catalog_request(bool albums, bool append) {
                 view.tracks_continuation = std::move(page.continuation);
             }
             playlist_filter_rows();
-            if (!append && g_ui.catalog_section == (albums ? 1 : 0)) g_ui.scroll_to_top = true;
+            if (!append && g_ui.catalog_section == (albums ? 1 : 0)) g_ui.playlist_scroll_to_top = true;
             if (!albums && g_ui.catalog_section == 1 && !view.albums_loaded && view.albums_error.empty()) catalog_request(true, false);
         });
     }, [generation, albums, append] {
@@ -4891,7 +4944,7 @@ void catalog_open_album(int index) {
 void catalog_switch_section(int section) {
     if (!g_playlist_view.catalog_open || section < 0 || section > 1) return;
     g_ui.catalog_section = section; g_ui.playlist_filter.clear(); g_ui.playlist_sort = 0;
-    playlist_filter_rows(); g_ui.scroll_to_top = true;
+    playlist_filter_rows(); g_ui.playlist_scroll_to_top = true;
     if (section == 1 && !g_playlist_view.albums_loaded) catalog_request(true, false);
 }
 void catalog_load_more() { catalog_request(g_ui.catalog_section == 1, true); }
@@ -5219,21 +5272,43 @@ void check_updates(bool notify) {
             request.url = updates::kApi;
             request.headers = {"Accept: application/vnd.github+json"};
             request.timeout_ms = 5000; request.follow_redirects = false;
-            result = updates::parse_release(net::execute(request), AINO_PLAYER_RELEASE_VERSION, updates::asset_suffix());
+            const auto response = net::execute(request);
+#ifdef _WIN32
+            result = updates::parse_release(response, AINO_PLAYER_RELEASE_VERSION, updates::asset_suffix(), platform::windows_installed_player());
+#elif defined(__linux__)
+            const auto channel = platform::package_channel();
+            result = updates::parse_release(response, AINO_PLAYER_RELEASE_VERSION,
+                std::string(updates::asset_suffix()).empty() ? "" : platform::package_suffix(channel));
+#else
+            result = updates::parse_release(response, AINO_PLAYER_RELEASE_VERSION, updates::asset_suffix());
+#endif
 #ifdef __linux__
-            result.package_command = platform::package_update_command(platform::package_channel());
+            result.package_command = platform::package_update_command(channel);
             if (!result.package_command.empty()) {
                 result.installer = false;
-                if (result.status == UpdateStatus::Available) result.message = "发现新版，请使用系统包管理器升级；软件源同步后可用";
+                if (result.status == UpdateStatus::Available) result.message = "发现新版，请使用系统包管理器升级。未配置软件源或同步未完成时，可直接下载包";
             }
 #endif
         } catch (...) { result.status = UpdateStatus::Failed; result.message = "检查更新失败，请稍后重试"; }
         post_ui([result = std::move(result), notify]() mutable {
             g_update.view = std::move(result);
-            if (g_update.view.status == UpdateStatus::Available) toast("发现新版本 " + g_update.view.version + "，可在设置 → 版本更新中下载", 7000);
+            if (g_update.view.status == UpdateStatus::Available) toast("发现新版本 " + g_update.view.version + "，请在设置 → 通用 → 检查更新中查看升级方式", 7000);
             else if (notify) toast(g_update.view.message, 5000);
         });
-    }, [] { g_update.view.status = UpdateStatus::Failed; });
+    }, [] {
+        g_update.view.status = UpdateStatus::Failed;
+        g_update.view.message = "检查更新失败，请重试；完整原因见通知";
+    });
+}
+void download_update_package() {
+    const auto url = !g_update.view.asset_url.empty() ? g_update.view.asset_url :
+        !g_update.view.release_url.empty() ? g_update.view.release_url : std::string(updates::kReleases);
+    if (!platform::open_browser(url)) toast("无法打开默认浏览器，请检查浏览器设置");
+}
+void cancel_update_download() {
+    if (g_update.view.status != UpdateStatus::Downloading) return;
+    g_update.cancel.store(true);
+    g_update.view.message = "正在取消下载，旧版仍可使用…";
 }
 void open_update(bool download) {
     if (download && !g_update.view.package_command.empty()) {
@@ -5244,12 +5319,12 @@ void open_update(bool download) {
         if (g_update.view.status != UpdateStatus::Available) return;
 #ifdef __linux__
         if (!platform::deb_installer_available()) {
-            toast("系统缺少 pkexec 或 apt-get，请安装 pkexec 后重试；无需卸载旧版", 7000); return;
+            g_update.view.message = "系统缺少 pkexec 或 apt-get，已改用浏览器下载；请通过系统软件安装工具安装，无需卸载旧版";
+            toast(g_update.view.message, 7000); download_update_package(); return;
         }
 #endif
         const auto release = g_update.view;
-        if (!release.asset_size || release.digest.size() != 71 || release.digest.rfind("sha256:", 0) != 0 ||
-            release.digest.substr(7).find_first_not_of("0123456789abcdef") != std::string::npos) {
+        if (!updates::verified_asset(release)) {
             toast("安装包缺少有效的 SHA-256 信息，请从 GitHub 发布页下载", 6000); return;
         }
         g_update.cancel.store(false);
@@ -5263,11 +5338,11 @@ void open_update(bool download) {
             const auto path = platform::join(g_temp_dir, "aino-update-" + tag + ".deb");
 #endif
             std::string error;
-            bool ok = false;
+            bool ok = false, too_large = false;
             try {
                 int previous = -1;
                 ok = net::download(release.asset_url, path, {}, [&](long long received, long long) {
-                    if (received > release.asset_size) { g_update.cancel.store(true); return; }
+                    if (received > release.asset_size) { too_large = true; g_update.cancel.store(true); return; }
                     const int progress = int(received * 100 / release.asset_size);
                     if (progress != previous) {
                         previous = progress;
@@ -5280,11 +5355,19 @@ void open_update(bool download) {
             } catch (...) { ok = false; error = "安装包下载失败，请稍后重试"; }
             if (!ok || g_update.cancel.load()) {
                 platform::remove(path);
+                if (too_large) error = "安装包超过发布声明的大小，已停止下载，请从发布页核对";
+                else if (g_update.cancel.load()) error = "已取消更新下载，旧版仍可使用";
                 post_ui([error] { g_update.view.status = UpdateStatus::Available; g_update.view.message = error; toast(error, 7000); });
                 return;
             }
 #ifdef _WIN32
             post_ui([path] {
+                if (g_update.cancel.load() || g_shutdown.load()) {
+                    platform::remove(path);
+                    g_update.view.status = UpdateStatus::Available;
+                    g_update.view.message = "已取消更新下载，旧版仍可使用";
+                    return;
+                }
                 if (!g_host.close || !platform::launch_installer(path)) {
                     g_update.view.status = UpdateStatus::Available; g_update.view.message = "无法启动安装器，请重试或从发布页下载";
                     platform::remove(path); return;
@@ -5294,28 +5377,44 @@ void open_update(bool download) {
                 g_host.close();
             });
 #else
-            post_ui([] {
+            post_ui([path] {
+                if (g_update.cancel.load() || g_shutdown.load()) {
+                    platform::remove(path);
+                    g_update.view.status = UpdateStatus::Available;
+                    g_update.view.message = "已取消更新下载，旧版仍可使用";
+                    return;
+                }
                 g_update.view.status = UpdateStatus::Installing;
                 g_update.view.message = "请完成系统授权窗口，正在覆盖升级。安装期间退出会等待安装结束…";
-            });
-            if (g_update.cancel.load() || g_shutdown.load()) { platform::remove(path); return; }
-            const auto data_dir = platform::config_dir();
-            const auto log = platform::join(data_dir.empty() ? g_temp_dir : data_dir, "update-install.log");
-            const int code = platform::install_deb(path, log);
-            platform::remove(path);
-            post_ui([code, log] {
-                g_update.view.status = code == 0 ? UpdateStatus::Installed : UpdateStatus::Available;
-                g_update.view.message = code == 0 ? "新版已覆盖安装，请重新启动播放器；配置和歌单已保留" :
-                    code == 126 ? "已取消系统授权，旧版仍可使用" :
-                    "覆盖安装未完成（退出码 " + std::to_string(code) + "），无需卸载旧版。详情见 " + log;
-                toast(g_update.view.message, 8000);
+                // 在 UI 线程结束可取消阶段，再提交安装任务，避免“已取消”之后仍开始系统安装。
+                run_task([path] {
+                    const auto data_dir = platform::config_dir();
+                    const auto log = platform::join(data_dir.empty() ? g_temp_dir : data_dir, "update-install.log");
+                    const int code = platform::install_deb(path, log);
+                    platform::remove(path);
+                    post_ui([code, log] {
+                        g_update.view.status = code == 0 ? UpdateStatus::Installed : UpdateStatus::Available;
+                        g_update.view.message = code == 0 ? "新版已安装，请从应用菜单启动新版；当前便携文件不会被替换，配置和歌单会保留" :
+                            code == 126 ? "已取消系统授权，旧版仍可使用" :
+                            "安装未完成（退出码 " + std::to_string(code) + "），无需卸载旧版。详情见 " + log;
+                        toast(g_update.view.message, 8000);
+                    });
+                }, [path] {
+                    platform::remove(path);
+                    g_update.view.status = UpdateStatus::Available;
+                    g_update.view.message = "安装未完成，请重试；完整原因见通知";
+                });
             });
 #endif
-        }, [] { g_update.view.status = UpdateStatus::Failed; });
+        }, [] {
+            g_update.view.status = UpdateStatus::Available;
+            g_update.view.message = "更新未完成，请重试或从发布页下载；完整原因见通知";
+        });
         return;
     }
 #endif
-    const auto url = download && !g_update.view.asset_url.empty() ? g_update.view.asset_url :
+    if (download) { download_update_package(); return; }
+    const auto url =
         !g_update.view.release_url.empty() ? g_update.view.release_url : std::string(updates::kReleases);
     if (!platform::open_browser(url)) toast("无法打开默认浏览器，请检查浏览器设置");
 }
@@ -5501,10 +5600,12 @@ void refresh_quick_search() {
     static std::string last_query; static unsigned last_library = ~0u; static int last_queue = -1; static bool opened = false;
     if (!g_ui.quick_open) {
         if (opened) { ++g_quick_serial; std::lock_guard<std::mutex> lock(g_quick_mutex); g_quick_pending.reset(); g_quick_index.reset(); g_ui.quick_results.clear(); g_ui.quick_loading = false; }
+        g_ui.quick_cursor = 0; g_ui.quick_scroll_to_top = true;
         opened = false; return;
     }
     if (opened && last_query == g_ui.quick_query && last_library == g_library_revision && last_queue == g_snapshot.tracks_version && !g_quick_failed) return;
     g_quick_failed = false;
+    g_ui.quick_cursor = 0; g_ui.quick_scroll_to_top = true;
     opened = true; last_query = g_ui.quick_query; last_library = g_library_revision; last_queue = g_snapshot.tracks_version;
     auto request = std::make_shared<QuickRequest>(QuickRequest{last_query, g_library, g_snapshot.tracks, last_library, last_queue, ++g_quick_serial});
     g_ui.quick_loading = true;
@@ -5546,7 +5647,11 @@ void refresh_quick_search() {
             std::vector<std::pair<int, size_t>> ranked; for (auto& bucket : matches) ranked.insert(ranked.end(), bucket.begin(), bucket.end());
             std::sort(ranked.begin(), ranked.end()); std::vector<QuickResult> results;
             for (const auto& match : ranked) { const auto& e = index->entries[match.second]; results.push_back({e.track ? *e.track : music::Track{}, e.key, e.kind, e.title, e.detail}); }
-            post_ui([serial = request->serial, results = std::move(results)]() mutable { if (serial != g_quick_serial.load() || !g_ui.quick_open) return; g_ui.quick_results = std::move(results); g_ui.quick_loading = false; });
+            post_ui([serial = request->serial, results = std::move(results)]() mutable {
+                if (serial != g_quick_serial.load() || !g_ui.quick_open) return;
+                g_ui.quick_results = std::move(results); g_ui.quick_loading = false;
+                g_ui.quick_cursor = 0; g_ui.quick_scroll_to_top = true;
+            });
         }
     }, [] { std::lock_guard<std::mutex> lock(g_quick_mutex); g_quick_worker = false; g_ui.quick_loading = false; g_quick_failed = true; });
 }
