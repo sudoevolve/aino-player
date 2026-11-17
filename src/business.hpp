@@ -90,6 +90,9 @@ enum class ClearAction { None, Cookies, Library, Queue, Cache };
 #ifndef AINO_PLAYER_VERSION
 #define AINO_PLAYER_VERSION "0.0.0"
 #endif
+#ifndef AINO_PLAYER_RELEASE_VERSION
+#define AINO_PLAYER_RELEASE_VERSION AINO_PLAYER_VERSION
+#endif
 inline constexpr const char* kVersion = AINO_PLAYER_VERSION;
 namespace project {
 inline constexpr const char* author = "sudoevolve";
@@ -5201,7 +5204,7 @@ void check_updates(bool notify) {
             request.url = updates::kApi;
             request.headers = {"Accept: application/vnd.github+json"};
             request.timeout_ms = 5000; request.follow_redirects = false;
-            result = updates::parse_release(net::execute(request), kVersion, updates::asset_suffix());
+            result = updates::parse_release(net::execute(request), AINO_PLAYER_RELEASE_VERSION, updates::asset_suffix());
 #ifdef __linux__
             result.package_command = platform::package_update_command(platform::package_channel());
             if (!result.package_command.empty()) {

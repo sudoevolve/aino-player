@@ -59,6 +59,11 @@ if __name__ == "__main__":
     version = re.search(r"project\(aino_player VERSION ([0-9]+\.[0-9]+\.[0-9]+)", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")).group(1)
     if not args.exe.is_file():
         parser.error("Build the player before packaging")
+    actual = subprocess.check_output([str(args.exe.resolve()), "--version"], text=True).strip()
+    match = re.fullmatch(r"aino player (" + re.escape(version) + r"(?:\.[0-9]+)?)", actual)
+    if not match:
+        parser.error(f"Executable version does not match project version {version}: {actual}")
+    version = match.group(1)
     args.output.mkdir(parents=True, exist_ok=True)
     subprocess.run([str(compiler()), f"/DAppVersion={version}", f"/DPlayerExe={args.exe.resolve()}",
                     f"/DOutputPath={args.output.resolve()}", str(ROOT / "packaging/windows.iss")], check=True)

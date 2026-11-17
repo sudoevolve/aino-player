@@ -36,6 +36,8 @@ python tools/build_installer.py --exe build/Release/aino_player.exe --output bui
 
 脚本优先使用本机 ISCC；缺失时下载固定的官方编译器并校验 SHA-256，准备到 `build/tools/inno`。安装器版本来自 CMake，资源及压缩安装器由发布工作流一并打包。图标源文件为 `assets/aino.svg`；正常构建直接使用已生成资源，只有重生成时才需 Pillow 并运行 `python tools/build_icon.py`。
 
+仅更新本地 Windows 安装时，可配置 `-DAINO_LOCAL_REVISION=1 -DAINO_BUILD_TESTS=OFF`。正式项目版本保持不变，程序显示、Windows 文件属性及安装器增加第四段（例如 `0.5.1.1`）；更新检查仍比较三段正式版本。安装器从待打包 EXE 读取并核对版本。准备正式发布前用 `-DAINO_LOCAL_REVISION=0` 恢复默认；该值只存于本机构建缓存，不创建标签或发布。
+
 精简 FFmpeg 只需首次构建，之后直接构建播放器。再次运行解码器脚本会复用相同源码版本、编译选项和工具链的配置，执行 GNU make 增量检查；产物不变时保留时间戳，不触发应用重新嵌入。已有构建目录如已开启测试，可用 `-DAINO_BUILD_TESTS=OFF` 关闭，或用 `cmake --build build --config Release --target aino_player --parallel 2` 只编译程序。
 
 主程序沿用 main、UI 和业务的少文件布局：`main.cpp` 定义 `AINO_PLAYER_INTERFACE`，只编译业务声明；业务实现由现有 `cover_decode.cpp` 在 `AINO_PLAYER_BUSINESS_UNIT` 构建宏下承载，后者同时保留 Linux 封面解码职责。业务实现只编译一份，UI 通过业务动作与 ViewModel 访问，不直接访问业务全局变量。测试目标保留原来的头文件实现方式。

@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.16)
 project(aino_player VERSION 0.5.1 LANGUAGES CXX C)
+set(AINO_LOCAL_REVISION "0" CACHE STRING "Local Windows build revision; zero uses the official version")
+if(NOT AINO_LOCAL_REVISION MATCHES "^[0-9]+$" OR AINO_LOCAL_REVISION GREATER 65535)
+  message(FATAL_ERROR "AINO_LOCAL_REVISION must be an integer from 0 to 65535")
+endif()
+set(AINO_DISPLAY_VERSION "${PROJECT_VERSION}")
+if(AINO_LOCAL_REVISION GREATER 0)
+  set(AINO_DISPLAY_VERSION "${PROJECT_VERSION}.${AINO_LOCAL_REVISION}")
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -148,7 +156,7 @@ else()
 endif()
 
 foreach(target player_audio player_login player_desktop aino_player)
-  target_compile_definitions(${target} PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN AINO_PLAYER_VERSION="${PROJECT_VERSION}")
+  target_compile_definitions(${target} PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN AINO_PLAYER_VERSION="${AINO_DISPLAY_VERSION}" AINO_PLAYER_RELEASE_VERSION="${PROJECT_VERSION}")
   # sources.hpp → lxsource.hpp → quickjs.h
   target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vendor/quickjs)
   if(MSVC)
