@@ -91,3 +91,9 @@
 - 文件关联元数据与 `git diff --check` 通过；EXE 报告 `aino player 0.5.2`，解码器报告内置 FFmpeg 8.1.3。没有安装或替换现用播放器。
 - 本机自动回归不等于真实账号及所有 LX 音源实播；没有将输入法或任务栏歌词的编译/模拟结果写成用户实机确认。
 - 四平台正式产物、安装验收和软件源同步由 v0.5.2 标签工作流完成；其最终结果以 GitHub Actions 和后续发布记录为准。
+
+最终发布结果：版本提交 `b7dfcf0`，标签 [v0.5.2](https://github.com/sudoevolve/aino-player/releases/tag/v0.5.2)，正式发布时间为 2026-11-17 15:10:15（Asia/Shanghai），非草稿、非预发布，并已设为最新稳定版。[发布工作流 44035916203](https://github.com/sudoevolve/aino-player/actions/runs/44035916203) 的 Windows、Ubuntu、Fedora、Arch 和 publish 全部成功：Windows **7/7，48.93 秒**；Ubuntu **9/9，23.62 秒**；Fedora **8/8，17.48 秒**；Arch **8/8，17.56 秒**。Linux 包安装与窗口启动检查通过，Ubuntu 还验证由上一正式版覆盖升级。
+
+本机下载全部 10 个发布附件，逐一核对实际文件大小和 SHA-256 与 GitHub asset digest 一致；9 项载荷另外与 `SHA256SUMS.txt` 一致，校验清单自身也与 GitHub 摘要一致。Windows 安装器 4,750,948 字节、便携 EXE 8,468,480 字节、deb 3,754,766 字节、rpm 3,201,925 字节、Arch 包 3,839,671 字节；FFmpeg 源码、两份构建信息与许可同时发布。
+
+[软件源工作流 44036629590](https://github.com/sudoevolve/aino-player/actions/runs/44036629590) 的 APT、RPM、Arch 和 Pages 部署全部成功。重新读取公开 APT Packages、RPM primary 元数据及 Arch 数据库，确认分别包含 0.5.2、0.5.2、0.5.2-1。没有替换用户正在使用的安装，没有操作真实音乐账号或把所有第三方音源宣称为逐一实播通过；R-02/R-03 等已明确暂缓的能力仍保持原记录。
