@@ -329,7 +329,7 @@ int main(int argc, char** argv) {
         if (!desktop.hidden()) ui::draw(ui, model);
 #ifdef AINO_PLATFORM_X11
         if (diagnostics) {
-            const auto stats = static_cast<aino::detail::X11TextRenderer*>(win.impl->text)->cache_stats();
+            const auto stats = static_cast<aino::detail::UnixTextRenderer*>(win.impl->text)->cache_stats();
             std::printf("scale=%.3f logical=%dx%d physical=%dx%d fonts=%zu faces=%zu glyph_bytes=%zu\n",
                 win.dpi_scale(), win.width(), win.height(), win.impl->client_w, win.impl->client_h,
                 stats.fonts, stats.faces, stats.glyph_bytes);
