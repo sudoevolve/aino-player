@@ -1,4 +1,4 @@
-// =============================================================================
+﻿// =============================================================================
 //  aino.hpp — 单头文件 C++17 桌面 UI 库
 //
 //  立即模式 API：应用持有状态，Stack 负责顺序布局，Theme 提供语义颜色。
@@ -32,8 +32,8 @@
 
 #define AINO_VERSION_MAJOR 0
 #define AINO_VERSION_MINOR 5
-#define AINO_VERSION_PATCH 3
-#define AINO_VERSION "0.5.3"
+#define AINO_VERSION_PATCH 4
+#define AINO_VERSION "0.5.4"
 
 #include <cstdint>
 #include <cstddef>
@@ -227,7 +227,6 @@ struct Rect {
     Rect cut_top(float amount) { Rect r(x, y, w, amount); y += amount; h -= amount; return r; }
     Rect cut_bottom(float amount) { h -= amount; return Rect(x, y + h, w, amount); }
     // 水平 / 垂直内边距后的可用区
-    Rect pad(float dx, float dy) const { return inset(dx, dy); }
 };
 
 enum class Align  { Left, Center, Right };
@@ -261,7 +260,7 @@ enum Key {
 // =============================================================================
 //  二、主题 —— macOS 风格语义色
 //
-//  label/fill/tint 描述文字、表面与强调色；background/card/primary 等字段保留兼容，
+//  label/fill/tint 描述文字、表面与强调色，所有组件共用同一组语义字段，
 //  由主题工厂映射。修改强调色应调用 set_tint()，同步前景、焦点环与选中行颜色。
 //
 //  设计资料与实现映射见 docs/macos27/README.md。
@@ -310,35 +309,10 @@ struct Theme {
     // ---- 强调色板（macOS 27 Accents 变量集）----
     Color blue, red, orange, yellow, green, mint, teal, cyan, indigo, purple, pink, brown, gray;
 
-    // ---- 旧字段（保持 API 兼容，由下面两个工厂映射）----
-    // 语义色
-    Color background;
-    Color foreground;
-
-    Color card;
-    Color card_foreground;
-
-    Color popover;
-    Color popover_foreground;
-
-    Color primary;
-    Color primary_foreground;
-
-    Color secondary;
-    Color secondary_foreground;
-
-    Color muted;
-    Color muted_foreground;
-
-    Color accent;
-    Color accent_foreground;
-
-    Color destructive;
-    Color destructive_foreground;
-
-    Color border;
-    Color input;
-    Color ring;
+    Color card_bg;               // 分组卡片表面
+    Color on_red;                // 危险色上的文字
+    Color input_border;
+    Color focus_ring;
 
     // 度量 —— macOS 27 控件刻度（参考资料 Sizes 变量集，Medium 为默认档）
     //   圆角：Mini~Medium 是圆角矩形（4/5/6），Large/XL 的按钮与开关是胶囊（半径 1000）
@@ -353,11 +327,6 @@ struct Theme {
 
     float font_size   = 13.0f;  // Body
     float line_height = 16.0f;
-    float control_h   = 24.0f;  // Medium（默认档）
-    float control_h_sm= 20.0f;  // Small
-    float control_h_mini = 16.0f;
-    float control_h_lg   = 28.0f;
-    float control_h_xl   = 36.0f;
 
     float pad_x       = 16.0f;  // Button/Padding - Horizontal (Medium)
     float pad_y       = 4.0f;   // Button/Vertical Padding (Medium)
@@ -397,16 +366,8 @@ struct Theme {
                 || size_font[i] != o.size_font[i] || size_line[i] != o.size_line[i]
                 || size_padx[i] != o.size_padx[i] || size_pady[i] != o.size_pady[i]) return false;
         }
-        return ceq(background, o.background) && ceq(foreground, o.foreground)
-            && ceq(card, o.card) && ceq(card_foreground, o.card_foreground)
-            && ceq(popover, o.popover) && ceq(popover_foreground, o.popover_foreground)
-            && ceq(primary, o.primary) && ceq(primary_foreground, o.primary_foreground)
-            && ceq(secondary, o.secondary) && ceq(secondary_foreground, o.secondary_foreground)
-            && ceq(muted, o.muted) && ceq(muted_foreground, o.muted_foreground)
-            && ceq(accent, o.accent) && ceq(accent_foreground, o.accent_foreground)
-            && ceq(destructive, o.destructive) && ceq(destructive_foreground, o.destructive_foreground)
-            && ceq(border, o.border) && ceq(input, o.input) && ceq(ring, o.ring)
-            // macOS 语义层：漏掉任何一个，改主题的那一帧就不会重绘
+        return ceq(card_bg, o.card_bg) && ceq(on_red, o.on_red)
+            && ceq(input_border, o.input_border) && ceq(focus_ring, o.focus_ring)
             && ceq(tint, o.tint) && ceq(tint_foreground, o.tint_foreground)
             && ceq(label, o.label) && ceq(label2, o.label2)
             && ceq(label3, o.label3) && ceq(label4, o.label4)
@@ -430,21 +391,17 @@ struct Theme {
             && radius_lg == o.radius_lg && radius_xl == o.radius_xl
             && radius_full == o.radius_full
             && font_size == o.font_size && line_height == o.line_height
-            && control_h == o.control_h && control_h_sm == o.control_h_sm
-            && control_h_mini == o.control_h_mini && control_h_lg == o.control_h_lg
-            && control_h_xl == o.control_h_xl && pad_x == o.pad_x && pad_y == o.pad_y
+            && pad_x == o.pad_x && pad_y == o.pad_y
             && font_family == o.font_family && font_family_mono == o.font_family_mono
             && corner_smoothing == o.corner_smoothing;
     }
 
-    // 同步原生强调色、旧 primary、焦点环和选中行；accent 仍是中性的悬停面。
+    // 同步强调色、前景、焦点环和选中行。
     // 由应用保存选择，再对当前 light()/dark() 主题调用，避免外观切换丢失强调色。
     Theme& set_tint(const Color& color) {
         tint = color;
         tint_foreground = color.luminance() > 0.55f ? Color(0, 0, 0, 217) : Color::white();
-        primary = tint;
-        primary_foreground = tint_foreground;
-        ring = tint.with_alpha(is_dark() ? 140 : 128);
+        focus_ring = tint.with_alpha(is_dark() ? 140 : 128);
         table_sel = tint;
         return *this;
     }
@@ -453,10 +410,6 @@ struct Theme {
     static Theme light();
     // 深色：窗口底 #1E1E1E，文字 85% 白
     static Theme dark();
-    // 显式别名 —— 分支之后 light()/dark() 本身就是 macOS 风，这两个名字只是
-    // 让调用方读起来不用猜。
-    static Theme macos_light() { return light(); }
-    static Theme macos_dark() { return dark(); }
 };
 
 // =============================================================================
@@ -513,9 +466,7 @@ struct Style {
 
     // -------- 链式修饰 --------
     Style& color(const Color& c) { fg = c; return *this; }
-    Style& text_color(const Color& c) { fg = c; return *this; }
     Style& background(const Color& c) { bg = c; return *this; }
-    Style& fill(const Color& c) { bg = c; return *this; }
     Style& stroke(float w, const Color& c) { border_width = w; border_color = c; return *this; }
     Style& corner(float r) { radius = r; return *this; }
     Style& padded(float x, float y) { pad_x = x; pad_y = y; return *this; }
@@ -698,14 +649,12 @@ struct ScrollScope {
     ScrollScope() = default;
     ScrollScope(const ScrollScope&) = delete;
     ScrollScope& operator=(const ScrollScope&) = delete;
-    ScrollScope(ScrollScope&& o) noexcept { *this = std::move(o); }
-    ScrollScope& operator=(ScrollScope&& o) noexcept {
-        if (this == &o) return *this;
-        ui = o.ui; id = o.id; state_scope_id = o.state_scope_id; box = o.box; content_h = o.content_h;
-        max_offset = o.max_offset; offset = o.offset; active = o.active;
+    ScrollScope(ScrollScope&& o) noexcept
+        : ui(o.ui), id(o.id), state_scope_id(o.state_scope_id), box(o.box), content_h(o.content_h),
+          max_offset(o.max_offset), offset(o.offset), active(o.active) {
         o.active = false; o.ui = nullptr;
-        return *this;
     }
+    ScrollScope& operator=(ScrollScope&&) = delete;
     ~ScrollScope();
 
     void  close();              // 收尾（幂等；也可等析构）
@@ -957,7 +906,7 @@ public:
     // ---------------- 动画 ----------------
     // 目标驱动补间：duration 秒内从"当前显示值"过渡到 target，缓动为 e。
     //   float t = ui.tween(make_id("w", rect), open ? 240.0f : 0.0f, 0.24f);
-    //   ui.fill_rect(Rect(x, y, t, 4), ui.theme().primary);
+    //   ui.fill_rect(Rect(x, y, t, 4), ui.theme().tint);
     // 运行期间自动要帧；到达目标后不再要帧（空闲 CPU 依旧 0%）。
     float tween(uint64_t id, float target, float duration = 0.22f, Easing e = easing::out_cubic);
     Color tween_color(uint64_t id, const Color& target, float duration = 0.22f,
@@ -990,7 +939,6 @@ public:
 
     // 容器类
     void panel(const Rect& box, const Style& st = Style());          // 卡片 / 面板
-    void card(const Rect& box, const Style& st = Style());           // panel 的别名语义
     void separator(const Rect& box, const Style& st = Style());      // 水平或垂直细线
     void badge(const std::string& text, const Rect& box, const Style& st = Style());
     void progress(float value, const Rect& box, const Style& st = Style());   // value 0..1
@@ -1126,8 +1074,8 @@ public:
     bool alert_dialog(const std::string& title, const std::string& body,
                       const std::string& confirm, const std::string& cancel,
                       bool* open, const Rect& box, const Style& st = Style());
-    // Drawer：位置由 box 指定的模态面板；side 保留兼容，不自动摆放或播放动画。
-    bool drawer(const std::string& title, bool* open, int side, const Rect& box,
+    // Drawer：位置由 box 指定的模态面板。
+    bool drawer(const std::string& title, bool* open, const Rect& box,
                 const std::function<void(const Rect&)>& draw, const Style& st = Style());
     // Context Menu：在 area 内右键弹出（不占布局，弹层在鼠标位置）
     bool context_menu(const Rect& area, const std::vector<std::string>& items,
@@ -1144,18 +1092,11 @@ public:
     void deferred(std::function<void()> fn);
 
     // 布局辅助（立即模式下的轻量自动布局）
-    Rect row(float height);            // 在"当前容器"里切一行
     // 按 ratio = 宽/高，从宽度算出高度。
     // 立即模式里没有"容器组件"，所以它就是一个算矩形的小工具：
     //   Rect r = Ui::aspect_rect(cell, 16.0f / 9.0f);  ui.fill_rect(r, bg);
     static Rect aspect_rect(const Rect& box, float ratio);
-    Rect column(float width);
-    void push_padding(float x, float y);
-    void pop_padding();
-    void begin_group(const Rect& box);
-    void end_group();
-
-    // 顺序布局器 —— 新代码优先用这两个，上面那组是早期接口（保留兼容）
+    // 顺序布局器
     Stack vbox(const Rect& box, float gap = 0.0f, float pad = 0.0f);
     Stack hbox(const Rect& box, float gap = 0.0f, float pad = 0.0f);
 
@@ -1196,13 +1137,6 @@ public:
         return drawn;
     }
 
-    // 显式写法：和 scroll() 完全同一套实现，只是不返回句柄 —— 用 end_scroll() 收尾。
-    // 老代码 `ui.begin_scroll(...); ...; ui.end_scroll();` 照旧成立。
-    void  begin_scroll(const Rect& box, float content_h);
-    void  end_scroll();                     // 关掉最内层（close() 的显式版）
-    float scroll_y() const;                 // 当前偏移（0 = 顶部）
-    void  scroll_to(float offset);          // 程序化滚动
-
     // 低层零件：自己算可见区间、自己画，只要偏移与滚动条
     float scroll_visible(const Rect& box, int count, float item_h, int* first, int* last);
     void  scroll_bar(const Rect& box, float content_h);
@@ -1215,6 +1149,7 @@ public:
 private:
     bool tabs_impl(const std::vector<std::string>& labels, int* index, const Rect& box,
                    const TabOptions& options, bool segmented_control, const Style& st);
+    void end_scroll();
     void repaint();
     friend struct ScrollScope;
 };
@@ -1294,8 +1229,6 @@ struct WindowConfig {
 class Window {
 public:
     explicit Window(const WindowConfig& cfg);
-    // 老写法，等价于只填 width / height / title。
-    Window(int width, int height, const std::string& title);
     ~Window();
     Window(const Window&) = delete;
     Window& operator=(const Window&) = delete;
@@ -1357,32 +1290,17 @@ public:
     void render(const std::function<void(Ui&)>& frame); // 同步绘制一帧，含 begin/end/present
 
     // 剪贴板（input 组件的复制粘贴用）
-    void set_clipboard(const std::string& text);
     /** @brief 写入系统剪贴板；失败返回 false，调用者应保留原始内容。 */
     bool try_set_clipboard(const std::string& text);
+    /** @brief 在窗口线程交付剪贴板内容；不阻塞等待 X11/Wayland 数据，失败交付空串。
+     * 每个窗口只保留一个请求；销毁窗口会取消回调。
+     */
+    void request_clipboard(std::function<void(std::string)> complete);
     std::string clipboard() const;
 
     struct Impl;
     Impl* impl = nullptr;
 };
-
-// =============================================================================
-//  八、内置图标（用 Unicode 符号，免依赖；也可换成你自己的字体图标）
-// =============================================================================
-namespace icons {
-    // C++17 inline 定义对所有调用单元可见，不依赖实现单元是否使用这些符号。
-    inline const char* check = "\xE2\x9C\x93";         // ✓
-    inline const char* chevron_down = "\xE2\x8C\x84";  // ⌄
-    inline const char* chevron_right = "\xE2\x80\xBA"; // ›
-    inline const char* close = "\xE2\x9C\x95";         // ✕
-    inline const char* plus = "+";
-    inline const char* minus = "\xE2\x88\x92";         // −
-    inline const char* search = "\xE2\x8C\x95";        // ⌕
-    inline const char* settings = "\xE2\x9A\x99";      // ⚙
-    inline const char* sun = "\xE2\x98\x80";           // ☀
-    inline const char* moon = "\xE2\x98\xBE";          // ☾
-    inline const char* dot = "\xE2\x80\xA2";           // •
-}
 
 /**
  * @brief 在创建窗口之前调用；处理短时系统图标解码子进程，并为普通启动启用隔离。
@@ -1563,21 +1481,6 @@ inline uint64_t make_id(const char* kind, const Rect& r, uint64_t extra = 0) {
 // -----------------------------------------------------------------------------
 //  UTF-8 <-> 码点（文本编辑必须按码点走，否则中文会被截断）
 // -----------------------------------------------------------------------------
-inline int utf8_decode(const char* s, uint32_t* out) {
-    const uint8_t* p = reinterpret_cast<const uint8_t*>(s);
-    if (p[0] < 0x80) { *out = p[0]; return 1; }
-    if ((p[0] & 0xE0) == 0xC0) { *out = ((p[0] & 0x1Fu) << 6) | (p[1] & 0x3Fu); return 2; }
-    if ((p[0] & 0xF0) == 0xE0) { *out = ((p[0] & 0x0Fu) << 12) | ((p[1] & 0x3Fu) << 6) | (p[2] & 0x3Fu); return 3; }
-    if ((p[0] & 0xF8) == 0xF0) {
-        *out = ((p[0] & 0x07u) << 18) | ((p[1] & 0x3Fu) << 12) | ((p[2] & 0x3Fu) << 6) | (p[3] & 0x3Fu);
-        return 4;
-    }
-    *out = 0xFFFD; return 1;
-}
-
-// 带长度的解码：截断的多字节序列（粘贴被切断、网络/文件读了一半）按替换符处理，
-// **不越界读**。返回值（前进多少字节）与上面的版本一致 —— 这样调用方的迭代次数、
-// 码点计数在畸形输入下也不变，只是不再踩到字符串末尾之外。
 inline int utf8_decode_n(const char* s, size_t avail, uint32_t* out) {
     const uint8_t* p = reinterpret_cast<const uint8_t*>(s);
     if (avail == 0) { *out = 0; return 0; }
@@ -1667,7 +1570,14 @@ inline size_t utf8_byte_offset(const std::string& s, int idx) {
 // （全名）；字符串优先取 platformID=3（Windows / UTF-16BE），没有再取
 // platformID=1（Mac Roman，当 Latin-1 处理）。
 inline std::string font_family_from_file(const std::string& path) {
+#ifdef AINO_PLATFORM_WINDOWS
+    const int path_units = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.data(), int(path.size()), nullptr, 0);
+    std::wstring wide(size_t(std::max(path_units, 0)), L'\0');
+    if (path_units <= 0 || !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.data(), int(path.size()), wide.data(), path_units)) return {};
+    std::FILE* f = _wfopen(wide.c_str(), L"rb");
+#else
     std::FILE* f = std::fopen(path.c_str(), "rb");
+#endif
     if (!f) return std::string();
     std::vector<uint8_t> buf;
     {
@@ -3063,6 +2973,16 @@ struct TextRenderer {
         const float lh = line_height(pixel_size, weight);
         draw(cv, utf8, cx - w * 0.5f, cy - lh * 0.5f, pixel_size, weight, c, clip);
     }
+    virtual void caret_positions(const std::string& utf8, float size, int weight, std::vector<float>& out) {
+        out.assign(1, 0.0f);
+        std::string prefix;
+        for (size_t i = 0; i < utf8.size();) {
+            uint32_t cp;
+            const size_t n = std::min(size_t(utf8_decode_n(utf8.data() + i, utf8.size() - i, &cp)), utf8.size() - i);
+            prefix.append(utf8, i, n); i += n;
+            out.push_back(measure(prefix, size, weight));
+        }
+    }
     virtual void  release() = 0;
     virtual void reconfigure(float dpi, const std::string& family, const std::string& mono) {
         release(); init(dpi, family, mono);
@@ -3074,108 +2994,13 @@ struct TextRenderer {
 //  Windows: GDI 文字
 // -----------------------------------------------------------------------------
 // 复用调用方缓冲，避免每次绘制文字都分配一个 wstring。
-// 严格 UTF-8 解码：整串合法才返回 true。
-// 走的是"逐码位判定 + 拒绝过长编码/代理区/超范围"，与 to_wide 的兜底路径同一套
-// 规则，所以两者的判定不会打架。
-inline bool strict_utf8_decode(const std::string& s, std::wstring& out) {
-    const unsigned char* p = reinterpret_cast<const unsigned char*>(s.data());
-    const size_t n = s.size();
-    static const unsigned int kMin[5] = {0u, 0u, 0x80u, 0x800u, 0x10000u};
-    std::wstring tmp;
-    tmp.reserve(n);
-    for (size_t i = 0; i < n;) {
-        const unsigned char b = p[i];
-        if (b < 0x80) { tmp.push_back(wchar_t(b)); ++i; continue; }
-        int len = 0;
-        unsigned int cp = 0;
-        if (b >= 0xC2 && b <= 0xDF)      { len = 2; cp = b & 0x1Fu; }
-        else if (b >= 0xE0 && b <= 0xEF) { len = 3; cp = b & 0x0Fu; }
-        else if (b >= 0xF0 && b <= 0xF4) { len = 4; cp = b & 0x07u; }
-        if (len == 0 || i + size_t(len) > n) return false;
-        for (int k = 1; k < len; ++k) {
-            const unsigned char c = p[i + size_t(k)];
-            if ((c & 0xC0) != 0x80) return false;
-            cp = (cp << 6) | (c & 0x3Fu);
-        }
-        if (cp < kMin[len] || cp > 0x10FFFFu || (cp >= 0xD800u && cp <= 0xDFFFu))
-            return false;
-        if (cp >= 0x10000u) {
-            const unsigned int v = cp - 0x10000u;
-            tmp.push_back(wchar_t(0xD800u + (v >> 10)));
-            tmp.push_back(wchar_t(0xDC00u + (v & 0x3FFu)));
-        } else {
-            tmp.push_back(wchar_t(cp));
-        }
-        i += size_t(len);
-    }
-    out.swap(tmp);
-    return true;
-}
-
 inline void to_wide_into(const std::string& s, std::wstring& out) {
     out.clear();
-    if (s.empty()) return;
-    // 快路径：正常编译出来的串都是纯合法 UTF-8，一次走完，别让所有文字都去跑
-    // 下面的逐字节兜底。
-    if (strict_utf8_decode(s, out)) return;
-    out.clear();
-    // 慢路径：串里有非法字节。两种来源方向相反 ——
-    //   (a) 整串是系统 ANSI（用户没加 /utf-8 编的 exe）→ 该按 CP_ACP 解；
-    //   (b) **混合**编码：中文留 UTF-8 字节，个别"ANSI 里也有单字节表示"的字符
-    //       （"·" U+00B7 最典型）被编译器转成单字节。
-    // 所以**逐段**解：走得通的 UTF-8 序列按 UTF-8 出，走不通的那一（或两）个字节
-    // 才交给 CP_ACP。绝不能整串回退 —— 那会把合法的中文全解成西欧字母。
-    const unsigned char* p = reinterpret_cast<const unsigned char*>(s.data());
-    const size_t n = s.size();
-    static const unsigned int kMin[5] = {0u, 0u, 0x80u, 0x800u, 0x10000u};
-    for (size_t i = 0; i < n;) {
-        const unsigned char b = p[i];
-        if (b < 0x80) {
-            out.push_back(wchar_t(b));
-            ++i;
-            continue;
-        }
-        int len = 0;
-        unsigned int cp = 0;
-        if (b >= 0xC2 && b <= 0xDF)      { len = 2; cp = b & 0x1Fu; }
-        else if (b >= 0xE0 && b <= 0xEF) { len = 3; cp = b & 0x0Fu; }
-        else if (b >= 0xF0 && b <= 0xF4) { len = 4; cp = b & 0x07u; }
-        bool ok = (len > 0 && i + size_t(len) <= n);
-        if (ok) {
-            for (int k = 1; k < len; ++k) {
-                const unsigned char c = p[i + size_t(k)];
-                if ((c & 0xC0) != 0x80) { ok = false; break; }
-                cp = (cp << 6) | (c & 0x3Fu);
-            }
-        }
-        if (ok && (cp < kMin[len] || cp > 0x10FFFFu ||
-                   (cp >= 0xD800u && cp <= 0xDFFFu)))
-            ok = false;
-        if (ok) {
-            if (cp >= 0x10000u) {
-                const unsigned int v = cp - 0x10000u;
-                out.push_back(wchar_t(0xD800u + (v >> 10)));
-                out.push_back(wchar_t(0xDC00u + (v & 0x3FFu)));
-            } else {
-                out.push_back(wchar_t(cp));
-            }
-            i += size_t(len);
-            continue;
-        }
-        // 不合法 UTF-8 —— 当成系统 ANSI 的一段。先试单字节（1252 这类单字节代码
-        // 页里 0xB7 就是"·"），再试双字节（936 这类双字节代码页里 A1A4 才是
-        // "·"）。都解不出来才落一个替换符。
-        size_t used = 0;
-        wchar_t buf[4] = {0, 0, 0, 0};
-        for (int trylen = 1; trylen <= 2 && i + size_t(trylen) <= n; ++trylen) {
-            const int got = MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS,
-                                                reinterpret_cast<const char*>(p + i),
-                                                trylen, buf, 4);
-            if (got == 1) { used = size_t(trylen); out.push_back(buf[0]); break; }
-        }
-        if (used == 0) { out.push_back(wchar_t(0xFFFD)); used = 1; }
-        i += used;
-    }
+    if (s.empty() || s.size() > size_t(0x7fffffff)) return;
+    const int count = MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), nullptr, 0);
+    if (count <= 0) return;
+    out.resize(size_t(count));
+    if (!MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), out.data(), count)) out.clear();
 }
 
 inline std::wstring to_wide(const std::string& s) {
@@ -3280,6 +3105,22 @@ public:
     }
     float measure_mono(const std::string& utf8, float size, int weight) override {
         return measure_impl(utf8, size, weight, true);
+    }
+    void caret_positions(const std::string& utf8, float size, int weight, std::vector<float>& out) override {
+        const auto wide = to_wide(utf8);
+        std::vector<int> advances(wide.size());
+        const auto old = SelectObject(metric_dc_, font(size, weight, 0, false));
+        SIZE extent{};
+        const bool ok = wide.empty() || GetTextExtentExPointW(metric_dc_, wide.data(), int(wide.size()),
+            0, nullptr, advances.data(), &extent);
+        SelectObject(metric_dc_, old);
+        if (!ok) { TextRenderer::caret_positions(utf8, size, weight, out); return; }
+        out.assign(1, 0.0f);
+        for (size_t i = 0; i < wide.size(); ++i) {
+            if (wide[i] >= 0xd800 && wide[i] <= 0xdbff && i + 1 < wide.size()
+                && wide[i + 1] >= 0xdc00 && wide[i + 1] <= 0xdfff) ++i;
+            out.push_back(float(advances[i]));
+        }
     }
     float measure_impl(const std::string& utf8, float size, int weight, bool mono) {
         if (utf8.empty()) return 0.0f;
@@ -3616,26 +3457,11 @@ Theme Theme::light() {
     t.tint_foreground   = Color::hex(0xFFFFFF);              // Labels/White
     t.separator         = Color::rgba(0, 0, 0, 26);          // Column Separator
 
-    // ---- 旧字段映射 ----
-    t.background            = t.window_bg;
-    t.foreground            = t.label;
-    t.card                  = t.control_bg;
-    t.card_foreground       = t.label;
-    t.popover               = t.popover_bg;
-    t.popover_foreground    = t.label;
-    t.primary               = t.tint;
-    t.primary_foreground    = t.tint_foreground;
-    t.secondary             = t.fill;
-    t.secondary_foreground  = t.label;
-    t.muted                 = t.fill3;
-    t.muted_foreground      = t.label2;
-    t.accent                = t.fill3;
-    t.accent_foreground     = t.label;
-    t.destructive           = t.red;
-    t.destructive_foreground= Color::hex(0xFFFFFF);
-    t.border                = t.separator;
-    t.input                 = Color::rgba(0, 0, 0, 26);
-    t.ring                  = Color::rgba(0, 132, 247, 128); // 焦点环 = 强调色 50%
+    // 分组表面与焦点
+    t.card_bg = t.control_bg;
+    t.on_red = Color::white();
+    t.input_border = Color::rgba(0, 0, 0, 26);
+    t.focus_ring = t.tint.with_alpha(128);
     return t;
 }
 
@@ -3685,26 +3511,11 @@ Theme Theme::dark() {
     t.tint_foreground   = Color::hex(0xFFFFFF);
     t.separator         = Color::rgba(255, 255, 255, 26);
 
-    // ---- 旧字段映射 ----
-    t.background            = t.window_bg;
-    t.foreground            = t.label;
-    t.card                  = Color::hex(0x252525);
-    t.card_foreground       = t.label;
-    t.popover               = t.popover_bg;
-    t.popover_foreground    = t.label;
-    t.primary               = t.tint;
-    t.primary_foreground    = t.tint_foreground;
-    t.secondary             = t.fill;
-    t.secondary_foreground  = t.label;
-    t.muted                 = t.fill3;
-    t.muted_foreground      = t.label2;
-    t.accent                = t.fill3;
-    t.accent_foreground     = t.label;
-    t.destructive           = t.red;
-    t.destructive_foreground= Color::hex(0xFFFFFF);
-    t.border                = t.separator;
-    t.input                 = Color::rgba(255, 255, 255, 26);
-    t.ring                  = Color::rgba(10, 149, 255, 140);
+    // 分组表面与焦点
+    t.card_bg = Color::hex(0x252525);
+    t.on_red = Color::white();
+    t.input_border = Color::rgba(255, 255, 255, 26);
+    t.focus_ring = t.tint.with_alpha(140);
     return t;
 }
 
@@ -3762,58 +3573,82 @@ class WidgetStateTable {
         }
     };
     std::unordered_map<Key, T, Hash> entries_;
-    std::vector<Key> measured_entries_;
+    std::unordered_map<Key, T, Hash> measured_entries_;
     uint64_t scope_ = 0;
     bool measuring_ = false;
 
 public:
     void set_scope(uint64_t scope) { scope_ = scope; }
-    // 测量中新建的节点仅供这次布局借用，结束即释放，不累积幽灵状态。
+    // 测量使用写时副本：既不能留下新节点，也不能改变已有滚动、动画和编辑状态。
     void set_measuring(bool on) {
         measuring_ = on;
         if (!on) {
-            for (const Key& key : measured_entries_) entries_.erase(key);
             measured_entries_.clear();
-            if (measured_entries_.capacity() > 64) std::vector<Key>().swap(measured_entries_);
+            if (measured_entries_.bucket_count() > 64) decltype(measured_entries_)().swap(measured_entries_);
         }
     }
     T& operator[](uint64_t id) {
         const Key key{scope_, id};
-        auto result = entries_.try_emplace(key);
-        if (measuring_ && result.second) measured_entries_.push_back(key);
-        return result.first->second;
+        if (measuring_) {
+            auto found = measured_entries_.find(key);
+            if (found != measured_entries_.end()) return found->second;
+            auto original = entries_.find(key);
+            return original == entries_.end() ? measured_entries_.try_emplace(key).first->second
+                : measured_entries_.emplace(key, original->second).first->second;
+        }
+        return entries_.try_emplace(key).first->second;
     }
     T& get_or_insert(uint64_t id, const T& initial) {
         const Key key{scope_, id};
+        if (measuring_) {
+            if (entries_.find(key) != entries_.end()) return (*this)[id];
+            return measured_entries_.try_emplace(key, initial).first->second;
+        }
         auto result = entries_.try_emplace(key, initial);
-        if (measuring_ && result.second) measured_entries_.push_back(key);
         return result.first->second;
     }
     T* get_if(uint64_t id) {
+        if (measuring_) {
+            auto found = measured_entries_.find(Key{scope_, id});
+            if (found != measured_entries_.end()) return &found->second;
+            return entries_.find(Key{scope_, id}) == entries_.end() ? nullptr : &(*this)[id];
+        }
         auto it = entries_.find(Key{scope_, id});
         return it == entries_.end() ? nullptr : &it->second;
     }
     const T* peek(uint64_t id) const {
+        if (measuring_) {
+            auto found = measured_entries_.find(Key{scope_, id});
+            if (found != measured_entries_.end()) return &found->second;
+        }
         auto it = entries_.find(Key{scope_, id});
         return it == entries_.end() ? nullptr : &it->second;
     }
-    size_t erase(uint64_t id) { return entries_.erase(Key{scope_, id}); }
+    size_t erase(uint64_t id) {
+        return measuring_ ? measured_entries_.erase(Key{scope_, id}) : entries_.erase(Key{scope_, id});
+    }
     size_t size() const { return entries_.size(); }
     bool empty() const { return entries_.empty(); }
     size_t bucket_count() const { return entries_.bucket_count(); }
 
     template<class Cost, class Age>
     void trim_bytes(size_t budget, uint64_t keep, Cost cost, Age age) {
+        if (measuring_) return;
         size_t total = 0;
         for (const auto& entry : entries_) total += cost(entry.second);
-        while (total > budget) {
-            auto oldest = entries_.end();
-            for (auto it = entries_.begin(); it != entries_.end(); ++it) {
-                if (it->first.scope == scope_ && it->first.id == keep) continue;
-                if (oldest == entries_.end() || age(it->second) < age(oldest->second)) oldest = it;
-            }
-            if (oldest == entries_.end()) break;
-            total -= cost(oldest->second); entries_.erase(oldest);
+        if (total <= budget) return;
+        std::vector<std::pair<uint64_t, Key>> candidates;
+        candidates.reserve(entries_.size());
+        for (const auto& entry : entries_) {
+            if (entry.first.scope == scope_ && entry.first.id == keep) continue;
+            candidates.push_back({age(entry.second), entry.first});
+        }
+        std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (const auto& candidate : candidates) {
+            if (total <= budget) break;
+            auto found = entries_.find(candidate.second);
+            total -= cost(found->second);
+            entries_.erase(found);
         }
     }
     template<class Cost> size_t bytes(Cost cost) const {
@@ -3875,6 +3710,7 @@ struct Ui::Impl {
     bool measure_any = false;
     Rect measure_acc{};
     Canvas* measure_canvas = nullptr;   // begin_measure 期间暂存的画布
+    Input measure_input;
     size_t measure_clip_depth = 0;
 
     void measure_add(const Rect& r) {
@@ -3960,7 +3796,6 @@ struct Ui::Impl {
     // 点一下按钮就留一圈蓝（Web 的 :focus-visible 之外的默认行为）很有"网页感"，
     // 而文本类控件点进去本来就有环，所以它们照旧画。
     bool focus_by_mouse = false;
-    bool  focus_consumed = false; // 本帧 Focus 是否已被某控件认领
 
     // 文本编辑状态
     int   caret = 0;              // 光标位置（码点索引）
@@ -4149,8 +3984,6 @@ struct Ui::Impl {
     std::deque<DeferredCall> defer;
 
     // 布局栈
-    std::vector<Rect> group;
-    std::vector<Vec2> pad;
     std::vector<Rect> clips;
     // 裁剪区的**逻辑坐标**副本。clips 存的是物理矩形（已经过变换与 DPI 缩放），
     // 而命中测试用的是逻辑坐标，两套对不上，所以并行记一份。
@@ -4179,7 +4012,7 @@ struct Ui::Impl {
     bool clip_excludes(float x, float y) const {
         return clip_logic_on && !clip_logic_cur.contains(x, y);
     }
-    // begin_scroll 的嵌套上下文（支持滚动区套滚动区）
+    // 滚动作用域的嵌套上下文。
     struct ScrollCtx {
         uint64_t id = 0, state_scope_id = 0;
         Rect box;
@@ -4205,7 +4038,6 @@ struct Ui::Impl {
         const uint64_t id = detail::hash_combine(parent.id, detail::make_id(kind, local, extra));
         return state_scope_id ? detail::hash_combine(state_scope_id, id) : id;
     }
-    float last_scroll = 0.0f;    // 最近一个滚动区的偏移（end_scroll 之后 scroll_y() 仍可读）
 
     // ---- 滚轮归属 ----
     // 滚轮事件是"整窗一个"，而滚动区可以嵌套（内容区里再放一个列表）。只按
@@ -4242,14 +4074,36 @@ struct Ui::Impl {
 
     // 平台回调
     std::function<void()> request_repaint;
-    std::function<void(const std::string&)> set_clipboard;
     std::function<bool(const std::string&)> try_set_clipboard;
-    std::function<std::string()> get_clipboard;
+    std::function<void(std::function<void(std::string)>)> get_clipboard_async;
+    struct PasteRequest {
+        uint64_t id = 0, scope = 0;
+        std::string before, text;
+        int caret = 0, anchor = -1;
+        bool ready = false;
+    };
+    std::shared_ptr<PasteRequest> paste;
+    std::string paste_text(uint64_t id, std::string& value, bool begin) {
+        if (paste && paste->id == id && paste->ready) {
+            auto result = std::move(paste); paste.reset();
+            if (result->scope != state_scope_id || result->before != value
+                || result->caret != caret || result->anchor != sel_anchor) return {};
+            return std::move(result->text);
+        }
+        if (!begin) return {};
+        if (!get_clipboard_async) return {};
+        auto request = std::make_shared<PasteRequest>();
+        request->id = id; request->scope = state_scope_id; request->before = value;
+        request->caret = caret; request->anchor = sel_anchor; paste = request;
+        get_clipboard_async([request](std::string text) { request->text = std::move(text); request->ready = true; });
+        if (request->ready) {
+            paste.reset();
+            return std::move(request->text);
+        }
+        return {};
+    }
     bool copy_to_clipboard(const std::string& value) {
-        if (try_set_clipboard) return try_set_clipboard(value);
-        if (!set_clipboard) return false;
-        set_clipboard(value); // 嵌入宿主保留旧回调契约；原生窗口使用可报告失败的回调。
-        return true;
+        return try_set_clipboard && try_set_clipboard(value);
     }
     // 把输入法的组合窗 / 候选窗挪到光标处（参数是**物理客户区**像素：
     // caret_x, 输入框上沿, 输入框下沿）。平台后端绑定；未绑定就什么都不做。
@@ -4333,6 +4187,7 @@ struct Ui::Impl {
         each_widget_state([&](auto& table) { table.set_scope(id); });
     }
     void release_widget_state(uint64_t id) {
+        if (paste && paste->scope == id) paste.reset();
         each_widget_state([&](auto& table) { table.release_scope(id); });
         if (active_scope_id == id) { active = 0; active_scope_id = 0; }
         if (focus_scope_id == id) {
@@ -4364,7 +4219,11 @@ struct Ui::Impl {
     }
     void abort_frame() noexcept {
         defer.clear();
-        if (measure_on) { canvas = measure_canvas; measure_canvas = nullptr; measure_on = false; }
+        if (measure_on) {
+            canvas = measure_canvas; measure_canvas = nullptr; measure_on = false;
+            input = std::move(measure_input);
+            each_widget_state([](auto& table) { table.set_measuring(false); });
+        }
         scroll_stack.clear();
         clip_logic.clear();
         xf_stack.clear();
@@ -4411,7 +4270,6 @@ void Ui::begin_frame(float w, float h, float dt, float dpi) {
     impl->caret_blink += impl->dt;
     if (impl->text_veto > 0.0f) impl->text_veto -= impl->dt;
     if (impl->input.any_ctrl_key() || impl->input.any_alt_key()) impl->text_veto = 0.15f;
-    impl->focus_consumed = false;
     impl->ime_owner = false;
     // 浮层闸门：把上一帧登记的"可交互区"搬进本帧，再清空下一帧的槽位。
     // 没有浮层登记的那一帧就是"不挡"，所以关闭后自动释放。
@@ -4439,10 +4297,6 @@ void Ui::begin_frame(float w, float h, float dt, float dpi) {
     // 滚轮归属用的滚动区快照：上一帧收集完的搬到 scroll_memo，本帧重新收集。
     impl->scroll_memo.swap(impl->scroll_memo_next);
     impl->scroll_memo_next.clear();
-    if (impl->group.empty()) impl->group.push_back(Rect(0, 0, w, h));
-    impl->group.resize(1);
-    impl->group[0] = Rect(0, 0, w, h);
-    impl->pad.resize(1);
     impl->clips.clear();
     impl->clip_logic.clear();
     // 帧回调抛异常时滚动区不会走 end_scroll()。不清栈的话下一帧会在"上一个
@@ -4486,6 +4340,7 @@ void Ui::end_frame() {
     for (int i = 0; i < KEY_COUNT; ++i) in.key_pressed[i] = false;
     in.mouse_delta = Vec2(0, 0);
     in.mouse_prev = in.mouse;
+    if (impl->paste && impl->paste->id != impl->focus_id) impl->paste.reset();
     impl->frame_open = false;
 }
 
@@ -4561,12 +4416,18 @@ void  Ui::set_cursor(Cursor c) { if (impl->measure_on) return; impl->cursor = c;
 Cursor Ui::cursor() const { return impl->cursor; }
 void* Ui::focused_id() const { return impl->focus; }
 void  Ui::set_focus(void* id) {
+    if (impl->measure_on) return;
+    if (id != impl->focus) impl->paste.reset();
     impl->focus = id;
+    impl->focus_id = uint64_t(reinterpret_cast<uintptr_t>(id));
     impl->focus_scope_id = id ? impl->state_scope_id : 0;
     if (id) impl->caret_blink = 0.0f;
 }
 
 void Ui::begin_measure() {
+    if (impl->measure_on) return;
+    impl->measure_input = std::move(impl->input);
+    impl->input = Input{};
     impl->measure_on = true;
     impl->measure_clip_depth = impl->clip_logic.size();
     impl->each_widget_state([](auto& table) { table.set_measuring(true); });
@@ -4578,10 +4439,12 @@ void Ui::begin_measure() {
     impl->canvas = nullptr;
 }
 Rect Ui::end_measure() {
+    if (!impl->measure_on) return {};
     impl->measure_on = false;
     impl->each_widget_state([](auto& table) { table.set_measuring(false); });
     impl->canvas = impl->measure_canvas;
     impl->measure_canvas = nullptr;
+    impl->input = std::move(impl->measure_input);
     return impl->measure_any ? impl->measure_acc : Rect{};
 }
 bool Ui::measuring() const { return impl->measure_on; }
@@ -5272,7 +5135,7 @@ float Ui::line_height(float font_size) const {
 }
 
 void Ui::set_clipboard(const std::string& text) {
-    if (impl->set_clipboard) impl->set_clipboard(text);
+    if (impl->try_set_clipboard) (void)impl->try_set_clipboard(text);
 }
 
 // -----------------------------------------------------------------------------
@@ -5666,48 +5529,11 @@ float Ui::alert_height(const std::string& title, const std::string& description,
 // =============================================================================
 //  8.7  轻量布局（立即模式下的顺序布局）
 // =============================================================================
-Rect Ui::row(float h) {
-    if (impl->group.empty()) return Rect();
-    Rect& g = impl->group.back();
-    float amount = std::min(h, g.h);
-    Rect r(g.x, g.y, g.w, amount);
-    g.y += amount;
-    g.h -= amount;
-    return r;
-}
-
 // ratio = 宽 / 高。ratio <= 0 时原样返回（别把高度算成 inf）。
 Rect Ui::aspect_rect(const Rect& box, float ratio) {
     Rect r = box;
     if (ratio > 0.0f) r.h = std::floor(box.w / ratio + 0.5f);
     return r;
-}
-
-Rect Ui::column(float w) {
-    if (impl->group.empty()) return Rect();
-    Rect& g = impl->group.back();
-    float amount = std::min(w, g.w);
-    Rect r(g.x, g.y, amount, g.h);
-    g.x += amount;
-    g.w -= amount;
-    return r;
-}
-
-void Ui::push_padding(float x, float y) {
-    if (impl->group.empty()) return;
-    impl->group.push_back(impl->group.back().inset(x, y));
-}
-
-void Ui::pop_padding() {
-    if (impl->group.size() > 1) impl->group.pop_back();
-}
-
-void Ui::begin_group(const Rect& box) {
-    impl->group.push_back(box);
-}
-
-void Ui::end_group() {
-    if (impl->group.size() > 1) impl->group.pop_back();
 }
 
 // -----------------------------------------------------------------------------
@@ -5877,7 +5703,7 @@ inline Skin make_skin(const Theme& th, const Style& st, int default_variant, flo
             break;
         case Style::Destructive:
             // 危险操作使用中性填充与红色标签。
-            sk.base  = th.fill2; sk.fg = th.destructive;
+            sk.base  = th.fill2; sk.fg = th.red;
             sk.hover = th.fill2;
             sk.press = th.fill_press;
             break;
@@ -5893,7 +5719,7 @@ inline Skin make_skin(const Theme& th, const Style& st, int default_variant, flo
     // 显式覆盖优先
     if (!st.bg.is_none()) { sk.base = st.bg; sk.hover = st.bg; sk.press = press_color(st.bg); }
     if (!st.fg.is_none()) sk.fg = st.fg;
-    if (st.muted) sk.fg = th.muted_foreground;
+    if (st.muted) sk.fg = th.label2;
     if (!st.border_color.is_none()) { sk.border = st.border_color; if (sk.border_w <= 0.0f) sk.border_w = 1.0f; }
     if (st.border_width >= 0.0f) sk.border_w = st.border_width;
     return sk;
@@ -5957,7 +5783,7 @@ inline void paint_focus_ring(Ui& ui, const Rect& r, float radius, const Color& r
     ui.stroke_rect(r.expand(2.0f), ring.scaled_alpha(0.85f), radius + 2.0f, 3.0f);
 }
 
-// 叠加色（th.accent / th.fill 这类自带 alpha 的"面"）按 t 淡入。
+// 叠加色（th.fill3 / th.fill 这类自带 alpha 的"面"）按 t 淡入。
 // ⚠ 不能用 with_alpha(255*t)：那是**替换** alpha，会把 13% 的叠加色变成 100%
 // 不透明 —— 深色主题下直接变成一块纯白实心矩形把文字盖死。必须缩现有 alpha。
 inline Color on_color(const Color& bg);   // 反色文字（定义在后面）
@@ -5986,7 +5812,7 @@ inline void paint_menu(Ui& ui, const Rect& list,
         }
         const float t_h = animate_value(ui.impl, ids[i] * 83u + 1u, hov[i] ? 1.0f : 0.0f, 20.0f);
         if (t_h > 0.02f) ui.fill_rect_s(rects[i], hover_bg.scaled_alpha(t_h), 8.0f, 0.35f);
-        const Color fg = i < enabled.size() && !enabled[i] ? th.label3 : th.popover_foreground;
+        const Color fg = i < enabled.size() && !enabled[i] ? th.label3 : th.label;
         const float left = rects[i].x + (show_check ? 24.0f : 10.0f);
         if (show_check && selected == int(i)) {
             ui.system_icon(SystemIcon::Check, {rects[i].x + 5, rects[i].cy() - 6, 12, 12}, fg);
@@ -6026,34 +5852,40 @@ inline Style text_style_of(const Style& st, const Skin& sk, int default_weight) 
 }
 
 inline bool is_focused(Ui::Impl* im, uint64_t id) {
-    return im->focus == reinterpret_cast<void*>(static_cast<uintptr_t>(id));
+    return !im->measure_on && im->focus == reinterpret_cast<void*>(static_cast<uintptr_t>(id));
 }
 inline void grab_focus(Ui::Impl* im, uint64_t id) {
+    if (im->focus_id != id || im->focus_scope_id != im->state_scope_id) im->paste.reset();
     im->focus = reinterpret_cast<void*>(static_cast<uintptr_t>(id));
     im->focus_id = id;
     im->focus_scope_id = im->state_scope_id;
     im->caret_blink = 0.0f;
     im->focus_by_mouse = im->input.pressed[0] || im->input.pressed[1];
 }
-inline void drop_focus(Ui::Impl* im) { im->focus = nullptr; im->focus_id = 0; im->focus_scope_id = 0; }
+inline void drop_focus(Ui::Impl* im) {
+    im->focus = nullptr; im->focus_id = 0; im->focus_scope_id = 0; im->paste.reset();
+}
+
+inline bool editor_focused(Ui::Impl* im, uint64_t id, bool enabled) {
+    if (!is_focused(im, id)) return false;
+    if (!enabled) { drop_focus(im); return false; }
+    return true;
+}
 
 // -----------------------------------------------------------------------------
 //  文本编辑小工具（input 组件用）
 // -----------------------------------------------------------------------------
 // 由横坐标反查光标应落在第几个码点
 inline int caret_from_x(const Ui& ui, const std::string& s, float local_x, float font_size, int weight) {
-    std::vector<uint32_t> cps = utf8_codepoints(s);
-    float acc = 0.0f;
+    if (!ui.impl->text) return 0;
+    std::vector<float> positions;
+    ui.impl->text->caret_positions(s, font_size * ui.dpi_scale(), weight, positions);
     int best = 0;
     float best_d = 1e9f;
-    for (size_t i = 0; i <= cps.size(); ++i) {
-        std::string prefix = utf8_from_codepoints(cps, 0, i);
-        float w = ui.text_width(prefix, font_size, weight);
-        float d = std::fabs(w - local_x);
+    for (size_t i = 0; i < positions.size(); ++i) {
+        float d = std::fabs(positions[i] / ui.dpi_scale() - local_x);
         if (d < best_d) { best_d = d; best = int(i); }
-        acc = w;
     }
-    (void)acc;
     return best;
 }
 
@@ -6198,7 +6030,7 @@ void Ui::label(const std::string& text, const Rect& box, const Style& st) {
     if (s.font_size <= 0.0f) s.font_size = impl->theme.font_size;
     if (s.font_weight <= 0) s.font_weight = 400;
     const Color c = !s.fg.is_none() ? s.fg
-                  : (s.muted ? impl->theme.muted_foreground : impl->theme.foreground);
+                  : (s.muted ? impl->theme.label2 : impl->theme.label);
     draw_text(text, box, c, s);
 }
 
@@ -6208,7 +6040,7 @@ void Ui::heading(const std::string& text, const Rect& box, const Style& st) {
     if (s.font_size <= 0.0f) s.font_size = 22.0f;
     if (s.font_weight <= 0) s.font_weight = 700;
     const Color c = !s.fg.is_none() ? s.fg
-                  : (s.muted ? impl->theme.muted_foreground : impl->theme.foreground);
+                  : (s.muted ? impl->theme.label2 : impl->theme.label);
     draw_text(text, box, c, s);
 }
 
@@ -6218,7 +6050,7 @@ void Ui::subheading(const std::string& text, const Rect& box, const Style& st) {
     if (s.font_size <= 0.0f) s.font_size = 15.0f;
     if (s.font_weight <= 0) s.font_weight = 600;
     const Color c = !s.fg.is_none() ? s.fg
-                  : (s.muted ? impl->theme.muted_foreground : impl->theme.foreground);
+                  : (s.muted ? impl->theme.label2 : impl->theme.label);
     draw_text(text, box, c, s);
 }
 
@@ -6226,7 +6058,7 @@ void Ui::muted_text(const std::string& text, const Rect& box, const Style& st) {
     Style s = st;
     if (s.font_size <= 0.0f) s.font_size = impl->theme.font_size;
     if (s.font_weight <= 0) s.font_weight = 400;
-    const Color c = !s.fg.is_none() ? s.fg : impl->theme.muted_foreground;
+    const Color c = !s.fg.is_none() ? s.fg : impl->theme.label2;
     draw_text(text, box, c, s);
 }
 
@@ -6234,7 +6066,7 @@ void Ui::code_text(const std::string& text, const Rect& box, const Style& st) {
     const Theme& th = impl->theme;
     const float rad = st.radius >= 0.0f ? st.radius : th.radius_sm;
     const float fs  = st.font_size > 0.0f ? st.font_size : th.font_size - 1.0f;
-    const Color bg  = !st.bg.is_none() ? st.bg : th.muted;
+    const Color bg  = !st.bg.is_none() ? st.bg : th.fill3;
     const float pad = 6.0f;
     fill_rect(box, bg, rad);
     if (st.border_width > 0.0f && !st.border_color.is_none())
@@ -6244,7 +6076,7 @@ void Ui::code_text(const std::string& text, const Rect& box, const Style& st) {
     ts.font_weight = 400;
     ts.align = st.align_set ? st.align : Align::Left;
     ts.valign = VAlign::Middle;
-    const Color c = !st.fg.is_none() ? st.fg : th.foreground;
+    const Color c = !st.fg.is_none() ? st.fg : th.label;
     draw_text(text, box.inset(pad, 0.0f), c, ts);
 }
 
@@ -6292,7 +6124,7 @@ inline const CodeColors& code_colors(const Theme& th) {
         Color(0xff, 0xab, 0x70),
         Color(0x6a, 0x73, 0x7d),
     };
-    const int luma = (th.background.r * 299 + th.background.g * 587 + th.background.b * 114) / 1000;
+    const int luma = (th.window_bg.r * 299 + th.window_bg.g * 587 + th.window_bg.b * 114) / 1000;
     return luma > 128 ? kLight : kDark;
 }
 
@@ -6510,7 +6342,7 @@ void Ui::code_block(const std::string& code, const Rect& box, const Style& st) {
 // =============================================================================
 void Ui::panel(const Rect& box, const Style& st) {
     const Theme& th = impl->theme;
-    const Color bg = !st.bg.is_none() ? st.bg : th.card;
+    const Color bg = !st.bg.is_none() ? st.bg : th.card_bg;
     // macOS 的 Group Box 是**一层填充，没有描边**（Figma `Group Box`：r12、
     // #00000008 再乘 50% 不透明度，图层里没有任何 stroke）。一圈 1px 线是
     // Web 卡片语汇 —— 系统的分组靠"面比底深一档"分层，不靠画框。
@@ -6527,10 +6359,9 @@ void Ui::panel(const Rect& box, const Style& st) {
     if (bw > 0.0f && bd.a > 0) stroke_rect(box, bd, rad, bw);
 }
 
-void Ui::card(const Rect& box, const Style& st) { panel(box, st); }
 
 void Ui::separator(const Rect& box, const Style& st) {
-    const Color c = !st.bg.is_none() ? st.bg : impl->theme.border;
+    const Color c = !st.bg.is_none() ? st.bg : impl->theme.separator;
     if (box.w >= box.h)
         fill_rect(Rect(box.x, box.cy() - 0.5f, box.w, 1.0f), c, 0.0f);
     else
@@ -6550,7 +6381,7 @@ void Ui::badge(const std::string& text, const Rect& box, const Style& st) {
     // 实心小色块是 iOS / Web 的写法，在一个 mac 界面里会变成最抢眼的东西。
     const int bv = st.variant >= 0 ? st.variant : Style::Default;
     if (st.bg.is_none() && (bv == Style::Default || bv == Style::Destructive)) {
-        const Color tone = (bv == Style::Destructive) ? th.destructive : th.tint;
+        const Color tone = (bv == Style::Destructive) ? th.red : th.tint;
         sk.base = tone; sk.base.a = 38;
         sk.fg = tone;
     }
@@ -6614,7 +6445,7 @@ void Ui::skeleton(const Rect& box, const Style& st) {
     if (impl->measure_on) { impl->measure_add(box); return; }
     const Theme& th = impl->theme;
     const float rad = st.radius >= 0.0f ? st.radius : th.radius;
-    Color c = !st.bg.is_none() ? st.bg : th.muted;
+    Color c = !st.bg.is_none() ? st.bg : th.fill3;
     // Skeleton 默认静止；启用 animate 后也仅在悬停时请求动画帧，以控制空闲重绘开销。
     if (st.animated) {
         // 被浮层遮挡时不触发悬停动画。
@@ -6665,7 +6496,7 @@ bool Ui::button(const std::string& text, const Rect& box, const Style& st) {
     draw_text(text, r.inset(padx, pady), fg, ts);
 
     if (detail::is_focused(impl, id))
-        detail::paint_focus_ring(*this, r, sk.radius, impl->theme.ring, true);
+        detail::paint_focus_ring(*this, r, sk.radius, impl->theme.focus_ring, true);
 
     if (in.pressed) detail::grab_focus(impl, id);
     return in.clicked && enabled;
@@ -6699,7 +6530,7 @@ bool Ui::icon_button(const std::string& glyph, const Rect& box, const Style& st)
     draw_text(glyph, box, fg, ts);
     if (in.pressed) detail::grab_focus(impl, id);
     if (detail::is_focused(impl, id))
-        detail::paint_focus_ring(*this, box, rad, impl->theme.ring);
+        detail::paint_focus_ring(*this, box, rad, impl->theme.focus_ring);
     return in.clicked && enabled;
 }
 
@@ -6764,7 +6595,7 @@ bool Ui::input(std::string* value, const Rect& box, const Style& st) {
 
     detail::Interact in = detail::interact(impl, id, box, enabled);
 
-    bool focused = detail::is_focused(impl, id);
+    bool focused = detail::editor_focused(impl, id, enabled);
     // 被浮层盖住就交回键盘焦点。块本身已经收不到点击，但焦点还留着，
     // 用户打的字会照样进这个框 —— 和"能点到后面"是同一类穿透，
     // 只是走的是键盘而不是鼠标。
@@ -6851,7 +6682,8 @@ bool Ui::input(std::string* value, const Rect& box, const Style& st) {
         }
 
         const bool edit_event = !kin.text_input.empty() || kin.key_hit(KEY_BACKSPACE) || kin.key_hit(KEY_DELETE)
-            || kin.key_hit(KEY_ENTER) || kin.key_hit(KEY_TAB) || kin.ctrl_of('X') || kin.ctrl_of('V');
+            || kin.key_hit(KEY_ENTER) || kin.key_hit(KEY_TAB) || kin.ctrl_of('X') || kin.ctrl_of('V')
+            || (impl->paste && impl->paste->id == id && impl->paste->ready);
         const std::string before_text = edit_event && !undone ? *value : std::string();
         const int caret0 = impl->caret, anchor0 = impl->sel_anchor;
         uint64_t edit_kind = detail::EDIT_OTHER;
@@ -6947,27 +6779,27 @@ bool Ui::input(std::string* value, const Rect& box, const Style& st) {
         }
 
         // 剪贴板。三条纪律：
-        //  · impl->set_clipboard 可能为空（Ui 脱离 Window 使用时没人绑），
+        //  · 剪贴板回调可能为空（Ui 脱离 Window 使用时没人绑），
         //    直接调会抛 bad_function_call → terminate，所以每个调用点都判空；
         //  · 没有选区时**不碰**系统剪贴板，否则按一下 Ctrl+C 就把用户刚复制的
         //    东西清空了；
         //  · 用 ctrl_of() 而非 ctrl()：Ctrl 的 KEYUP 可能排在字母 KEYDOWN 之后。
         if (!st.password && !undone && kin.ctrl_of('C')) {
-            if (has_sel && (impl->set_clipboard || impl->try_set_clipboard)) {
+            if (has_sel && impl->try_set_clipboard) {
                 std::vector<uint32_t> cps = utf8_codepoints(*value);
                 impl->copy_to_clipboard(utf8_from_codepoints(cps, size_t(sel_from), size_t(sel_to - sel_from)));
             }
         }
         // 剪切必须"进了剪贴板才删"。回调不可用却照样删，等于把用户选中的东西
         // 凭空丢掉了 —— 比不响应更糟。
-        if (!st.password && !undone && kin.ctrl_of('X') && has_sel && (impl->set_clipboard || impl->try_set_clipboard)) {
+        if (!st.password && !undone && kin.ctrl_of('X') && has_sel && impl->try_set_clipboard) {
             edit_kind = detail::EDIT_OTHER;
             std::vector<uint32_t> cps = utf8_codepoints(*value);
             if (impl->copy_to_clipboard(utf8_from_codepoints(cps, size_t(sel_from), size_t(sel_to - sel_from))))
                 delete_selection();
         }
-        if (!undone && kin.ctrl_of('V')) {
-            std::string paste = impl->get_clipboard ? impl->get_clipboard() : std::string();
+        if (!undone && (kin.ctrl_of('V') || (impl->paste && impl->paste->id == id && impl->paste->ready))) {
+            std::string paste = impl->paste_text(id, *value, kin.ctrl_of('V'));
             // 单行输入不接收 Tab、换行及其它控制字符，保留 UTF-8 字节。
             std::string filtered;
             for (unsigned char ch : paste) if (ch >= 32 && ch != 127) filtered.push_back(char(ch));
@@ -7013,7 +6845,7 @@ bool Ui::input(std::string* value, const Rect& box, const Style& st) {
 
     // ---------------- 绘制 ----------------
     const float t_hover = detail::animate_value(impl, id * 31u + 1u, (in.hovered && !focused) ? 1.0f : 0.0f, 18.0f);
-    // border_width 为 0 且未指定背景时，由调用方绘制外壳，供 input_group 组合使用；普通输入框使用 th.input。
+    // border_width 为 0 且未指定背景时，由调用方绘制外壳，供 input_group 组合使用；普通输入框使用 th.input_border。
     Color bg = !st.bg.is_none() ? st.bg
              : (th.is_dark() ? Color(255, 255, 255, 20) : th.window_bg);
     const bool bare = st.border_width == 0.0f && st.bg.is_none();
@@ -7033,7 +6865,7 @@ bool Ui::input(std::string* value, const Rect& box, const Style& st) {
     // 焦点环：macOS 是**外面**一圈 3px 的强调色光晕，不是把边框染蓝变粗。
     if (focused && !bare) {
         // 焦点环使用低透明度强调色。
-        stroke_rect(box.outset(3.0f), th.ring.scaled_alpha(0.5f), rad + 3.0f, 3.0f);
+        stroke_rect(box.outset(3.0f), th.focus_ring.scaled_alpha(0.5f), rad + 3.0f, 3.0f);
     }
 
     // IME 预编辑串（拼音）。它不是 value 的一部分，所以单独量宽、单独画：
@@ -7075,12 +6907,12 @@ bool Ui::input(std::string* value, const Rect& box, const Style& st) {
         float x0 = text_width(utf8_from_codepoints(cps, 0, size_t(sf)), fs, 400);
         float x1 = text_width(utf8_from_codepoints(cps, 0, size_t(stt)), fs, 400);
         fill_rect(Rect(box.x + pad + x0 - scroll, box.cy() - fs * 0.72f, x1 - x0, fs * 1.44f),
-                  th.primary.with_alpha(52), 2.0f);
+                  th.tint.with_alpha(52), 2.0f);
     }
 
     // 占位符是 **25%**（kit `Text Field/Rounded` 的 Placeholder 是 #000000 @0.25），
     // 不是 secondary label 的 50% —— 后者会让空输入框看着像"已经有内容"。
-    Color fg = !st.fg.is_none() ? st.fg : (show_placeholder ? th.label3 : th.foreground);
+    Color fg = !st.fg.is_none() ? st.fg : (show_placeholder ? th.label3 : th.label);
     if (st.disabled) fg.a = uint8_t(float(fg.a) * 0.45f);
     if (composing) {
         // 分三段画：正文前半 / 预编辑串（主色 + 下划线）/ 正文后半。
@@ -7092,9 +6924,9 @@ bool Ui::input(std::string* value, const Rect& box, const Style& st) {
         const float bx = box.x + pad - scroll;
         const float bw = text_width(before, fs, 400);
         draw_text(before, Rect(bx, box.y, std::max(bw, 1.0f), box.h), fg, ts);
-        draw_text(composition, Rect(bx + bw, box.y, comp_w + 2.0f, box.h), th.primary, ts);
+        draw_text(composition, Rect(bx + bw, box.y, comp_w + 2.0f, box.h), th.tint, ts);
         fill_rect(Rect(bx + bw, box.cy() + fs * 0.60f, comp_w, 1.0f),
-                  th.primary.with_alpha(170), 0.0f);
+                  th.tint.with_alpha(170), 0.0f);
         draw_text(after, Rect(bx + bw + comp_w, box.y, std::max(box.w, 1.0f), box.h), fg, ts);
     } else {
         draw_text(shown, text_box, fg, ts);
@@ -7109,7 +6941,7 @@ bool Ui::input(std::string* value, const Rect& box, const Style& st) {
     }
     if (focused && std::fmod(impl->caret_blink, 1.06f) < 0.62f) {
         float ch = fs * 1.15f;
-        fill_rect(Rect(caret_x, box.cy() - ch * 0.5f, 1.4f, ch), th.foreground, 0.7f);
+        fill_rect(Rect(caret_x, box.cy() - ch * 0.5f, 1.4f, ch), th.label, 0.7f);
     }
     if (focused) impl->schedule_caret();
     // 输入法：把拼音串钉在输入框下沿、候选框再往下一点。
@@ -7122,7 +6954,7 @@ bool Ui::input(std::string* value, const Rect& box, const Style& st) {
     pop_clip();
 
     if (detail::is_focused(impl, id) && focused)
-        detail::paint_focus_ring(*this, box, rad, th.ring, true);
+        detail::paint_focus_ring(*this, box, rad, th.focus_ring, true);
 
     return changed;
 }
@@ -7199,7 +7031,7 @@ bool Ui::checkbox(bool* value, const std::string& label_text, const Rect& box, c
     }
 
     if (in.pressed) detail::grab_focus(impl, id);
-    if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, box_r, rad, th.ring);
+    if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, box_r, rad, th.focus_ring);
     return changed;
 }
 
@@ -7259,7 +7091,7 @@ bool Ui::toggle(bool* value, const Rect& box, const Style& st) {
     stroke_rect_s(knob_r, Color(0, 0, 0, 18), knob_h * 0.5f, 1.0f, 0.0f);
 
     if (in.pressed) detail::grab_focus(impl, id);
-    if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, track, rad, th.ring);
+    if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, track, rad, th.focus_ring);
     return changed;
 }
 
@@ -7406,13 +7238,6 @@ bool Ui::tabs_impl(const std::vector<std::string>& labels, int* index, const Rec
         Color container_bg = !st.bg.is_none() ? st.bg : th.track_well();
         if (st.disabled) container_bg.a = uint8_t(float(container_bg.a) * 0.45f);
         fill_rect_s(container, container_bg, rad, 0.35f);
-        // 段间细缝：1×14 的 25% 标签色，选中段随后会盖住对应分隔线。
-        const float separator_h = box.h <= 16.0f ? 10.0f : box.h <= 20.0f ? 12.0f
-                                 : box.h <= 24.0f ? 14.0f : box.h <= 28.0f ? 18.0f : 20.0f;
-        const float ph = std::min(separator_h, std::max(inner.h - 4.0f, 1.0f));
-        for (size_t i = 1; i < labels.size(); ++i)
-            fill_rect(Rect(inner.x + equal_w * float(i), inner.y + (inner.h - ph) * 0.5f, 1.0f, ph),
-                      th.label3, 0.0f);
     }
 
     push_clip(viewport);
@@ -7461,7 +7286,7 @@ bool Ui::tabs_impl(const std::vector<std::string>& labels, int* index, const Rec
         // 分段控件与标签栏分别使用各自的选中及未选中标签色。
         Color c;
         if (pill) c = (*index == int(i)) ? detail::on_color(th.tint) : th.label;
-        else      c = (*index == int(i)) ? th.foreground : th.label2;
+        else      c = (*index == int(i)) ? th.label : th.label2;
         if (st.disabled) c.a = uint8_t(float(c.a) * 0.45f);
         Rect text_box = item;
         const Color dot = indicator(i);
@@ -7523,7 +7348,7 @@ bool Ui::select(const std::vector<std::string>& items, int* index, const Rect& b
 
     // 弹出选择器使用半透明按钮面，无输入框描边。
     Color bg = !st.bg.is_none() ? st.bg : th.fill2;
-    if (t_hover > 0.01f) bg = bg.mix(th.foreground.with_alpha(38), t_hover * 0.55f);
+    if (t_hover > 0.01f) bg = bg.mix(th.label.with_alpha(38), t_hover * 0.55f);
     if (bg.a > 0) fill_rect_s(box, bg, rad, 0.35f);
     Color bd = !st.border_color.is_none() ? st.border_color : Color(0, 0, 0, 0);
     if (bd.a > 0) stroke_rect(box, bd, rad, st.border_width >= 0.0f ? st.border_width : 1.0f);
@@ -7536,14 +7361,14 @@ bool Ui::select(const std::vector<std::string>& items, int* index, const Rect& b
     ts.font_weight = 500;
     ts.align = Align::Left;
     ts.valign = VAlign::Middle;
-    Color fg = !st.fg.is_none() ? st.fg : (cur.empty() ? th.muted_foreground : th.foreground);
+    Color fg = !st.fg.is_none() ? st.fg : (cur.empty() ? th.label2 : th.label);
     draw_text(cur.empty() && !st.placeholder.empty() ? st.placeholder : cur, label_box, fg, ts);
 
     // 右侧是**上下两个小三角**（NSPopUpButton 的经典标记）。单个向下箭头是
     // Web 的 <select>；mac 的下拉按钮从上世纪到现在都是"上下"两个箭头。
     if (st.show_indicator) detail::paint_popup_chevrons(*this, box, pad, th.label2);
 
-    if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, box, rad, th.ring);
+    if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, box, rad, th.focus_ring);
 
     // --- 弹层 ---
     if (open) {
@@ -7673,11 +7498,11 @@ bool Ui::radio_group(const std::vector<std::string>& items, int* index, const Re
         ts.font_weight = 500;
         ts.align = Align::Left;
         ts.valign = VAlign::Middle;
-        Color c = !st.fg.is_none() ? st.fg : th.foreground;
+        Color c = !st.fg.is_none() ? st.fg : th.label;
         if (st.disabled) c.a = uint8_t(float(c.a) * 0.45f);
         draw_text(items[i], Rect(row.x + dot + 9.0f, row.y, std::max(row.w - dot - 9.0f, 1.0f), row.h), c, ts);
 
-        if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, dot_r, dot * 0.5f, th.ring);
+        if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, dot_r, dot * 0.5f, th.focus_ring);
     }
     return changed;
 }
@@ -7729,7 +7554,7 @@ bool Ui::stepper(float* value, float step, float min_value, float max_value, con
         if (st.disabled) c.a = uint8_t(float(c.a) * 0.45f);
         system_icon(up ? SystemIcon::ChevronUp : SystemIcon::ChevronDown,
                     Rect::centered(r.cx(), r.cy(), 10, 8), c);
-        if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, r, br, th.ring);
+        if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, r, br, th.focus_ring);
         return in.clicked;
     };
 
@@ -7754,7 +7579,7 @@ bool Ui::stepper(float* value, float step, float min_value, float max_value, con
     ts.font_weight = 400;
     ts.align = Align::Right;      // macOS 的数值框数字靠右
     ts.valign = VAlign::Middle;
-    Color fc = !st.fg.is_none() ? st.fg : th.foreground;
+    Color fc = !st.fg.is_none() ? st.fg : th.label;
     if (st.disabled) fc.a = uint8_t(float(fc.a) * 0.45f);
     push_clip(value_r);
     draw_text(buf, value_r.inset(8.0f, 0.0f), fc, ts);
@@ -7797,7 +7622,7 @@ bool Ui::search_field(std::string* value, const Rect& box, const Style& st) {
 
     // 禁用时放大镜跟着文字一起淡到 45%：只淡文字、图标还是满色的话，看着像
     // "图标可点、文字是灰的"。
-    Color mag = th.muted_foreground;
+    Color mag = th.label2;
     if (st.disabled) mag.a = uint8_t(float(mag.a) * 0.45f);
     detail::paint_magnifier(*this, box.x + 13.0f, box.cy(), 4.2f, mag);
 
@@ -7807,7 +7632,7 @@ bool Ui::search_field(std::string* value, const Rect& box, const Style& st) {
         // 禁用时叉照画、只是淡下去（kit 的 `State=Disabled` 变体里 Clear 还在，
         // 直接不画反而对不上）。
         const float dim = st.disabled ? 0.45f : 1.0f;
-        Color badge = th.label3.is_none() ? th.muted_foreground : th.label3;
+        Color badge = th.label3.is_none() ? th.label2 : th.label3;
         Color cross = Color(255, 255, 255, 235);
         if (dim < 1.0f) {
             badge.a = uint8_t(float(badge.a) * dim);
@@ -7844,7 +7669,7 @@ bool Ui::color_well(const Color& c, const Rect& box, const Style& st) {
     stroke_rect_s(box, th.separator, rad, 1.0f, th.corner_smoothing);
 
     if (in.pressed) detail::grab_focus(impl, id);
-    if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, box, rad, th.ring);
+    if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, box, rad, th.focus_ring);
     return in.clicked && !st.disabled;
 }
 
@@ -7890,7 +7715,7 @@ bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
     const float lh   = std::max(line_height(fs), fs * 1.15f);
 
     detail::Interact in = detail::interact(impl, id, box, enabled);
-    bool focused = detail::is_focused(impl, id);
+    bool focused = detail::editor_focused(impl, id, enabled);
     if (focused && impl->gate_blocked_here(box)) {   // 同上：焦点也要被挡住
         detail::drop_focus(impl);
         focused = false;
@@ -8058,7 +7883,8 @@ bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
         }
 
         const bool edit_event = !kin.text_input.empty() || kin.key_hit(KEY_BACKSPACE) || kin.key_hit(KEY_DELETE)
-            || kin.key_hit(KEY_ENTER) || kin.key_hit(KEY_TAB) || kin.ctrl_of('X') || kin.ctrl_of('V');
+            || kin.key_hit(KEY_ENTER) || kin.key_hit(KEY_TAB) || kin.ctrl_of('X') || kin.ctrl_of('V')
+            || (impl->paste && impl->paste->id == id && impl->paste->ready);
         const std::string before_text = edit_event && !undone ? *value : std::string();
         const int caret0 = impl->caret, anchor0 = impl->sel_anchor;
         uint64_t edit_kind = detail::EDIT_OTHER;
@@ -8190,19 +8016,19 @@ bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
         }
         // 与单行 input 同一条纪律：可能没绑回调 → 必须判空；无选区不动剪贴板。
         if (!undone && kin.ctrl_of('C')) {
-            if (has_sel && (impl->set_clipboard || impl->try_set_clipboard)) {
+            if (has_sel && impl->try_set_clipboard) {
                 const std::vector<uint32_t> cps = utf8_codepoints(*value);
                 impl->copy_to_clipboard(utf8_from_codepoints(cps, size_t(sel_from), size_t(sel_to - sel_from)));
             }
         }
-        if (!undone && kin.ctrl_of('X') && has_sel && (impl->set_clipboard || impl->try_set_clipboard)) {
+        if (!undone && kin.ctrl_of('X') && has_sel && impl->try_set_clipboard) {
             edit_kind = detail::EDIT_OTHER;
             const std::vector<uint32_t> cps = utf8_codepoints(*value);
             if (impl->copy_to_clipboard(utf8_from_codepoints(cps, size_t(sel_from), size_t(sel_to - sel_from))))
                 delete_sel();
         }
-        if (!undone && kin.ctrl_of('V') && impl->get_clipboard) {
-            const std::string paste = impl->get_clipboard();
+        if (!undone && (kin.ctrl_of('V') || (impl->paste && impl->paste->id == id && impl->paste->ready))) {
+            const std::string paste = impl->paste_text(id, *value, kin.ctrl_of('V'));
             if (!paste.empty()) { edit_kind = detail::EDIT_OTHER; insert_text(paste); }
         }
         if (!undone && kin.ctrl_of('A')) { impl->sel_anchor = 0; impl->caret = n_cp; }
@@ -8279,16 +8105,16 @@ bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
             if (b > a) {
                 const float x0 = line_x(int(i), a);
                 const float x1 = line_x(int(i), b);
-                fill_rect(Rect(box.x + padx + x0, y, x1 - x0, lh), th.primary.with_alpha(52), 2.0f);
+                fill_rect(Rect(box.x + padx + x0, y, x1 - x0, lh), th.tint.with_alpha(52), 2.0f);
             }
             // 行尾的换行符也被选中时补一小段，不然"选中换行"看不出反馈
             if (stt > base + n && sf <= base + n)
-                fill_rect(Rect(box.x + padx + line_x(int(i), n), y, 6.0f, lh), th.primary.with_alpha(52), 2.0f);
+                fill_rect(Rect(box.x + padx + line_x(int(i), n), y, 6.0f, lh), th.tint.with_alpha(52), 2.0f);
         }
     }
 
     // 占位符 25%（同 Text Field）
-    const Color fg = show_ph ? th.label3 : (!st.fg.is_none() ? st.fg : th.foreground);
+    const Color fg = show_ph ? th.label3 : (!st.fg.is_none() ? st.fg : th.label);
 
     // IME 预编辑串只挂在一行上（caret 所在行），在这里算一次就够
     std::pair<int, int> comp_lc(-1, -1);
@@ -8312,9 +8138,9 @@ bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
             const float bx = box.x + padx;
             const float bw = text_width(before, fs, 400);
             draw_text(before, Rect(bx, y, std::max(bw, 1.0f), lh), fg, ts);
-            draw_text(impl->ime_comp, Rect(bx + bw, y, comp_w + 2.0f, lh), th.primary, ts);
+            draw_text(impl->ime_comp, Rect(bx + bw, y, comp_w + 2.0f, lh), th.tint, ts);
             fill_rect(Rect(bx + bw, y + lh * 0.78f, comp_w, 1.0f),
-                      th.primary.with_alpha(170), 0.0f);
+                      th.tint.with_alpha(170), 0.0f);
             draw_text(after, Rect(bx + bw + comp_w, y, std::max(box.w, 1.0f), lh), fg, ts);
         } else {
             draw_text(text_line, Rect(box.x + padx, y, std::max(box.w - padx * 2.0f, 1.0f), lh), fg, ts);
@@ -8329,7 +8155,7 @@ bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
         float cy = box.y + pady + lh * float(lc.first) - tscroll;
         if (std::fmod(impl->caret_blink, 1.06f) < 0.62f) {
             if (cy + lh > box.y && cy < box.bottom())
-                fill_rect(Rect(cx, cy + lh * 0.06f, 1.4f, lh * 0.88f), th.foreground, 0.7f);
+                fill_rect(Rect(cx, cy + lh * 0.06f, 1.4f, lh * 0.88f), th.label, 0.7f);
         }
         impl->schedule_caret();
         if (impl->ime_pos) {
@@ -8343,7 +8169,7 @@ bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
 
     pop_clip();
 
-    if (focused) detail::paint_focus_ring(*this, box, rad, th.ring, true);
+    if (focused) detail::paint_focus_ring(*this, box, rad, th.focus_ring, true);
     return changed;
 }
 
@@ -8366,11 +8192,11 @@ bool Ui::rating(int* value, int max_stars, const Rect& box, const Style& st) {
     const float r_out = size * 0.5f;
     const float r_in  = r_out * 0.44f;
 
-    // 空星：先压平再判断"是不是浅到看不见" —— th.muted 本身是半透明的，量它自己的
+    // 空星：先压平再判断"是不是浅到看不见" —— th.fill3 本身是半透明的，量它自己的
     // 亮度永远是 0，这个判断从来不会生效，空星就一直停在 5% 黑上。
-    Color empty_c = th.muted.over(th.window_bg);
-    if (empty_c.luminance() > 0.82f) empty_c = th.border;     // 浅色主题下 muted 太淡，用 border
-    const Color full_c = !st.bg.is_none() ? st.bg : th.primary;
+    Color empty_c = th.fill3.over(th.window_bg);
+    if (empty_c.luminance() > 0.82f) empty_c = th.separator;     // 浅色主题下 muted 太淡，用 border
+    const Color full_c = !st.bg.is_none() ? st.bg : th.tint;
 
     bool changed = false;
     for (int i = 0; i < max_stars; ++i) {
@@ -8395,7 +8221,7 @@ bool Ui::rating(int* value, int max_stars, const Rect& box, const Style& st) {
 
         // 悬停时勾一圈细边，让"可点"这件事看得出来
         if (t_h > 0.01f && t < 0.9f) {
-            const Color hc = th.foreground.with_alpha(uint8_t(80.0f * t_h));
+            const Color hc = th.label.with_alpha(uint8_t(80.0f * t_h));
             for (size_t k = 0; k < pts.size(); ++k) {
                 const Vec2& p0 = pts[k];
                 const Vec2& p1 = pts[(k + 1) % pts.size()];
@@ -8417,7 +8243,7 @@ void Ui::avatar(const std::string& text, const Rect& box, const Style& st) {
     if (d <= 2.0f) return;
     const Rect c = Rect::centered(box.cx(), box.cy(), d, d);
 
-    // 默认底 = 10% 的填充（`th.fill`）。用 `th.muted`（5%）在浅色主题下几乎看不见，
+    // 默认底 = 10% 的填充（`th.fill`）。用 `th.fill3`（5%）在浅色主题下几乎看不见，
     // 头像就只剩一个描边圈；10% 既能当"没照片的占位"，又不至于抢照片位。
     Color bg = !st.bg.is_none() ? st.bg : th.fill;
     if (st.disabled) bg.a = uint8_t(float(bg.a) * 0.45f);
@@ -8425,7 +8251,7 @@ void Ui::avatar(const std::string& text, const Rect& box, const Style& st) {
     // 默认 1px 描边保证头像在浅色容器内保持可辨识轮廓。
     const float bw = st.border_width >= 0.0f ? st.border_width : 1.0f;
     if (bw > 0.0f) {
-        const Color bc = !st.border_color.is_none() ? st.border_color : th.border;
+        const Color bc = !st.border_color.is_none() ? st.border_color : th.separator;
         stroke_rect(c, bc, d * 0.5f, bw);
     }
 
@@ -8437,11 +8263,11 @@ void Ui::avatar(const std::string& text, const Rect& box, const Style& st) {
     ts.font_weight = 600;
     ts.align = Align::Center;
     ts.valign = VAlign::Middle;
-    // 前景色按**压平后**的底色判断。默认底是 th.muted = rgba(0,0,0,13)：量它自己的
+    // 前景色按**压平后**的底色判断。默认底是 th.fill3 = rgba(0,0,0,13)：量它自己的
     // 亮度是 0（纯黑），于是"浅色主题给白字" —— 白字落在 5% 黑的圆上，等于隐形。
     const Color eff = bg.over(th.window_bg);
     Color fg = !st.fg.is_none() ? st.fg
-             : (eff.luminance() > 0.55f ? th.foreground : Color(255, 255, 255));
+             : (eff.luminance() > 0.55f ? th.label : Color(255, 255, 255));
     if (st.disabled) fg.a = uint8_t(float(fg.a) * 0.45f);
     draw_text(initial, c, fg, ts);
 }
@@ -8461,8 +8287,8 @@ void Ui::spinner(const Rect& box, const Style& st) {
     // 同 rating：底环与拖尾环直接 raster_arc / raster_ring_tail 到画布
     if (impl->measure_on) { impl->measure_add(box); return; }
 
-    Color track = !st.border_color.is_none() ? st.border_color : th.muted;
-    Color arc   = !st.bg.is_none() ? st.bg : th.primary;
+    Color track = !st.border_color.is_none() ? st.border_color : th.fill3;
+    Color arc   = !st.bg.is_none() ? st.bg : th.tint;
     if (st.disabled) { track.a = uint8_t(float(track.a) * 0.45f); arc.a = uint8_t(float(arc.a) * 0.45f); }
 
     const bool hovered = this->hovered(box);
@@ -8505,8 +8331,8 @@ void Ui::alert(const std::string& title, const std::string& description, const R
 
     Color bg = st.bg;
     if (bg.is_none() && quiet) bg = th.fill4;
-    Color head_c = !st.fg.is_none() ? st.fg : th.foreground;
-    Color icon_c = danger ? th.destructive : th.label2;
+    Color head_c = !st.fg.is_none() ? st.fg : th.label;
+    Color icon_c = danger ? th.red : th.label2;
     if (st.disabled) {
         bg.a     = uint8_t(float(bg.a) * 0.45f);
         head_c.a = uint8_t(float(head_c.a) * 0.45f);
@@ -8548,7 +8374,7 @@ void Ui::alert(const std::string& title, const std::string& description, const R
         ds.wrap = true;
         draw_text(description, Rect(tx, box.y + pad + lh + 2.0f, tw,
                                     std::max(box.h - pad * 2.0f - lh - 2.0f, 1.0f)),
-                  th.muted_foreground, ds);
+                  th.label2, ds);
     }
 }
 
@@ -8567,13 +8393,13 @@ void Ui::breadcrumb(const std::vector<std::string>& items, const Rect& box, cons
         ts.font_weight = last ? 500 : 400;
         ts.align = Align::Left;
         ts.valign = VAlign::Middle;
-        Color c = last ? (!st.fg.is_none() ? st.fg : th.foreground) : th.muted_foreground;
+        Color c = last ? (!st.fg.is_none() ? st.fg : th.label) : th.label2;
         if (st.disabled) c.a = uint8_t(float(c.a) * 0.45f);
         draw_text(items[i], Rect(x, box.y, w + 1.0f, box.h), c, ts);
         x += w;
         if (!last) {
             const float mx = x + 7.0f, my = box.cy();
-            const Color ac = th.muted_foreground.scaled_alpha(0.85f);
+            const Color ac = th.label2.scaled_alpha(0.85f);
             system_icon(SystemIcon::Next, Rect::centered(mx, my, fs * .7f, fs * .7f), ac);
             x += 14.0f;
         }
@@ -8629,7 +8455,7 @@ bool Ui::accordion(const std::string& title, bool* open, const Rect& box, const 
     ts.font_weight = 500;
     ts.align = Align::Left;
     ts.valign = VAlign::Middle;
-    Color c = !st.fg.is_none() ? st.fg : th.foreground;
+    Color c = !st.fg.is_none() ? st.fg : th.label;
     if (st.disabled) c.a = uint8_t(float(c.a) * 0.45f);
     // 三角在**行首**（NSDisclosureGroup / 系统设置的披露行都这样），标题跟在它
     // 后面缩进 22。把三角放到行尾是 Web 手风琴的写法（右侧 chevron），在 mac
@@ -8637,9 +8463,9 @@ bool Ui::accordion(const std::string& title, bool* open, const Rect& box, const 
     draw_text(title, Rect(head.x + 22.0f, head.y, std::max(head.w - 34.0f, 1.0f), head.h), c, ts);
 
     system_icon(*open ? SystemIcon::ChevronDown : SystemIcon::Next,
-                Rect::centered(head.x + 10, head.cy(), 12, 12), th.muted_foreground);
+                Rect::centered(head.x + 10, head.cy(), 12, 12), th.label2);
 
-    if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, head, rad, th.ring);
+    if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, head, rad, th.focus_ring);
     return changed;
 }
 
@@ -8703,7 +8529,7 @@ void Ui::table(const std::vector<std::string>& headers,
             // 用上面预算好的 num_col：逐格再判一次，等于把每行的字符串又扫一遍。
             ts.align = num_col[c] ? Align::Right : Align::Left;
             ts.valign = VAlign::Middle;
-            Color cc = !st.fg.is_none() ? st.fg : th.foreground;
+            Color cc = !st.fg.is_none() ? st.fg : th.label;
             if (st.disabled) cc.a = uint8_t(float(cc.a) * 0.45f);
             draw_text(rows[r][c], Rect(rr.x + col_w * float(c), rr.y, col_w, rr.h).inset(cell_pad, 0.0f), cc, ts);
         }
@@ -8728,7 +8554,7 @@ void Ui::sparkline(const std::vector<float>& values, const Rect& box, const Styl
     const float iw  = std::max(box.w - pad * 2.0f, 1.0f);
     const float ih  = std::max(box.h - pad * 2.0f, 1.0f);
     const float step = iw / float(values.size() - 1);
-    const Color line_c = !st.bg.is_none() ? st.bg : th.primary;
+    const Color line_c = !st.bg.is_none() ? st.bg : th.tint;
     const float lw = st.border_width > 0.0f ? st.border_width : 1.8f;
 
     std::vector<Vec2> pts;
@@ -8764,12 +8590,12 @@ void Ui::bars(const std::vector<float>& values, const Rect& box, const Style& st
     const float gap = values.size() > 1 ? std::max(2.0f, box.w * 0.02f) : 0.0f;
     const float bw  = std::max(1.0f, (box.w - gap * float(values.size() - 1)) / float(values.size()));
     const float rad = st.radius >= 0.0f ? st.radius : std::min(3.0f, bw * 0.5f);
-    const Color pos_c = !st.bg.is_none() ? st.bg : th.primary;
+    const Color pos_c = !st.bg.is_none() ? st.bg : th.tint;
 
     for (size_t i = 0; i < values.size(); ++i) {
         const float t = detail::clampf(std::fabs(values[i]) / hi, 0.0f, 1.0f);
         const float h = std::max(1.0f, box.h * t);
-        Color cc = values[i] < 0.0f ? th.muted : pos_c;
+        Color cc = values[i] < 0.0f ? th.fill3 : pos_c;
         if (st.disabled) cc.a = uint8_t(float(cc.a) * 0.45f);
         fill_rect(Rect(box.x + (bw + gap) * float(i), box.bottom() - h, bw, h), cc, rad);
     }
@@ -8829,7 +8655,7 @@ void Ui::tooltip(const Rect& anchor, const std::string& text, const Style& st) {
         fill_rect(box, !st_copy.bg.is_none() ? st_copy.bg : th.tooltip_bg, 5.0f);
         if (!th.tooltip_stroke.is_none() && th.tooltip_stroke.a > 0)
             stroke_rect(box, th.tooltip_stroke, 5.0f, 0.6f);
-        draw_text(text, box.inset(padx, pady), !st_copy.fg.is_none() ? st_copy.fg : th.popover_foreground, ts);
+        draw_text(text, box.inset(padx, pady), !st_copy.fg.is_none() ? st_copy.fg : th.label, ts);
     });
 }
 
@@ -8867,7 +8693,7 @@ bool Ui::menu(const std::string& label, const std::vector<std::string>& items,
     draw_text(label, Rect(box.x + pad, box.y, std::max(box.w - pad * 2.0f - 18.0f, 1.0f), box.h), fg, ts);
     if (st.show_indicator) system_icon(SystemIcon::ChevronDown,
                 Rect::centered(box.right() - pad - 5, box.cy(), 12, 12), fg);
-    if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, box, rad, th.ring);
+    if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, box, rad, th.focus_ring);
     if (in.pressed) detail::grab_focus(impl, id);
     if (in.clicked) {
         open = !open;
@@ -8973,7 +8799,7 @@ MenuPick Ui::menubar(const std::vector<std::string>& labels,
     detail::Skin sk = detail::make_skin(th, st, Style::Ghost, rad);
     if (st.font_weight <= 0) sk.weight = 500;
     detail::paint_surface(*this, box, sk, 0.0f, 0.0f, st.disabled);
-    draw_line(box.x, box.bottom() - 0.5f, box.right(), box.bottom() - 0.5f, th.border, 1.0f);
+    draw_line(box.x, box.bottom() - 0.5f, box.right(), box.bottom() - 0.5f, th.separator, 1.0f);
 
     // --- 顶级项排布：文字宽 + 左右各 padx，从左边依次排 ---
     std::vector<Rect> trg(labels.size());
@@ -9015,7 +8841,7 @@ MenuPick Ui::menubar(const std::vector<std::string>& labels,
         const bool act = (int(i) == open_idx);
         const float t = detail::animate_value(impl, bar_id * 97u + i, (hov[i] || act) ? 1.0f : 0.0f, 20.0f);
         if (t > 0.02f)
-            fill_rect(trg[i], th.accent.mix(th.foreground.with_alpha(10), t * 0.3f),
+            fill_rect(trg[i], th.fill3.mix(th.label.with_alpha(10), t * 0.3f),
                       std::max(0.0f, rad - 4.0f));
         Style ts;
         ts.font_size = fs;
@@ -9127,7 +8953,7 @@ bool Ui::dialog(const std::string& title, const std::string& body, bool* open,
     hs.valign = VAlign::Top;
     hs.wrap = true;
     draw_text(title, Rect(box.x + pad, box.y + pad, std::max(box.w - pad * 2.0f - 26.0f, 1.0f), title_lh),
-              !st.fg.is_none() ? st.fg : th.foreground, hs);
+              !st.fg.is_none() ? st.fg : th.label, hs);
     if (!body.empty()) {
         Style bs;
         bs.font_size = 11.0f;               // Footnote 11（kit 的 Alert Description）
@@ -9138,7 +8964,7 @@ bool Ui::dialog(const std::string& title, const std::string& body, bool* open,
         bs.line_gap = 3.0f;                 // 正文比标题松一点，长段落才好读
         draw_text(body, Rect(box.x + pad, box.y + pad + title_lh + 10.0f, box.w - pad * 2.0f,
                              std::max(box.h - pad * 2.0f - title_lh - 10.0f, 1.0f)),
-                  th.foreground, bs);
+                  th.label, bs);
     }
     pop_clip();
 
@@ -9187,7 +9013,7 @@ bool Ui::sheet(const std::string& title, const std::string& body, bool* open,
     hs.valign = VAlign::Top;
     hs.wrap = true;
     draw_text(title, Rect(box.x + pad, box.y + pad, box.w - pad * 2.0f, title_lh),
-              !st.fg.is_none() ? st.fg : th.foreground, hs);
+              !st.fg.is_none() ? st.fg : th.label, hs);
     if (!body.empty()) {
         Style bs;
         bs.font_size = 11.0f;
@@ -9198,7 +9024,7 @@ bool Ui::sheet(const std::string& title, const std::string& body, bool* open,
         bs.line_gap = 3.0f;
         draw_text(body, Rect(box.x + pad, box.y + pad + title_lh + 8.0f,
                              box.w - pad * 2.0f, std::max(box.h - pad * 2.0f - title_lh - 8.0f, 1.0f)),
-                  th.foreground, bs);
+                  th.label, bs);
     }
     pop_clip();
 
@@ -9215,9 +9041,9 @@ void Ui::toast(const std::string& text, const Rect& box, const Style& st) {
     const bool danger = (st.variant == Style::Destructive);
 
     Color bg = !st.bg.is_none() ? st.bg : th.popover_bg;
-    Color fg = !st.fg.is_none() ? st.fg : th.popover_foreground;
+    Color fg = !st.fg.is_none() ? st.fg : th.label;
     if (st.disabled) { bg.a = uint8_t(float(bg.a) * 0.6f); fg.a = uint8_t(float(fg.a) * 0.6f); }
-    if (danger) fg = th.destructive;
+    if (danger) fg = th.red;
 
     // 浮起的通知条：r10 + Secondary 投影，**不描边**（描一圈线是 Web 的 toast）。
     // Web 那种"左边一条色带"在 macOS 里也不存在，告警用**文字颜色**表达。
@@ -9315,7 +9141,9 @@ inline bool group_cell(Ui& ui, Ui::Impl* im, uint64_t id, const Rect& r, const s
         ui.fill_rect(inner, th.fill4.scaled_alpha(t_h * 0.7f), ir);
     }
 
-    Color fg = !selectable ? th.foreground : (on ? Color(255, 255, 255) : th.label);
+    // 有选中语义的组：选中项 85%，其余 50%（参考资料 Segmented 就是这样分级的）；
+    // 一次性动作的按钮组没有"选中"，所有标签都是主标签色。
+    Color fg = !selectable ? th.label : (on ? th.label : th.label2);
     if (st.disabled) fg.a = uint8_t(float(fg.a) * 0.45f);
     Style ts;
     ts.font_size = fs;
@@ -9324,7 +9152,7 @@ inline bool group_cell(Ui& ui, Ui::Impl* im, uint64_t id, const Rect& r, const s
     ts.valign = VAlign::Middle;
     ui.draw_text(text, r, fg, ts);
 
-    if (is_focused(im, id)) paint_focus_ring(ui, r, outer_rad, th.ring);
+    if (is_focused(im, id)) paint_focus_ring(ui, r, outer_rad, th.focus_ring);
     return in.clicked;
 }
 
@@ -9360,9 +9188,9 @@ bool Ui::toggle_button(const std::string& label, bool* value, const Rect& box, c
         bg = detail::fade(th.fill, t_h);
     }
     if (bg.a > 0) fill_rect_s(box, bg, rad, 0.35f);
-    if (st.border_width > 0.0f) stroke_rect(box, th.border, rad, st.border_width);
+    if (st.border_width > 0.0f) stroke_rect(box, th.separator, rad, st.border_width);
 
-    Color fg = !st.fg.is_none() ? st.fg : th.foreground;
+    Color fg = !st.fg.is_none() ? st.fg : th.label;
     if (st.disabled) fg.a = uint8_t(float(fg.a) * 0.45f);
     Style ts;
     ts.font_size = fs;
@@ -9372,7 +9200,7 @@ bool Ui::toggle_button(const std::string& label, bool* value, const Rect& box, c
     const float pad = st.pad_x >= 0.0f ? st.pad_x : 10.0f;
     draw_text(label, Rect(box.x + pad, box.y, std::max(box.w - pad * 2.0f, 1.0f), box.h), fg, ts);
 
-    if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, box, rad, th.ring);
+    if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, box, rad, th.focus_ring);
     return changed;
 }
 
@@ -9486,7 +9314,7 @@ bool Ui::input_group(std::string* value, const std::string& prefix, const std::s
     const float pre_w = prefix.empty() ? 0.0f : text_width(prefix, fs, 400) + 10.0f;
     const float suf_w = suffix.empty() ? 0.0f : text_width(suffix, fs, 400) + 10.0f;
 
-    // 组合输入框与 input 共用 th.input 背景、顶部内阴影和细描边。
+    // 组合输入框与 input 共用 th.input_border 背景、顶部内阴影和细描边。
     fill_rect(box, !st.bg.is_none() ? st.bg
                                    : (th.is_dark() ? th.control_bg : th.window_bg), rad);
     inner_shadow(box, th.is_dark() ? Color(0, 0, 0, 70) : Color(0, 0, 0, 18), rad, 1.8f, 1.0f);
@@ -9498,10 +9326,10 @@ bool Ui::input_group(std::string* value, const std::string& prefix, const std::s
     ts.align = Align::Left;
     ts.valign = VAlign::Middle;
     if (!prefix.empty())
-        draw_text(prefix, Rect(box.x + pad, box.y, pre_w, box.h), th.muted_foreground, ts);
+        draw_text(prefix, Rect(box.x + pad, box.y, pre_w, box.h), th.label2, ts);
     if (!suffix.empty()) {
         ts.align = Align::Right;
-        draw_text(suffix, Rect(box.right() - pad - suf_w, box.y, suf_w, box.h), th.muted_foreground, ts);
+        draw_text(suffix, Rect(box.right() - pad - suf_w, box.y, suf_w, box.h), th.label2, ts);
     }
 
     const float inner_x = box.x + pad + pre_w;
@@ -9536,8 +9364,8 @@ bool Ui::input_group(std::string* value, const std::string& prefix, const std::s
     // 组合输入框负责外层焦点边框，必须在内部 input 绘制后补画，避免被其背景覆盖。
     if (detail::is_focused(impl, impl->widget_id("input", inner, 0,
             st.identity ? st.identity : uint64_t(reinterpret_cast<uintptr_t>(value))))) {
-        stroke_rect(box, th.ring, rad, 1.4f);
-        detail::paint_focus_ring(*this, box, rad, th.ring, true);
+        stroke_rect(box, th.focus_ring, rad, 1.4f);
+        detail::paint_focus_ring(*this, box, rad, th.focus_ring, true);
     }
     return changed;
 }
@@ -9568,7 +9396,7 @@ bool Ui::input_otp(std::string* value, int length, const Rect& box, const Style&
     int cur = detail::clampi(int(cur_f + 0.5f), 0, int(value->size()));
 
     detail::Interact in = detail::interact(impl, id, box, !st.disabled);
-    bool focused = detail::is_focused(impl, id);
+    bool focused = detail::editor_focused(impl, id, !st.disabled);
     if (focused && impl->gate_blocked_here(box)) { detail::drop_focus(impl); focused = false; }
 
     bool changed = false;
@@ -9604,10 +9432,10 @@ bool Ui::input_otp(std::string* value, int length, const Rect& box, const Style&
     for (int i = 0; i < length; ++i) {
         const Rect r(x0 + (cell + gap) * float(i), cy, cell, cell);
         const bool active = focused && i == cur;
-        fill_rect(r, !st.bg.is_none() ? st.bg : th.background, rad);
-        stroke_rect(r, active ? th.ring : th.input, rad, active ? 1.6f : 1.0f);
+        fill_rect(r, !st.bg.is_none() ? st.bg : th.window_bg, rad);
+        stroke_rect(r, active ? th.focus_ring : th.input_border, rad, active ? 1.6f : 1.0f);
 
-        Color fg = !st.fg.is_none() ? st.fg : th.foreground;
+        Color fg = !st.fg.is_none() ? st.fg : th.label;
         if (st.disabled) fg.a = uint8_t(float(fg.a) * 0.45f);
         Style ts;
         ts.font_size = fs;
@@ -9657,7 +9485,7 @@ void Ui::field(const std::string& label, const std::string& hint, const std::str
         ls.font_weight = 500;
         ls.align = Align::Left;
         ls.valign = VAlign::Top;
-        Color lc = !st.fg.is_none() ? st.fg : th.foreground;
+        Color lc = !st.fg.is_none() ? st.fg : th.label;
         draw_text(label, Rect(box.x, y, box.w, lh_label), lc, ls);
         y += lh_label + 6.0f;
     }
@@ -9672,14 +9500,14 @@ void Ui::field(const std::string& label, const std::string& hint, const std::str
         ms.font_weight = 400;
         ms.align = Align::Left;
         ms.valign = VAlign::Top;
-        draw_text(error, Rect(box.x, y, box.w, lh_msg), th.destructive, ms);
+        draw_text(error, Rect(box.x, y, box.w, lh_msg), th.red, ms);
     } else if (!hint.empty()) {
         Style ms;
         ms.font_size = fs - 1.0f;
         ms.font_weight = 400;
         ms.align = Align::Left;
         ms.valign = VAlign::Top;
-        draw_text(hint, Rect(box.x, y, box.w, lh_msg), th.muted_foreground, ms);
+        draw_text(hint, Rect(box.x, y, box.w, lh_msg), th.label2, ms);
     }
 }
 
@@ -9713,7 +9541,7 @@ bool Ui::item(const std::string& title, const std::string& description,
         ts.font_weight = st.font_weight > 0 ? st.font_weight : 500;
         ts.align = Align::Left;
         ts.valign = VAlign::Middle;
-        draw_text(title, text_box, !st.fg.is_none() ? st.fg : th.foreground, ts);
+        draw_text(title, text_box, !st.fg.is_none() ? st.fg : th.label, ts);
     } else {
         const float lh1 = line_height(fs);
         const float lh2 = line_height(11.0f);
@@ -9724,7 +9552,7 @@ bool Ui::item(const std::string& title, const std::string& description,
         ts.font_weight = st.font_weight > 0 ? st.font_weight : 500;
         ts.align = Align::Left;
         ts.valign = VAlign::Top;
-        draw_text(title, Rect(text_box.x, y0, text_box.w, lh1), !st.fg.is_none() ? st.fg : th.foreground, ts);
+        draw_text(title, Rect(text_box.x, y0, text_box.w, lh1), !st.fg.is_none() ? st.fg : th.label, ts);
 
         Style ds;
         ds.font_size = 11.0f;      // Subheadline：列表副标题
@@ -9742,7 +9570,7 @@ bool Ui::item(const std::string& title, const std::string& description,
         tr.align = Align::Right;
         tr.valign = VAlign::Middle;
         draw_text(trailing, Rect(box.right() - pad - trail_w, box.y, trail_w, box.h),
-                  th.muted_foreground, tr);
+                  th.label2, tr);
     }
 
     // 行底线内缩到文字起点，和 macOS 列表一致（通栏的线会显得像分隔条）
@@ -9750,7 +9578,7 @@ bool Ui::item(const std::string& title, const std::string& description,
         fill_rect(Rect(box.x + pad, box.bottom() - 1.0f, std::max(box.w - pad, 1.0f), 1.0f),
                   th.separator, 0.0f);
 
-    if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, box, rad, th.ring);
+    if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, box, rad, th.focus_ring);
     return in.clicked;
 }
 
@@ -9774,7 +9602,7 @@ void Ui::empty_state(const std::string& title, const std::string& description,
     ts.align = Align::Center;
     ts.valign = VAlign::Top;
     draw_text(title, Rect(box.x + 16.0f, y0, std::max(box.w - 32.0f, 1.0f), lh1),
-              !st.fg.is_none() ? st.fg : th.foreground, ts);
+              !st.fg.is_none() ? st.fg : th.label, ts);
 
     if (!description.empty()) {
         Style ds;
@@ -9783,7 +9611,7 @@ void Ui::empty_state(const std::string& title, const std::string& description,
         ds.align = Align::Center;
         ds.valign = VAlign::Top;
         draw_text(description, Rect(box.x + 16.0f, y0 + lh1, std::max(box.w - 32.0f, 1.0f), lh2),
-                  th.muted_foreground, ds);
+                  th.label2, ds);
     }
 }
 
@@ -9841,7 +9669,7 @@ bool Ui::pagination(int* page, int total_pages, const Rect& box, const Style& st
         const int s = slots[size_t(i)];
 
         if (s == -2) {                           // 省略号
-            draw_text("...", r, th.muted_foreground, ts);
+            draw_text("...", r, th.label2, ts);
             continue;
         }
 
@@ -9869,7 +9697,7 @@ bool Ui::pagination(int* page, int total_pages, const Rect& box, const Style& st
             // 上一页 / 下一页使用系统箭头。
             const bool left = (s == -1);
             const bool enabled = left ? cur > 0 : cur < total - 1;
-            const Color ac = enabled ? th.foreground : th.muted_foreground.with_alpha(110);
+            const Color ac = enabled ? th.label : th.label2.with_alpha(110);
             system_icon(left ? SystemIcon::Prev : SystemIcon::Next,
                         Rect::centered(r.cx(), r.cy(), 12, 12), ac);
             if (in.clicked && enabled) { *page = cur + (left ? -1 : 1); changed = true; repaint(); }
@@ -9877,11 +9705,11 @@ bool Ui::pagination(int* page, int total_pages, const Rect& box, const Style& st
             char buf[16];
             std::snprintf(buf, sizeof buf, "%d", s + 1);
             // 选中页使用浅色底与主标签色。
-            draw_text(buf, r, th.foreground, ts);
+            draw_text(buf, r, th.label, ts);
             if (in.clicked && s != cur) { *page = s; changed = true; repaint(); }
         }
 
-        if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, inner, std::max(0.0f, rad - 3.0f), th.ring);
+        if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, inner, std::max(0.0f, rad - 3.0f), th.focus_ring);
     }
     return changed;
 }
@@ -9923,9 +9751,9 @@ bool Ui::calendar(int* year, int* month, int* day, const Rect& box, const Style&
         detail::Interact in = detail::interact(impl, id, r, true);
         if (in.hovered) set_cursor(Cursor::Arrow);
         const float t_h = detail::animate_value(impl, id * 109u + 1u, in.hovered ? 1.0f : 0.0f, 20.0f);
-        if (t_h > 0.01f) fill_rect(r, th.accent.scaled_alpha(t_h), rad);
+        if (t_h > 0.01f) fill_rect(r, th.fill3.scaled_alpha(t_h), rad);
         system_icon(k == 0 ? SystemIcon::Prev : SystemIcon::Next,
-                    Rect::centered(r.cx(), r.cy(), 12, 12), th.muted_foreground);
+                    Rect::centered(r.cx(), r.cy(), 12, 12), th.label2);
         if (in.clicked) {
             if (k == 0) { if (--m < 1) { m = 12; --y; } }
             else        { if (++m > 12) { m = 1; ++y; } }
@@ -9942,7 +9770,7 @@ bool Ui::calendar(int* year, int* month, int* day, const Rect& box, const Style&
     hs.font_weight = 600;
     hs.align = Align::Center;
     hs.valign = VAlign::Middle;
-    draw_text(title, head, th.foreground, hs);
+    draw_text(title, head, th.label, hs);
 
     // ---- 星期表头 ----
     static const char* kWeek[7] = {"日", "一", "二", "三", "四", "五", "六"};
@@ -9952,7 +9780,7 @@ bool Ui::calendar(int* year, int* month, int* day, const Rect& box, const Style&
     ws.align = Align::Center;
     ws.valign = VAlign::Middle;
     for (int c = 0; c < 7; ++c) {
-        draw_text(kWeek[c], Rect(box.x + cw * float(c), wkh.y, cw, wk_h), th.muted_foreground, ws);
+        draw_text(kWeek[c], Rect(box.x + cw * float(c), wkh.y, cw, wk_h), th.label2, ws);
     }
 
     // ---- 日期网格 ----
@@ -9977,21 +9805,21 @@ bool Ui::calendar(int* year, int* month, int* day, const Rect& box, const Style&
             if (is_sel) fill_rect_s(dot, th.tint, dia * 0.5f, 0.0f);
             else if (t_h > 0.01f) fill_rect_s(dot, th.label5.scaled_alpha(t_h), dia * 0.5f, 0.0f);
 
-            char buf[8];
+            char buf[16];
             std::snprintf(buf, sizeof buf, "%d", d);
             Style ds;
             ds.font_size = fs - 1.0f;
             ds.font_weight = is_sel ? 600 : 400;
             ds.align = Align::Center;
             ds.valign = VAlign::Middle;
-            draw_text(buf, r, is_sel ? detail::on_color(th.tint) : th.foreground, ds);
+            draw_text(buf, r, is_sel ? detail::on_color(th.tint) : th.label, ds);
 
             if (in.clicked) {
                 sel = d;
                 changed = true;
                 repaint();
             }
-            if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, inner, std::max(0.0f, rad - 2.0f), th.ring);
+            if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, inner, std::max(0.0f, rad - 2.0f), th.focus_ring);
         }
     }
 
@@ -10042,7 +9870,7 @@ bool Ui::popover(const std::string& label, bool* open, const Rect& box,
     draw_text(label, Rect(box.x + pad, box.y, std::max(box.w - pad * 2.0f - 18.0f, 1.0f), box.h), fg, ts);
     if (st.show_indicator) system_icon(SystemIcon::ChevronDown,
                 Rect::centered(box.right() - pad - 5, box.cy(), 12, 12), fg);
-    if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, box, rad, th.ring);
+    if (detail::is_focused(impl, id)) detail::paint_focus_ring(*this, box, rad, th.focus_ring);
 
     if (in.clicked) { *open = !*open; repaint(); }
     if (!*open) return false;
@@ -10267,7 +10095,7 @@ bool Ui::alert_dialog(const std::string& title, const std::string& body,
     hs.valign = VAlign::Top;
     hs.wrap = true;
     draw_text(title, Rect(box.x + pad, box.y + pad_v, std::max(box.w - pad * 2.0f, 1.0f), title_lh),
-              !st.fg.is_none() ? st.fg : th.foreground, hs);
+              !st.fg.is_none() ? st.fg : th.label, hs);
 
     if (!body.empty()) {
         Style bs;
@@ -10279,7 +10107,7 @@ bool Ui::alert_dialog(const std::string& title, const std::string& body,
         bs.line_gap = 3.0f;
         draw_text(body, Rect(box.x + pad, box.y + pad_v + title_lh + 10.0f, box.w - pad * 2.0f,
                              std::max(ok_r.y - 12.0f - (box.y + pad_v + title_lh + 10.0f), 1.0f)),
-                  th.foreground, bs);
+                  th.label, bs);
     }
     pop_clip();
 
@@ -10319,11 +10147,10 @@ bool Ui::alert_dialog(const std::string& title, const std::string& body,
 //
 //  面板位置由 box 指定，内容回调在裁剪区内绘制，不做隐式位移动画。
 // -----------------------------------------------------------------------------
-bool Ui::drawer(const std::string& title, bool* open, int side, const Rect& box,
+bool Ui::drawer(const std::string& title, bool* open, const Rect& box,
                        const std::function<void(const Rect&)>& draw, const Style& st) {
     if (!open || box.w <= 0.0f || box.h <= 0.0f) return false;
     const Theme& th = impl->theme;
-    (void)side;  // 位置由 box 决定；保留参数以兼容已有调用。
     const uint64_t z_first = impl->seq + 1;
     const float fs = st.font_size > 0.0f ? st.font_size : th.font_size;
     const float pad = st.pad_x >= 0.0f ? st.pad_x : 20.0f;
@@ -10337,7 +10164,7 @@ bool Ui::drawer(const std::string& title, bool* open, int side, const Rect& box,
     if ((kin.pressed[0] || kin.pressed[1]) && !box.contains(kin.mouse.x, kin.mouse.y)) dismiss = true;
 
     // 面板依靠圆角和投影分层，不绘制全窗口遮罩。
-    const Color bg = !st.bg.is_none() ? st.bg : th.background;
+    const Color bg = !st.bg.is_none() ? st.bg : th.window_bg;
 
     // 面板：r10 + 二级投影，不描边（描边会把它读成"网页侧边栏"）
     detail::pop_shadow(*this, box, 10.0f, th, 2);
@@ -10349,9 +10176,9 @@ bool Ui::drawer(const std::string& title, bool* open, int side, const Rect& box,
     hs.align = Align::Left;
     hs.valign = VAlign::Middle;
     draw_text(title, Rect(box.x + pad, box.y, std::max(box.w - pad * 2.0f - 30.0f, 1.0f), head_h),
-              !st.fg.is_none() ? st.fg : th.foreground, hs);
+              !st.fg.is_none() ? st.fg : th.label, hs);
 
-    fill_rect(Rect(box.x, box.y + head_h - 1.0f, box.w, 1.0f), th.border, 0.0f);
+    fill_rect(Rect(box.x, box.y + head_h - 1.0f, box.w, 1.0f), th.separator, 0.0f);
 
     const Rect content(box.x + pad, box.y + head_h + pad * 0.5f,
                        std::max(box.w - pad * 2.0f, 1.0f),
@@ -10500,7 +10327,7 @@ bool Ui::combobox(const std::vector<std::string>& items, int* index,
 
     const bool has_sel = (*index >= 0 && *index < int(items.size()));
     // 占位符 25%（同 Text Field），已选值 85%
-    Color fg = !st.fg.is_none() ? st.fg : (has_sel ? th.foreground : th.label3);
+    Color fg = !st.fg.is_none() ? st.fg : (has_sel ? th.label : th.label3);
     Style ts;
     ts.font_size = fs;
     ts.font_weight = 500;
@@ -10511,7 +10338,7 @@ bool Ui::combobox(const std::vector<std::string>& items, int* index,
               Rect(box.x + pad, box.y, std::max(box.w - pad * 2.0f - 18.0f, 1.0f), box.h), fg, ts);
     detail::paint_popup_chevrons(*this, box, pad, th.label2);
     // 焦点走 3px 光环（同 input），不要"把边框染粗"—— 那是 Web 的 :focus 写法
-    if (focused) detail::paint_focus_ring(*this, box, rad, th.ring, true);
+    if (focused) detail::paint_focus_ring(*this, box, rad, th.focus_ring, true);
 
     if (!open) return false;
 
@@ -10614,7 +10441,7 @@ bool Ui::combobox(const std::vector<std::string>& items, int* index,
         ss.align = Align::Left;
         ss.valign = VAlign::Middle;
         draw_text(query_c.empty() ? std::string("搜索") : query_c, sr.inset(20.0f, 0.0f),
-                  query_c.empty() ? th_c.label3 : th_c.foreground, ss);
+                  query_c.empty() ? th_c.label3 : th_c.label, ss);
 
         for (int r = 0; r < rows; ++r) {
             const int ii = vis_c[size_t(r)];
@@ -10624,7 +10451,7 @@ bool Ui::combobox(const std::vector<std::string>& items, int* index,
             // 参考资料弹出菜单：高亮行是**强调色实心 + 白字**，不是 13% 的一层灰。
             // 当前值不靠底色，靠行首的对勾（所以所有行都留出 16px 的勾位）。
             if (hot) fill_rect_s(rr, th_c.tint, 5.0f, 0.35f);
-            const Color fg = hot ? detail::on_color(th_c.tint) : th_c.popover_foreground;
+            const Color fg = hot ? detail::on_color(th_c.tint) : th_c.label;
             if (on) {
                 system_icon(SystemIcon::Check, Rect::centered(rr.x + 10.f, rr.cy(), 12, 12), fg);
             }
@@ -10643,7 +10470,7 @@ bool Ui::combobox(const std::vector<std::string>& items, int* index,
             es.valign = VAlign::Middle;
             draw_text("无匹配项",
                       Rect(list.x + 14.0f, sr.bottom() + 4.0f, list.w - 20.0f, item_h),
-                      th_c.muted_foreground, es);
+                      th_c.label2, es);
         }
         pop_clip();
     });
@@ -10693,7 +10520,7 @@ bool Ui::split_pane(float* ratio, const Rect& box, Rect* first, Rect* second,
     }
 
     // 视觉只有 1px，热区是 7px —— 和滚动条同一个取舍：看得见但不抢眼。
-    const Color bc = dragging ? th.ring : (hot ? th.foreground.with_alpha(70) : th.border);
+    const Color bc = dragging ? th.focus_ring : (hot ? th.label.with_alpha(70) : th.separator);
     if (vertical) fill_rect(Rect(box.x + box.w * r - 0.5f, box.y, 1.0f, box.h), bc, 0.0f);
     else          fill_rect(Rect(box.x, box.y + box.h * r - 0.5f, box.w, 1.0f), bc, 0.0f);
 
@@ -10711,8 +10538,7 @@ bool Ui::split_pane(float* ratio, const Rect& box, Rect* first, Rect* second,
 
 // =============================================================================
 //  8.16  滚动
-//  实现方式是把"视口"翻译成布局语义：压一个负向偏移的 group + 一个裁剪区，
-//  于是内部的 row()/column() 自动吃到那个偏移，不用逐个组件改坐标。
+//  作用域保存偏移并压入裁剪区，Stack 构建时应用该偏移。
 //
 //  通用滚动与虚拟滚动走的是**同一个函数**：虚拟模式只是把内容高度算成
 //  行数 × 行高，然后按可见区间挑着调用回调。所以偏移只存一份（按 box 记忆），
@@ -10840,7 +10666,7 @@ ScrollScope Ui::scroll(const Rect& box, float content_h) {
     float& off = impl->flags[sc.id];
     const Input& kin = impl->input;
     const int depth = int(impl->scroll_stack.size());
-    impl->scroll_memo_next.push_back(Impl::ScrollRectMemo{box, depth});
+    if (!impl->measure_on) impl->scroll_memo_next.push_back(Impl::ScrollRectMemo{box, depth});
     // 测量模式不吃滚轮：同一份绘制代码要跑两遍，吃两次就等于把滚动距离翻倍。
     //
     // 嵌套时只让最内层吃：外层滚动区一定也 contains(鼠标)，只按位置判定就会
@@ -10868,13 +10694,12 @@ ScrollScope Ui::scroll(const Rect& box, float content_h) {
     impl->clip_logic.push_back(box);
     impl->recompute_clip_logic();
     impl->recompute_clip();
-    impl->group.push_back(Rect(box.x, box.y - off, box.w, std::max(content_h, box.h)));
     sc.active = true;
     return sc;
 }
 
 // 收尾：画滚动条（放在收尾而不是开头，才能盖在内容之上）、弹裁剪与偏移。
-// 幂等 —— RAII 析构和手工 end_scroll() 同时存在也不会弹两次。
+// 幂等收尾，允许在作用域析构前显式 close()。
 void ScrollScope::close() {
     if (!active || !ui) return;
     active = false;
@@ -10896,8 +10721,6 @@ void ScrollScope::content(float h) {
     if (!ui->impl->scroll_stack.empty() && ui->impl->scroll_stack.back().id == id) {
         ui->impl->scroll_stack.back().max_offset = max_offset;
         ui->impl->scroll_stack.back().offset = off;
-        if (!ui->impl->group.empty())
-            ui->impl->group.back() = Rect(box.x, box.y - off, box.w, std::max(h, box.h));
     }
 }
 
@@ -10910,54 +10733,30 @@ void ScrollScope::to(float v) {
     offset = nv;
     if (!ui->impl->scroll_stack.empty() && ui->impl->scroll_stack.back().id == id) {
         ui->impl->scroll_stack.back().offset = nv;
-        if (!ui->impl->group.empty())
-            ui->impl->group.back() = Rect(box.x, box.y - nv, box.w, std::max(content_h, box.h));
     }
 }
 
 
-// 老写法：开区但不交还句柄 —— 收尾交给 end_scroll()，和 0.1.0 的语义一致。
-// （句柄的 active 置 false 是刻意的：否则这个临时对象一析构就把区关了。）
-void Ui::begin_scroll(const Rect& box, float content_h) {
-    ScrollScope sc = scroll(box, content_h);
-    sc.active = false;
-}
-
+// 仅供 ScrollScope 收尾，先绘制滚动条，再恢复外层裁剪。
 void Ui::end_scroll() {
     if (impl->scroll_stack.empty()) return;
     const Ui::Impl::ScrollCtx ctx = impl->scroll_stack.back();
     auto state = state_scope(ctx.state_scope_id);
 
-    // 滚动条在内容之上（所以放在 end_scroll 里，而不是 begin_scroll）。
+    // 滚动条必须在内容绘制后叠加。
     // 先吃交互再画：同一帧里拖动要立刻反映到滑块位置上，晚一帧会明显发黏。
     if (ctx.max_offset > 0.0f) {
         const detail::ScrollbarDraw sb =
             detail::scrollbar_draw(*this, ctx.id, ctx.box, ctx.max_offset);
-        impl->last_scroll = sb.offset;
+
         if (sb.need_frame) repaint();      // 淡出要帧推进，否则停在半透明上
     }
 
-    impl->last_scroll = ctx.offset;
     impl->scroll_stack.pop_back();
     if (!impl->clips.empty()) impl->clips.pop_back();
     if (!impl->clip_logic.empty()) impl->clip_logic.pop_back();
     impl->recompute_clip_logic();
-    if (impl->group.size() > 1) impl->group.pop_back();
     impl->recompute_clip();
-}
-
-// 滚动区开启期间返回内层的偏移；已经 end_scroll() 之后返回最近一次的值，
-// 这样"滚完再读一下滚到哪了"也是成立的（一开始只在栈里可取，是个坑）。
-float Ui::scroll_y() const {
-    return impl->scroll_stack.empty() ? impl->last_scroll : impl->scroll_stack.back().offset;
-}
-
-void Ui::scroll_to(float offset) {
-    if (impl->scroll_stack.empty()) return;
-    const Ui::Impl::ScrollCtx& ctx = impl->scroll_stack.back();
-    auto state = state_scope(ctx.state_scope_id);
-    const float nv = detail::clampf(offset, 0.0f, ctx.max_offset);
-    if (nv != ctx.offset) { impl->flags[ctx.id] = nv; repaint(); }
 }
 
 // -----------------------------------------------------------------------------
@@ -11155,7 +10954,8 @@ struct Window::Impl {
     // 值是文件路径时写文件 —— WIN32 子系统的程序没有控制台，stderr 是无效句柄，
     // 重定向到文件也拿不到任何输出（实测：0 字节），而示例程序全是 WIN32 子系统。
     bool frame_log = false;
-    std::unique_ptr<std::FILE, decltype(&std::fclose)> frame_log_out{nullptr, &std::fclose};
+    struct FileCloser { void operator()(std::FILE* file) const { std::fclose(file); } };
+    std::unique_ptr<std::FILE, FileCloser> frame_log_out;
     uint32_t frame_log_n = 0;
     uint64_t frame_log_sum = 0;     // µs
     uint32_t frame_log_worst = 0;   // µs
@@ -11168,14 +10968,33 @@ struct Window::Impl {
     void* native = nullptr;
     std::function<void()> frame_cb_ptr;   // run() 期间指向用户回调，render() 用
     bool close_reported = false;         // 子窗口关闭时只通知其它窗口一次。
+    std::function<void(std::string)> clipboard_complete;
+    uint64_t clipboard_serial = 0;
+    std::chrono::steady_clock::time_point clipboard_deadline;
+    int clipboard_fd = -1;
+    std::string clipboard_data;
+    void finish_clipboard(std::string text) {
+#ifndef AINO_PLATFORM_WINDOWS
+        if (clipboard_fd >= 0) ::close(clipboard_fd);
+#endif
+        clipboard_fd = -1; clipboard_data.clear();
+        auto callback = std::move(clipboard_complete); clipboard_complete = {};
+        need_frame = true;
+        if (callback) callback(std::move(text));
+    }
     // run() 期间指向 Window::render()。窗口过程里要"同步补一帧"时用它 ——
     // 拖边框缩放时主循环被 user32 的模态循环卡住，根本轮不到 run() 出帧。
     std::function<void()> render_fn;
 
     ~Impl() {
+#ifndef AINO_PLATFORM_WINDOWS
+        if (clipboard_fd >= 0) ::close(clipboard_fd);
+#endif
         if (text) { text->release(); delete text; text = nullptr; }
     }
 };
+
+namespace detail { inline void service_clipboard(Window::Impl*); }
 
 #ifdef AINO_PLATFORM_WINDOWS
 namespace detail {
@@ -11193,21 +11012,6 @@ struct WaylandState;
 inline void wayland_set_ime_pos(WaylandState* s, float x, float top, float bottom);
 } // namespace detail
 #endif
-
-// 老的两参构造：集中填一次，避免 WindowConfig{ w, h, title } 这种聚合初始化
-// 在 -Wextra 下报一串 missing-field-initializers（新增字段时还会悄悄漏填）。
-namespace detail {
-inline WindowConfig legacy_window_config(int w, int h, const std::string& title) {
-    WindowConfig cfg;
-    cfg.width = w;
-    cfg.height = h;
-    cfg.title = title;
-    return cfg;
-}
-} // namespace detail
-
-Window::Window(int w, int h, const std::string& title)
-    : Window(detail::legacy_window_config(w, h, title)) {}
 
 Window::Window(const WindowConfig& cfg) : impl(new Impl()) {
     if (!impl->wake_signal.valid()) return;
@@ -11252,9 +11056,8 @@ Window::Window(const WindowConfig& cfg) : impl(new Impl()) {
     // 抛 std::bad_function_call、没人接、std::terminate，进程当场没了（用户看到的
     // 就是"复制一下程序自己关了"）。Ctrl+V 因为调用点写了判空所以不崩，只是没反应。
     // 现在两头都补：这里绑上真实实现，调用点也一律判空（Ui 可以脱离 Window 用）。
-    impl->ui.impl->set_clipboard = [this](const std::string& t) { Window::set_clipboard(t); };
     impl->ui.impl->try_set_clipboard = [this](const std::string& t) { return Window::try_set_clipboard(t); };
-    impl->ui.impl->get_clipboard = [this]() { return Window::clipboard(); };
+    impl->ui.impl->get_clipboard_async = [this](auto callback) { request_clipboard(std::move(callback)); };
     // 诊断开关：AINO_FRAME_LOG=1 时每 120 帧打印一次渲染耗时。
 #if defined(_MSC_VER)
 #  pragma warning(push)
@@ -11556,11 +11359,13 @@ inline void win_append_utf16(std::string& out, uint32_t unit) {
 }
 
 inline void win_create_backbuffer(Win32State* s, int w, int h) {
-    if (w <= 0 || h <= 0) return;
+    if (w <= 0 || h <= 0 || w > 16384 || h > 16384 || uint64_t(w) * uint64_t(h) > 16777216u) return;
     if (s->pw == w && s->ph == h && s->has_backbuffer) return;
 
     HDC screen = GetDC(nullptr);
+    if (!screen) return;
     if (!s->mem_dc) s->mem_dc = CreateCompatibleDC(screen);
+    if (!s->mem_dc) { ReleaseDC(nullptr, screen); return; }
 
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
@@ -11572,10 +11377,11 @@ inline void win_create_backbuffer(Win32State* s, int w, int h) {
     void* bits = nullptr;
     HBITMAP hb = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
     ReleaseDC(nullptr, screen);
-    if (!hb || !bits) { s->has_backbuffer = false; return; }
+    if (!hb || !bits) { if (hb) DeleteObject(hb); return; }
 
     // 换上新的，旧的被换出后才允许删除
     HBITMAP old = reinterpret_cast<HBITMAP>(SelectObject(s->mem_dc, hb));
+    if (!old || old == HGDI_ERROR) { DeleteObject(hb); return; }
     if (old && old == s->hbmp) DeleteObject(old);
     s->hbmp = hb;
     SetBkMode(s->mem_dc, TRANSPARENT);
@@ -11598,7 +11404,7 @@ inline void win_create_backbuffer(Win32State* s, int w, int h) {
     // run() 之前（窗口刚建出来、还没绑定 render_fn）没有任何人会马上渲染它，
     // 这时先把缓冲铺成主题底色，免得首帧出现前露一块黑。
     if (!o->render_fn) {
-        const Color& bg = o->theme.background;
+        const Color& bg = o->theme.window_bg;
         uint8_t* p = reinterpret_cast<uint8_t*>(bits);
         const size_t n = size_t(w) * size_t(h);
         for (size_t i = 0; i < n; ++i, p += 4) {
@@ -12308,6 +12114,7 @@ bool Window::poll() {
     Window::Impl* o = impl;
     detail::Win32State* s = reinterpret_cast<detail::Win32State*>(o->native);
     if (!s || !o->running) return false;
+    detail::service_clipboard(impl);
     if (o->wake_signal.consume()) o->need_frame = true;
 
     MSG msg;
@@ -12436,9 +12243,6 @@ inline bool clipboard_open_retry(HWND owner = nullptr) {
 }
 } // namespace detail
 
-void Window::set_clipboard(const std::string& text) {
-    (void)try_set_clipboard(text);
-}
 bool Window::try_set_clipboard(const std::string& text) {
     auto* state = reinterpret_cast<detail::Win32State*>(impl->native);
     if (!state || !state->hwnd) return false;
@@ -12470,17 +12274,6 @@ std::string Window::clipboard() const {
             while (n < cap && p[n]) ++n;
             out = detail::from_wide(std::wstring(p, n));
             GlobalUnlock(h);
-        }
-    } else if (HANDLE h8 = GetClipboardData(CF_TEXT)) {
-        // 有些老工具 / 终端只放 CF_TEXT。剪贴板不会自动升级成 CF_UNICODETEXT，
-        // 所以这里得自己取 ANSI 再转（to_wide 会按 CP_ACP 解）。
-        const char* p = reinterpret_cast<const char*>(GlobalLock(h8));
-        if (p) {
-            const size_t cap = GlobalSize(h8);
-            size_t n = 0;
-            while (n < cap && p[n]) ++n;
-            out = detail::from_wide(detail::to_wide(std::string(p, n)));
-            GlobalUnlock(h8);
         }
     }
     CloseClipboard();
@@ -12848,6 +12641,19 @@ public:
 #else
         return float(utf8_count(utf8)) * size * 0.55f;
 #endif
+    }
+    void caret_positions(const std::string& utf8, float size, int weight, std::vector<float>& out) override {
+        Font* f = font(size, weight, false);
+        if (!f) { TextRenderer::caret_positions(utf8, size, weight, out); return; }
+        out.assign(1, 0.0f);
+        float pen = 0;
+        for (size_t i = 0; i < utf8.size();) {
+            uint32_t cp;
+            const int n = utf8_decode_n(utf8.data() + i, utf8.size() - i, &cp);
+            i += size_t(std::max(1, n));
+            pen += float(glyph(*f, cp).adv) / 64.0f;
+            out.push_back(pen);
+        }
     }
     float ascent(float size, int weight) override {
         if (Font* f = font(size, weight, false)) return float(f->asc);
@@ -13434,7 +13240,6 @@ private:
 
 
 #ifdef AINO_PLATFORM_X11
-using X11TextRenderer = UnixTextRenderer;
 struct X11State {
     Window::Impl* owner = nullptr;
     Display* dpy = nullptr;
@@ -13669,17 +13474,19 @@ inline int x11_map_keysym(KeySym ks) {
 }
 
 inline void x11_create_backbuffer(X11State* s, int w, int h) {
-    if (w <= 0 || h <= 0) return;
+    if (w <= 0 || h <= 0 || w > 16384 || h > 16384 || uint64_t(w) * h > 16777216u) return;
     if (s->pw == w && s->ph == h && s->img) return;
-    if (s->img) { s->img->data = nullptr; XDestroyImage(s->img); s->img = nullptr; }
 
     XWindowAttributes wa{};
-    XGetWindowAttributes(s->dpy, s->win, &wa);
-    s->buffer.assign(size_t(w) * size_t(h) * 4u, 0);
-    s->img = XCreateImage(s->dpy, wa.visual, unsigned(wa.depth), ZPixmap, 0,
-                          reinterpret_cast<char*>(s->buffer.data()), unsigned(w), unsigned(h),
+    if (!XGetWindowAttributes(s->dpy, s->win, &wa)) return;
+    std::vector<uint8_t> buffer(size_t(w) * size_t(h) * 4u, 0);
+    XImage* image = XCreateImage(s->dpy, wa.visual, unsigned(wa.depth), ZPixmap, 0,
+                          reinterpret_cast<char*>(buffer.data()), unsigned(w), unsigned(h),
                           32, w * 4);
-    if (!s->img) return;
+    if (!image) return;
+    if (s->img) { s->img->data = nullptr; XDestroyImage(s->img); }
+    s->buffer.swap(buffer);
+    s->img = image;
     s->pw = w; s->ph = h;
 
     Window::Impl* o = s->owner;
@@ -13809,7 +13616,7 @@ inline void x11_refresh_scale(X11State* s) {
     // 新字号重新生成位图，释放旧 DPI 下的字体和字形缓存。
     if (o->text) {
         o->text->release(); o->text->init(scale, o->ui.theme().font_family, o->ui.theme().font_family_mono);
-        static_cast<X11TextRenderer*>(o->text)->set_drawable(s->dpy, s->win, s->gc);
+        static_cast<UnixTextRenderer*>(o->text)->set_drawable(s->dpy, s->win, s->gc);
     }
     x11_size_hints(s, w, h);
     XResizeWindow(s->dpy, s->win, unsigned(w), unsigned(h));
@@ -14133,14 +13940,13 @@ inline void x11_create(Window* self, const WindowConfig& cfg) {
     XMapWindow(s->dpy, s->win);
     XFlush(s->dpy);
 
-    X11TextRenderer* tr = new X11TextRenderer();
+    UnixTextRenderer* tr = new UnixTextRenderer();
     tr->init(o->scale, o->theme.font_family, o->theme.font_family_mono);
     tr->set_drawable(s->dpy, s->win, s->gc);
     o->text = tr;
     o->ui.impl->text = tr;
 
     x11_create_backbuffer(s, w, h);
-    o->ui.impl->set_clipboard = [self](const std::string& text) { self->set_clipboard(text); };
     o->ui.impl->canvas = &o->canvas;
     o->need_frame = true;
     x11_clipboard_windows().push_back(s);
@@ -14178,12 +13984,14 @@ bool Window::poll() {
     Window::Impl* o = impl;
     detail::X11State* s = reinterpret_cast<detail::X11State*>(o->native);
     if (!s || !o->running) return false;
+    detail::service_clipboard(impl);
     if (o->wake_signal.consume()) o->need_frame = true;
     while (XPending(s->dpy)) {
         XEvent e;
         XNextEvent(s->dpy, &e);
         if (!detail::x11_handle(s, e)) break;
     }
+    if (o->running) detail::service_clipboard(impl);
     return o->running;
 }
 
@@ -14239,7 +14047,6 @@ void Window::activate() {
     XFlush(s->dpy);
 }
 
-void Window::set_clipboard(const std::string& text) { (void)try_set_clipboard(text); }
 bool Window::try_set_clipboard(const std::string& text) {
     auto* s = reinterpret_cast<detail::X11State*>(impl->native);
     if (!s || !s->dpy || text.size() > (32u << 20)) return false;
@@ -16379,6 +16186,7 @@ inline void wayland_wait_fds(WaylandState* s, std::vector<pollfd>& fds, int& tim
     if (input && s->repeat_key && s->keyboard_inside && s->repeat_rate > 0) deadline(s->repeat_at);
     fds.push_back({wl::api().get_fd(s->display), short(POLLIN | (s->flush_blocked ? POLLOUT : 0)), 0});
     if (input) fds.push_back({s->owner->wake_signal.read_descriptor(), POLLIN, 0});
+    if (input && s->owner->clipboard_fd >= 0) fds.push_back({s->owner->clipboard_fd, POLLIN, 0});
     for (const auto& send : s->sends) { fds.push_back({send.fd, POLLOUT, 0}); deadline(send.deadline); }
     if (input && s->drop_fd >= 0) { fds.push_back({s->drop_fd, POLLIN, 0}); deadline(s->drop_deadline); }
 }
@@ -16395,8 +16203,10 @@ int Window::height() const {
 bool Window::poll() {
     auto* s = static_cast<detail::WaylandState*>(impl->native);
     if (!s || !impl->running) return false;
+    detail::service_clipboard(impl);
     if (impl->wake_signal.consume()) impl->need_frame = true;
     detail::wayland_dispatch(s);
+    if (impl->running) detail::service_clipboard(impl);
     detail::wayland_send_clipboard(s);
     detail::wayland_read_drop(s);
     detail::wayland_repeat(s);
@@ -16466,7 +16276,6 @@ void Window::set_size(int width, int height) {
     if (!impl->cfg.resizable) detail::wayland_size_hints(s);
     detail::wayland_scale_changed(s);
 }
-void Window::set_clipboard(const std::string& text) { (void)try_set_clipboard(text); }
 bool Window::try_set_clipboard(const std::string& text) {
     return detail::wayland_set_clipboard(static_cast<detail::WaylandState*>(impl->native), text);
 }
@@ -16561,6 +16370,19 @@ public:
         CTFontRef f = font(size, weight, true); return f ? float(CTFontGetAscent(f)) : size * .8f;
     }
     float measure(const std::string& text, float size, int weight) override { return measure_impl(text, size, weight, false); }
+    void caret_positions(const std::string& text, float size, int weight, std::vector<float>& out) override {
+        CTLineRef line = make_line(text, size, weight, Color(0, 0, 0), false);
+        if (!line) { TextRenderer::caret_positions(text, size, weight, out); return; }
+        ScopeExit release([&] { CFRelease(line); });
+        out.assign(1, 0.0f);
+        CFIndex units = 0;
+        for (size_t i = 0; i < text.size();) {
+            uint32_t cp;
+            const int n = utf8_decode_n(text.data() + i, text.size() - i, &cp);
+            i += size_t(std::max(1, n)); units += cp > 0xffff ? 2 : 1;
+            out.push_back(float(CTLineGetOffsetForStringIndex(line, units, nullptr)));
+        }
+    }
     float measure_impl(const std::string& utf8, float size, int weight, bool mono) {
         CTLineRef line = make_line(utf8, size, weight, Color(0, 0, 0), mono);
         if (!line) return 0.0f;
@@ -16720,7 +16542,7 @@ struct CocoaState {
 };
 
 inline bool cocoa_create_backbuffer(CocoaState* s, int w, int h) {
-    if (w <= 0 || h <= 0) return false;
+    if (w <= 0 || h <= 0 || w > 16384 || h > 16384 || uint64_t(w) * h > 16777216u) return false;
     if (s->pw == w && s->ph == h && s->ctx) return true;
     // 先准备新缓冲，失败时保留仍被 Canvas 引用的原始资源。
     std::vector<uint8_t> buffer(size_t(w) * size_t(h) * 4u, 0);
@@ -16979,7 +16801,8 @@ inline void cocoa_window_blur(id self, SEL, id) {
 inline void cocoa_sync_geometry(CocoaState* s) {
     if (!s->geometry_dirty || s->closed || s->owner->ui.impl->frame_open) return;
     const CGRect bounds = oc_send<CGRect>(s->view, sel_registerName("bounds"));
-    const float scale = std::max(1.0f, float(oc_send<CGFloat>(s->window, sel_registerName("backingScaleFactor"))));
+    const float scale = s->owner->cfg.high_dpi
+        ? std::max(1.0f, float(oc_send<CGFloat>(s->window, sel_registerName("backingScaleFactor")))) : 1.0f;
     if (s->owner->scale != scale && s->owner->text)
         s->owner->text->reconfigure(scale, s->owner->ui.theme().font_family, s->owner->ui.theme().font_family_mono);
     s->owner->scale = scale;
@@ -17093,20 +16916,20 @@ inline void cocoa_create(Window* self, const WindowConfig& cfg) {
     CFStringRef t = CFStringCreateWithCString(kCFAllocatorDefault,
                                               cfg.title.empty() ? "aino" : cfg.title.c_str(),
                                               kCFStringEncodingUTF8);
-    oc_send<void>(window, sel_registerName("setTitle:"), t);
-    CFRelease(t);
+    if (t) oc_send<void>(window, sel_registerName("setTitle:"), t);
+    if (t) CFRelease(t);
 
     // 图标：macOS 的窗口没有标题栏图标位，只能设应用图标（Dock / Cmd+Tab）。
     if (!cfg.icon_path.empty()) {
         CFStringRef ip = CFStringCreateWithCString(kCFAllocatorDefault, cfg.icon_path.c_str(),
                                                    kCFStringEncodingUTF8);
-        id img = oc_send<id>(oc_send<id>(objc_getClass("NSImage"), sel_registerName("alloc")),
-                             sel_registerName("initWithContentsOfFile:"), ip);
+        id img = ip ? oc_send<id>(oc_send<id>(objc_getClass("NSImage"), sel_registerName("alloc")),
+                             sel_registerName("initWithContentsOfFile:"), ip) : nullptr;
         if (img) {
             oc_send<void>(app, sel_registerName("setApplicationIconImage:"), img);
             oc_send<void>(img, sel_registerName("release"));
         } else std::fprintf(stderr, "[aino] Cannot load icon: %s\n", cfg.icon_path.c_str());
-        CFRelease(ip);
+        if (ip) CFRelease(ip);
     }
 
     oc_send<void>(window, sel_registerName("makeKeyAndOrderFront:"), (id)nullptr);
@@ -17167,6 +16990,7 @@ bool Window::poll() {
     Window::Impl* o = impl;
     detail::CocoaState* s = reinterpret_cast<detail::CocoaState*>(o->native);
     if (!s || !o->running) return false;
+    detail::service_clipboard(impl);
     id pool = oc_send<id>(oc_send<id>(objc_getClass("NSAutoreleasePool"), sel_registerName("alloc")), sel_registerName("init"));
     detail::ScopeExit drain([&] { oc_send<void>(pool, sel_registerName("drain")); });
     if (o->wake_signal.consume()) o->need_frame = true;
@@ -17227,8 +17051,8 @@ void Window::set_title(const std::string& title) {
     detail::CocoaState* s = reinterpret_cast<detail::CocoaState*>(impl->native);
     if (!s || !s->window) return;
     CFStringRef t = CFStringCreateWithCString(kCFAllocatorDefault, title.c_str(), kCFStringEncodingUTF8);
-    oc_send<void>(s->window, sel_registerName("setTitle:"), t);
-    CFRelease(t);
+    if (t) oc_send<void>(s->window, sel_registerName("setTitle:"), t);
+    if (t) CFRelease(t);
 }
 void Window::set_size(int w, int h) {
     detail::CocoaState* s = reinterpret_cast<detail::CocoaState*>(impl->native);
@@ -17238,7 +17062,6 @@ void Window::set_size(int w, int h) {
         detail::cocoa_sync_geometry(s);
     }
 }
-void Window::set_clipboard(const std::string& text) { (void)try_set_clipboard(text); }
 bool Window::try_set_clipboard(const std::string& text) {
     if (!pthread_main_np()) return false;
     id pool = oc_send<id>(oc_send<id>(objc_getClass("NSAutoreleasePool"), sel_registerName("alloc")), sel_registerName("init"));
@@ -17262,6 +17085,76 @@ std::string Window::clipboard() const {
 
 #endif // AINO_PLATFORM_MACOS
 
+
+void Window::request_clipboard(std::function<void(std::string)> complete) {
+    const auto serial = ++impl->clipboard_serial;
+    if (impl->clipboard_complete) impl->finish_clipboard({});
+    // 被取消请求的回调可以立即发起更新的请求；不能覆盖它的 callback 或接收 fd。
+    if (impl->clipboard_serial != serial) { if (complete) complete({}); return; }
+    if (!complete || !ok()) { if (complete) complete({}); return; }
+    impl->clipboard_complete = std::move(complete);
+    impl->clipboard_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+#if defined(AINO_PLATFORM_X11)
+    auto* s = static_cast<detail::X11State*>(impl->native);
+    detail::x11_clipboard_atoms(s);
+    const auto owner = XGetSelectionOwner(s->dpy, s->clipboard_selection);
+    if (!owner || owner == s->win) { impl->finish_clipboard(owner ? s->clipboard_text : std::string()); return; }
+    s->clipboard_received.clear(); s->clipboard_done = s->clipboard_ok = s->clipboard_incr = false;
+    s->clipboard_waiting = true;
+    XConvertSelection(s->dpy, s->clipboard_selection, s->clipboard_utf8, s->clipboard_property, s->win, CurrentTime);
+    XFlush(s->dpy);
+#elif defined(AINO_PLATFORM_WAYLAND)
+    auto* s = static_cast<detail::WaylandState*>(impl->native);
+    std::string mime;
+    for (const auto& offer : s->offers) if (offer.proxy == s->selection) mime = offer.mime;
+    int sockets[2];
+    if (mime.empty() || socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) < 0) {
+        impl->finish_clipboard({}); return;
+    }
+    if (fcntl(sockets[0], F_SETFL, O_NONBLOCK) < 0) {
+        ::close(sockets[0]); ::close(sockets[1]); impl->finish_clipboard({}); return;
+    }
+    impl->clipboard_fd = sockets[0];
+    detail::wl::request(s->selection, 1, mime.c_str(), sockets[1]); ::close(sockets[1]);
+    detail::wayland_flush(s);
+#else
+    impl->finish_clipboard(clipboard());
+#endif
+    wake();
+}
+
+namespace detail {
+inline void service_clipboard(Window::Impl* o) {
+    if (!o->clipboard_complete) return;
+    const bool expired = std::chrono::steady_clock::now() >= o->clipboard_deadline;
+#if defined(AINO_PLATFORM_X11)
+    auto* s = static_cast<X11State*>(o->native);
+    if (s->clipboard_done || expired) {
+        auto result = !expired && s->clipboard_ok ? std::move(s->clipboard_received) : std::string();
+        s->clipboard_waiting = false;
+        XDeleteProperty(s->dpy, s->win, s->clipboard_property);
+        o->finish_clipboard(std::move(result));
+    }
+#elif defined(AINO_PLATFORM_WAYLAND)
+    if (expired) { o->finish_clipboard({}); return; }
+    size_t budget = 256u << 10;
+    while (budget && o->clipboard_fd >= 0) {
+        char bytes[65536];
+        const auto n = ::read(o->clipboard_fd, bytes, std::min(sizeof bytes, budget));
+        if (n > 0) {
+            if (o->clipboard_data.size() + size_t(n) > (32u << 20)) { o->finish_clipboard({}); return; }
+            o->clipboard_data.append(bytes, size_t(n)); budget -= size_t(n);
+        } else if (!n) {
+            auto result = std::move(o->clipboard_data); o->finish_clipboard(std::move(result)); return;
+        } else if (errno == EINTR) continue;
+        else if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+        else { o->finish_clipboard({}); return; }
+    }
+#else
+    (void)expired;
+#endif
+}
+} // namespace detail
 
 void Window::set_frame_callback(std::function<void(Ui&)> frame) {
     auto& windows = detail::scheduled_windows();
@@ -17340,6 +17233,8 @@ void Window::run(const std::function<void(Ui&)>& frame) {
             auto* o = window->impl;
             if (!o->running || !o->frame_cb_ptr) continue;
             if (o->wake_signal.pending()) limit(0);
+            if (o->clipboard_complete) limit(int(std::max<int64_t>(0,
+                std::chrono::ceil<std::chrono::milliseconds>(o->clipboard_deadline - Clock::now()).count())));
 #ifdef AINO_PLATFORM_WAYLAND
             if (!detail::wayland_can_render(static_cast<detail::WaylandState*>(o->native))) continue;
 #endif
@@ -17559,6 +17454,7 @@ inline SystemIconMask x11_decode_system_icon(const std::string& file, int size) 
     if (!api.lib || file.empty()) return mask;
     void* image = api.load(file.c_str(), size, size, 1, nullptr);
     if (!image) return mask;
+    ScopeExit release([&] { api.unref(image); });
     const int w = api.width(image), h = api.height(image), stride = api.stride(image), channels = api.channels(image);
     const auto* pixels = api.pixels(image);
     if (pixels && w > 0 && h > 0 && w <= size && h <= size &&
@@ -17571,7 +17467,6 @@ inline SystemIconMask x11_decode_system_icon(const std::string& file, int size) 
                 uint8_t(255 - (299 * pixel[0] + 587 * pixel[1] + 114 * pixel[2]) / 1000);
         }
     }
-    api.unref(image);
     return mask;
 }
 #if defined(__linux__)
@@ -17770,7 +17665,10 @@ inline SystemIconMask load_system_icon(SystemIcon icon, int size) {
     if (!oc_send<BOOL>(image_class, sel_registerName("respondsToSelector:"), selector)) return mask;
     id pool = oc_send<id>(oc_send<id>(objc_getClass("NSAutoreleasePool"), sel_registerName("alloc")),
                           sel_registerName("init"));
+    ScopeExit drain([&] { oc_send<void>(pool, sel_registerName("drain")); });
     CFStringRef name = CFStringCreateWithCString(nullptr, names[index], kCFStringEncodingUTF8);
+    ScopeExit release([&] { if (name) CFRelease(name); });
+    if (!name) return mask;
     id image = oc_send<id>(image_class, selector, reinterpret_cast<id>(const_cast<void*>(
                               reinterpret_cast<const void*>(name))), static_cast<id>(nullptr));
     CGRect proposed = CGRectMake(0, 0, size, size);
@@ -17790,8 +17688,6 @@ inline SystemIconMask load_system_icon(SystemIcon icon, int size) {
             CGContextRelease(context);
         } else mask = SystemIconMask{};
     }
-    if (name) CFRelease(name);
-    oc_send<void>(pool, sel_registerName("drain"));
 #elif defined(AINO_PLATFORM_UNIX)
     return x11_load_system_icon(icon, size);
 #else
@@ -17883,7 +17779,9 @@ bool Image::load(const std::string& path, std::string* error) {
 #elif defined(AINO_PLATFORM_MACOS)
     CFURLRef url = CFURLCreateFromFileSystemRepresentation(nullptr,
         reinterpret_cast<const UInt8*>(path.data()), CFIndex(path.size()), false);
+    detail::ScopeExit release_url([&] { if (url) CFRelease(url); });
     CGImageSourceRef source = url ? CGImageSourceCreateWithURL(url, nullptr) : nullptr;
+    detail::ScopeExit release_source([&] { if (source) CFRelease(source); });
     CFDictionaryRef properties = source ? CGImageSourceCopyPropertiesAtIndex(source, 0, nullptr) : nullptr;
     int64_t metadata_w = 0, metadata_h = 0;
     if (properties) {
@@ -17896,6 +17794,7 @@ bool Image::load(const std::string& path, std::string* error) {
     const bool bounded = metadata_w > 0 && metadata_h > 0 && metadata_w <= 16384 && metadata_h <= 16384
         && uint64_t(metadata_w) * uint64_t(metadata_h) <= 67108864u;
     CGImageRef image = source && bounded ? CGImageSourceCreateImageAtIndex(source, 0, nullptr) : nullptr;
+    detail::ScopeExit release_image([&] { if (image) CGImageRelease(image); });
     const size_t w = image ? CGImageGetWidth(image) : 0, h = image ? CGImageGetHeight(image) : 0;
     if (w && h && w <= 16384 && h <= 16384 && w * h <= 67108864u) {
         result.width = int(w); result.height = int(h);
@@ -17916,9 +17815,6 @@ bool Image::load(const std::string& path, std::string* error) {
         } else result = Image{};
         if (space) CGColorSpaceRelease(space);
     }
-    if (image) CGImageRelease(image);
-    if (source) CFRelease(source);
-    if (url) CFRelease(url);
 #elif defined(AINO_PLATFORM_UNIX)
     static detail::X11IconPixels api;
     int metadata_w = 0, metadata_h = 0;
@@ -17926,6 +17822,7 @@ bool Image::load(const std::string& path, std::string* error) {
         && metadata_w > 0 && metadata_h > 0 && metadata_w <= 16384 && metadata_h <= 16384
         && uint64_t(metadata_w) * uint64_t(metadata_h) <= 67108864u;
     void* image = bounded ? api.load(path.c_str(), -1, -1, 1, nullptr) : nullptr;
+    detail::ScopeExit release_image([&] { if (image) api.unref(image); });
     if (image) {
         const int w = api.width(image), h = api.height(image), n = api.channels(image);
         const int stride = api.stride(image);
@@ -17941,7 +17838,6 @@ bool Image::load(const std::string& path, std::string* error) {
                 d[0] = p[0]; d[1] = p[1]; d[2] = p[2]; d[3] = alpha ? p[3] : 255;
             }
         }
-        api.unref(image);
     }
 #endif
     if (!result.valid()) {
@@ -18018,15 +17914,23 @@ bool Ui::system_icon(SystemIcon icon, const Rect& box, const Color& color) {
     const uint64_t key = uint64_t(icon) << 32 | uint32_t(size);
     // 按线程缓存栅格化结果，复用时只混合像素；尺寸变化不保留系统 DC、字体或 NSImage。
     static thread_local std::unordered_map<uint64_t, detail::SystemIconMask> masks;
+    static thread_local size_t mask_bytes = 0;
 #ifdef AINO_PLATFORM_UNIX
     static thread_local std::string last_theme;
     const auto current_theme = detail::x11_effective_icon_theme();
-    if (last_theme != current_theme) { masks.clear(); last_theme = current_theme; }
+    if (last_theme != current_theme) { masks.clear(); mask_bytes = 0; last_theme = current_theme; }
 #endif
+    if (size > 512 || size_t(icon) >= size_t(SystemIcon::Count)) return false;
     auto found = masks.find(key);
     if (found == masks.end()) {
-        if (masks.size() >= 512) masks.clear();
-        found = masks.emplace(key, detail::load_system_icon(icon, size)).first;
+        auto loaded = detail::load_system_icon(icon, size);
+        const size_t cost = loaded.alpha.capacity();
+        constexpr size_t budget = 8u << 20;
+        while (!masks.empty() && (masks.size() >= 512 || mask_bytes + cost > budget)) {
+            auto old = masks.begin(); mask_bytes -= old->second.alpha.capacity(); masks.erase(old);
+        }
+        found = masks.emplace(key, std::move(loaded)).first;
+        mask_bytes += cost;
     }
     const auto& mask = found->second;
     if (mask.alpha.empty()) return false;

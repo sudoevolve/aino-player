@@ -46,9 +46,9 @@ python tools/build_installer.py --exe build/Release/aino_player.exe --output bui
 
 主程序沿用 main、UI 和业务的少文件布局：`main.cpp` 定义 `AINO_PLAYER_INTERFACE`，只编译业务声明；业务实现由现有 `cover_decode.cpp` 在 `AINO_PLAYER_BUSINESS_UNIT` 构建宏下承载，后者同时保留 Linux 封面解码职责。业务实现只编译一份，UI 通过业务动作与 ViewModel 访问，不直接访问业务全局变量。测试目标保留原来的头文件实现方式。
 
-`AINO_PLAYER_PCH=ON` 默认缓存 aino 公共声明，可用 `-DAINO_PLAYER_PCH=OFF` 禁用；业务单元跳过该 PCH。aino 0.5.3 的公共实现不再全部为 inline，因此 PCH 不定义 `AINO_IMPLEMENTATION`，由 `main.cpp` 提供唯一实现，避免 PCH 对象与主程序重复定义。实现部分仍需随主单元编译，不能沿用旧版 PCH 的性能预期。
+`AINO_PLAYER_PCH=ON` 默认缓存 aino 公共声明，可用 `-DAINO_PLAYER_PCH=OFF` 禁用；业务单元跳过该 PCH。aino 0.5.4 的公共实现不再全部为 inline，因此 PCH 不定义 `AINO_IMPLEMENTATION`，由 `main.cpp` 提供唯一实现，避免 PCH 对象与主程序重复定义。实现部分仍需随主单元编译，不能沿用旧版 PCH 的性能预期。
 
-内置 UI 库同步上游提交 `76904bb34f09eab73a6ed7176f5df4d9725b5ce0`（版本 `0.5.3`，含 Wayland 后端），三方差异中保留播放器扩展：封面位图、系统字体、菜单选中／禁用及箭头控制、完整提示、主题色选择与关闭回调。Windows 原生 IME、候选定位和文字提交仍按用户确认版本保留；合并或模拟输入都不能代替实机确认。
+内置 UI 库同步上游标签 `v0.5.4`（提交 `74d86d49b8c8848d5a8b3b9c75f917a23795d247`），三方差异中保留播放器扩展：封面位图、系统字体、菜单选中／禁用及箭头控制、完整提示、主题色选择、窗口激活和关闭回调。剪贴板写入迁移到新版可检查接口；Windows 原生 IME、候选定位和文字提交保留用户确认版本，未确认的定时器实验未进入发布候选。合并或模拟输入都不能代替实机确认。
 
 Windows 消息泵另有播放器修补：`Window::poll` 在原生消息派发后再次消费 wake 请求，保证托盘／媒体回调提交的业务事件在本轮可触发帧回调，不修改输入法分支。
 

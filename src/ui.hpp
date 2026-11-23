@@ -1,4 +1,4 @@
-// 界面：布局、绘制与输入；业务操作统一调用 business.hpp 的动作。
+﻿// 界面：布局、绘制与输入；业务操作统一调用 business.hpp 的动作。
 #pragma once
 #include "business.hpp"
 #include "aino.hpp"
@@ -785,7 +785,7 @@ static void result_row(Ctx& c, const music::Track& t, int index, const Rect& box
         if (dl_done) {
             c.ui.system_icon(SystemIcon::Check, dl.center(13, 13), c.th.tint);
         } else if (dl_failed) {
-            c.ui.system_icon(SystemIcon::Warning, dl.center(13, 13), c.th.destructive);
+            c.ui.system_icon(SystemIcon::Warning, dl.center(13, 13), c.th.red);
         } else if (pct >= 0) {
             Style ps;
             ps.font_size = 8.5f;
@@ -1253,7 +1253,7 @@ static void catalog_detail(Ctx& c) {
     if (changed) { playlist_filter_rows(); c.model.ui.playlist_scroll_to_top = true; }
     float list_y = filter_y + 40;
     if (!error.empty()) {
-        c.ui.draw_text(ellipsize(c.ui, error, mw, 10.5f), {mx, list_y, mw, 22}, c.th.destructive, Style().font(10.5f));
+        c.ui.draw_text(ellipsize(c.ui, error, mw, 10.5f), {mx, list_y, mw, 22}, c.th.red, Style().font(10.5f));
         c.ui.tooltip({mx, list_y, mw, 22}, error); list_y += 28;
     }
     const auto count = int(albums ? view.album_rows.size() : view.rows.size());
@@ -1474,7 +1474,7 @@ static void tab_playlists(Ctx& c) {
         Style es;
         es.font_size = 11.0f;
         es.wrap_text();
-        c.ui.draw_text(err, {mx, 148.0f, mw, 48}, c.th.destructive, es);
+        c.ui.draw_text(err, {mx, 148.0f, mw, 48}, c.th.red, es);
         return;
     }
     if (loading && pl_count == 0) {
@@ -1747,7 +1747,7 @@ static void source_tab_scripts(Ctx& c, const Rect& area) {
     const auto check_note = on && !source_check_status().empty() ? source_check_status() : on ? std::string("启动时静默测速一轮；之后仅手动重新检测") : std::string("已停用：取流只走自带接口");
     c.ui.draw_text(ellipsize(c.ui, check_note, head.w - 200, 11),
                    {head.x + 20, head.y + 78 + header_extra, head.w - 200, 18},
-                   on ? c.th.label2 : c.th.destructive, Style().font(11.0f));
+                   on ? c.th.label2 : c.th.red, Style().font(11.0f));
     c.ui.tooltip({head.x + 20, head.y + 78 + header_extra, head.w - 200, 18}, check_note);
 
     c.ui.draw_text("音源智能切换", {head.x + 20, head.y + 112 + header_extra, 160, 20}, c.th.label, Style().font(12).weight(600));
@@ -1809,7 +1809,7 @@ static void source_tab_scripts(Ctx& c, const Rect& area) {
                 for (size_t p = 0; p < item.platforms.size(); ++p) {
                     const auto& state = item.platforms[p];
                     const float x = row.x + left + float(p) * cell_w;
-                    const auto color = state.state == 2 ? c.th.tint : state.state == 3 ? c.th.destructive :
+                    const auto color = state.state == 2 ? c.th.tint : state.state == 3 ? c.th.red :
                         state.state == 1 || state.state == 5 || state.state == 6 ? c.th.label2 : c.th.label3;
                     c.ui.fill_circle(x + 4, row.y + 43, 3, color);
                     c.ui.draw_text(state.name, {x + 14, row.y + 35, cell_w - 16, 16}, c.th.label2, Style().font(10.5f));
@@ -1890,7 +1890,7 @@ static void source_tab_builtin(Ctx& c, const Rect& area) {
         const bool bad = rep.rfind("失败", 0) == 0;
         const Rect status{card.x + 34, card.y + 38, std::max(40.0f, card.w - 160), 16};
         c.ui.draw_text(ellipsize(c.ui, rep, status.w, 11), status,
-                       bad ? c.th.destructive : c.th.label2, Style().font(11.0f));
+                       bad ? c.th.red : c.th.label2, Style().font(11.0f));
         c.ui.tooltip(status, rep);
         if (bad) {
             auto retry = Style().font(10.5f); retry.disabled = c.s.searching;
@@ -1985,7 +1985,7 @@ static void account_card(Ctx& c, int site, const Rect& box) {
         if (connecting) cancel_login(site); else begin_login(site);
     }
     if (!error.empty() || !note.empty()) c.ui.draw_text(ellipsize(c.ui, error.empty() ? note : error, box.w - 32, 10.5f),
-        {box.x + 16, box.y + 66, box.w - 32, 16}, error.empty() ? c.th.label3 : c.th.destructive, Style().font(10.5f));
+        {box.x + 16, box.y + 66, box.w - 32, 16}, error.empty() ? c.th.label3 : c.th.red, Style().font(10.5f));
 }
 static void storage_settings(Ctx& c, float x, float w, float y) {
     const Rect paths{x, y + 28, w, 144};
@@ -2007,7 +2007,7 @@ static void storage_settings(Ctx& c, float x, float w, float y) {
         const float top = data.y + i * 66;
         c.ui.draw_text(names[i], {x + 16, top + 10, w - 112, 20}, c.th.label, Style().font(12));
         c.ui.muted_text(ellipsize(c.ui, details[i], w - 112, 10.5f), {x + 16, top + 34, w - 112, 18}, Style().font(10.5f));
-        if (c.ui.button("清除…", {x + w - 80, top + 20, 64, 26}, Style().ghost().font(11).color(c.th.destructive))) c.model.ui.clear_action = actions[i];
+        if (c.ui.button("清除…", {x + w - 80, top + 20, 64, 26}, Style().ghost().font(11).color(c.th.red))) c.model.ui.clear_action = actions[i];
         if (i < 3) settings_rule(c, data, top + 66);
     }
     c.ui.muted_text("清除前会再次确认。已下载的音乐和本地音频文件会保留。", {x + 2, data.bottom() + 12, w - 4, 36}, Style().font(10.5f).wrap_text());
@@ -2088,7 +2088,7 @@ static void update_settings(Ctx& c, float x, float w, float y) {
     c.ui.muted_text(std::string("版本 ") + kVersion, {x + 78, card.y + 47, w - 98, 18}, Style().font(11));
     const auto& update = c.model.update;
     c.ui.draw_text(update.message.empty() ? "启动时自动检查 GitHub 正式版" : update.message,
-        {x + 20, card.y + 87, w - 40, 48}, update.status == UpdateStatus::Failed ? c.th.destructive : c.th.label2, Style().font(11.5f).wrap_text());
+        {x + 20, card.y + 87, w - 40, 48}, update.status == UpdateStatus::Failed ? c.th.red : c.th.label2, Style().font(11.5f).wrap_text());
     if (!update.message.empty()) c.ui.tooltip({x + 20, card.y + 87, w - 40, 48}, update.message);
     Style check = Style().font(11);
     check.disabled = update.status == UpdateStatus::Checking || update.status == UpdateStatus::Downloading ||
@@ -2184,7 +2184,7 @@ static void tab_downloads(Ctx& c) {
         const float tw = std::max(20.0f, row.w - 100);
         c.ui.draw_text(ellipsize(c.ui, d.name, tw, 12), {row.x + 4, row.y + 9, tw, 20}, c.th.label, Style().font(12));
         const std::string status = d.publishing ? "正在保存文件与标签" : d.done ? (d.preview ? "试听片段（不作为完整离线版本）" : "已完成") : d.missing ? "文件已移动或改变" : d.cancelled ? "已取消" : d.failed ? d.err : d.queued ? "等待下载" : "正在下载 " + std::to_string(d.percent) + "%";
-        c.ui.draw_text(ellipsize(c.ui, status, tw, 10.5f), {row.x + 4, row.y + 34, tw, 18}, d.failed ? c.th.destructive : c.th.label2, Style().font(10.5f));
+        c.ui.draw_text(ellipsize(c.ui, status, tw, 10.5f), {row.x + 4, row.y + 34, tw, 18}, d.failed ? c.th.red : c.th.label2, Style().font(10.5f));
         c.ui.tooltip({row.x, row.y + 30, tw, 23}, status);
         const auto stamp = [](long long value) { if (!value) return std::string("未知时间"); const auto time = static_cast<std::time_t>(value / 1000); std::tm local{};
 #ifdef _WIN32
@@ -2447,7 +2447,7 @@ static void shortcuts_settings(Ctx& c, const Rect& area) {
     if (c.ui.button("恢复默认", {area.x, reset_y, 96, 28}, Style().font(11))) { state.shortcuts = {}; changed = true; }
     if (changed) { state.config_dirty = true; state.shortcut_error.clear(); }
     const auto detail = state.shortcut_error.empty() ? "若组合键被其他程序占用会在这里提示。Wayland 请在桌面键盘设置中配置媒体快捷键。" : state.shortcut_error;
-    c.ui.draw_text(detail, {area.x, reset_y + 42, area.w - 16, compact ? 100.0f : 64.0f}, state.shortcut_error.empty() ? c.th.label2 : c.th.destructive, Style().font(11).wrap_text().top());
+    c.ui.draw_text(detail, {area.x, reset_y + 42, area.w - 16, compact ? 100.0f : 64.0f}, state.shortcut_error.empty() ? c.th.label2 : c.th.red, Style().font(11).wrap_text().top());
 }
 static void tab_settings(Ctx& c) {
     const float available = c.W - kSidebar - right_panel_width(c);
@@ -2719,7 +2719,7 @@ static void player_bar(Ctx& c) {
     c.ui.draw_text(ellipsize(c.ui, title, title_w, 12.5f, 600), {tx, y + 14, title_w, 19}, c.s.now_title.empty() ? c.th.label2 : c.th.label, Style().font(12.5f).weight(600));
     if (state_badge) {
         const std::string state = c.s.ps == PlayState::Failed ? "播放失败" : c.s.pending_paused ? "已暂停" : playback_stage_name(c.s.stage);
-        c.ui.draw_text(state, {tx + tw - lane_w - 72, y + 14, 72, 19}, c.s.ps == PlayState::Failed ? c.th.destructive : c.th.tint, Style().font(9.5f).right());
+        c.ui.draw_text(state, {tx + tw - lane_w - 72, y + 14, 72, 19}, c.s.ps == PlayState::Failed ? c.th.red : c.th.tint, Style().font(9.5f).right());
     }
     if (has_lane) {
         const Rect chip{tx + tw - lane_w + 2, y + 15, lane_w - 4, 17};
@@ -2782,7 +2782,7 @@ static void player_bar(Ctx& c) {
     if (dl != c.model.downloads.end() && !dl->second.done && !dl->second.failed)
         c.ui.draw_text(std::to_string(dl->second.percent), download, c.th.tint, Style().font(9).center());
     else c.ui.system_icon(dl != c.model.downloads.end() && dl->second.done ? SystemIcon::Check : dl != c.model.downloads.end() && dl->second.failed ? SystemIcon::Warning : SystemIcon::Download,
-        download.center(15, 15), dl != c.model.downloads.end() && dl->second.failed ? c.th.destructive : c.th.label2);
+        download.center(15, 15), dl != c.model.downloads.end() && dl->second.failed ? c.th.red : c.th.label2);
     const bool saved = !c.s.now_track.variants.empty() && c.model.favorites.contains(c.s.now_track);
     if (c.ui.icon_button("", favorite, track_action)) favorite_toggle(c.s.now_track);
     if (saved) c.ui.fill_rect(favorite, c.th.tint.scaled_alpha(0.1f), 6);

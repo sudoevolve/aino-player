@@ -270,7 +270,8 @@ static void menu_checks() {
 #ifdef _WIN32
 static void windows_event_wakeup_checks() {
     using namespace aino;
-    Window window(320, 200, "Windows desktop event wakeup");
+    WindowConfig config; config.width = 320; config.height = 200; config.title = "Windows desktop event wakeup";
+    Window window(config);
     check(window.ok(), "desktop wakeup fixture window");
     const auto handle = static_cast<detail::Win32State*>(window.impl->native)->hwnd;
     window.poll(); window.render(); window.poll();
@@ -320,7 +321,8 @@ static void windows_event_wakeup_checks() {
 }
 static void ime_backend_checks() {
     using namespace aino;
-    Window window(320,200,"IME candidate position"); check(window.ok(),"IME probe window");
+    WindowConfig config; config.width = 320; config.height = 200; config.title = "IME candidate position";
+    Window window(config); check(window.ok(),"IME probe window");
     // Windows IME 恢复上游基线探针；此处保留独立的模态绘制重入检查。
     auto* ui = window.impl->ui.impl;
     bool drawn=false;
