@@ -10,12 +10,13 @@
 //      #include "aino.hpp"
 //
 //  编译：
-//      MSVC: cl /std:c++17 /utf-8 /EHsc /MT main.cpp user32.lib gdi32.lib
+//      MSVC: cl /std:c++17 /utf-8 /EHsc /MT main.cpp user32.lib gdi32.lib ole32.lib windowscodecs.lib
 //      GCC: g++ -std=c++17 main.cpp -lX11 -ldl
-//      Clang: clang++ -std=c++17 main.cpp -framework Cocoa -framework CoreText -framework CoreGraphics
+//      Wayland: g++ -std=c++17 -DAINO_WAYLAND main.cpp -ldl -pthread
+//      Clang: clang++ -std=c++17 main.cpp -framework Cocoa -framework CoreText -framework CoreGraphics -framework ImageIO
 //
 //  源码为 UTF-8，MSVC 使用 /utf-8。
-//  静态运行时与平台依赖说明见 docs/01-quickstart.md。
+//  静态运行时与平台依赖说明见 docs/wiki/01-quickstart.md。
 //
 //  作者：sudoevolve <sudoevolve@gmail.com>
 //  许可：Apache-2.0（见 LICENSE）
@@ -31,8 +32,8 @@
 
 #define AINO_VERSION_MAJOR 0
 #define AINO_VERSION_MINOR 5
-#define AINO_VERSION_PATCH 2
-#define AINO_VERSION "0.5.2"
+#define AINO_VERSION_PATCH 3
+#define AINO_VERSION "0.5.3"
 
 #include <cstdint>
 #include <cstddef>
@@ -40,6 +41,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
+#include <algorithm>
+#include <utility>
 #include <string>
 #include <vector>
 #include <map>
@@ -53,7 +56,12 @@
 #elif defined(__APPLE__)
 #  define AINO_PLATFORM_MACOS 1
 #elif defined(__linux__) || defined(__unix__)
-#  define AINO_PLATFORM_X11 1
+#  if defined(AINO_WAYLAND)
+#    define AINO_PLATFORM_WAYLAND 1
+#  else
+#    define AINO_PLATFORM_X11 1
+#  endif
+#  define AINO_PLATFORM_UNIX 1
 #else
 #  error "aino: 未支持的平台"
 #endif
@@ -120,12 +128,7 @@ struct Color {
                      uint8_t(g * (1.0f - amount) + 0.5f),
                      uint8_t(b * (1.0f - amount) + 0.5f), a);
     }
-    // 把本层（可能是半透明）**压到** base 上，得到"实际看到的颜色"。
-    //
-    // 判断"该配深色还是浅色前景"之前必须先压平：`th.muted`（rgba(0,0,0,13)）、
-    // `th.label2`（rgba(0,0,0,128)）这些 token 都带 alpha，直接 luminance() 量到的
-    // 是它们自己 RGB 的亮度 —— 一个 5% 黑的填充在浅色主题下会被判成"黑底"，
-    // 于是配上白字，实际看到的是"白字 + 近乎白的圆"，什么也读不出来。
+    // 将本色合成到不透明 base 上；半透明颜色判断前景对比度前应先合成。
     Color over(const Color& base) const {
         if (a == 255) return *this;
         const float t = float(a) / 255.0f;
@@ -145,6 +148,23 @@ struct Color {
     bool operator==(const Color& o) const { return r == o.r && g == o.g && b == o.b && a == o.a; }
     bool operator!=(const Color& o) const { return !(*this == o); }
 };
+
+// 解码后的 RGBA 像素（非预乘 alpha）；加载一次，跨帧复用。
+struct Image {
+    int width = 0, height = 0;
+    std::vector<uint8_t> pixels;
+    bool load(const std::string& path, std::string* error = nullptr);
+    bool load_resource(int resource_id, std::string* error = nullptr);
+    bool valid() const {
+        return width > 0 && height > 0 && width <= 16384 && height <= 16384 &&
+               uint64_t(width) * uint64_t(height) <= 67108864u &&
+               pixels.size() == size_t(width) * size_t(height) * 4u;
+    }
+};
+
+/** @brief 当前可执行文件的 UTF-8 目录，含末尾分隔符；无法取得时返回空字符串。
+ */
+std::string executable_directory();
 
 struct Vec2 {
     float x = 0, y = 0;
@@ -531,7 +551,7 @@ struct Style {
 
     // 语义变体
     Style& primary()     { variant = Default;     return *this; }
-    /** @brief 中性实心按钮，带细边缘；Secondary 使用半透明填充。 */
+    /** @brief 中性实心按钮；Secondary 使用半透明填充。 */
     Style& standard()    { variant = Standard;    return *this; }
     Style& secondary()   { variant = Secondary;   return *this; }
     Style& outline()     { variant = Outline;     return *this; }
@@ -633,26 +653,15 @@ struct Input {
 // =============================================================================
 //  五、Stack —— 顺序布局器
 //
-//  立即模式没有控件树，"画完再排版"这条路走不通，只能边画边切。所以这里的
-//  做法是：给一个矩形和一条主方向，让调用方按顺序把它切开。
+//  从指定矩形沿主方向依次切分空间，调用方负责元素尺寸。
 //
 //      Stack col = ui.vbox({x, y, w, h}, 10);   // 纵向，元素间距 10
 //      ui.heading("标题", col.next(32));
 //      ui.button("确定",  col.next(36));
 //      ui.button("更多",  col.fill());          // 吃掉剩余
 //
-//  和手写 yy 游标相比，这里多出四件事：
-//    · gap 只在两个元素之间生效（同 CSS 的 gap 语义），所以 fill() 拿到的是
-//      精确的剩余空间，不会白少一个间距；
-//    · next_frac / part 做比例与等分，不用自己算 (pw - 12) * 0.5；
-//    · next_text 按文字真实像素宽度定宽 —— 系统字体引擎可以直接量，这是
-//      "宽度自适应"能做而"高度自适应"不能做的原因；
-//    · 子布局可以嵌套，父子之间继承 gap。
-//
-//  刻意不做：内容自适应高度、自动换行、网格、约束求解。它们要么需要两趟
-//  遍历，要么需要尺寸缓存依赖图，与"单头文件、最小示例 exe 约 380 KiB"的目标直接冲突。
-//  布局器本身是纯值语义（一个 Rect + 一个方向 + 一个间距），不注册任何
-//  状态，所以嵌套/丢弃/复制都没有代价。
+//  gap 只加在元素之间；next_frac / part 提供比例与等分，子布局可继承 gap。
+//  Stack 可按值复制，不拥有控件状态；不自动换行或计算内容高度。
 // =============================================================================
 class Ui;
 
@@ -673,16 +682,9 @@ private:
     uint64_t previous_ = 0;
 };
 
-// -----------------------------------------------------------------------------
-//  ScrollScope —— 一个滚动视口的句柄（`ui.scroll()` 的返回值）
-//
-//  滚动只有一件事：**一个视口 + 一段内容高度**。虚拟列表不是另一套东西，
-//  只是"内容高度 = 行数 × 行高"的特例。所以这里只有一种句柄，通用与虚拟
-//  共用：同一份偏移记忆（按 box 记忆）、同一根滚动条、同一套裁剪。
-//
-//  句柄析构时自动收尾（弹裁剪、还原布局偏移、画滚动条）—— 于是不需要
-//  begin/end 手工配对；提前想收尾就调 close()（可重复调用）。
-// -----------------------------------------------------------------------------
+/** @brief 滚动视口的作用域句柄；析构或 close() 时恢复裁剪与布局并绘制滚动条。
+ * 在所属 Ui 存活期间、同一帧内按嵌套顺序关闭；不要覆盖仍活跃的句柄。
+ */
 struct ScrollScope {
     Ui*      ui         = nullptr;
     uint64_t id         = 0;
@@ -753,16 +755,8 @@ private:
 // =============================================================================
 //  五之二、动画与变换
 //
-//  动画：本库**没有**常驻动画系统（那会让空闲 CPU 从 0% 变 100%），只有两种
-//  明确的东西：
-//    · tween()  —— 目标驱动的补间。目标一变就从当前显示值重新起跑，跑完自动
-//                   停止要帧；停下来的那一刻起 CPU 回到 0。
-//    · smooth() —— 指数平滑的纯函数，适合跟随鼠标这类"没有终点"的量。
-//  两者都不注册任何东西、不依赖控件树 —— 立即模式的本分。
-//
-//  变换：push_transform / pop_transform 叠加一个仿射变换（平移 → 旋转 → 缩放
-//  作用于局部坐标）。它只影响**绘制**，不影响布局与命中判定：布局仍然算逻辑
-//  坐标，"看起来变了"和"点得到"是两件事（CSS transform 也是这个语义）。
+//  tween 按目标推进并在完成后停止续帧；smooth 是不申请帧的指数平滑函数。
+//  push_transform / pop_transform 只影响绘制，不影响布局与命中坐标。
 // =============================================================================
 using Easing = float (*)(float);
 
@@ -803,6 +797,7 @@ struct MenuPick {
 // =============================================================================
 //  六、Ui —— 每帧的绘制与组件入口
 // =============================================================================
+/** @brief 绘制、布局与交互入口；在所属 UI 线程使用。 */
 class Ui {
 public:
     Ui();
@@ -853,6 +848,8 @@ public:
      * 每帧仅在动画仍需推进时调用；停止调用即停止续帧，不改变全局动画开关。
      */
     bool request_animation_frame();
+    /** @brief 当前帧登记一次延迟重绘；下一帧若仍需要，应重新登记。仅 UI 线程调用。 */
+    void request_frame_in(float seconds);
 
     // ---- 布局测量 ----
     // 进入后所有图元与命中测试只记账、不落地（不画、不响应、不排帧）。
@@ -905,6 +902,8 @@ public:
     void fill_crescent(float cx, float cy, float radius,
                        float cut_cx, float cut_cy, float cut_radius, const Color& c);
     void draw_line(float x0, float y0, float x1, float y1, const Color& c, float width = 1.0f);
+    /** @brief 将已解码图像拉伸到 box，遵守当前裁剪与变换。 */
+    void draw_image(const Image& image, const Rect& box);
     // 画文本；Style 支持字号、字重、斜体、对齐、折行与行距。
     void draw_text(const std::string& text, const Rect& box, const Color& c, const Style& st = Style());
     /** @brief 在指定区域居中绘制系统图标；尊重当前裁剪、缩放和颜色。 */
@@ -1115,11 +1114,11 @@ public:
     // 轻提示条（通常自己摆在右下角；生命周期由调用方用 bool 控制）
     void toast(const std::string& text, const Rect& box, const Style& st = Style());
 
-    // Popover：点触发器弹任意内容。draw 在**帧末**被调用一次，拿到内容区矩形。
-    // 返回"本帧是否处于打开态"。
+    // Popover：返回调用时的打开状态；draw 在帧末执行，收到内容区矩形。
+    // open 及回调引用的数据须存活至本帧结束；回调关闭面板不改变已返回的值。
     bool popover(const std::string& label, bool* open, const Rect& box, Vec2 content,
                  const std::function<void(const Rect&)>& draw, const Style& st = Style());
-    // Hover Card：悬停 anchor 弹任意内容（不点击、不抢焦点）
+    // Hover Card：悬停时在帧末绘制只读内容；回调引用的数据须存活至本帧结束。
     void hover_card(const Rect& anchor, Vec2 content, const std::function<void(const Rect&)>& draw,
                     const Style& st = Style());
     // Alert Dialog：带确认/取消的模态框。返回 true 表示本帧点了确认。
@@ -1141,7 +1140,7 @@ public:
     bool split_pane(float* ratio, const Rect& box, Rect* first, Rect* second,
                     bool vertical = true, float min_ratio = 0.15f, const Style& st = Style());
 
-    // 把绘制推迟到帧末（弹出层用 —— 保证它盖在其它组件之上）
+    // 将回调推迟到 end_frame()；按值捕获临时值，引用的数据须存活至帧末。
     void deferred(std::function<void()> fn);
 
     // 布局辅助（立即模式下的轻量自动布局）
@@ -1214,34 +1213,45 @@ public:
     Impl* impl = nullptr;
 
 private:
+    bool tabs_impl(const std::vector<std::string>& labels, int* index, const Rect& box,
+                   const TabOptions& options, bool segmented_control, const Style& st);
     void repaint();
     friend struct ScrollScope;
+};
+
+// 带可拖动标题区的玻璃面板。每帧传入 bounds 作为默认位置；draw() 返回实际绘制位置，
+// 子控件基于返回值定位。radius、Style().blur(...) 和 Style().background(...) 可调节材质。
+//   GlassPanel panel(64.0f);
+//   Rect r = panel.draw(ui, bounds, 18.0f, Style().blur(14.0f).background(tint));
+class GlassPanel {
+public:
+    explicit GlassPanel(float drag_height = 72.0f) : drag_height_(drag_height) {}
+
+    Rect draw(Ui& ui, const Rect& bounds, float radius = 12.0f,
+              const Style& st = Style());
+    void set_drag_height(float height) { drag_height_ = std::max(0.0f, height); }
+    void reset() { offset_x_ = offset_y_ = 0.0f; dragging_ = false; }
+
+private:
+    float drag_height_ = 72.0f;
+    float offset_x_ = 0.0f, offset_y_ = 0.0f;
+    float drag_offset_x_ = 0.0f, drag_offset_y_ = 0.0f;
+    bool dragging_ = false;
 };
 
 // =============================================================================
 //  七、Window —— 窗口与主循环
 // =============================================================================
 
-// 窗口配置。默认值就是"能直接跑"：1180×760 之外都留空。
-//
-// 为什么用结构体而不是一串重载：窗口可配的东西会一直长（图标、字体、
-// 尺寸约束、是否可缩放、居中），每加一项就多一个构造函数重载不是办法。
-// 结构体 + 指定初始化还能只写想改的那几项：
-//
-//     aino::Window win({ .width = 1180, .height = 760, .title = "aino",
-//                        .icon_path = "app.ico", .min_width = 900 });
-//
-// 指定初始化要 C++20；C++17 下老老实实逐字段赋值，或者用 builder 式的
-// `WindowConfig cfg; cfg.width = ...;`
+// 窗口配置。C++17 用 WindowConfig cfg; cfg.width = ...; 按需覆盖默认值。
 struct WindowConfig {
     int         width  = 1180;
     int         height = 760;
     std::string title  = "aino";
 
     // ---- 图标 ----
-    // Windows 读 .ico（LoadImage 直接认）；macOS 读 .png / .icns 并设成
-    // **应用图标**（macOS 的窗口本身没有标题栏图标这个位置，只能改 Dock）；
-    // X11 目前忽略（_NET_WM_ICON 要自己把 PNG 解成 ARGB，这一版不做）。
+    // Windows: .ico; macOS: image or .icns for Dock; X11: _NET_WM_ICON。
+    // Wayland 通过 app_id 和桌面 .desktop 文件匹配图标。
     std::string icon_path;
 
     // ---- 字体 ----
@@ -1249,8 +1259,7 @@ struct WindowConfig {
     // 再按文件里 `name` 表写着的家族名排版 —— 所以不用手工填家族名。
     // 只填 font_family 则使用系统已安装的家族名。两个都填时：先注册文件，
     // 家族名以文件为准；注册失败才退回 font_family。
-    // X11 忽略 font_path（核心 X 字体没有"加载字体文件"这条路，只能按
-    // 家族名挑已装的 XLFD），此时行为等同只填 font_family。
+    // Linux 不注册字体文件；解析出的家族名仍通过 fontconfig 匹配。
     std::string font_path;
     std::string font_family;            // 空 = 平台默认无衬线
     std::string font_family_mono;       // 空 = Consolas / 平台等宽
@@ -1269,12 +1278,19 @@ struct WindowConfig {
     bool center = true;
 
     // Windows：关掉后不声明进程 DPI 感知，由系统缩放；只有第一个窗口说了算。
-    // X11：关掉后固定使用 1 倍逻辑像素，不读取桌面 DPI 或缩放环境变量。
+    // Linux：关掉后固定以 1 倍栅格绘制；Wayland 的输出缩放由 compositor 协调。
     bool high_dpi = true;
-    /** @brief UI 线程收到系统关闭请求时调用；返回 false 取消关闭（例如隐藏到托盘）。 */
+
+    /** @brief UI 线程收到系统关闭请求时调用；返回 false 取消关闭。 */
     std::function<bool()> close_requested;
+
+    /** @brief Wayland 的桌面标识，应与 .desktop 文件名一致；其他后端忽略。 */
+    std::string app_id = "aino";
 };
 
+/** @brief 原生窗口与事件循环；除 wake()/close() 外，在所属 UI 线程操作。
+ * macOS 必须使用主线程；后台调用者须在窗口析构前结束。
+ */
 class Window {
 public:
     explicit Window(const WindowConfig& cfg);
@@ -1304,18 +1320,8 @@ public:
     // 跨线程叫醒主循环请使用 wake()。
     void request_repaint();
 
-    // 跨线程叫醒主循环。
-    //
-    // request_repaint() 只置一个标志位 —— 主循环空闲时是阻塞在内核里的
-    // （WaitMessage / XNextEvent），光改标志叫不醒它。所以**后台线程**里有
-    // 数据到达时（SSH 收字节、下载进度、日志尾部、长任务回调）要用这个：
-    //
-    //     std::thread([&] {
-    //         while (running) { if (recv_new_bytes()) win.wake(); }
-    //     }).detach();
-    //
-    // 通知内核事件/管道，由 UI 线程消费后请求一帧；不会从后台调用 Xlib/AppKit。
-    // 主线程也可调用。调用方保证窗口存活，后台线程须在窗口析构前结束。
+    // 唤醒阻塞的主循环并请求一帧，可跨线程调用；应用数据仍须自行同步。
+    // 不调用 Xlib/AppKit；后台线程须在窗口析构前结束，不要分离捕获窗口引用的线程。
     void wake();
 
     // 常驻动画（spinner / 光标闪烁 / hover 插值）的重绘帧率上限，默认 60fps。
@@ -1339,6 +1345,11 @@ public:
     // 主循环：事件驱动。有事件就处理，没事件就阻塞在内核等待 —— 空闲 0% CPU。
     // frame 回调只在"需要重绘"时被调用，所以它可以放心地重建整个 UI。
     void run(const std::function<void(Ui&)>& frame);
+    /** @brief 注册同线程子窗口的绘制回调，由该线程正在运行的 run() 派发。
+     * @note 按值持有回调。窗口及回调状态必须在所属 UI 线程销毁，不能在自身回调中销毁窗口。
+     * macOS 的窗口与事件循环必须位于主线程；清空回调可停止自动绘制。
+     */
+    void set_frame_callback(std::function<void(Ui&)> frame);
 
     // 单步：给需要自己控制循环的人用
     bool poll();                       // 处理一批消息，返回是否仍存活
@@ -1347,6 +1358,8 @@ public:
 
     // 剪贴板（input 组件的复制粘贴用）
     void set_clipboard(const std::string& text);
+    /** @brief 写入系统剪贴板；失败返回 false，调用者应保留原始内容。 */
+    bool try_set_clipboard(const std::string& text);
     std::string clipboard() const;
 
     struct Impl;
@@ -1357,17 +1370,18 @@ public:
 //  八、内置图标（用 Unicode 符号，免依赖；也可换成你自己的字体图标）
 // =============================================================================
 namespace icons {
-    extern const char* check;
-    extern const char* chevron_down;
-    extern const char* chevron_right;
-    extern const char* close;
-    extern const char* plus;
-    extern const char* minus;
-    extern const char* search;
-    extern const char* settings;
-    extern const char* sun;
-    extern const char* moon;
-    extern const char* dot;
+    // C++17 inline 定义对所有调用单元可见，不依赖实现单元是否使用这些符号。
+    inline const char* check = "\xE2\x9C\x93";         // ✓
+    inline const char* chevron_down = "\xE2\x8C\x84";  // ⌄
+    inline const char* chevron_right = "\xE2\x80\xBA"; // ›
+    inline const char* close = "\xE2\x9C\x95";         // ✕
+    inline const char* plus = "+";
+    inline const char* minus = "\xE2\x88\x92";         // −
+    inline const char* search = "\xE2\x8C\x95";        // ⌕
+    inline const char* settings = "\xE2\x9A\x99";      // ⚙
+    inline const char* sun = "\xE2\x98\x80";           // ☀
+    inline const char* moon = "\xE2\x98\xBE";          // ☾
+    inline const char* dot = "\xE2\x80\xA2";           // •
 }
 
 /**
@@ -1400,6 +1414,7 @@ int system_icon_worker_entry(int argc, char** argv);
 #  endif
 #  include <windows.h>
 #  include <windowsx.h>
+#  include <wincodec.h>
 #elif defined(AINO_PLATFORM_X11)
 #  include <X11/Xlib.h>
 #  include <X11/Xutil.h>
@@ -1407,7 +1422,13 @@ int system_icon_worker_entry(int argc, char** argv);
 #  include <X11/cursorfont.h>   // XC_left_ptr / XC_hand2 ...
 #  include <X11/keysym.h>
 #  include <X11/Xatom.h>
+#endif
+#if defined(AINO_PLATFORM_UNIX)
 #  include <unistd.h>
+#  include <sys/mman.h>
+#  include <sys/socket.h>
+#  include <pthread.h>
+#  include <clocale>
 #  include <cerrno>       // XOpenDisplay 失败时要报 errno（EAGAIN=11 是"现在别连"）
 // 文字渲染：FreeType + fontconfig（运行时 dlopen），核心 XLFD 字体兜底。
 //
@@ -1435,7 +1456,8 @@ int system_icon_worker_entry(int argc, char** argv);
 #    include <filesystem>
 extern char** environ;
 #  endif
-#elif defined(AINO_PLATFORM_MACOS)
+#endif
+#if defined(AINO_PLATFORM_MACOS)
 // MacTypes.h 会往**全局**塞 ::Rect 和 ::Style（QuickDraw 遗产），和 aino::Rect /
 // aino::Style 撞名 —— 用户代码里 `using aino::Rect;` 会变成二义性。包含系统头之前
 // 先把这两个名字改掉，让全局只剩 MacRect / MacStyle（SDL 处理 QuickDraw 也是这招）。
@@ -1443,9 +1465,12 @@ extern char** environ;
 #  define Style MacStyle
 #  include <ApplicationServices/ApplicationServices.h>
 #  include <CoreText/CoreText.h>
+#  include <ImageIO/ImageIO.h>
 #  include <objc/objc.h>
 #  include <objc/message.h>
 #  include <objc/runtime.h>
+#  include <mach-o/dyld.h>
+#  include <pthread.h>
 #  undef Rect
 #  undef Style
 #  include <unistd.h>
@@ -1462,10 +1487,12 @@ extern char** environ;
 #include <list>
 #include <limits>
 #include <unordered_map>
+#include <type_traits>
 #include <deque>
 #include <memory>
 #include <fstream>
 #include <atomic>
+#include <mutex>
 #if !defined(AINO_PLATFORM_WINDOWS)
 #  include <poll.h>
 #  include <fcntl.h>
@@ -1474,6 +1501,14 @@ extern char** environ;
 
 namespace aino {
 namespace detail {
+
+template<class Fn> struct ScopeExit {
+    Fn fn;
+    explicit ScopeExit(Fn action) : fn(std::move(action)) {}
+    ScopeExit(const ScopeExit&) = delete;
+    ScopeExit& operator=(const ScopeExit&) = delete;
+    ~ScopeExit() { fn(); }
+};
 
 // =============================================================================
 //  8.1  基础工具
@@ -1701,7 +1736,7 @@ inline std::string font_family_from_file(const std::string& path) {
 
 // =============================================================================
 //  8.2  像素画布 + CPU 光栅化
-//     内存布局：4 字节/像素。Windows / X11 是 BGRA，macOS 是 RGBA。
+//     内存布局：4 字节/像素。Windows / Linux 是 BGRA，macOS 是 RGBA。
 // =============================================================================
 #ifdef AINO_PLATFORM_MACOS
 static const int CH_R = 0, CH_G = 1, CH_B = 2, CH_A = 3;
@@ -2604,16 +2639,32 @@ inline void raster_rrect_inner(Canvas& cv, const Rect& r, float rad, float blur,
     if (c.a == 0 || blur <= 0.01f) return;
     int y0 = std::max(0, (int)std::floor(r.y)), y1 = std::min(cv.h, (int)std::ceil(r.bottom()));
     int x0 = std::max(0, (int)std::floor(r.x)), x1 = std::min(cv.w, (int)std::ceil(r.right()));
+    if (cv.clipped) {
+        x0 = std::max(x0, cv.clip_x0); x1 = std::min(x1, cv.clip_x1);
+        y0 = std::max(y0, cv.clip_y0); y1 = std::min(y1, cv.clip_y1);
+    }
     if (y1 <= y0 || x1 <= x0) return;
+    const float inset = std::max(blur, std::min(rad, std::min(r.w, r.h) * 0.5f));
+    const int middle0 = clampi(int(std::ceil(r.x + inset - 0.5f)), x0, x1);
+    const int middle1 = clampi(int(std::ceil(r.right() - inset - 0.5f)), middle0, x1);
     for (int py = y0; py < y1; ++py) {
-        if (cv.clipped && (py < cv.clip_y0 || py >= cv.clip_y1)) continue;
-        for (int px = x0; px < x1; ++px) {
-            const float d = -rrect_sdf(float(px) + 0.5f, float(py) + 0.5f - dy, r, rad);
-            if (d <= -1.0f) continue;                       // 完全在形状外
-            const float edge = clampf(d + 1.0f, 0.0f, 1.0f); // 边界抗锯齿
-            const float t = clampf(1.0f - std::max(d, 0.0f) / blur, 0.0f, 1.0f);
-            const float a = t * t * edge;
-            if (a > 0.002f) cv.blend(px, py, c, a);
+        const float sample_y = float(py) + 0.5f - dy;
+        const bool skip_middle = sample_y >= r.y + inset && sample_y <= r.bottom() - inset;
+        auto draw_range = [&](int first, int last) {
+            for (int px = first; px < last; ++px) {
+                const float d = -rrect_sdf(float(px) + 0.5f, sample_y, r, rad);
+                if (d <= -1.0f) continue;
+                const float edge = clampf(d + 1.0f, 0.0f, 1.0f);
+                const float t = clampf(1.0f - std::max(d, 0.0f) / blur, 0.0f, 1.0f);
+                const float a = t * t * edge;
+                if (a > 0.002f) cv.blend(px, py, c, a);
+            }
+        };
+        if (skip_middle) {
+            draw_range(x0, middle0);
+            draw_range(middle1, x1);
+        } else {
+            draw_range(x0, x1);
         }
     }
 }
@@ -2913,6 +2964,7 @@ inline void blur_backdrop(Canvas& cv, const Rect& p, float rad, float blur) {
     // 8.8 定点：两级插值各 1/256 精度，肉眼足够；关键是乘积留在 32 位里
     // （16.16 的两段相乘要到 2^48，只能用 64 位乘法，慢一倍）。
     const int step = 256 / S;                   // 输出 1px 在缩小图上的步进
+    const int channels[3] = {CH_R, CH_G, CH_B};
     const float frad = rad;
     for (int y = ry0; y < ry1; ++y) {
         if (cv.clipped && (y < cv.clip_y0 || y >= cv.clip_y1)) continue;
@@ -2949,9 +3001,10 @@ inline void blur_backdrop(Canvas& cv, const Rect& p, float rad, float blur) {
                 const int top = int(s00[ch]) * iw + int(s10[ch]) * wx;
                 const int bot = int(s01[ch]) * iw + int(s11[ch]) * wx;
                 const int v = (top * ih + bot * wy) >> 16;
-                q[ch] = (cov >= 0.999f)
-                      ? uint8_t(v)
-                      : uint8_t(float(q[ch]) + (float(v) - float(q[ch])) * cov + 0.5f);
+                const int channel = channels[ch];
+                q[channel] = (cov >= 0.999f)
+                            ? uint8_t(v)
+                            : uint8_t(float(q[channel]) + (float(v) - float(q[channel])) * cov + 0.5f);
             }
         };
         if (y_flat) {
@@ -3011,6 +3064,9 @@ struct TextRenderer {
         draw(cv, utf8, cx - w * 0.5f, cy - lh * 0.5f, pixel_size, weight, c, clip);
     }
     virtual void  release() = 0;
+    virtual void reconfigure(float dpi, const std::string& family, const std::string& mono) {
+        release(); init(dpi, family, mono);
+    }
 };
 
 #ifdef AINO_PLATFORM_WINDOWS
@@ -3206,6 +3262,12 @@ public:
     void invalidate_dc_state() { cur_font_ = nullptr; cur_color_ = 0xFFFFFFFF; cur_bk_ = -1; }
 
     void release() override {
+        if (cur_dc_ && GetObjectType(cur_dc_)) SelectObject(cur_dc_, GetStockObject(SYSTEM_FONT));
+        cur_dc_ = nullptr;
+        invalidate_dc_state();
+        if (mask_dc_) { DeleteDC(mask_dc_); mask_dc_ = nullptr; }
+        if (mask_bitmap_) { DeleteObject(mask_bitmap_); mask_bitmap_ = nullptr; }
+        mask_pixels_ = nullptr; mask_w_ = mask_h_ = 0;
         for (auto& kv : fonts_) if (kv.second) DeleteObject(kv.second);
         fonts_.clear();
         measure_cache_.clear();
@@ -3235,8 +3297,8 @@ public:
         SIZE sz{0, 0};
         GetTextExtentPoint32W(metric_dc_, w.c_str(), int(w.size()), &sz);
         SelectObject(metric_dc_, old);
-        // 满了一律清空会让接下来几十段文字全部回落到 GDI 往返（周期性卡顿）。
-        // 丢一半就腾得出空间，热的一半还在。
+        if (utf8.size() > 4096) return float(sz.cx); // 限制每项字节，条目数预算才有意义。
+        // 分批腾出空间，避免整表清空；unordered_map 的遍历顺序不是 LRU。
         if (measure_cache_.size() >= 2048) {
             auto it = measure_cache_.begin();
             for (int i = 0; i < 1024 && it != measure_cache_.end(); ++i) it = measure_cache_.erase(it);
@@ -3265,6 +3327,7 @@ public:
         GetTextMetricsW(metric_dc_, &tm);
         SelectObject(metric_dc_, old);
         const float v = float(tm.tmHeight + tm.tmExternalLeading);
+        if (lh_cache_.size() >= 256) lh_cache_.erase(lh_cache_.begin());
         lh_cache_[fk] = v;
         return v;
     }
@@ -3279,7 +3342,8 @@ public:
     }
     void draw_impl(Canvas& cv, const std::string& utf8, float x, float y_top,
                    float size, int weight, const Color& c, const Rect& clip, bool mono) {
-        if (utf8.empty()) return;
+        if (utf8.empty() || c.a == 0) return;
+        if (c.a < 255) { draw_alpha(cv, utf8, x, y_top, size, weight, c, clip, mono, 0); return; }
         HDC dc = reinterpret_cast<HDC>(cv.platform_dc);
         if (!dc) return;
         HFONT f = font(size, weight, 0, mono);
@@ -3312,7 +3376,7 @@ public:
     //     所以先把中心沿旋转后的 x/y 轴各退半宽半高，得到那个角。
     void draw_rot(Canvas& cv, const std::string& utf8, float cx, float cy,
                   float size, int weight, const Color& c, const Rect& clip, float degrees) override {
-        if (utf8.empty()) return;
+        if (utf8.empty() || c.a == 0) return;
         HDC dc = reinterpret_cast<HDC>(cv.platform_dc);
         if (!dc) return;
         const float w  = measure(utf8, size, weight);
@@ -3322,6 +3386,7 @@ public:
         const float hw = w * 0.5f, hh = lh * 0.5f;
         const float ax = cx - (hw * cs - hh * sn);
         const float ay = cy - (hw * sn + hh * cs);
+        if (c.a < 255) { draw_alpha(cv, utf8, ax, ay, size, weight, c, clip, false, degrees); return; }
 
         const int esc10 = int(-degrees * 10.0f);
         HGDIOBJ old_font = SelectObject(dc, font(size, weight, esc10));
@@ -3345,6 +3410,67 @@ public:
     }
 
 private:
+    // GDI 只提供覆盖率；透明文字在 CPU 上与任意背景合成。掩膜分块且复用，
+    // 不为每段文字分配原生对象，也不把 RGB 文字直接烘焙成不透明色。
+    void draw_alpha(Canvas& cv, const std::string& utf8, float x, float y, float size,
+                    int weight, const Color& color, const Rect& clip, bool mono, float degrees) {
+        if (!cv.px) return;
+        const float width = measure_impl(utf8, size, weight, mono);
+        const float height = line_height(size, weight);
+        const float radians = degrees * 3.14159265358979f / 180.0f;
+        const float cs = std::cos(radians), sn = std::sin(radians);
+        float left = x, right = x, top = y, bottom = y;
+        for (int i = 1; i < 4; ++i) {
+            const float dx = (i & 1) ? width : 0, dy = (i & 2) ? height : 0;
+            const float px = x + dx * cs - dy * sn, py = y + dx * sn + dy * cs;
+            left = std::min(left, px); right = std::max(right, px);
+            top = std::min(top, py); bottom = std::max(bottom, py);
+        }
+        // 字形可能在行盒外有 overhang；最终裁剪始终尊重调用方与 Canvas。
+        const float margin = std::max(2.0f, size);
+        Rect visible = Rect(left - margin, top - margin, right - left + 2 * margin,
+                            bottom - top + 2 * margin).intersect(Rect(0, 0, float(cv.w), float(cv.h)));
+        if (clip.w >= 0) visible = visible.intersect(clip);
+        if (cv.clipped) visible = visible.intersect(Rect(float(cv.clip_x0), float(cv.clip_y0),
+            float(cv.clip_x1 - cv.clip_x0), float(cv.clip_y1 - cv.clip_y0)));
+        if (visible.empty()) return;
+        const int x0 = int(std::floor(visible.x)), y0 = int(std::floor(visible.y));
+        const int x1 = int(std::ceil(visible.right())), y1 = int(std::ceil(visible.bottom()));
+        const int mw = std::min(4096, x1 - x0), mh = std::min(512, y1 - y0);
+        if (!mask_dc_ || mask_w_ < mw || mask_h_ < mh) {
+            if (mask_dc_) DeleteDC(mask_dc_);
+            if (mask_bitmap_) DeleteObject(mask_bitmap_);
+            mask_bitmap_ = nullptr; mask_pixels_ = nullptr;
+            mask_dc_ = CreateCompatibleDC(nullptr);
+            mask_w_ = mw; mask_h_ = mh;
+            BITMAPINFO info{};
+            info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            info.bmiHeader.biWidth = mw; info.bmiHeader.biHeight = -mh;
+            info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32;
+            if (mask_dc_) mask_bitmap_ = CreateDIBSection(mask_dc_, &info, DIB_RGB_COLORS,
+                reinterpret_cast<void**>(&mask_pixels_), nullptr, 0);
+            if (mask_bitmap_) SelectObject(mask_dc_, mask_bitmap_);
+        }
+        if (!mask_dc_ || !mask_bitmap_ || !mask_pixels_) return;
+        const HFONT selected = font(size, weight, int(-degrees * 10.0f), mono);
+        const HGDIOBJ old_font = SelectObject(mask_dc_, selected);
+        detail::ScopeExit restore_font([&] { SelectObject(mask_dc_, old_font); });
+        SetTextColor(mask_dc_, RGB(255, 255, 255)); SetBkMode(mask_dc_, TRANSPARENT);
+        const std::wstring text = to_wide(utf8);
+        GdiFlush();
+        for (int ty = y0; ty < y1; ty += mask_h_) for (int tx = x0; tx < x1; tx += mask_w_) {
+            std::memset(mask_pixels_, 0, size_t(mask_w_) * size_t(mask_h_) * 4);
+            SetViewportOrgEx(mask_dc_, -tx, -ty, nullptr);
+            ExtTextOutW(mask_dc_, int(std::floor(x + .5f)), int(std::floor(y + .5f)), 0,
+                nullptr, text.c_str(), UINT(text.size()), nullptr);
+            GdiFlush();
+            const int rows = std::min(mask_h_, y1 - ty), cols = std::min(mask_w_, x1 - tx);
+            for (int row = 0; row < rows; ++row) for (int col = 0; col < cols; ++col) {
+                const unsigned coverage = mask_pixels_[(size_t(row) * mask_w_ + col) * 4];
+                if (coverage) cv.blend(tx + col, ty + row, color, float(coverage) / 255.0f);
+            }
+        }
+    }
     static std::wstring& wide_scratch() {
         thread_local std::wstring b;
         return b;
@@ -3366,6 +3492,14 @@ private:
         const uint64_t key = font_key(size, weight, esc10, mono);
         auto it = fonts_.find(key);
         if (it != fonts_.end()) return it->second;
+        if (fonts_.size() >= 256) {
+            for (auto old = fonts_.begin(); old != fonts_.end(); ++old) {
+                if (old->second != cur_font_ && DeleteObject(old->second)) {
+                    fonts_.erase(old);
+                    break;
+                }
+            }
+        }
         int px = int(std::floor(float(int32_t(key >> 32)) / 4.0f + 0.5f));
         HFONT hf = CreateFontW(-px, 0, esc10, esc10, weight < 0 ? FW_NORMAL : weight,
                                FALSE, FALSE, FALSE, DEFAULT_CHARSET,
@@ -3382,6 +3516,10 @@ private:
         return hf;
     }
     HDC metric_dc_ = nullptr;
+    HDC mask_dc_ = nullptr;
+    HBITMAP mask_bitmap_ = nullptr;
+    uint8_t* mask_pixels_ = nullptr;
+    int mask_w_ = 0, mask_h_ = 0;
     float dpi_ = 1.0f;
     std::string family_, mono_;
     std::unordered_map<uint64_t, HFONT> fonts_;
@@ -3415,6 +3553,9 @@ void w32_destroy(Window* self);
 #elif defined(AINO_PLATFORM_X11)
 void x11_create(Window* self, const WindowConfig& cfg);
 void x11_destroy(Window* self);
+#elif defined(AINO_PLATFORM_WAYLAND)
+void wayland_create(Window* self, const WindowConfig& cfg);
+void wayland_destroy(Window* self);
 #elif defined(AINO_PLATFORM_MACOS)
 void cocoa_create(Window* self, const WindowConfig& cfg);
 void cocoa_destroy(Window* self);
@@ -3463,8 +3604,8 @@ Theme Theme::light() {
     t.row_alt           = Color::rgba(0, 0, 0, 13);
     t.overlay           = Color::rgba(171, 171, 171, 153);   // Miscellaneous/Alerts/Overlay
 
-    // ---- 强调色（macOS 27 Accents）----
-    t.blue   = Color::hex(0x0088FF); t.red    = Color::hex(0xFF383C);
+    // ---- 强调色（按 macOS 官方界面参考图取值）----
+    t.blue   = Color::hex(0x0084F7); t.red    = Color::hex(0xFF383C);
     t.orange = Color::hex(0xFF8D28); t.yellow = Color::hex(0xFFCC00);
     t.green  = Color::hex(0x34C759); t.mint   = Color::hex(0x00C8B3);
     t.teal   = Color::hex(0x00C3D0); t.cyan   = Color::hex(0x00C0E8);
@@ -3494,7 +3635,7 @@ Theme Theme::light() {
     t.destructive_foreground= Color::hex(0xFFFFFF);
     t.border                = t.separator;
     t.input                 = Color::rgba(0, 0, 0, 26);
-    t.ring                  = Color::rgba(0, 136, 255, 128);  // 焦点环 = 强调色 50%
+    t.ring                  = Color::rgba(0, 132, 247, 128); // 焦点环 = 强调色 50%
     return t;
 }
 
@@ -3533,7 +3674,7 @@ Theme Theme::dark() {
     t.overlay           = Color::rgba(23, 23, 23, 158);
 
     // ---- 强调色 ----
-    t.blue   = Color::hex(0x0091FF); t.red    = Color::hex(0xFF4245);
+    t.blue   = Color::hex(0x0A95FF); t.red    = Color::hex(0xFF4245);
     t.orange = Color::hex(0xFF9230); t.yellow = Color::hex(0xFFD600);
     t.green  = Color::hex(0x30D158); t.mint   = Color::hex(0x00DAC3);
     t.teal   = Color::hex(0x00D2E0); t.cyan   = Color::hex(0x3CD3FE);
@@ -3563,25 +3704,9 @@ Theme Theme::dark() {
     t.destructive_foreground= Color::hex(0xFFFFFF);
     t.border                = t.separator;
     t.input                 = Color::rgba(255, 255, 255, 26);
-    t.ring                  = Color::rgba(0, 145, 255, 140);
+    t.ring                  = Color::rgba(10, 149, 255, 140);
     return t;
 }
-
-namespace icons {
-// inline：这些是**定义**而不是声明，两个编译单元都定义 AINO_IMPLEMENTATION 时
-// 原来的写法会重定义（链接期 duplicate symbol）。inline 变量要 C++17，本项目正好是。
-inline const char* check         = "\xE2\x9C\x93";              // ✓
-inline const char* chevron_down  = "\xE2\x8C\x84";              // ⌄
-inline const char* chevron_right = "\xE2\x80\xBA";              // ›
-inline const char* close         = "\xE2\x9C\x95";              // ✕
-inline const char* plus          = "+";
-inline const char* minus         = "\xE2\x88\x92";              // −
-inline const char* search        = "\xE2\x8C\x95";              // ⌕
-inline const char* settings      = "\xE2\x9A\x99";              // ⚙
-inline const char* sun           = "\xE2\x98\x80";              // ☀
-inline const char* moon          = "\xE2\x98\xBE";              // ☾
-inline const char* dot           = "\xE2\x80\xA2";              // •
-} // namespace icons
 
 namespace detail {
 // 交互态配色：亮底压暗、暗底提亮 —— 两条路径都保证对比度单调变化
@@ -3677,6 +3802,26 @@ public:
     bool empty() const { return entries_.empty(); }
     size_t bucket_count() const { return entries_.bucket_count(); }
 
+    template<class Cost, class Age>
+    void trim_bytes(size_t budget, uint64_t keep, Cost cost, Age age) {
+        size_t total = 0;
+        for (const auto& entry : entries_) total += cost(entry.second);
+        while (total > budget) {
+            auto oldest = entries_.end();
+            for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+                if (it->first.scope == scope_ && it->first.id == keep) continue;
+                if (oldest == entries_.end() || age(it->second) < age(oldest->second)) oldest = it;
+            }
+            if (oldest == entries_.end()) break;
+            total -= cost(oldest->second); entries_.erase(oldest);
+        }
+    }
+    template<class Cost> size_t bytes(Cost cost) const {
+        size_t total = 0;
+        for (const auto& entry : entries_) total += cost(entry.second);
+        return total;
+    }
+
     void release_scope(uint64_t scope) {
         for (auto it = entries_.begin(); it != entries_.end();) {
             if (it->first.scope == scope) it = entries_.erase(it);
@@ -3730,9 +3875,18 @@ struct Ui::Impl {
     bool measure_any = false;
     Rect measure_acc{};
     Canvas* measure_canvas = nullptr;   // begin_measure 期间暂存的画布
+    size_t measure_clip_depth = 0;
 
     void measure_add(const Rect& r) {
         Rect q = r;
+        // 只应用测量期间新增的裁剪，外层视口不能裁掉待测的屏幕外内容。
+        for (size_t i = measure_clip_depth; i < clip_logic.size(); ++i) {
+            const Rect& clip = clip_logic[i];
+            const float x0 = std::max(q.x, clip.x), y0 = std::max(q.y, clip.y);
+            const float x1 = std::min(q.right(), clip.right()), y1 = std::min(q.bottom(), clip.bottom());
+            if (x1 <= x0 || y1 <= y0) return;
+            q = Rect(x0, y0, x1 - x0, y1 - y0);
+        }
         // 滚动区里的内容只算**视口内**的部分：内层列表画了 20 行、视口只有 164px，
         // 全算进来会把卡片撑成 600px（滚动区的内容天生超出，这正是它存在的理由）。
         if (!scroll_stack.empty()) {
@@ -3774,7 +3928,8 @@ struct Ui::Impl {
     // 判定只用**上一帧**的信息（布局每帧基本一致，而且真有变化的那一帧本来
     // 就会自己排帧）。
     bool hover_would_change(float x, float y) const {
-        if (active != 0) return true;                 // 拖动中：位置本身就影响画面
+        if (active != 0 || input.down[0] || input.down[1] || input.down[2])
+            return true;                              // 控件或自定义拖动中：位置会影响画面
         if (hot_rect_valid) return !hot_rect.contains(x, y);
         for (const Rect& r : hit_rects)
             if (r.contains(x, y)) return true;        // 从空白进了某个控件
@@ -3835,7 +3990,7 @@ struct Ui::Impl {
     struct EditSnap { std::string text; int caret = 0; int anchor = -1; };
     struct EditStack {
         std::deque<EditSnap> undo, redo;
-        float last = -1e9f;       // 上次压栈时间（合并连续输入用）
+        double last = -1e9;       // steady_clock 时间，与动画步长无关。
         uint64_t kind = 0;
     };
     detail::WidgetStateTable<EditStack> edit_stack;
@@ -3857,8 +4012,16 @@ struct Ui::Impl {
         std::string src;                    // 上一帧的全文，用于校验
         std::vector<std::string> lines;
         std::vector<int> cps_n, cp_base;
+        uint64_t used = 0;
+        size_t bytes() const {
+            size_t total = sizeof(TextLines) + 64 + src.capacity() + lines.capacity() * sizeof(std::string)
+                + (cps_n.capacity() + cp_base.capacity()) * sizeof(int);
+            for (const auto& line : lines) total += line.capacity() + 1;
+            return total;
+        }
     };
     detail::WidgetStateTable<TextLines> text_lines;
+    uint64_t text_lines_serial = 0;
 
     // 本帧 interact() 的调用序号。立即模式下"调用顺序 = 绘制顺序 = 层级"，
     // 序号小的先画、在下面，所以它可以直接当 z 序用。每帧归零重数。
@@ -4080,10 +4243,18 @@ struct Ui::Impl {
     // 平台回调
     std::function<void()> request_repaint;
     std::function<void(const std::string&)> set_clipboard;
+    std::function<bool(const std::string&)> try_set_clipboard;
     std::function<std::string()> get_clipboard;
+    bool copy_to_clipboard(const std::string& value) {
+        if (try_set_clipboard) return try_set_clipboard(value);
+        if (!set_clipboard) return false;
+        set_clipboard(value); // 嵌入宿主保留旧回调契约；原生窗口使用可报告失败的回调。
+        return true;
+    }
     // 把输入法的组合窗 / 候选窗挪到光标处（参数是**物理客户区**像素：
     // caret_x, 输入框上沿, 输入框下沿）。平台后端绑定；未绑定就什么都不做。
     std::function<void(float, float, float)> ime_pos;
+    std::function<void(bool, bool)> ime_content_type;
     // IME 正在组字的串（拼音/注音…，UTF-8）。这是**预编辑**文本：上屏前它不属于
     // value，一个字节都不该写进去（写进去就等于"打拼音时正文被污染"）。
     // input / textarea 在聚焦时把它画在 caret 处、带下划线，caret 顺延到它后面。
@@ -4190,6 +4361,20 @@ struct Ui::Impl {
         Easing e = tw.e ? tw.e : easing::out_cubic;
         const float k = tw.dur > 0.0001f ? clampf(tw.t / tw.dur, 0.0f, 1.0f) : 1.0f;
         return tw.from + (tw.to - tw.from) * e(k);
+    }
+    void abort_frame() noexcept {
+        defer.clear();
+        if (measure_on) { canvas = measure_canvas; measure_canvas = nullptr; measure_on = false; }
+        scroll_stack.clear();
+        clip_logic.clear();
+        xf_stack.clear();
+        frame_open = false;
+        active = 0;
+        gate_on = gate_next = false;
+        gate_allow_n = gate_next_allow_n = 0;
+        input.text_input.clear();
+        input.wheel = 0;
+        for (int i = 0; i < KEY_COUNT; ++i) input.key_pressed[i] = false;
     }
 };
 
@@ -4330,7 +4515,16 @@ bool Ui::pointer_available() const {
            !impl->clip_excludes(impl->input.mouse.x, impl->input.mouse.y);
 }
 const Theme& Ui::theme() const { return impl->theme; }
-void  Ui::set_theme(const Theme& t) { impl->theme = t; }
+void Ui::set_theme(const Theme& t) {
+    const bool fonts_changed = impl->theme.font_family != t.font_family
+        || impl->theme.font_family_mono != t.font_family_mono;
+    impl->theme = t;
+    if (fonts_changed) {
+        if (impl->text) impl->text->reconfigure(impl->scale, t.font_family, t.font_family_mono);
+        impl->adv_cache.clear();
+        impl->wrap_cache.clear(); impl->wrap_lru.clear(); impl->wrap_bytes = 0;
+    }
+}
 float Ui::dpi_scale() const { return impl->scale; }
 float Ui::width() const { return impl->width; }
 float Ui::height() const { return impl->height; }
@@ -4349,6 +4543,14 @@ bool Ui::request_animation_frame() {
     repaint();
     return true;
 }
+void Ui::request_frame_in(float seconds) {
+    if (impl->measure_on || !impl->frame_open || !std::isfinite(seconds)) return;
+    const auto delay = std::chrono::duration<double>(detail::clampf(seconds, 0.0f, 86400.0f));
+    const auto at = std::chrono::steady_clock::now()
+        + std::chrono::duration_cast<std::chrono::steady_clock::duration>(delay);
+    if (!impl->timed_repaint || at < impl->repaint_at) impl->repaint_at = at;
+    impl->timed_repaint = true;
+}
 void Ui::set_animating(bool on) {
     if (impl->measure_on) return;
     impl->animating = on;
@@ -4366,6 +4568,7 @@ void  Ui::set_focus(void* id) {
 
 void Ui::begin_measure() {
     impl->measure_on = true;
+    impl->measure_clip_depth = impl->clip_logic.size();
     impl->each_widget_state([](auto& table) { table.set_measuring(true); });
     impl->measure_any = false;
     impl->measure_acc = Rect{};
@@ -4571,12 +4774,15 @@ void Ui::fill_rect(const Rect& r, const Color& c, float radius) {
                 float cov_y = clampf(std::min(float(y + 1), p.bottom()) - std::max(float(y), p.y), 0.0f, 1.0f);
                 if (cov_y >= 0.999f) {
                     impl->canvas->fill_row_fast(y, x0, x1, c);
-                    // 左右边缘单独补
-                    for (int x = x0; x < x1; ++x) {
-                        if (x < p.x || x + 1 > p.right()) {
-                            float cov = clampf(std::min(float(x + 1), p.right()) - std::max(float(x), p.x), 0.0f, 1.0f);
-                            impl->canvas->blend(x, y, c, cov);
-                        }
+                    // 只有首尾像素可能与矩形边界相交。
+                    if (x0 < p.x || x0 + 1 > p.right()) {
+                        float cov = clampf(std::min(float(x0 + 1), p.right()) - std::max(float(x0), p.x), 0.0f, 1.0f);
+                        impl->canvas->blend(x0, y, c, cov);
+                    }
+                    const int last = x1 - 1;
+                    if (last > x0 && (last < p.x || last + 1 > p.right())) {
+                        float cov = clampf(std::min(float(last + 1), p.right()) - std::max(float(last), p.x), 0.0f, 1.0f);
+                        impl->canvas->blend(last, y, c, cov);
                     }
                 } else {
                     for (int x = x0; x < x1; ++x) {
@@ -4591,6 +4797,59 @@ void Ui::fill_rect(const Rect& r, const Color& c, float radius) {
         return;
     }
     detail::raster_rrect(*impl->canvas, p, c, rad, impl->theme.corner_smoothing);
+}
+
+void Ui::draw_image(const Image& image, const Rect& box) {
+    if (!image.valid() || box.empty()) return;
+    if (impl->measure_on) { impl->measure_add(box); return; }
+    if (!impl->canvas) return;
+    const auto& m = impl->xf;
+    const float det = m.a * m.d - m.b * m.c;
+    if (!std::isfinite(det) || std::fabs(det) < 1e-8f || impl->scale <= 0) return;
+    const Vec2 p0 = impl->xf_map(box.x, box.y), p1 = impl->xf_map(box.right(), box.y);
+    const Vec2 p2 = impl->xf_map(box.right(), box.bottom()), p3 = impl->xf_map(box.x, box.bottom());
+    const float left = std::min(std::min(p0.x, p1.x), std::min(p2.x, p3.x));
+    const float top = std::min(std::min(p0.y, p1.y), std::min(p2.y, p3.y));
+    const float right = std::max(std::max(p0.x, p1.x), std::max(p2.x, p3.x));
+    const float bottom = std::max(std::max(p0.y, p1.y), std::max(p2.y, p3.y));
+    const Rect bounds(left, top, right - left, bottom - top);
+    if (!std::isfinite(bounds.x) || !std::isfinite(bounds.y) ||
+        !std::isfinite(bounds.right()) || !std::isfinite(bounds.bottom())) return;
+    Canvas& cv = *impl->canvas;
+    const int x0 = std::max(cv.clipped ? cv.clip_x0 : 0,
+        int(std::max(0.f, std::min(float(cv.w), std::floor(bounds.x)))));
+    const int y0 = std::max(cv.clipped ? cv.clip_y0 : 0,
+        int(std::max(0.f, std::min(float(cv.h), std::floor(bounds.y)))));
+    const int x1 = std::min(cv.clipped ? cv.clip_x1 : cv.w,
+        int(std::max(0.f, std::min(float(cv.w), std::ceil(bounds.right())))));
+    const int y1 = std::min(cv.clipped ? cv.clip_y1 : cv.h,
+        int(std::max(0.f, std::min(float(cv.h), std::ceil(bounds.bottom())))));
+    for (int y = y0; y < y1; ++y) for (int x = x0; x < x1; ++x) {
+        const float px = (float(x) + .5f) / impl->scale - m.e;
+        const float py = (float(y) + .5f) / impl->scale - m.f;
+        const float lx = (m.d * px - m.c * py) / det;
+        const float ly = (m.a * py - m.b * px) / det;
+        const float u = (lx - box.x) / box.w, v = (ly - box.y) / box.h;
+        if (u < 0.f || u >= 1.f || v < 0.f || v >= 1.f) continue;
+        const float fx = std::max(0.f, std::min(float(image.width - 1), u * image.width - .5f));
+        const float fy = std::max(0.f, std::min(float(image.height - 1), v * image.height - .5f));
+        const int sx = int(fx), sy = int(fy);
+        const int sx1 = std::min(sx + 1, image.width - 1), sy1 = std::min(sy + 1, image.height - 1);
+        const float dx = fx - sx, dy = fy - sy;
+        const float weights[] = {(1 - dx) * (1 - dy), dx * (1 - dy), (1 - dx) * dy, dx * dy};
+        const size_t indices[] = {
+            (size_t(sy) * image.width + sx) * 4u, (size_t(sy) * image.width + sx1) * 4u,
+            (size_t(sy1) * image.width + sx) * 4u, (size_t(sy1) * image.width + sx1) * 4u};
+        float alpha = 0, red = 0, green = 0, blue = 0;
+        for (int i = 0; i < 4; ++i) {
+            const uint8_t* p = &image.pixels[indices[i]];
+            const float a = weights[i] * p[3];
+            alpha += a; red += a * p[0]; green += a * p[1]; blue += a * p[2];
+        }
+        if (alpha > 0) cv.blend(x, y, Color(uint8_t(red / alpha + .5f),
+            uint8_t(green / alpha + .5f), uint8_t(blue / alpha + .5f),
+            uint8_t(std::min(alpha + .5f, 255.f))), 1.f);
+    }
 }
 
 void Ui::stroke_rect(const Rect& r, const Color& c, float radius, float width) {
@@ -4830,6 +5089,40 @@ void Ui::glass(const Rect& r, float radius, const Style& st) {
     // 5) 外描边：只描一圈极淡的冷白，把玻璃从同色背景上分出来。
     stroke_rect_s(r, Color(255, 255, 255, dark ? 30 : 90), rad, 1.0f,
                   th.corner_smoothing);
+}
+
+Rect GlassPanel::draw(Ui& ui, const Rect& bounds, float radius, const Style& st) {
+    const float min_x = -bounds.x;
+    const float max_x = ui.width() - bounds.right();
+    const float min_y = -bounds.y;
+    const float max_y = ui.height() - bounds.bottom();
+    if (max_x >= min_x) offset_x_ = std::max(min_x, std::min(offset_x_, max_x));
+    else offset_x_ = (ui.width() - bounds.w) * 0.5f - bounds.x;
+    if (max_y >= min_y) offset_y_ = std::max(min_y, std::min(offset_y_, max_y));
+    else offset_y_ = (ui.height() - bounds.h) * 0.5f - bounds.y;
+
+    Rect panel = bounds.offset(offset_x_, offset_y_);
+    const Rect drag_area(panel.x, panel.y, panel.w, std::min(panel.h, drag_height_));
+    const Input& input = ui.input();
+
+    if (input.pressed[0] && drag_area.contains(input.mouse)) {
+        dragging_ = true;
+        drag_offset_x_ = input.mouse.x - panel.x;
+        drag_offset_y_ = input.mouse.y - panel.y;
+        ui.set_focus(nullptr);
+    }
+    if (!input.down[0]) dragging_ = false;
+    if (dragging_ && input.down[0]) {
+        offset_x_ = input.mouse.x - drag_offset_x_ - bounds.x;
+        offset_y_ = input.mouse.y - drag_offset_y_ - bounds.y;
+        panel = bounds.offset(offset_x_, offset_y_);
+    }
+
+    // Keep the title strip attached to the effective panel bounds on every frame.
+    const Rect effective_drag_area(panel.x, panel.y, panel.w, std::min(panel.h, drag_height_));
+    if (effective_drag_area.contains(input.mouse)) ui.set_cursor(Cursor::Hand);
+    ui.glass(panel, radius, st);
+    return panel;
 }
 
 // -----------------------------------------------------------------------------
@@ -5568,11 +5861,9 @@ inline Skin make_skin(const Theme& th, const Style& st, int default_variant, flo
             sk.fg   = th.label;
             break;
         case Style::Standard:
-            sk.base = th.is_dark() ? th.fill_hover.over(th.control_bg) : th.control_bg;
+            sk.base = th.fill_hover.over(th.control_bg);
             sk.hover = sk.base;
             sk.press = th.fill_press.over(sk.base);
-            sk.border = th.separator; sk.border_w = 1.0f;
-            sk.rim = Color(255, 255, 255, 40);
             break;
         case Style::Outline:
             // Outline 保留细描边，以区别于 Secondary 的半透明填充。
@@ -5843,7 +6134,7 @@ inline void trim_edit_history(Ui::Impl::EditStack& st) {
 inline void edit_snapshot(Ui::Impl* im, uint64_t id, const std::string& before,
                           int caret0, int anchor0, uint64_t kind) {
     auto& st = im->edit_stack[id];
-    const float now = im->clock;
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
     if (before.size() > edit_history_budget() - sizeof(Ui::Impl::EditSnap) - 1) {
         st.undo.clear();
         st.redo.clear();
@@ -6559,7 +6850,9 @@ bool Ui::input(std::string* value, const Rect& box, const Style& st) {
             }
         }
 
-        const std::string before_text = *value;
+        const bool edit_event = !kin.text_input.empty() || kin.key_hit(KEY_BACKSPACE) || kin.key_hit(KEY_DELETE)
+            || kin.key_hit(KEY_ENTER) || kin.key_hit(KEY_TAB) || kin.ctrl_of('X') || kin.ctrl_of('V');
+        const std::string before_text = edit_event && !undone ? *value : std::string();
         const int caret0 = impl->caret, anchor0 = impl->sel_anchor;
         uint64_t edit_kind = detail::EDIT_OTHER;
 
@@ -6660,18 +6953,18 @@ bool Ui::input(std::string* value, const Rect& box, const Style& st) {
         //    东西清空了；
         //  · 用 ctrl_of() 而非 ctrl()：Ctrl 的 KEYUP 可能排在字母 KEYDOWN 之后。
         if (!st.password && !undone && kin.ctrl_of('C')) {
-            if (has_sel && impl->set_clipboard) {
+            if (has_sel && (impl->set_clipboard || impl->try_set_clipboard)) {
                 std::vector<uint32_t> cps = utf8_codepoints(*value);
-                impl->set_clipboard(utf8_from_codepoints(cps, size_t(sel_from), size_t(sel_to - sel_from)));
+                impl->copy_to_clipboard(utf8_from_codepoints(cps, size_t(sel_from), size_t(sel_to - sel_from)));
             }
         }
         // 剪切必须"进了剪贴板才删"。回调不可用却照样删，等于把用户选中的东西
         // 凭空丢掉了 —— 比不响应更糟。
-        if (!st.password && !undone && kin.ctrl_of('X') && has_sel && impl->set_clipboard) {
+        if (!st.password && !undone && kin.ctrl_of('X') && has_sel && (impl->set_clipboard || impl->try_set_clipboard)) {
             edit_kind = detail::EDIT_OTHER;
             std::vector<uint32_t> cps = utf8_codepoints(*value);
-            impl->set_clipboard(utf8_from_codepoints(cps, size_t(sel_from), size_t(sel_to - sel_from)));
-            delete_selection();
+            if (impl->copy_to_clipboard(utf8_from_codepoints(cps, size_t(sel_from), size_t(sel_to - sel_from))))
+                delete_selection();
         }
         if (!undone && kin.ctrl_of('V')) {
             std::string paste = impl->get_clipboard ? impl->get_clipboard() : std::string();
@@ -6822,6 +7115,7 @@ bool Ui::input(std::string* value, const Rect& box, const Style& st) {
     // 输入法：把拼音串钉在输入框下沿、候选框再往下一点。
     // 不做这一步，系统会把它们放在客户区左上角，和输入框完全对不上。
     if (focused && impl->ime_pos) {
+        if (impl->ime_content_type) impl->ime_content_type(st.password, false);
         const Rect pb = impl->phys(Rect(caret_x, box.y, 1.0f, box.h));
         impl->ime_pos(pb.x, pb.y, pb.bottom());
     }
@@ -7032,13 +7326,16 @@ bool Ui::tabs(const std::vector<std::string>& labels, int* index, const Rect& bo
 
 bool Ui::tabs(const std::vector<std::string>& labels, int* index, const Rect& box,
                      const TabOptions& options, const Style& st) {
+    return tabs_impl(labels, index, box, options, false, st);
+}
+
+bool Ui::tabs_impl(const std::vector<std::string>& labels, int* index, const Rect& box,
+                   const TabOptions& options, bool segmented_control, const Style& st) {
     if (options.close_index) *options.close_index = -1;
     if (!index || labels.empty() || box.w <= 0.0f || box.h <= 0.0f) return false;
     const Theme& th = impl->theme;
     uint64_t base_id = impl->widget_id("tabs", box, 0, st.identity);
     const bool pill = (st.variant == Style::Secondary || st.variant == Style::Outline);
-    // 参考资料 Segmented Control 是**胶囊**（Figma 里 r=1000，按钮 r=100），不是
-    // r6 的圆角矩形：24 高的控件整个是圆的，选中段内缩 2 之后也是胶囊。
     const float rad = st.radius >= 0.0f ? st.radius : (pill ? box.h * 0.5f : 6.0f);
     const float fs = st.font_size > 0.0f ? st.font_size : th.font_size;
     const bool closable = !pill && options.close_index;
@@ -7049,8 +7346,8 @@ bool Ui::tabs(const std::vector<std::string>& labels, int* index, const Rect& bo
 
     bool changed = false;
     Rect container(box.x, box.y, box.w, box.h);
-    // 参考资料 Segmented Control：容器 8% 半透明底，选中段内缩 2px、圆角比容器小 2（同心圆角）
-    const Rect inner = pill ? container.inset(2.0f, 2.0f) : container;
+    // Segmented Control 的选中段与轨道等高；普通胶囊页签仍保留 2px 内缩。
+    const Rect inner = pill && !segmented_control ? container.inset(2.0f, 2.0f) : container;
     const float equal_w = inner.w / float(labels.size());
 
     // 胶囊分段等宽，普通标签栏按文字宽度计算位置。
@@ -7109,8 +7406,10 @@ bool Ui::tabs(const std::vector<std::string>& labels, int* index, const Rect& bo
         Color container_bg = !st.bg.is_none() ? st.bg : th.track_well();
         if (st.disabled) container_bg.a = uint8_t(float(container_bg.a) * 0.45f);
         fill_rect_s(container, container_bg, rad, 0.35f);
-        // 段间细缝：1×14 的 25% 标签色。必须先画，选中的滑块（内缩 2）才会盖住它。
-        const float ph = std::min(14.0f, std::max(inner.h - 10.0f, 1.0f));
+        // 段间细缝：1×14 的 25% 标签色，选中段随后会盖住对应分隔线。
+        const float separator_h = box.h <= 16.0f ? 10.0f : box.h <= 20.0f ? 12.0f
+                                 : box.h <= 24.0f ? 14.0f : box.h <= 28.0f ? 18.0f : 20.0f;
+        const float ph = std::min(separator_h, std::max(inner.h - 4.0f, 1.0f));
         for (size_t i = 1; i < labels.size(); ++i)
             fill_rect(Rect(inner.x + equal_w * float(i), inner.y + (inner.h - ph) * 0.5f, 1.0f, ph),
                       th.label3, 0.0f);
@@ -7132,11 +7431,12 @@ bool Ui::tabs(const std::vector<std::string>& labels, int* index, const Rect& bo
         const float t_hov = detail::animate_value(impl, id * 47u + 2u, in.hovered ? 1.0f : 0.0f, 18.0f);
 
         if (pill) {
-            // 选中段 = **强调色实心 + 白字**。依据是 kit 里分段的两个变体：
-            //   `Segmented Control/3/1/True`  → 活动窗口：BG #0088FF，Label #FFFFFF
-            //   `Segmented Control/3/1/False` → 非活动窗口：BG #0000001A，Label 85%
-            const Rect seg = item.inset(2.0f, 2.0f);
-            const float sr = std::max(0.0f, seg.h * 0.5f);
+            // Segmented 的活动段填满所属分段；普通胶囊页签仍上下内缩 2px。
+            const Rect seg = segmented_control
+                                 ? item
+                                 : item.inset(2.0f, 2.0f);
+            const float sr = segmented_control ? std::min(seg.h * 0.5f, rad)
+                                               : std::max(0.0f, seg.h * 0.5f);
             if (t_sel > 0.02f) {
                 Color sel_bg = !st.border_color.is_none() ? st.border_color : th.tint;
                 sel_bg.a = uint8_t(float(sel_bg.a) * t_sel + 0.5f);
@@ -7185,13 +7485,14 @@ bool Ui::tabs(const std::vector<std::string>& labels, int* index, const Rect& bo
 }
 
 // -----------------------------------------------------------------------------
-//  segmented —— 语义上"选一个值"，视觉固定走胶囊式（凹槽 + 浮起的滑块）
+//  segmented —— 等宽胶囊分段选择
 // -----------------------------------------------------------------------------
 bool Ui::segmented(const std::vector<std::string>& items, int* index, const Rect& box, const Style& st) {
-    // 调用方没点明变体时补成 Secondary；显式传了别的就照它画。
+    // 调用方没点明变体时使用分段控件样式；显式传了别的则沿用 tabs 对应变体。
     Style ps = st;
     if (ps.variant < 0) ps.variant = Style::Secondary;
-    return tabs(items, index, box, ps);
+    const bool segmented_control = ps.variant == Style::Secondary || ps.variant == Style::Outline;
+    return tabs_impl(items, index, box, TabOptions{}, segmented_control, ps);
 }
 
 // -----------------------------------------------------------------------------
@@ -7624,8 +7925,13 @@ bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
     const std::vector<int>* cps_p = &cps_local;
     const std::vector<int>* base_p = &base_local;
     Impl::TextLines* tc = nullptr;
-    if (value->size() >= size_t(64u << 10)) tc = &impl->text_lines[id];
-    else impl->text_lines.erase(id);    // 缩回小文档后不再留着整篇副本
+    bool discard_text_cache = false;
+    // 本帧布局持有缓存内 vector 的引用；超预算条目只能在使用结束后释放。
+    detail::ScopeExit trim_text_cache([&] { if (discard_text_cache) impl->text_lines.erase(id); });
+    static const size_t text_budget = detail::memory_budget_kib("AINO_TEXT_BUDGET", size_t(16u << 20));
+    if (value->size() >= size_t(64u << 10) && value->size() <= text_budget / 2) {
+        tc = &impl->text_lines[id]; tc->used = ++impl->text_lines_serial;
+    } else impl->text_lines.erase(id);    // 缩回小文档后不再留着整篇副本
 
     // 重建（或重建后写回缓存）。原地赋值：下面所有 lambda 都按引用捕获
     // lines / cps_n / cp_base，重建后引用仍然有效。
@@ -7643,6 +7949,11 @@ bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
             tc->lines = std::move(nl);
             tc->cps_n = std::move(nc);
             tc->cp_base = std::move(nb);
+            if (tc->bytes() > text_budget) {
+                discard_text_cache = true;
+            } else impl->text_lines.trim_bytes(text_budget, id,
+                [](const Impl::TextLines& entry) { return entry.bytes(); },
+                [](const Impl::TextLines& entry) { return entry.used; });
             // 数据搬进缓存后局部向量是空的，指针必须跟着改过去。
             lines_p = &tc->lines; cps_p = &tc->cps_n; base_p = &tc->cp_base;
         } else {
@@ -7746,7 +8057,9 @@ bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
             }
         }
 
-        const std::string before_text = *value;
+        const bool edit_event = !kin.text_input.empty() || kin.key_hit(KEY_BACKSPACE) || kin.key_hit(KEY_DELETE)
+            || kin.key_hit(KEY_ENTER) || kin.key_hit(KEY_TAB) || kin.ctrl_of('X') || kin.ctrl_of('V');
+        const std::string before_text = edit_event && !undone ? *value : std::string();
         const int caret0 = impl->caret, anchor0 = impl->sel_anchor;
         uint64_t edit_kind = detail::EDIT_OTHER;
 
@@ -7877,16 +8190,16 @@ bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
         }
         // 与单行 input 同一条纪律：可能没绑回调 → 必须判空；无选区不动剪贴板。
         if (!undone && kin.ctrl_of('C')) {
-            if (has_sel && impl->set_clipboard) {
+            if (has_sel && (impl->set_clipboard || impl->try_set_clipboard)) {
                 const std::vector<uint32_t> cps = utf8_codepoints(*value);
-                impl->set_clipboard(utf8_from_codepoints(cps, size_t(sel_from), size_t(sel_to - sel_from)));
+                impl->copy_to_clipboard(utf8_from_codepoints(cps, size_t(sel_from), size_t(sel_to - sel_from)));
             }
         }
-        if (!undone && kin.ctrl_of('X') && has_sel && impl->set_clipboard) {
+        if (!undone && kin.ctrl_of('X') && has_sel && (impl->set_clipboard || impl->try_set_clipboard)) {
             edit_kind = detail::EDIT_OTHER;
             const std::vector<uint32_t> cps = utf8_codepoints(*value);
-            impl->set_clipboard(utf8_from_codepoints(cps, size_t(sel_from), size_t(sel_to - sel_from)));
-            delete_sel();
+            if (impl->copy_to_clipboard(utf8_from_codepoints(cps, size_t(sel_from), size_t(sel_to - sel_from))))
+                delete_sel();
         }
         if (!undone && kin.ctrl_of('V') && impl->get_clipboard) {
             const std::string paste = impl->get_clipboard();
@@ -8020,6 +8333,7 @@ bool Ui::textarea(std::string* value, const Rect& box, const Style& st) {
         }
         impl->schedule_caret();
         if (impl->ime_pos) {
+            if (impl->ime_content_type) impl->ime_content_type(false, true);
             // 光标滚出可视区时把 IME 钉在最近的那一行，别让它飞到框外
             const float iy = detail::clampf(cy, box.y, std::max(box.y, box.bottom() - lh));
             const Rect pb = impl->phys(Rect(cx, iy, 1.0f, lh));
@@ -9915,11 +10229,12 @@ bool Ui::alert_dialog(const std::string& title, const std::string& body,
     if (kin.key_pressed[KEY_ESC]) dismiss = true;
 
     // 操作按钮以通宽行纵向排列，取消位于底部；交互在遮罩绘制前处理。
-    const float pad_v = 16.0f;
+    const float pad_v = 14.0f;
     const float btn_h = 28.0f;
+    const float action_gap = 6.0f;
     const float inner_w = std::max(box.w - pad * 2.0f, 1.0f);
     const Rect cancel_r(box.x + pad, box.bottom() - pad_v - btn_h, inner_w, btn_h);
-    const Rect ok_r(box.x + pad, cancel_r.y - 16.0f - btn_h, inner_w, btn_h);
+    const Rect ok_r(box.x + pad, cancel_r.y - action_gap - btn_h, inner_w, btn_h);
 
     const uint64_t ok_id = impl->widget_id("alert_ok", box, 0, st.identity);
     const uint64_t no_id = impl->widget_id("alert_no", box, 1u, st.identity);
@@ -9937,8 +10252,9 @@ bool Ui::alert_dialog(const std::string& title, const std::string& body,
     // ---- 画 ----
     // 不铺整屏黑幕：macOS 的 alert 是"浮起来的一块面板 + 强投影"，窗口本身
     // 只是失去焦点，不会被压暗。整屏 35% 黑是 Web Dialog 的 overlay。
+    const Color panel_bg = !st.bg.is_none() ? st.bg : th.popover_bg;
     detail::pop_shadow(*this, box, rad, th, 2);
-    fill_rect(box, !st.bg.is_none() ? st.bg : th.popover_bg, rad);
+    fill_rect(box, panel_bg, rad);
     // 面板不描边：macOS 靠投影与底色分层，一圈 1px 会让它看起来像 Web 的卡片
 
     push_clip(box);
@@ -9970,7 +10286,12 @@ bool Ui::alert_dialog(const std::string& title, const std::string& body,
     const float cr = cancel_r.h * 0.5f;
     Style ok_style, cancel_style;
     ok_style.corner(cr);
-    if (danger) ok_style.destructive(); else ok_style.primary();
+    if (danger) {
+        ok_style.destructive();
+        ok_style.background(th.red.mix(panel_bg, 0.78f));
+    } else {
+        ok_style.primary();
+    }
     cancel_style.secondary().corner(cr);
     const auto ok_skin = detail::make_skin(th, ok_style, Style::Default, cr);
     const auto cancel_skin = detail::make_skin(th, cancel_style, Style::Default, cr);
@@ -10734,6 +11055,7 @@ public:
         return pipe_[0] >= 0;
 #endif
     }
+    bool pending() const { return pending_.load(); }
     void notify() {
         if (pending_.exchange(true)) return;
 #ifdef AINO_PLATFORM_WINDOWS
@@ -10773,6 +11095,11 @@ public:
         ::poll(fds, 2, timeout_ms);
 #endif
     }
+#if defined(AINO_PLATFORM_WINDOWS)
+    HANDLE wait_handle() const { return event_; }
+#else
+    int read_descriptor() const { return pipe_[0]; }
+#endif
 private:
     std::atomic<bool> pending_{false};
 #ifdef AINO_PLATFORM_WINDOWS
@@ -10781,6 +11108,13 @@ private:
     int pipe_[2] = {-1, -1};
 #endif
 };
+} // namespace detail
+
+namespace detail {
+inline std::vector<Window*>& scheduled_windows() {
+    thread_local std::vector<Window*> windows;
+    return windows;
+}
 } // namespace detail
 
 struct Window::Impl {
@@ -10796,6 +11130,7 @@ struct Window::Impl {
     bool need_frame = true;
     // 上一帧的时刻（毫秒）。每窗口独立 —— 见 render() 里的说明。
     uint64_t last_frame_ms = 0;
+    std::chrono::steady_clock::time_point next_frame_at{};
     // 上一帧的"再要一帧"是组件自己提的（spinner / 光标闪烁 / hover 插值），
     // 而不是用户输入触发的。主循环靠它决定要不要按 60fps 节流：
     // 区分不出来的话，只要有一个连续动画在跑，need_frame 就恒为真 →
@@ -10831,6 +11166,7 @@ struct Window::Impl {
     Cursor cursor = Cursor::Arrow;
     void* native = nullptr;
     std::function<void()> frame_cb_ptr;   // run() 期间指向用户回调，render() 用
+    bool close_reported = false;         // 子窗口关闭时只通知其它窗口一次。
     // run() 期间指向 Window::render()。窗口过程里要"同步补一帧"时用它 ——
     // 拖边框缩放时主循环被 user32 的模态循环卡住，根本轮不到 run() 出帧。
     std::function<void()> render_fn;
@@ -10849,6 +11185,11 @@ inline void win_set_ime_pos(Win32State* s, float caret_x, float top, float botto
 namespace detail {
 struct X11State;
 inline void x11_set_ime_pos(X11State* s, float caret_x, float top, float bottom);
+} // namespace detail
+#elif defined(AINO_PLATFORM_WAYLAND)
+namespace detail {
+struct WaylandState;
+inline void wayland_set_ime_pos(WaylandState* s, float x, float top, float bottom);
 } // namespace detail
 #endif
 
@@ -10899,6 +11240,11 @@ Window::Window(const WindowConfig& cfg) : impl(new Impl()) {
         impl->ui.impl->ime_owner = true;
         detail::x11_set_ime_pos(static_cast<detail::X11State*>(impl->native), x, top, bottom);
     };
+#elif defined(AINO_PLATFORM_WAYLAND)
+    impl->ui.impl->ime_pos = [this](float x, float top, float bottom) {
+        impl->ui.impl->ime_owner = true;
+        detail::wayland_set_ime_pos(static_cast<detail::WaylandState*>(impl->native), x, top, bottom);
+    };
 #endif
     // 剪贴板：input / textarea 的 Ctrl+C / X / V 从这里读写系统剪贴板。
     // 这两个回调原先**忘了绑** —— 结果是按 Ctrl+C 时调用一个空的 std::function，
@@ -10906,6 +11252,7 @@ Window::Window(const WindowConfig& cfg) : impl(new Impl()) {
     // 就是"复制一下程序自己关了"）。Ctrl+V 因为调用点写了判空所以不崩，只是没反应。
     // 现在两头都补：这里绑上真实实现，调用点也一律判空（Ui 可以脱离 Window 用）。
     impl->ui.impl->set_clipboard = [this](const std::string& t) { Window::set_clipboard(t); };
+    impl->ui.impl->try_set_clipboard = [this](const std::string& t) { return Window::try_set_clipboard(t); };
     impl->ui.impl->get_clipboard = [this]() { return Window::clipboard(); };
     // 诊断开关：AINO_FRAME_LOG=1 时每 120 帧打印一次渲染耗时。
 #if defined(_MSC_VER)
@@ -10932,16 +11279,22 @@ Window::Window(const WindowConfig& cfg) : impl(new Impl()) {
     detail::w32_create(this, impl->cfg);
 #elif defined(AINO_PLATFORM_X11)
     detail::x11_create(this, impl->cfg);
+#elif defined(AINO_PLATFORM_WAYLAND)
+    detail::wayland_create(this, impl->cfg);
 #elif defined(AINO_PLATFORM_MACOS)
     detail::cocoa_create(this, impl->cfg);
 #endif
 }
 
 Window::~Window() {
+    auto& windows = detail::scheduled_windows();
+    windows.erase(std::remove(windows.begin(), windows.end(), this), windows.end());
 #ifdef AINO_PLATFORM_WINDOWS
     detail::w32_destroy(this);
 #elif defined(AINO_PLATFORM_X11)
     detail::x11_destroy(this);
+#elif defined(AINO_PLATFORM_WAYLAND)
+    detail::wayland_destroy(this);
 #elif defined(AINO_PLATFORM_MACOS)
     detail::cocoa_destroy(this);
 #endif
@@ -10972,8 +11325,10 @@ void  Window::set_theme(const Theme& t) {
     impl->ui.set_theme(t);
     impl->need_frame = true;
 }
+#ifndef AINO_PLATFORM_WAYLAND
 int   Window::width() const { return int(float(impl->client_w) / impl->scale + 0.5f); }
 int   Window::height() const { return int(float(impl->client_h) / impl->scale + 0.5f); }
+#endif
 float Window::dpi_scale() const { return impl->scale; }
 bool  Window::should_close() const { return !impl->running; }
 void  Window::request_repaint() {
@@ -11037,6 +11392,8 @@ inline Fn dll_proc(HMODULE module, const char* name) {
 struct Win32State {
     Window::Impl* owner = nullptr;
     HWND hwnd = nullptr;
+    HICON icon_big = nullptr, icon_small = nullptr;
+    std::wstring icon_path;
     HDC mem_dc = nullptr;
     HBITMAP hbmp = nullptr;
     void* bits = nullptr;
@@ -11107,6 +11464,36 @@ inline UINT win_dpi_of(HWND hwnd) {
     UINT d = UINT(GetDeviceCaps(dc, LOGPIXELSX));
     ReleaseDC(nullptr, dc);
     return d ? d : 96;
+}
+
+inline void win_update_icons(Win32State* state, UINT dpi) {
+    using MetricsForDpi = int (WINAPI*)(int, UINT);
+    static const auto metrics = dll_proc<MetricsForDpi>(GetModuleHandleW(L"user32.dll"), "GetSystemMetricsForDpi");
+    const auto size = [&](int index) {
+        return metrics ? metrics(index, dpi)
+                       : MulDiv(GetSystemMetrics(index), int(dpi), int(win_dpi_of(nullptr)));
+    };
+    const bool from_file = !state->icon_path.empty();
+    const auto instance = from_file ? nullptr : GetModuleHandleW(nullptr);
+    const auto source = from_file ? state->icon_path.c_str() : MAKEINTRESOURCEW(1);
+    const UINT flags = from_file ? LR_LOADFROMFILE : 0;
+    // 每个窗口拥有匹配自身 DPI 的图标；不使用共享类图标的尺寸与所有权。
+    HICON big_icon = reinterpret_cast<HICON>(LoadImageW(instance, source, IMAGE_ICON,
+        size(SM_CXICON), size(SM_CYICON), flags));
+    HICON small_icon = reinterpret_cast<HICON>(LoadImageW(instance, source, IMAGE_ICON,
+        size(SM_CXSMICON), size(SM_CYSMICON), flags));
+    if (big_icon) {
+        SendMessageW(state->hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(big_icon));
+        if (state->icon_big) DestroyIcon(state->icon_big);
+        state->icon_big = big_icon;
+    }
+    if (small_icon) {
+        SendMessageW(state->hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(small_icon));
+        if (state->icon_small) DestroyIcon(state->icon_small);
+        state->icon_small = small_icon;
+    }
+    if (from_file && (!big_icon || !small_icon))
+        std::fprintf(stderr, "[aino] Cannot load icon at %u DPI\n", dpi);
 }
 
 inline void win_enable_dpi_awareness() {
@@ -11630,6 +12017,7 @@ inline LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
     case WM_DPICHANGED: {
         s->owner->scale = float(HIWORD(w)) / 96.0f;
+        win_update_icons(s, HIWORD(w));
         RECT* r = reinterpret_cast<RECT*>(l);
         SetWindowPos(h, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
                      SWP_NOZORDER | SWP_NOACTIVATE);
@@ -11666,6 +12054,7 @@ inline void w32_create(Window* self, const WindowConfig& cfg) {
 
     Win32State* s = new Win32State();
     s->owner = o;
+    s->icon_path = to_wide(cfg.icon_path);
     o->native = s;
 
     // 字体文件：先注册进本进程（FR_PRIVATE，不污染别的程序），再按解析出的
@@ -11684,6 +12073,9 @@ inline void w32_create(Window* self, const WindowConfig& cfg) {
         wc.lpfnWndProc   = win_proc;
         wc.hInstance     = GetModuleHandleW(nullptr);
         wc.hCursor       = LoadCursorW(nullptr, AINO_IDC_ARROW);
+        wc.hIcon         = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(1));
+        wc.hIconSm       = reinterpret_cast<HICON>(LoadImageW(wc.hInstance, MAKEINTRESOURCEW(1),
+                              IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED));
         wc.lpszClassName = L"AinoWindowClass";
         wc.hbrBackground = nullptr;
         RegisterClassExW(&wc);
@@ -11737,22 +12129,8 @@ inline void w32_create(Window* self, const WindowConfig& cfg) {
 
     o->scale = float(win_dpi_of(hwnd)) / 96.0f;
 
-    // 图标：.ico 用 LoadImageW 直接读文件，按大/小两个尺寸各设一次
-    // （只设 ICON_BIG 的话标题栏和 Alt+Tab 里还会是默认图标）。
-    if (!cfg.icon_path.empty()) {
-        const std::wstring wi = to_wide(cfg.icon_path);
-        HICON ib = reinterpret_cast<HICON>(LoadImageW(nullptr, wi.c_str(), IMAGE_ICON,
-                                                      GetSystemMetrics(SM_CXICON),
-                                                      GetSystemMetrics(SM_CYICON),
-                                                      LR_LOADFROMFILE));
-        HICON is = reinterpret_cast<HICON>(LoadImageW(nullptr, wi.c_str(), IMAGE_ICON,
-                                                      GetSystemMetrics(SM_CXSMICON),
-                                                      GetSystemMetrics(SM_CYSMICON),
-                                                      LR_LOADFROMFILE));
-        if (ib) SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(ib));
-        if (is) SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(is));
-        // 句柄交给窗口自己管（DestroyWindow 会释放通过 WM_SETICON 设进去的图标）
-    }
+    // 内嵌资源与显式 .ico 都按当前窗口 DPI 分别设置大小图标。
+    win_update_icons(s, win_dpi_of(hwnd));
 
     GdiTextRenderer* tr = new GdiTextRenderer();
     tr->init(o->scale, o->theme.font_family, o->theme.font_family_mono);
@@ -11792,6 +12170,8 @@ inline void w32_destroy(Window* self) {
     }
     if (s->hbmp) { DeleteObject(s->hbmp); s->hbmp = nullptr; }
     if (s->hwnd && IsWindow(s->hwnd)) DestroyWindow(s->hwnd);
+    if (s->icon_big) DestroyIcon(s->icon_big);
+    if (s->icon_small) DestroyIcon(s->icon_small);
     delete s;
     o->native = nullptr;
 }
@@ -11861,16 +12241,10 @@ struct WinPreciseTimer {
         if (!h) h = CreateWaitableTimerW(nullptr, FALSE, nullptr);
     }
     ~WinPreciseTimer() { if (h) CloseHandle(h); }
-    void wait_us(uint64_t us) {
-        if (us == 0) return;
-        if (!h) { Sleep(DWORD((us + 999) / 1000)); return; }
-        LARGE_INTEGER due;
-        due.QuadPart = -LONGLONG(us * 10);        // 相对时间，单位 100ns
-        if (!SetWaitableTimer(h, &due, 0, nullptr, nullptr, FALSE)) {
-            Sleep(DWORD((us + 999) / 1000));
-            return;
-        }
-        WaitForSingleObject(h, INFINITE);
+    HANDLE arm_ms(int milliseconds) {
+        if (!h || milliseconds <= 0) return nullptr;
+        LARGE_INTEGER due{}; due.QuadPart = -LONGLONG(milliseconds) * 10000;
+        return SetWaitableTimer(h, &due, 0, nullptr, nullptr, FALSE) ? h : nullptr;
     }
 };
 
@@ -11982,6 +12356,9 @@ void Window::render() {
     // 重新把它置 true，从而让下一帧继续。放到帧末清会把请求吃掉，动画就卡在第一帧。
     o->need_frame = false;
 
+    detail::ScopeExit frame_cleanup([o] {
+        if (o->ui.impl->frame_open) { o->ui.impl->abort_frame(); o->need_frame = true; }
+    });
     Ui& ui = o->ui;
     ui.begin_frame(float(s->pw) / o->scale, float(s->ph) / o->scale, dt, o->scale);
     if (o->frame_cb_ptr) o->frame_cb_ptr();
@@ -12018,44 +12395,6 @@ void Window::render() {
     }
 }
 
-void Window::run(const std::function<void(Ui&)>& frame) {
-    Window::Impl* o = impl;
-    detail::Win32State* s = reinterpret_cast<detail::Win32State*>(o->native);
-    if (!s) return;
-
-    o->frame_cb_ptr = [&frame, o]() { frame(o->ui); };
-    // 窗口过程（WM_SIZE / WM_PAINT）要能在 user32 的模态循环里自己补一帧
-    o->render_fn = [this]() { render(); };
-
-    while (o->running) {
-        // 先把消息队列抽干
-        if (!poll()) break;
-
-        const bool anim = o->ui.animating();
-        if (o->need_frame || anim || o->ui.impl->repaint_timeout_ms() == 0) {
-            o->self_repaint = false;                 // 本轮"自请求"标记清零
-            const uint64_t t0 = detail::win_ticks_us();
-            render();
-            const uint64_t el_us = detail::win_ticks_us() - t0;
-            // 帧日志覆盖所有帧，不只连续动画：鼠标驱动的那一帧往往才是大头。
-            if (o->frame_log) detail::win_frame_log(o, el_us);
-            // 指针移动触发的帧用更长的预算合并；拖动/动画仍按 60fps。
-            const uint32_t budget_ms =
-                (o->move_only && o->ui.impl->active == 0)
-                    ? std::max(o->anim_budget_ms, o->move_budget_ms)
-                    : o->anim_budget_ms;
-            o->move_only = false;      // 下一帧的触发源重新判定
-            const uint64_t budget_us = uint64_t(budget_ms) * 1000u;
-            // 用高精度等待补足预算：Sleep 的 15.6ms 粒度会把 60fps 砍到 33fps。
-            if (el_us < budget_us) detail::win_timer().wait_us(budget_us - el_us);
-        } else {
-            // 没有待办 → 阻塞在内核里等消息。这就是空闲 0% CPU 的来源。
-            o->wake_signal.wait(o->ui.impl->repaint_timeout_ms());
-        }
-    }
-    o->frame_cb_ptr = nullptr;
-    o->render_fn = nullptr;
-}
 
 void Window::set_title(const std::string& title) {
     Window::Impl* o = impl;
@@ -12087,9 +12426,9 @@ void Window::set_size(int w, int h) {
 
 // OpenClipboard 可能因其它进程占用而失败；最多重试 8 次，每次间隔 1ms。
 namespace detail {
-inline bool clipboard_open_retry() {
+inline bool clipboard_open_retry(HWND owner = nullptr) {
     for (int i = 0; i < 8; ++i) {
-        if (OpenClipboard(nullptr)) return true;
+        if (OpenClipboard(owner)) return true;
         Sleep(1);
     }
     return false;
@@ -12097,19 +12436,24 @@ inline bool clipboard_open_retry() {
 } // namespace detail
 
 void Window::set_clipboard(const std::string& text) {
-    if (!detail::clipboard_open_retry()) return;
-    EmptyClipboard();
+    (void)try_set_clipboard(text);
+}
+bool Window::try_set_clipboard(const std::string& text) {
+    auto* state = reinterpret_cast<detail::Win32State*>(impl->native);
+    if (!state || !state->hwnd) return false;
     const std::wstring w = detail::to_wide(text);
     const size_t bytes = (w.size() + 1) * sizeof(wchar_t);
-    if (HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
-        void* dst = GlobalLock(mem);
-        if (!dst) { GlobalFree(mem); CloseClipboard(); return; }
-        memcpy(dst, w.c_str(), bytes);
-        GlobalUnlock(mem);
-        // SetClipboardData 成功后所有权归系统，不能再 GlobalFree；失败则必须自己释放。
-        if (!SetClipboardData(CF_UNICODETEXT, mem)) GlobalFree(mem);
-    }
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!mem) return false;
+    void* dst = GlobalLock(mem);
+    if (!dst) { GlobalFree(mem); return false; }
+    memcpy(dst, w.c_str(), bytes);
+    GlobalUnlock(mem);
+    if (!detail::clipboard_open_retry(state->hwnd)) { GlobalFree(mem); return false; }
+    const bool stored = EmptyClipboard() && SetClipboardData(CF_UNICODETEXT, mem);
+    if (!stored) GlobalFree(mem);
     CloseClipboard();
+    return stored;
 }
 
 std::string Window::clipboard() const {
@@ -12215,7 +12559,7 @@ inline float desktop_scale(const char* override_scale, const char* gdk_scale,
 }
 } // namespace detail
 
-#if defined(AINO_PLATFORM_X11)
+#if defined(AINO_PLATFORM_UNIX)
 
 namespace detail {
 
@@ -12226,7 +12570,7 @@ inline std::string& x11_icon_theme() { static thread_local std::string theme; re
 // 是**全缓冲**的，不 flush 的话进程一死，前面打的字全部丢失 —— 日志里只剩
 // 一行 glibc 的报错，看不出死在哪一步。
 inline bool x11_trace_on() {
-    static const bool on = (std::getenv("AINO_X11_TRACE") != nullptr);
+    static const bool on = (std::getenv("AINO_X11_TRACE") != nullptr || std::getenv("AINO_WAYLAND_TRACE") != nullptr);
     return on;
 }
 inline void x11_trace(const char* fmt, ...) {
@@ -12438,7 +12782,7 @@ inline int x11_chain_cap() {
     return v >= 2 ? v : 16;
 }
 
-class X11TextRenderer : public TextRenderer {
+class UnixTextRenderer : public TextRenderer {
 public:
     void init(float, const std::string& family, const std::string& mono) override {
         // 两套名字：FreeType 按 fontconfig 家族名匹配（"sans"），
@@ -12450,8 +12794,20 @@ public:
         x11_trace("text init: family=%s mono=%s freetype=%d", family.c_str(), mono.c_str(),
                   ft_ready_ ? 1 : 0);
     }
+    void reconfigure(float dpi, const std::string& family, const std::string& mono) override {
+#ifdef AINO_PLATFORM_X11
+        Display* dpy = dpy_;
+        const Drawable target = target_;
+#endif
+        release();
+        init(dpi, family, mono);
+#ifdef AINO_PLATFORM_X11
+        set_drawable(dpy, target, nullptr);
+#endif
+    }
     void release() override {
         release_fonts();
+#ifdef AINO_PLATFORM_X11
         if (dpy_) {
             for (auto& kv : sets_) {
                 if (!kv.second) continue;
@@ -12463,6 +12819,7 @@ public:
         }
         sets_.clear();
         dpy_ = nullptr;
+#endif
         x11_trace("text release done");
     }
     float measure(const std::string& utf8, float size, int weight) override {
@@ -12478,6 +12835,7 @@ public:
             }
             if (w > 0.0f) return w;
         }
+#ifdef AINO_PLATFORM_X11
         XFontSet fs = fontset(size);
         if (!fs) return float(utf8.size()) * size * 0.55f;
         XRectangle ink{}, logical{};
@@ -12486,22 +12844,33 @@ public:
         // 文字算成"零宽"，居中/右对齐全错位。退回按字宽估算。
         if (logical.width <= 0) return float(utf8.size()) * size * 0.55f;
         return float(logical.width);
+#else
+        return float(utf8_count(utf8)) * size * 0.55f;
+#endif
     }
     float ascent(float size, int weight) override {
         if (Font* f = font(size, weight, false)) return float(f->asc);
+#ifdef AINO_PLATFORM_X11
         XFontSet fs = fontset(size);
         if (!fs) return size * 0.8f;
         XFontSetExtents* e = XExtentsOfFontSet(fs);
         if (!e) return size * 0.8f;
         return float(-e->max_logical_extent.y);
+#else
+        return size * 0.8f;
+#endif
     }
     float line_height(float size, int weight) override {
         if (Font* f = font(size, weight, false)) return float(f->asc + f->desc);
+#ifdef AINO_PLATFORM_X11
         XFontSet fs = fontset(size);
         if (!fs) return size * 1.4f;
         XFontSetExtents* e = XExtentsOfFontSet(fs);
         if (!e) return size * 1.4f;
         return float(e->max_logical_extent.height);
+#else
+        return size * 1.4f;
+#endif
     }
     // 等宽通道：代码块靠它按列对齐。Windows 用 Consolas，Linux 自然就是
     // fontconfig 的 monospace（DejaVu Sans Mono / Noto Sans Mono）。
@@ -12529,18 +12898,25 @@ public:
               float size, int weight, const Color& c, const Rect& clip) override {
         if (utf8.empty()) return;
         if (ft_draw(cv, utf8, x, y_top, size, weight, c, clip, false)) return;
+#ifdef AINO_PLATFORM_X11
         if (dpy_) core_draw(cv, utf8, x, y_top, size, weight, c, clip);
+#endif
     }
     void draw_mono(Canvas& cv, const std::string& utf8, float x, float y_top,
                    float size, int weight, const Color& c, const Rect& clip) override {
         if (utf8.empty()) return;
         if (ft_draw(cv, utf8, x, y_top, size, weight, c, clip, true)) return;
+#ifdef AINO_PLATFORM_X11
         if (dpy_) core_draw(cv, utf8, x, y_top, size, weight, c, clip);
+#endif
     }
+#ifdef AINO_PLATFORM_X11
     void set_drawable(Display* d, Drawable target, GC) {
         dpy_ = d;
         target_ = target;
     }
+#endif
+    bool ready() const { return ft_ready_; }
     struct CacheStats { size_t fonts, faces, glyph_bytes; };
     CacheStats cache_stats() const { return {fonts_.size(), faces_.size(), glyph_bytes_}; }
 
@@ -12742,7 +13118,7 @@ private:
     }
 
     // 取一个码位的字形：先试上次命中的字体，再沿兜底链找第一个覆盖它的。
-    // 一个都没有就只占半格宽度、不画墨 —— 宁可空白也不吐豆腐方块。
+    // 缺少字体时画 .notdef 并报告一次，不能把不可读的内容静默变成空白。
     const Glyph& glyph(Font& f, unsigned long cp) {
         uncached_glyph_ = Glyph{};
         auto it = f.glyphs.find(cp);
@@ -12793,6 +13169,19 @@ private:
             }
         } else {
             g.adv = int(f.px * 0.5 * 64.0 + 0.5);
+            if (cp >= 32 && cp != 127) {
+                if (!missing_font_reported_) {
+                    std::fprintf(stderr, "[aino/font] No installed font covers U+%04lX; showing a missing-glyph marker. "
+                        "Install suitable fonts (CJK: fonts-noto-cjk).\n", cp);
+                    missing_font_reported_ = true;
+                }
+                if (void* face = open_face(f, 0)) {
+                    if (ft.load_glyph(face, 0, 0x4) == 0) {
+                        auto* slot = static_cast<FtSlotLite*>(static_cast<FtFaceLite*>(face)->glyph);
+                        if (slot) { g.adv = int(slot->advance.x); copy_bitmap(slot, g); }
+                    }
+                }
+            }
         }
         constexpr size_t budget = 4u * 1024u * 1024u;
         // 单个超大字形只供本次调用使用，不让它撑破持久缓存预算。
@@ -12893,6 +13282,7 @@ private:
 
     // 核心 XLFD 字体那条老路：1bit 点阵、无抗锯齿、字重拉不开。
     // 只在 FreeType 加载不到（极简容器）时才会走到这里。
+#ifdef AINO_PLATFORM_X11
     void core_draw(Canvas& cv, const std::string& utf8, float x, float y_top,
                    float size, int weight, const Color& c, const Rect& clip) {
         if (!dpy_ || utf8.empty()) return;
@@ -13022,11 +13412,15 @@ private:
     Drawable target_ = 0;      // 窗口：只用来创建 Pixmap
     Pixmap pm1_ = 0;           // 1×1 depth 1 —— 只为建下面那个 GC
     GC gc1_ = nullptr;         // depth 1 的 GC
+#endif
     bool ft_ready_ = false;    // FreeType + fontconfig 都加载成功
+    bool missing_font_reported_ = false;
     std::string family_;       // 核心字体的 XLFD 家族（空 = "*"）
     std::string sans_;         // fontconfig 家族名（空 = "sans"）
     std::string mono_;
+#ifdef AINO_PLATFORM_X11
     std::unordered_map<int, XFontSet> sets_;
+#endif
     std::unordered_map<int, Font> fonts_;
     struct SharedFace { void* face = nullptr; long size = 0; uint64_t touched = 0; };
     std::map<std::pair<std::string, long>, SharedFace> faces_;
@@ -13038,6 +13432,8 @@ private:
 };
 
 
+#ifdef AINO_PLATFORM_X11
+using X11TextRenderer = UnixTextRenderer;
 struct X11State {
     Window::Impl* owner = nullptr;
     Display* dpy = nullptr;
@@ -13055,7 +13451,17 @@ struct X11State {
     ::Window settings_owner = 0;
     Atom settings_selection = 0, settings_property = 0, resource_manager = 0, manager = 0;
     WindowConfig config;
-    std::string clipboard_text;
+
+    std::string clipboard_text, clipboard_received;
+    bool clipboard_waiting = false, clipboard_done = false, clipboard_ok = false, clipboard_incr = false;
+    Atom clipboard_property = 0, clipboard_selection = 0, clipboard_utf8 = 0, clipboard_increment = 0;
+    struct ClipboardSend {
+        ::Window window; Atom property, type; std::string text; size_t offset = 0;
+        std::chrono::steady_clock::time_point updated = std::chrono::steady_clock::now();
+    };
+    std::vector<ClipboardSend> clipboard_sends;
+    ::Cursor cursors[6] = {};
+    unsigned cursor_shape = 0;
 
     float mx = -1e6f, my = -1e6f;
     bool  btn_down[3] = {false, false, false};
@@ -13070,6 +13476,149 @@ struct X11State {
     bool  key_shift[KEY_COUNT] = {};
     bool  key_alt[KEY_COUNT]   = {};
 };
+
+inline std::vector<X11State*>& x11_clipboard_windows() {
+    thread_local std::vector<X11State*> windows;
+    return windows;
+}
+
+// 外部选区 requestor 可以随时销毁。仅在这段同步事务中捕获其 BadWindow，
+// 其它 Display / Thread 的错误继续交回宿主处理器；退出后恢复全局 Xlib handler。
+class X11SelectionErrors {
+    Display* display_;
+    std::unique_lock<std::mutex> lock_;
+    static std::mutex& mutex() { static std::mutex value; return value; }
+    static std::atomic<XErrorHandler>& previous() { static std::atomic<XErrorHandler> value{nullptr}; return value; }
+    static X11SelectionErrors*& current() { thread_local X11SelectionErrors* value = nullptr; return value; }
+    static int handle(Display* display, XErrorEvent* error) {
+        auto* scope = current();
+        if (scope && scope->display_ == display && (error->error_code == BadWindow || error->error_code == BadAtom
+            || error->error_code == BadMatch)) return 0;
+        auto handler = previous().load(); return handler ? handler(display, error) : 0;
+    }
+public:
+    explicit X11SelectionErrors(Display* display) : display_(display), lock_(mutex()) {
+        XSync(display_, False);
+        previous().store(XSetErrorHandler(handle)); current() = this;
+    }
+    ~X11SelectionErrors() {
+        XSync(display_, False); current() = nullptr; XSetErrorHandler(previous().load());
+    }
+};
+
+inline void x11_clipboard_atoms(X11State* s) {
+    if (s->clipboard_selection) return;
+    s->clipboard_selection = XInternAtom(s->dpy, "CLIPBOARD", False);
+    s->clipboard_utf8 = XInternAtom(s->dpy, "UTF8_STRING", False);
+    s->clipboard_increment = XInternAtom(s->dpy, "INCR", False);
+    s->clipboard_property = XInternAtom(s->dpy, "AINO_CLIPBOARD", False);
+}
+inline Bool x11_clipboard_filter(Display*, XEvent* e, XPointer arg) {
+    auto* s = reinterpret_cast<X11State*>(arg);
+    if (e->type == SelectionRequest || e->type == SelectionNotify || e->type == SelectionClear) return True;
+    if (e->type != PropertyNotify) return False;
+    if (e->xproperty.window == s->win && e->xproperty.atom == s->clipboard_property) return True;
+    for (const auto& send : s->clipboard_sends)
+        if (send.window == e->xproperty.window && send.property == e->xproperty.atom) return True;
+    return False;
+}
+inline bool x11_clipboard_event(X11State* s, XEvent& event) {
+    if (event.type == DestroyNotify && event.xdestroywindow.window != s->win) {
+        const auto count = s->clipboard_sends.size();
+        s->clipboard_sends.erase(std::remove_if(s->clipboard_sends.begin(), s->clipboard_sends.end(),
+            [&](const X11State::ClipboardSend& send) { return send.window == event.xdestroywindow.window; }), s->clipboard_sends.end());
+        if (count != s->clipboard_sends.size()) return true;
+    }
+    if (event.type != SelectionRequest && event.type != SelectionNotify
+        && event.type != SelectionClear && event.type != PropertyNotify) return false;
+    x11_clipboard_atoms(s);
+    constexpr size_t limit = 32u << 20, chunk = 64u << 10;
+    const Atom selection = s->clipboard_selection, utf8 = s->clipboard_utf8, incr = s->clipboard_increment;
+    if (event.type == SelectionRequest) {
+        const auto& request = event.xselectionrequest;
+        if (request.selection != selection) return false;
+        X11SelectionErrors errors(s->dpy);
+        const auto now = std::chrono::steady_clock::now();
+        s->clipboard_sends.erase(std::remove_if(s->clipboard_sends.begin(), s->clipboard_sends.end(),
+            [&](const X11State::ClipboardSend& send) { return now - send.updated > std::chrono::seconds(30); }), s->clipboard_sends.end());
+        XEvent reply{};
+        reply.xselection.type = SelectionNotify; reply.xselection.display = request.display;
+        reply.xselection.requestor = request.requestor; reply.xselection.selection = request.selection;
+        reply.xselection.target = request.target; reply.xselection.time = request.time;
+        const Atom property = request.property ? request.property : request.target;
+        const Atom targets = XInternAtom(s->dpy, "TARGETS", False), text = XInternAtom(s->dpy, "TEXT", False);
+        if (request.target == targets) {
+            const Atom supported[] = {targets, utf8, text};
+            XChangeProperty(s->dpy, request.requestor, property, XA_ATOM, 32, PropModeReplace,
+                reinterpret_cast<const unsigned char*>(supported), 3);
+            reply.xselection.property = property;
+        } else if (request.target == utf8 || request.target == text) {
+            if (s->clipboard_text.size() <= chunk) {
+                XChangeProperty(s->dpy, request.requestor, property, utf8, 8, PropModeReplace,
+                    reinterpret_cast<const unsigned char*>(s->clipboard_text.data()), int(s->clipboard_text.size()));
+                reply.xselection.property = property;
+            } else {
+                size_t bytes = s->clipboard_text.size();
+                for (const auto& send : s->clipboard_sends) bytes += send.text.size();
+                XWindowAttributes attributes{};
+                if (bytes <= limit && s->clipboard_sends.size() < 8
+                    && XGetWindowAttributes(s->dpy, request.requestor, &attributes)) {
+                    XSelectInput(s->dpy, request.requestor, attributes.your_event_mask | PropertyChangeMask | StructureNotifyMask);
+                    s->clipboard_sends.push_back({request.requestor, property, utf8, s->clipboard_text, 0});
+                    const unsigned long length = static_cast<unsigned long>(s->clipboard_text.size());
+                    XChangeProperty(s->dpy, request.requestor, property, incr, 32, PropModeReplace,
+                        reinterpret_cast<const unsigned char*>(&length), 1);
+                    reply.xselection.property = property;
+                }
+            }
+        }
+        XSendEvent(s->dpy, request.requestor, False, 0, &reply); XFlush(s->dpy);
+        return true;
+    }
+    if (event.type == SelectionClear && event.xselectionclear.selection == selection) {
+        s->clipboard_text.clear(); return true;
+    }
+    if (event.type == PropertyNotify && event.xproperty.state == PropertyDelete) {
+        for (auto it = s->clipboard_sends.begin(); it != s->clipboard_sends.end(); ++it) {
+            if (it->window != event.xproperty.window || it->property != event.xproperty.atom) continue;
+            X11SelectionErrors errors(s->dpy);
+            it->updated = std::chrono::steady_clock::now();
+            const size_t size = std::min(chunk, it->text.size() - it->offset);
+            XChangeProperty(s->dpy, it->window, it->property, it->type, 8, PropModeReplace,
+                reinterpret_cast<const unsigned char*>(it->text.data() + it->offset), int(size));
+            it->offset += size;
+            if (!size) s->clipboard_sends.erase(it);
+            XFlush(s->dpy); return true;
+        }
+    }
+    const bool notify = event.type == SelectionNotify && s->clipboard_waiting
+        && event.xselection.requestor == s->win && event.xselection.selection == selection;
+    const bool next = event.type == PropertyNotify && s->clipboard_waiting && s->clipboard_incr
+        && event.xproperty.window == s->win && event.xproperty.atom == s->clipboard_property
+        && event.xproperty.state == PropertyNewValue;
+    if (!notify && !next) return false;
+    if (notify && !event.xselection.property) { s->clipboard_done = true; return true; }
+    Atom type = 0; int format = 0;
+    unsigned long count = 0, remaining = 0;
+    unsigned char* data = nullptr;
+    const int rc = XGetWindowProperty(s->dpy, s->win, s->clipboard_property, 0, long(limit / 4),
+        True, AnyPropertyType, &type, &format, &count, &remaining, &data);
+    ScopeExit release([&] { if (data) XFree(data); });
+    if (rc != Success || remaining || (type != incr && (format != 8 || type != utf8))) {
+        s->clipboard_done = true; return true;
+    }
+    if (type == incr) {
+        if (format != 32 || count != 1 || !data || *reinterpret_cast<unsigned long*>(data) > limit) {
+            s->clipboard_done = true; return true;
+        }
+        s->clipboard_incr = true;
+        XDeleteProperty(s->dpy, s->win, s->clipboard_property);
+    } else if (count <= limit - s->clipboard_received.size()) {
+        if (count) s->clipboard_received.append(reinterpret_cast<const char*>(data), size_t(count));
+        if (!s->clipboard_incr || !count) { s->clipboard_ok = true; s->clipboard_done = true; }
+    } else s->clipboard_done = true;
+    XFlush(s->dpy); return true;
+}
 
 // 输入法坐标始终是物理客户区坐标，随输入框滚动和 DPI 更新。
 inline void x11_set_ime_pos(X11State* s, float caret_x, float top, float bottom) {
@@ -13153,13 +13702,16 @@ inline void x11_apply_cursor(X11State* s) {
     unsigned shape = XC_left_ptr;
     switch (s->owner->cursor) {
         case Cursor::Hand:    shape = XC_hand2; break;
+        case Cursor::Text:
         case Cursor::IBeam:   shape = XC_xterm; break;
         case Cursor::ResizeH: shape = XC_sb_h_double_arrow; break;
         case Cursor::ResizeV: shape = XC_sb_v_double_arrow; break;
         default:              shape = XC_left_ptr; break;
     }
-    ::Cursor c = XCreateFontCursor(s->dpy, shape);   // Xlib 的 Cursor，不是 aino::Cursor
-    if (c) { XDefineCursor(s->dpy, s->win, c); XFreeCursor(s->dpy, c); }
+    const int index = std::max(0, std::min(5, int(s->owner->cursor)));
+    if (s->cursor_shape == shape && s->cursors[index]) return;
+    if (!s->cursors[index]) s->cursors[index] = XCreateFontCursor(s->dpy, shape);
+    if (s->cursors[index]) { XDefineCursor(s->dpy, s->win, s->cursors[index]); s->cursor_shape = shape; }
 }
 
 inline void x11_feed_input(X11State* s) {
@@ -13255,7 +13807,7 @@ inline void x11_refresh_scale(X11State* s) {
     o->scale = scale;
     // 新字号重新生成位图，释放旧 DPI 下的字体和字形缓存。
     if (o->text) {
-        o->text->release(); o->text->init(scale, o->theme.font_family, o->theme.font_family_mono);
+        o->text->release(); o->text->init(scale, o->ui.theme().font_family, o->ui.theme().font_family_mono);
         static_cast<X11TextRenderer*>(o->text)->set_drawable(s->dpy, s->win, s->gc);
     }
     x11_size_hints(s, w, h);
@@ -13264,6 +13816,7 @@ inline void x11_refresh_scale(X11State* s) {
 }
 
 inline bool x11_handle(X11State* s, XEvent& e) {
+    if (x11_clipboard_event(s, e)) return true;
     Window::Impl* o = s->owner;
     // XIM 先消费组字按键及协议事件，避免拼音同时落入正文和快捷键。
     if (XFilterEvent(&e, None)) { o->need_frame = true; return true; }
@@ -13502,8 +14055,28 @@ inline void x11_create(Window* self, const WindowConfig& cfg) {
     s->win = XCreateSimpleWindow(s->dpy, root, wx, wy, unsigned(w), unsigned(h), 0,
                                  BlackPixel(s->dpy, screen), WhitePixel(s->dpy, screen));
     x11_set_title(s->dpy, s->win, cfg.title);
+    if (!cfg.icon_path.empty()) {
+        Image icon;
+        std::string error;
+        if (icon.load(cfg.icon_path, &error)) {
+            const float scale = std::min(1.f, 128.f / float(std::max(icon.width, icon.height)));
+            const int iw = std::max(1, int(icon.width * scale)), ih = std::max(1, int(icon.height * scale));
+            std::vector<unsigned long> data(2u + size_t(iw) * size_t(ih));
+            data[0] = static_cast<unsigned long>(iw);
+            data[1] = static_cast<unsigned long>(ih);
+            for (int y = 0; y < ih; ++y) for (int x = 0; x < iw; ++x) {
+                const int sx = int(int64_t(x) * icon.width / iw), sy = int(int64_t(y) * icon.height / ih);
+                const auto* p = &icon.pixels[(size_t(sy) * size_t(icon.width) + size_t(sx)) * 4u];
+                data[2u + size_t(y) * size_t(iw) + size_t(x)] = (static_cast<unsigned long>(p[3]) << 24) | (static_cast<unsigned long>(p[0]) << 16) |
+                              (static_cast<unsigned long>(p[1]) << 8) | static_cast<unsigned long>(p[2]);
+            }
+            const Atom property = XInternAtom(s->dpy, "_NET_WM_ICON", False);
+            XChangeProperty(s->dpy, s->win, property, XA_CARDINAL, 32, PropModeReplace,
+                            reinterpret_cast<const unsigned char*>(data.data()), int(data.size()));
+        } else std::fprintf(stderr, "[aino] %s\n", error.c_str());
+    }
     XSelectInput(s->dpy, s->win,
-                 ExposureMask | StructureNotifyMask | PointerMotionMask |
+                 PropertyChangeMask | ExposureMask | StructureNotifyMask | PointerMotionMask |
                  ButtonPressMask | ButtonReleaseMask | KeyPressMask | KeyReleaseMask |
                  EnterWindowMask | LeaveWindowMask | FocusChangeMask);
     s->wm_delete = XInternAtom(s->dpy, "WM_DELETE_WINDOW", False);
@@ -13513,10 +14086,7 @@ inline void x11_create(Window* self, const WindowConfig& cfg) {
     // 尺寸约束。X11 没有"不可缩放"这个位，只能把 min 和 max 设成同一个值 ——
     // 主流 WM 都按这个理解（ICCCM 里没人保证，但这是唯一可移植的做法）。
     x11_size_hints(s, w, h);
-    // 图标与字体文件在 X11 上不做：_NET_WM_ICON 要自己把 PNG 解成 ARGB，
-    // 而核心 X 字体（XLFD）没有"装一个字体文件进进程"这条路。
-    // 行为：图标忽略；字体只按 cfg.font_family 挑已装的家族（见 CoreTextRenderer
-    // 同款的 init 约定）。
+    // X11 字体按 cfg.font_family 选择系统已安装的家族。
 
     // 输入法：中文输入需要 XIM/XIC
     if (XSetLocaleModifiers("") != nullptr) {
@@ -13572,12 +14142,15 @@ inline void x11_create(Window* self, const WindowConfig& cfg) {
     o->ui.impl->set_clipboard = [self](const std::string& text) { self->set_clipboard(text); };
     o->ui.impl->canvas = &o->canvas;
     o->need_frame = true;
+    x11_clipboard_windows().push_back(s);
 }
 
 inline void x11_destroy(Window* self) {
     Window::Impl* o = self->impl;
     X11State* s = reinterpret_cast<X11State*>(o->native);
     if (!s) return;
+    auto& windows = x11_clipboard_windows();
+    windows.erase(std::remove(windows.begin(), windows.end(), s), windows.end());
     // 文本渲染器持有此 Display 的 XFontSet / GC / Pixmap，必须在关闭连接前释放。
     if (o->text) o->text->release();
     if (s->img) { s->img->data = nullptr; XDestroyImage(s->img); s->img = nullptr; }
@@ -13585,6 +14158,7 @@ inline void x11_destroy(Window* self) {
     if (s->im) { XCloseIM(s->im); s->im = nullptr; }
     if (s->im_font) { XFreeFontSet(s->dpy, s->im_font); s->im_font = nullptr; }
     if (s->gc) { XFreeGC(s->dpy, s->gc); s->gc = nullptr; }
+    for (auto cursor : s->cursors) if (cursor) XFreeCursor(s->dpy, cursor);
     if (s->win) XDestroyWindow(s->dpy, s->win);
     if (s->dpy) XCloseDisplay(s->dpy);
     delete s;
@@ -13617,6 +14191,7 @@ void Window::render() {
     detail::X11State* s = reinterpret_cast<detail::X11State*>(o->native);
     if (!s || !s->img) return;
 
+    if (o->ui.impl->frame_open) { o->need_frame = true; return; }
     timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
     uint64_t now = uint64_t(ts.tv_sec) * 1000u + uint64_t(ts.tv_nsec / 1000000);
@@ -13626,6 +14201,9 @@ void Window::render() {
 
     detail::x11_feed_input(s);
     o->need_frame = false;   // 同 Windows：帧前清，帧内 repaint() 可再次置位
+    detail::ScopeExit frame_cleanup([o] {
+        if (o->ui.impl->frame_open) { o->ui.impl->abort_frame(); o->need_frame = true; }
+    });
     Ui& ui = o->ui;
     ui.begin_frame(float(s->pw) / o->scale, float(s->ph) / o->scale, dt, o->scale);
     if (o->frame_cb_ptr) o->frame_cb_ptr();
@@ -13636,29 +14214,6 @@ void Window::render() {
     detail::x11_apply_cursor(s);
 }
 
-void Window::run(const std::function<void(Ui&)>& frame) {
-    Window::Impl* o = impl;
-    detail::X11State* s = reinterpret_cast<detail::X11State*>(o->native);
-    if (!s) return;
-    o->frame_cb_ptr = [&frame, o]() { frame(o->ui); };
-
-    while (o->running) {
-        if (!poll()) break;
-        const bool anim = o->ui.animating();
-        if (o->need_frame || anim || o->ui.impl->repaint_timeout_ms() == 0) {
-            o->self_repaint = false;
-            const uint64_t t0 = detail::x11_ticks_ms();
-            render();
-            // 所有帧统一节流到 anim_fps（默认 60fps），不只连续动画：
-            // 鼠标每动一次 X 就投一个 MotionNotify，不封顶就被输入频率牵着走。
-            const uint64_t el = detail::x11_ticks_ms() - t0;
-            if (el < o->anim_budget_ms) usleep(useconds_t((o->anim_budget_ms - el) * 1000));
-        } else {
-            o->wake_signal.wait(o->ui.impl->repaint_timeout_ms(), ConnectionNumber(s->dpy));
-        }
-    }
-    o->frame_cb_ptr = nullptr;
-}
 
 void Window::set_title(const std::string& title) {
     detail::X11State* s = reinterpret_cast<detail::X11State*>(impl->native);
@@ -13678,27 +14233,2289 @@ void Window::activate() {
     event.xclient.type = ClientMessage; event.xclient.window = s->win;
     event.xclient.message_type = XInternAtom(s->dpy, "_NET_ACTIVE_WINDOW", False);
     event.xclient.format = 32; event.xclient.data.l[0] = 1; event.xclient.data.l[1] = CurrentTime;
-    XSendEvent(s->dpy, DefaultRootWindow(s->dpy), False, SubstructureRedirectMask | SubstructureNotifyMask, &event);
+    XSendEvent(s->dpy, DefaultRootWindow(s->dpy), False,
+               SubstructureRedirectMask | SubstructureNotifyMask, &event);
     XFlush(s->dpy);
 }
 
-void Window::set_clipboard(const std::string& text) {
-    detail::X11State* s = reinterpret_cast<detail::X11State*>(impl->native);
-    if (!s || !s->dpy) return;
-    Atom sel = XInternAtom(s->dpy, "CLIPBOARD", False);
+void Window::set_clipboard(const std::string& text) { (void)try_set_clipboard(text); }
+bool Window::try_set_clipboard(const std::string& text) {
+    auto* s = reinterpret_cast<detail::X11State*>(impl->native);
+    if (!s || !s->dpy || text.size() > (32u << 20)) return false;
+    detail::x11_clipboard_atoms(s);
     s->clipboard_text = text;
-    XSetSelectionOwner(s->dpy, sel, s->win, CurrentTime);
+    XSetSelectionOwner(s->dpy, s->clipboard_selection, s->win, CurrentTime);
     XFlush(s->dpy);
+    return XGetSelectionOwner(s->dpy, s->clipboard_selection) == s->win;
 }
-std::string Window::clipboard() const { return std::string(); }
+std::string Window::clipboard() const {
+    auto* s = reinterpret_cast<detail::X11State*>(impl->native);
+    if (!s || !s->dpy || s->clipboard_waiting) return {};
+    detail::x11_clipboard_atoms(s);
+    const auto owner = XGetSelectionOwner(s->dpy, s->clipboard_selection);
+    if (!owner) return {};
+    if (owner == s->win) return s->clipboard_text;
+    s->clipboard_received.clear(); s->clipboard_done = s->clipboard_ok = s->clipboard_incr = false;
+    s->clipboard_waiting = true;
+    detail::ScopeExit reset([&] {
+        s->clipboard_waiting = false; XDeleteProperty(s->dpy, s->win, s->clipboard_property);
+    });
+    XConvertSelection(s->dpy, s->clipboard_selection, s->clipboard_utf8,
+        s->clipboard_property, s->win, CurrentTime);
+    XFlush(s->dpy);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!s->clipboard_done && std::chrono::steady_clock::now() < deadline) {
+        // 同线程的选区 owner 可能在另一个 Display 连接上；一起服务协议以免互等超时。
+        // 帧内不派发 resize 或其它 UI 事件，避免重建正在使用的画布。
+        std::vector<pollfd> descriptors;
+        bool saturated = false;
+        for (auto* window : detail::x11_clipboard_windows()) {
+            XEvent event{};
+            int handled = 0;
+            while (handled < 64 && std::chrono::steady_clock::now() < deadline
+                && XCheckIfEvent(window->dpy, &event, detail::x11_clipboard_filter, reinterpret_cast<XPointer>(window))) {
+                detail::x11_clipboard_event(window, event);
+                ++handled;
+            }
+            saturated |= handled == 64;
+            descriptors.push_back({ConnectionNumber(window->dpy), POLLIN, 0});
+        }
+        if (s->clipboard_done) break;
+        if (saturated) continue; // 队列已读入 Xlib 时无需再等 fd，同时保留总截止时间。
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+        ::poll(descriptors.data(), descriptors.size(), int(std::max<int64_t>(0, left)));
+    }
+    return s->clipboard_ok ? s->clipboard_received : std::string();
+}
 
+#else
+} // namespace detail
 #endif // AINO_PLATFORM_X11
+#endif // AINO_PLATFORM_UNIX
 
 // =============================================================================
-//  8.20  macOS 后端
-//        纯 C++ 通过 objc runtime 调 AppKit（不写 Objective-C 语法，
-//        这样头文件在普通 .cpp 里也能编译）；绘制用 CoreGraphics，
-//        文字用 CoreText。同样未经真机验证。
+//  8.20  Wayland 后端：CPU 画布、共享内存呈现与原生输入协议
+// =============================================================================
+#ifdef AINO_PLATFORM_WAYLAND
+namespace detail {
+namespace wl {
+struct Proxy;
+struct Interface;
+struct Message { const char* name; const char* signature; const Interface** types; };
+struct Interface {
+    const char* name;
+    int version, method_count;
+    const Message* methods;
+    int event_count;
+    const Message* events;
+};
+struct Array { size_t size, alloc; void* data; };
+// BEGIN AINO WAYLAND PROTOCOLS (tools/generate_wayland_protocols.py)
+// 协议布局来自 Wayland / wayland-protocols XML，保留原协议名称与版本。
+/* wayland
+Copyright © 2008-2011 Kristian Høgsberg
+Copyright © 2010-2011 Intel Corporation
+Copyright © 2012-2013 Collabora, Ltd.
+
+Permission is hereby granted, free of charge, to any person
+obtaining a copy of this software and associated documentation files
+(the "Software"), to deal in the Software without restriction,
+including without limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of the Software,
+and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice (including the
+next paragraph) shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT.  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*/
+/* xdg_shell
+Copyright © 2008-2013 Kristian Høgsberg
+Copyright © 2013      Rafael Antognolli
+Copyright © 2013      Jasper St. Pierre
+Copyright © 2010-2013 Intel Corporation
+Copyright © 2015-2017 Samsung Electronics Co., Ltd
+Copyright © 2015-2017 Red Hat Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice (including the next
+paragraph) shall be included in all copies or substantial portions of the
+Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+*/
+/* viewporter
+Copyright © 2013-2016 Collabora, Ltd.
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice (including the next
+paragraph) shall be included in all copies or substantial portions of the
+Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+*/
+/* fractional_scale_v1
+Copyright © 2022 Kenny Levinsen
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice (including the next
+paragraph) shall be included in all copies or substantial portions of the
+Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+*/
+/* text_input_unstable_v3
+Copyright © 2012, 2013 Intel Corporation
+Copyright © 2015, 2016 Jan Arne Petersen
+Copyright © 2017, 2018 Red Hat, Inc.
+Copyright © 2018       Purism SPC
+
+Permission to use, copy, modify, distribute, and sell this
+software and its documentation for any purpose is hereby granted
+without fee, provided that the above copyright notice appear in
+all copies and that both that copyright notice and this permission
+notice appear in supporting documentation, and that the name of
+the copyright holders not be used in advertising or publicity
+pertaining to distribution of the software without specific,
+written prior permission.  The copyright holders make no
+representations about the suitability of this software for any
+purpose.  It is provided "as is" without express or implied
+warranty.
+
+THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS
+SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS, IN NO EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY
+SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
+AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+THIS SOFTWARE.
+*/
+/* xdg_decoration_unstable_v1
+Copyright © 2018 Simon Ser
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice (including the next
+paragraph) shall be included in all copies or substantial portions of the
+Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+*/
+extern const Interface wl_display;
+extern const Interface wl_registry;
+extern const Interface wl_callback;
+extern const Interface wl_compositor;
+extern const Interface wl_shm_pool;
+extern const Interface wl_shm;
+extern const Interface wl_buffer;
+extern const Interface wl_data_offer;
+extern const Interface wl_data_source;
+extern const Interface wl_data_device;
+extern const Interface wl_data_device_manager;
+extern const Interface wl_shell;
+extern const Interface wl_shell_surface;
+extern const Interface wl_surface;
+extern const Interface wl_seat;
+extern const Interface wl_pointer;
+extern const Interface wl_keyboard;
+extern const Interface wl_touch;
+extern const Interface wl_output;
+extern const Interface wl_region;
+extern const Interface wl_subcompositor;
+extern const Interface wl_subsurface;
+extern const Interface xdg_wm_base;
+extern const Interface xdg_positioner;
+extern const Interface xdg_surface;
+extern const Interface xdg_toplevel;
+extern const Interface xdg_popup;
+extern const Interface wp_viewporter;
+extern const Interface wp_viewport;
+extern const Interface wp_fractional_scale_manager_v1;
+extern const Interface wp_fractional_scale_v1;
+extern const Interface zwp_text_input_v3;
+extern const Interface zwp_text_input_manager_v3;
+extern const Interface zxdg_decoration_manager_v1;
+extern const Interface zxdg_toplevel_decoration_v1;
+inline const Interface* wl_display_request_types_0[] = {&wl_callback};
+inline const Interface* wl_display_request_types_1[] = {&wl_registry};
+inline const Message wl_display_requests[] = {
+        {"sync", "n", wl_display_request_types_0},
+        {"get_registry", "n", wl_display_request_types_1},
+};
+inline const Interface* wl_display_event_types_0[] = {nullptr, nullptr, nullptr};
+inline const Interface* wl_display_event_types_1[] = {nullptr};
+inline const Message wl_display_events[] = {
+        {"error", "ous", wl_display_event_types_0},
+        {"delete_id", "u", wl_display_event_types_1},
+};
+inline const Interface wl_display{"wl_display", 1, 2, wl_display_requests, 2, wl_display_events};
+inline const Interface* wl_registry_request_types_0[] = {nullptr, nullptr, nullptr, nullptr};
+inline const Message wl_registry_requests[] = {
+        {"bind", "usun", wl_registry_request_types_0},
+};
+inline const Interface* wl_registry_event_types_0[] = {nullptr, nullptr, nullptr};
+inline const Interface* wl_registry_event_types_1[] = {nullptr};
+inline const Message wl_registry_events[] = {
+        {"global", "usu", wl_registry_event_types_0},
+        {"global_remove", "u", wl_registry_event_types_1},
+};
+inline const Interface wl_registry{"wl_registry", 1, 1, wl_registry_requests, 2, wl_registry_events};
+inline const Interface* wl_callback_event_types_0[] = {nullptr};
+inline const Message wl_callback_events[] = {
+        {"done", "u", wl_callback_event_types_0},
+};
+inline const Interface wl_callback{"wl_callback", 1, 0, nullptr, 1, wl_callback_events};
+inline const Interface* wl_compositor_request_types_0[] = {&wl_surface};
+inline const Interface* wl_compositor_request_types_1[] = {&wl_region};
+inline const Message wl_compositor_requests[] = {
+        {"create_surface", "n", wl_compositor_request_types_0},
+        {"create_region", "n", wl_compositor_request_types_1},
+};
+inline const Interface wl_compositor{"wl_compositor", 6, 2, wl_compositor_requests, 0, nullptr};
+inline const Interface* wl_shm_pool_request_types_0[] = {&wl_buffer, nullptr, nullptr, nullptr, nullptr, nullptr};
+inline const Interface* wl_shm_pool_request_types_2[] = {nullptr};
+inline const Message wl_shm_pool_requests[] = {
+        {"create_buffer", "niiiiu", wl_shm_pool_request_types_0},
+        {"destroy", "", nullptr},
+        {"resize", "i", wl_shm_pool_request_types_2},
+};
+inline const Interface wl_shm_pool{"wl_shm_pool", 1, 3, wl_shm_pool_requests, 0, nullptr};
+inline const Interface* wl_shm_request_types_0[] = {&wl_shm_pool, nullptr, nullptr};
+inline const Message wl_shm_requests[] = {
+        {"create_pool", "nhi", wl_shm_request_types_0},
+};
+inline const Interface* wl_shm_event_types_0[] = {nullptr};
+inline const Message wl_shm_events[] = {
+        {"format", "u", wl_shm_event_types_0},
+};
+inline const Interface wl_shm{"wl_shm", 1, 1, wl_shm_requests, 1, wl_shm_events};
+inline const Message wl_buffer_requests[] = {
+        {"destroy", "", nullptr},
+};
+inline const Message wl_buffer_events[] = {
+        {"release", "", nullptr},
+};
+inline const Interface wl_buffer{"wl_buffer", 1, 1, wl_buffer_requests, 1, wl_buffer_events};
+inline const Interface* wl_data_offer_request_types_0[] = {nullptr, nullptr};
+inline const Interface* wl_data_offer_request_types_1[] = {nullptr, nullptr};
+inline const Interface* wl_data_offer_request_types_4[] = {nullptr, nullptr};
+inline const Message wl_data_offer_requests[] = {
+        {"accept", "u?s", wl_data_offer_request_types_0},
+        {"receive", "sh", wl_data_offer_request_types_1},
+        {"destroy", "", nullptr},
+        {"finish", "3", nullptr},
+        {"set_actions", "3uu", wl_data_offer_request_types_4},
+};
+inline const Interface* wl_data_offer_event_types_0[] = {nullptr};
+inline const Interface* wl_data_offer_event_types_1[] = {nullptr};
+inline const Interface* wl_data_offer_event_types_2[] = {nullptr};
+inline const Message wl_data_offer_events[] = {
+        {"offer", "s", wl_data_offer_event_types_0},
+        {"source_actions", "3u", wl_data_offer_event_types_1},
+        {"action", "3u", wl_data_offer_event_types_2},
+};
+inline const Interface wl_data_offer{"wl_data_offer", 3, 5, wl_data_offer_requests, 3, wl_data_offer_events};
+inline const Interface* wl_data_source_request_types_0[] = {nullptr};
+inline const Interface* wl_data_source_request_types_2[] = {nullptr};
+inline const Message wl_data_source_requests[] = {
+        {"offer", "s", wl_data_source_request_types_0},
+        {"destroy", "", nullptr},
+        {"set_actions", "3u", wl_data_source_request_types_2},
+};
+inline const Interface* wl_data_source_event_types_0[] = {nullptr};
+inline const Interface* wl_data_source_event_types_1[] = {nullptr, nullptr};
+inline const Interface* wl_data_source_event_types_5[] = {nullptr};
+inline const Message wl_data_source_events[] = {
+        {"target", "?s", wl_data_source_event_types_0},
+        {"send", "sh", wl_data_source_event_types_1},
+        {"cancelled", "", nullptr},
+        {"dnd_drop_performed", "3", nullptr},
+        {"dnd_finished", "3", nullptr},
+        {"action", "3u", wl_data_source_event_types_5},
+};
+inline const Interface wl_data_source{"wl_data_source", 3, 3, wl_data_source_requests, 6, wl_data_source_events};
+inline const Interface* wl_data_device_request_types_0[] = {&wl_data_source, &wl_surface, &wl_surface, nullptr};
+inline const Interface* wl_data_device_request_types_1[] = {&wl_data_source, nullptr};
+inline const Message wl_data_device_requests[] = {
+        {"start_drag", "?oo?ou", wl_data_device_request_types_0},
+        {"set_selection", "?ou", wl_data_device_request_types_1},
+        {"release", "2", nullptr},
+};
+inline const Interface* wl_data_device_event_types_0[] = {&wl_data_offer};
+inline const Interface* wl_data_device_event_types_1[] = {nullptr, &wl_surface, nullptr, nullptr, &wl_data_offer};
+inline const Interface* wl_data_device_event_types_3[] = {nullptr, nullptr, nullptr};
+inline const Interface* wl_data_device_event_types_5[] = {&wl_data_offer};
+inline const Message wl_data_device_events[] = {
+        {"data_offer", "n", wl_data_device_event_types_0},
+        {"enter", "uoff?o", wl_data_device_event_types_1},
+        {"leave", "", nullptr},
+        {"motion", "uff", wl_data_device_event_types_3},
+        {"drop", "", nullptr},
+        {"selection", "?o", wl_data_device_event_types_5},
+};
+inline const Interface wl_data_device{"wl_data_device", 3, 3, wl_data_device_requests, 6, wl_data_device_events};
+inline const Interface* wl_data_device_manager_request_types_0[] = {&wl_data_source};
+inline const Interface* wl_data_device_manager_request_types_1[] = {&wl_data_device, &wl_seat};
+inline const Message wl_data_device_manager_requests[] = {
+        {"create_data_source", "n", wl_data_device_manager_request_types_0},
+        {"get_data_device", "no", wl_data_device_manager_request_types_1},
+};
+inline const Interface wl_data_device_manager{"wl_data_device_manager", 3, 2, wl_data_device_manager_requests, 0, nullptr};
+inline const Interface* wl_shell_request_types_0[] = {&wl_shell_surface, &wl_surface};
+inline const Message wl_shell_requests[] = {
+        {"get_shell_surface", "no", wl_shell_request_types_0},
+};
+inline const Interface wl_shell{"wl_shell", 1, 1, wl_shell_requests, 0, nullptr};
+inline const Interface* wl_shell_surface_request_types_0[] = {nullptr};
+inline const Interface* wl_shell_surface_request_types_1[] = {&wl_seat, nullptr};
+inline const Interface* wl_shell_surface_request_types_2[] = {&wl_seat, nullptr, nullptr};
+inline const Interface* wl_shell_surface_request_types_4[] = {&wl_surface, nullptr, nullptr, nullptr};
+inline const Interface* wl_shell_surface_request_types_5[] = {nullptr, nullptr, &wl_output};
+inline const Interface* wl_shell_surface_request_types_6[] = {&wl_seat, nullptr, &wl_surface, nullptr, nullptr, nullptr};
+inline const Interface* wl_shell_surface_request_types_7[] = {&wl_output};
+inline const Interface* wl_shell_surface_request_types_8[] = {nullptr};
+inline const Interface* wl_shell_surface_request_types_9[] = {nullptr};
+inline const Message wl_shell_surface_requests[] = {
+        {"pong", "u", wl_shell_surface_request_types_0},
+        {"move", "ou", wl_shell_surface_request_types_1},
+        {"resize", "ouu", wl_shell_surface_request_types_2},
+        {"set_toplevel", "", nullptr},
+        {"set_transient", "oiiu", wl_shell_surface_request_types_4},
+        {"set_fullscreen", "uu?o", wl_shell_surface_request_types_5},
+        {"set_popup", "ouoiiu", wl_shell_surface_request_types_6},
+        {"set_maximized", "?o", wl_shell_surface_request_types_7},
+        {"set_title", "s", wl_shell_surface_request_types_8},
+        {"set_class", "s", wl_shell_surface_request_types_9},
+};
+inline const Interface* wl_shell_surface_event_types_0[] = {nullptr};
+inline const Interface* wl_shell_surface_event_types_1[] = {nullptr, nullptr, nullptr};
+inline const Message wl_shell_surface_events[] = {
+        {"ping", "u", wl_shell_surface_event_types_0},
+        {"configure", "uii", wl_shell_surface_event_types_1},
+        {"popup_done", "", nullptr},
+};
+inline const Interface wl_shell_surface{"wl_shell_surface", 1, 10, wl_shell_surface_requests, 3, wl_shell_surface_events};
+inline const Interface* wl_surface_request_types_1[] = {&wl_buffer, nullptr, nullptr};
+inline const Interface* wl_surface_request_types_2[] = {nullptr, nullptr, nullptr, nullptr};
+inline const Interface* wl_surface_request_types_3[] = {&wl_callback};
+inline const Interface* wl_surface_request_types_4[] = {&wl_region};
+inline const Interface* wl_surface_request_types_5[] = {&wl_region};
+inline const Interface* wl_surface_request_types_7[] = {nullptr};
+inline const Interface* wl_surface_request_types_8[] = {nullptr};
+inline const Interface* wl_surface_request_types_9[] = {nullptr, nullptr, nullptr, nullptr};
+inline const Interface* wl_surface_request_types_10[] = {nullptr, nullptr};
+inline const Message wl_surface_requests[] = {
+        {"destroy", "", nullptr},
+        {"attach", "?oii", wl_surface_request_types_1},
+        {"damage", "iiii", wl_surface_request_types_2},
+        {"frame", "n", wl_surface_request_types_3},
+        {"set_opaque_region", "?o", wl_surface_request_types_4},
+        {"set_input_region", "?o", wl_surface_request_types_5},
+        {"commit", "", nullptr},
+        {"set_buffer_transform", "2i", wl_surface_request_types_7},
+        {"set_buffer_scale", "3i", wl_surface_request_types_8},
+        {"damage_buffer", "4iiii", wl_surface_request_types_9},
+        {"offset", "5ii", wl_surface_request_types_10},
+};
+inline const Interface* wl_surface_event_types_0[] = {&wl_output};
+inline const Interface* wl_surface_event_types_1[] = {&wl_output};
+inline const Interface* wl_surface_event_types_2[] = {nullptr};
+inline const Interface* wl_surface_event_types_3[] = {nullptr};
+inline const Message wl_surface_events[] = {
+        {"enter", "o", wl_surface_event_types_0},
+        {"leave", "o", wl_surface_event_types_1},
+        {"preferred_buffer_scale", "6i", wl_surface_event_types_2},
+        {"preferred_buffer_transform", "6u", wl_surface_event_types_3},
+};
+inline const Interface wl_surface{"wl_surface", 6, 11, wl_surface_requests, 4, wl_surface_events};
+inline const Interface* wl_seat_request_types_0[] = {&wl_pointer};
+inline const Interface* wl_seat_request_types_1[] = {&wl_keyboard};
+inline const Interface* wl_seat_request_types_2[] = {&wl_touch};
+inline const Message wl_seat_requests[] = {
+        {"get_pointer", "n", wl_seat_request_types_0},
+        {"get_keyboard", "n", wl_seat_request_types_1},
+        {"get_touch", "n", wl_seat_request_types_2},
+        {"release", "5", nullptr},
+};
+inline const Interface* wl_seat_event_types_0[] = {nullptr};
+inline const Interface* wl_seat_event_types_1[] = {nullptr};
+inline const Message wl_seat_events[] = {
+        {"capabilities", "u", wl_seat_event_types_0},
+        {"name", "2s", wl_seat_event_types_1},
+};
+inline const Interface wl_seat{"wl_seat", 9, 4, wl_seat_requests, 2, wl_seat_events};
+inline const Interface* wl_pointer_request_types_0[] = {nullptr, &wl_surface, nullptr, nullptr};
+inline const Message wl_pointer_requests[] = {
+        {"set_cursor", "u?oii", wl_pointer_request_types_0},
+        {"release", "3", nullptr},
+};
+inline const Interface* wl_pointer_event_types_0[] = {nullptr, &wl_surface, nullptr, nullptr};
+inline const Interface* wl_pointer_event_types_1[] = {nullptr, &wl_surface};
+inline const Interface* wl_pointer_event_types_2[] = {nullptr, nullptr, nullptr};
+inline const Interface* wl_pointer_event_types_3[] = {nullptr, nullptr, nullptr, nullptr};
+inline const Interface* wl_pointer_event_types_4[] = {nullptr, nullptr, nullptr};
+inline const Interface* wl_pointer_event_types_6[] = {nullptr};
+inline const Interface* wl_pointer_event_types_7[] = {nullptr, nullptr};
+inline const Interface* wl_pointer_event_types_8[] = {nullptr, nullptr};
+inline const Interface* wl_pointer_event_types_9[] = {nullptr, nullptr};
+inline const Interface* wl_pointer_event_types_10[] = {nullptr, nullptr};
+inline const Message wl_pointer_events[] = {
+        {"enter", "uoff", wl_pointer_event_types_0},
+        {"leave", "uo", wl_pointer_event_types_1},
+        {"motion", "uff", wl_pointer_event_types_2},
+        {"button", "uuuu", wl_pointer_event_types_3},
+        {"axis", "uuf", wl_pointer_event_types_4},
+        {"frame", "5", nullptr},
+        {"axis_source", "5u", wl_pointer_event_types_6},
+        {"axis_stop", "5uu", wl_pointer_event_types_7},
+        {"axis_discrete", "5ui", wl_pointer_event_types_8},
+        {"axis_value120", "8ui", wl_pointer_event_types_9},
+        {"axis_relative_direction", "9uu", wl_pointer_event_types_10},
+};
+inline const Interface wl_pointer{"wl_pointer", 9, 2, wl_pointer_requests, 11, wl_pointer_events};
+inline const Message wl_keyboard_requests[] = {
+        {"release", "3", nullptr},
+};
+inline const Interface* wl_keyboard_event_types_0[] = {nullptr, nullptr, nullptr};
+inline const Interface* wl_keyboard_event_types_1[] = {nullptr, &wl_surface, nullptr};
+inline const Interface* wl_keyboard_event_types_2[] = {nullptr, &wl_surface};
+inline const Interface* wl_keyboard_event_types_3[] = {nullptr, nullptr, nullptr, nullptr};
+inline const Interface* wl_keyboard_event_types_4[] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+inline const Interface* wl_keyboard_event_types_5[] = {nullptr, nullptr};
+inline const Message wl_keyboard_events[] = {
+        {"keymap", "uhu", wl_keyboard_event_types_0},
+        {"enter", "uoa", wl_keyboard_event_types_1},
+        {"leave", "uo", wl_keyboard_event_types_2},
+        {"key", "uuuu", wl_keyboard_event_types_3},
+        {"modifiers", "uuuuu", wl_keyboard_event_types_4},
+        {"repeat_info", "4ii", wl_keyboard_event_types_5},
+};
+inline const Interface wl_keyboard{"wl_keyboard", 9, 1, wl_keyboard_requests, 6, wl_keyboard_events};
+inline const Message wl_touch_requests[] = {
+        {"release", "3", nullptr},
+};
+inline const Interface* wl_touch_event_types_0[] = {nullptr, nullptr, &wl_surface, nullptr, nullptr, nullptr};
+inline const Interface* wl_touch_event_types_1[] = {nullptr, nullptr, nullptr};
+inline const Interface* wl_touch_event_types_2[] = {nullptr, nullptr, nullptr, nullptr};
+inline const Interface* wl_touch_event_types_5[] = {nullptr, nullptr, nullptr};
+inline const Interface* wl_touch_event_types_6[] = {nullptr, nullptr};
+inline const Message wl_touch_events[] = {
+        {"down", "uuoiff", wl_touch_event_types_0},
+        {"up", "uui", wl_touch_event_types_1},
+        {"motion", "uiff", wl_touch_event_types_2},
+        {"frame", "", nullptr},
+        {"cancel", "", nullptr},
+        {"shape", "6iff", wl_touch_event_types_5},
+        {"orientation", "6if", wl_touch_event_types_6},
+};
+inline const Interface wl_touch{"wl_touch", 9, 1, wl_touch_requests, 7, wl_touch_events};
+inline const Message wl_output_requests[] = {
+        {"release", "3", nullptr},
+};
+inline const Interface* wl_output_event_types_0[] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+inline const Interface* wl_output_event_types_1[] = {nullptr, nullptr, nullptr, nullptr};
+inline const Interface* wl_output_event_types_3[] = {nullptr};
+inline const Interface* wl_output_event_types_4[] = {nullptr};
+inline const Interface* wl_output_event_types_5[] = {nullptr};
+inline const Message wl_output_events[] = {
+        {"geometry", "iiiiissi", wl_output_event_types_0},
+        {"mode", "uiii", wl_output_event_types_1},
+        {"done", "2", nullptr},
+        {"scale", "2i", wl_output_event_types_3},
+        {"name", "4s", wl_output_event_types_4},
+        {"description", "4s", wl_output_event_types_5},
+};
+inline const Interface wl_output{"wl_output", 4, 1, wl_output_requests, 6, wl_output_events};
+inline const Interface* wl_region_request_types_1[] = {nullptr, nullptr, nullptr, nullptr};
+inline const Interface* wl_region_request_types_2[] = {nullptr, nullptr, nullptr, nullptr};
+inline const Message wl_region_requests[] = {
+        {"destroy", "", nullptr},
+        {"add", "iiii", wl_region_request_types_1},
+        {"subtract", "iiii", wl_region_request_types_2},
+};
+inline const Interface wl_region{"wl_region", 1, 3, wl_region_requests, 0, nullptr};
+inline const Interface* wl_subcompositor_request_types_1[] = {&wl_subsurface, &wl_surface, &wl_surface};
+inline const Message wl_subcompositor_requests[] = {
+        {"destroy", "", nullptr},
+        {"get_subsurface", "noo", wl_subcompositor_request_types_1},
+};
+inline const Interface wl_subcompositor{"wl_subcompositor", 1, 2, wl_subcompositor_requests, 0, nullptr};
+inline const Interface* wl_subsurface_request_types_1[] = {nullptr, nullptr};
+inline const Interface* wl_subsurface_request_types_2[] = {&wl_surface};
+inline const Interface* wl_subsurface_request_types_3[] = {&wl_surface};
+inline const Message wl_subsurface_requests[] = {
+        {"destroy", "", nullptr},
+        {"set_position", "ii", wl_subsurface_request_types_1},
+        {"place_above", "o", wl_subsurface_request_types_2},
+        {"place_below", "o", wl_subsurface_request_types_3},
+        {"set_sync", "", nullptr},
+        {"set_desync", "", nullptr},
+};
+inline const Interface wl_subsurface{"wl_subsurface", 1, 6, wl_subsurface_requests, 0, nullptr};
+inline const Interface* xdg_wm_base_request_types_1[] = {&xdg_positioner};
+inline const Interface* xdg_wm_base_request_types_2[] = {&xdg_surface, &wl_surface};
+inline const Interface* xdg_wm_base_request_types_3[] = {nullptr};
+inline const Message xdg_wm_base_requests[] = {
+        {"destroy", "", nullptr},
+        {"create_positioner", "n", xdg_wm_base_request_types_1},
+        {"get_xdg_surface", "no", xdg_wm_base_request_types_2},
+        {"pong", "u", xdg_wm_base_request_types_3},
+};
+inline const Interface* xdg_wm_base_event_types_0[] = {nullptr};
+inline const Message xdg_wm_base_events[] = {
+        {"ping", "u", xdg_wm_base_event_types_0},
+};
+inline const Interface xdg_wm_base{"xdg_wm_base", 7, 4, xdg_wm_base_requests, 1, xdg_wm_base_events};
+inline const Interface* xdg_positioner_request_types_1[] = {nullptr, nullptr};
+inline const Interface* xdg_positioner_request_types_2[] = {nullptr, nullptr, nullptr, nullptr};
+inline const Interface* xdg_positioner_request_types_3[] = {nullptr};
+inline const Interface* xdg_positioner_request_types_4[] = {nullptr};
+inline const Interface* xdg_positioner_request_types_5[] = {nullptr};
+inline const Interface* xdg_positioner_request_types_6[] = {nullptr, nullptr};
+inline const Interface* xdg_positioner_request_types_8[] = {nullptr, nullptr};
+inline const Interface* xdg_positioner_request_types_9[] = {nullptr};
+inline const Message xdg_positioner_requests[] = {
+        {"destroy", "", nullptr},
+        {"set_size", "ii", xdg_positioner_request_types_1},
+        {"set_anchor_rect", "iiii", xdg_positioner_request_types_2},
+        {"set_anchor", "u", xdg_positioner_request_types_3},
+        {"set_gravity", "u", xdg_positioner_request_types_4},
+        {"set_constraint_adjustment", "u", xdg_positioner_request_types_5},
+        {"set_offset", "ii", xdg_positioner_request_types_6},
+        {"set_reactive", "3", nullptr},
+        {"set_parent_size", "3ii", xdg_positioner_request_types_8},
+        {"set_parent_configure", "3u", xdg_positioner_request_types_9},
+};
+inline const Interface xdg_positioner{"xdg_positioner", 7, 10, xdg_positioner_requests, 0, nullptr};
+inline const Interface* xdg_surface_request_types_1[] = {&xdg_toplevel};
+inline const Interface* xdg_surface_request_types_2[] = {&xdg_popup, &xdg_surface, &xdg_positioner};
+inline const Interface* xdg_surface_request_types_3[] = {nullptr, nullptr, nullptr, nullptr};
+inline const Interface* xdg_surface_request_types_4[] = {nullptr};
+inline const Message xdg_surface_requests[] = {
+        {"destroy", "", nullptr},
+        {"get_toplevel", "n", xdg_surface_request_types_1},
+        {"get_popup", "n?oo", xdg_surface_request_types_2},
+        {"set_window_geometry", "iiii", xdg_surface_request_types_3},
+        {"ack_configure", "u", xdg_surface_request_types_4},
+};
+inline const Interface* xdg_surface_event_types_0[] = {nullptr};
+inline const Message xdg_surface_events[] = {
+        {"configure", "u", xdg_surface_event_types_0},
+};
+inline const Interface xdg_surface{"xdg_surface", 7, 5, xdg_surface_requests, 1, xdg_surface_events};
+inline const Interface* xdg_toplevel_request_types_1[] = {&xdg_toplevel};
+inline const Interface* xdg_toplevel_request_types_2[] = {nullptr};
+inline const Interface* xdg_toplevel_request_types_3[] = {nullptr};
+inline const Interface* xdg_toplevel_request_types_4[] = {&wl_seat, nullptr, nullptr, nullptr};
+inline const Interface* xdg_toplevel_request_types_5[] = {&wl_seat, nullptr};
+inline const Interface* xdg_toplevel_request_types_6[] = {&wl_seat, nullptr, nullptr};
+inline const Interface* xdg_toplevel_request_types_7[] = {nullptr, nullptr};
+inline const Interface* xdg_toplevel_request_types_8[] = {nullptr, nullptr};
+inline const Interface* xdg_toplevel_request_types_11[] = {&wl_output};
+inline const Message xdg_toplevel_requests[] = {
+        {"destroy", "", nullptr},
+        {"set_parent", "?o", xdg_toplevel_request_types_1},
+        {"set_title", "s", xdg_toplevel_request_types_2},
+        {"set_app_id", "s", xdg_toplevel_request_types_3},
+        {"show_window_menu", "ouii", xdg_toplevel_request_types_4},
+        {"move", "ou", xdg_toplevel_request_types_5},
+        {"resize", "ouu", xdg_toplevel_request_types_6},
+        {"set_max_size", "ii", xdg_toplevel_request_types_7},
+        {"set_min_size", "ii", xdg_toplevel_request_types_8},
+        {"set_maximized", "", nullptr},
+        {"unset_maximized", "", nullptr},
+        {"set_fullscreen", "?o", xdg_toplevel_request_types_11},
+        {"unset_fullscreen", "", nullptr},
+        {"set_minimized", "", nullptr},
+};
+inline const Interface* xdg_toplevel_event_types_0[] = {nullptr, nullptr, nullptr};
+inline const Interface* xdg_toplevel_event_types_2[] = {nullptr, nullptr};
+inline const Interface* xdg_toplevel_event_types_3[] = {nullptr};
+inline const Message xdg_toplevel_events[] = {
+        {"configure", "iia", xdg_toplevel_event_types_0},
+        {"close", "", nullptr},
+        {"configure_bounds", "4ii", xdg_toplevel_event_types_2},
+        {"wm_capabilities", "5a", xdg_toplevel_event_types_3},
+};
+inline const Interface xdg_toplevel{"xdg_toplevel", 7, 14, xdg_toplevel_requests, 4, xdg_toplevel_events};
+inline const Interface* xdg_popup_request_types_1[] = {&wl_seat, nullptr};
+inline const Interface* xdg_popup_request_types_2[] = {&xdg_positioner, nullptr};
+inline const Message xdg_popup_requests[] = {
+        {"destroy", "", nullptr},
+        {"grab", "ou", xdg_popup_request_types_1},
+        {"reposition", "3ou", xdg_popup_request_types_2},
+};
+inline const Interface* xdg_popup_event_types_0[] = {nullptr, nullptr, nullptr, nullptr};
+inline const Interface* xdg_popup_event_types_2[] = {nullptr};
+inline const Message xdg_popup_events[] = {
+        {"configure", "iiii", xdg_popup_event_types_0},
+        {"popup_done", "", nullptr},
+        {"repositioned", "3u", xdg_popup_event_types_2},
+};
+inline const Interface xdg_popup{"xdg_popup", 7, 3, xdg_popup_requests, 3, xdg_popup_events};
+inline const Interface* wp_viewporter_request_types_1[] = {&wp_viewport, &wl_surface};
+inline const Message wp_viewporter_requests[] = {
+        {"destroy", "", nullptr},
+        {"get_viewport", "no", wp_viewporter_request_types_1},
+};
+inline const Interface wp_viewporter{"wp_viewporter", 1, 2, wp_viewporter_requests, 0, nullptr};
+inline const Interface* wp_viewport_request_types_1[] = {nullptr, nullptr, nullptr, nullptr};
+inline const Interface* wp_viewport_request_types_2[] = {nullptr, nullptr};
+inline const Message wp_viewport_requests[] = {
+        {"destroy", "", nullptr},
+        {"set_source", "ffff", wp_viewport_request_types_1},
+        {"set_destination", "ii", wp_viewport_request_types_2},
+};
+inline const Interface wp_viewport{"wp_viewport", 1, 3, wp_viewport_requests, 0, nullptr};
+inline const Interface* wp_fractional_scale_manager_v1_request_types_1[] = {&wp_fractional_scale_v1, &wl_surface};
+inline const Message wp_fractional_scale_manager_v1_requests[] = {
+        {"destroy", "", nullptr},
+        {"get_fractional_scale", "no", wp_fractional_scale_manager_v1_request_types_1},
+};
+inline const Interface wp_fractional_scale_manager_v1{"wp_fractional_scale_manager_v1", 1, 2, wp_fractional_scale_manager_v1_requests, 0, nullptr};
+inline const Message wp_fractional_scale_v1_requests[] = {
+        {"destroy", "", nullptr},
+};
+inline const Interface* wp_fractional_scale_v1_event_types_0[] = {nullptr};
+inline const Message wp_fractional_scale_v1_events[] = {
+        {"preferred_scale", "u", wp_fractional_scale_v1_event_types_0},
+};
+inline const Interface wp_fractional_scale_v1{"wp_fractional_scale_v1", 1, 1, wp_fractional_scale_v1_requests, 1, wp_fractional_scale_v1_events};
+inline const Interface* zwp_text_input_v3_request_types_3[] = {nullptr, nullptr, nullptr};
+inline const Interface* zwp_text_input_v3_request_types_4[] = {nullptr};
+inline const Interface* zwp_text_input_v3_request_types_5[] = {nullptr, nullptr};
+inline const Interface* zwp_text_input_v3_request_types_6[] = {nullptr, nullptr, nullptr, nullptr};
+inline const Message zwp_text_input_v3_requests[] = {
+        {"destroy", "", nullptr},
+        {"enable", "", nullptr},
+        {"disable", "", nullptr},
+        {"set_surrounding_text", "sii", zwp_text_input_v3_request_types_3},
+        {"set_text_change_cause", "u", zwp_text_input_v3_request_types_4},
+        {"set_content_type", "uu", zwp_text_input_v3_request_types_5},
+        {"set_cursor_rectangle", "iiii", zwp_text_input_v3_request_types_6},
+        {"commit", "", nullptr},
+};
+inline const Interface* zwp_text_input_v3_event_types_0[] = {&wl_surface};
+inline const Interface* zwp_text_input_v3_event_types_1[] = {&wl_surface};
+inline const Interface* zwp_text_input_v3_event_types_2[] = {nullptr, nullptr, nullptr};
+inline const Interface* zwp_text_input_v3_event_types_3[] = {nullptr};
+inline const Interface* zwp_text_input_v3_event_types_4[] = {nullptr, nullptr};
+inline const Interface* zwp_text_input_v3_event_types_5[] = {nullptr};
+inline const Message zwp_text_input_v3_events[] = {
+        {"enter", "o", zwp_text_input_v3_event_types_0},
+        {"leave", "o", zwp_text_input_v3_event_types_1},
+        {"preedit_string", "?sii", zwp_text_input_v3_event_types_2},
+        {"commit_string", "?s", zwp_text_input_v3_event_types_3},
+        {"delete_surrounding_text", "uu", zwp_text_input_v3_event_types_4},
+        {"done", "u", zwp_text_input_v3_event_types_5},
+};
+inline const Interface zwp_text_input_v3{"zwp_text_input_v3", 1, 8, zwp_text_input_v3_requests, 6, zwp_text_input_v3_events};
+inline const Interface* zwp_text_input_manager_v3_request_types_1[] = {&zwp_text_input_v3, &wl_seat};
+inline const Message zwp_text_input_manager_v3_requests[] = {
+        {"destroy", "", nullptr},
+        {"get_text_input", "no", zwp_text_input_manager_v3_request_types_1},
+};
+inline const Interface zwp_text_input_manager_v3{"zwp_text_input_manager_v3", 1, 2, zwp_text_input_manager_v3_requests, 0, nullptr};
+inline const Interface* zxdg_decoration_manager_v1_request_types_1[] = {&zxdg_toplevel_decoration_v1, &xdg_toplevel};
+inline const Message zxdg_decoration_manager_v1_requests[] = {
+        {"destroy", "", nullptr},
+        {"get_toplevel_decoration", "no", zxdg_decoration_manager_v1_request_types_1},
+};
+inline const Interface zxdg_decoration_manager_v1{"zxdg_decoration_manager_v1", 1, 2, zxdg_decoration_manager_v1_requests, 0, nullptr};
+inline const Interface* zxdg_toplevel_decoration_v1_request_types_1[] = {nullptr};
+inline const Message zxdg_toplevel_decoration_v1_requests[] = {
+        {"destroy", "", nullptr},
+        {"set_mode", "u", zxdg_toplevel_decoration_v1_request_types_1},
+        {"unset_mode", "", nullptr},
+};
+inline const Interface* zxdg_toplevel_decoration_v1_event_types_0[] = {nullptr};
+inline const Message zxdg_toplevel_decoration_v1_events[] = {
+        {"configure", "u", zxdg_toplevel_decoration_v1_event_types_0},
+};
+inline const Interface zxdg_toplevel_decoration_v1{"zxdg_toplevel_decoration_v1", 1, 3, zxdg_toplevel_decoration_v1_requests, 1, zxdg_toplevel_decoration_v1_events};
+// END AINO WAYLAND PROTOCOLS
+
+struct Api {
+    void* library = nullptr;
+    Proxy* (*connect)(const char*) = nullptr;
+    void (*disconnect)(Proxy*) = nullptr;
+    int (*get_fd)(Proxy*) = nullptr;
+    int (*flush)(Proxy*) = nullptr;
+    int (*dispatch_pending)(Proxy*) = nullptr;
+    int (*prepare_read)(Proxy*) = nullptr;
+    int (*read_events)(Proxy*) = nullptr;
+    void (*cancel_read)(Proxy*) = nullptr;
+    int (*roundtrip)(Proxy*) = nullptr;
+    Proxy* (*marshal)(Proxy*, uint32_t, const Interface*, uint32_t, uint32_t, ...) = nullptr;
+    uint32_t (*version)(Proxy*) = nullptr;
+    int (*listen)(Proxy*, void (**)(void), void*) = nullptr;
+    void (*destroy)(Proxy*) = nullptr;
+    bool load() {
+        library = dlopen("libwayland-client.so.0", RTLD_NOW | RTLD_LOCAL);
+        if (!library) return false;
+#define AINO_WL_LOAD(field, name) \
+        field = reinterpret_cast<decltype(field)>(dlsym(library, name)); \
+        if (!field) return false
+        AINO_WL_LOAD(connect, "wl_display_connect");
+        AINO_WL_LOAD(disconnect, "wl_display_disconnect");
+        AINO_WL_LOAD(get_fd, "wl_display_get_fd");
+        AINO_WL_LOAD(flush, "wl_display_flush");
+        AINO_WL_LOAD(dispatch_pending, "wl_display_dispatch_pending");
+        AINO_WL_LOAD(prepare_read, "wl_display_prepare_read");
+        AINO_WL_LOAD(read_events, "wl_display_read_events");
+        AINO_WL_LOAD(cancel_read, "wl_display_cancel_read");
+        AINO_WL_LOAD(roundtrip, "wl_display_roundtrip");
+        AINO_WL_LOAD(marshal, "wl_proxy_marshal_flags");
+        AINO_WL_LOAD(version, "wl_proxy_get_version");
+        AINO_WL_LOAD(listen, "wl_proxy_add_listener");
+        AINO_WL_LOAD(destroy, "wl_proxy_destroy");
+#undef AINO_WL_LOAD
+        return true;
+    }
+};
+inline Api& api() { static Api value; return value; }
+inline bool available() { static const bool ready = api().load(); return ready; }
+template<class... Args> inline Proxy* request(Proxy* object, uint32_t opcode, Args... args) {
+    return api().marshal(object, opcode, nullptr, api().version(object), 0, args...);
+}
+template<class... Args> inline Proxy* create(Proxy* object, uint32_t opcode, const Interface& type, Args... args) {
+    return api().marshal(object, opcode, &type, std::min(api().version(object), uint32_t(type.version)), 0, nullptr, args...);
+}
+inline void destroy(Proxy*& object, uint32_t opcode = 0) {
+    if (object) api().marshal(object, opcode, nullptr, api().version(object), 1);
+    object = nullptr;
+}
+inline void local_destroy(Proxy*& object) {
+    if (object) api().destroy(object);
+    object = nullptr;
+}
+template<class Listener> inline void listen(Proxy* object, const Listener& listener, void* data) {
+    api().listen(object, reinterpret_cast<void (**)(void)>(const_cast<Listener*>(&listener)), data);
+}
+
+struct Xkb {
+    void* library = nullptr;
+    void* (*context_new)(int) = nullptr;
+    void (*context_unref)(void*) = nullptr;
+    void* (*keymap_new)(void*, const char*, int, int) = nullptr;
+    void (*keymap_unref)(void*) = nullptr;
+    void* (*state_new)(void*) = nullptr;
+    void (*state_unref)(void*) = nullptr;
+    uint32_t (*update_mask)(void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) = nullptr;
+    uint32_t (*sym)(void*, uint32_t) = nullptr;
+    uint32_t (*layout)(void*, uint32_t) = nullptr;
+    int (*symbols)(void*, uint32_t, uint32_t, uint32_t, const uint32_t**) = nullptr;
+    int (*utf8)(void*, uint32_t, char*, size_t) = nullptr;
+    int (*mod_active)(void*, const char*, int) = nullptr;
+    int (*repeats)(void*, uint32_t) = nullptr;
+    void* (*compose_table)(void*, const char*, int) = nullptr;
+    void (*compose_table_unref)(void*) = nullptr;
+    void* (*compose_new)(void*, int) = nullptr;
+    void (*compose_unref)(void*) = nullptr;
+    int (*compose_feed)(void*, uint32_t) = nullptr;
+    int (*compose_status)(void*) = nullptr;
+    int (*compose_utf8)(void*, char*, size_t) = nullptr;
+    void (*compose_reset)(void*) = nullptr;
+    bool load() {
+        library = dlopen("libxkbcommon.so.0", RTLD_NOW | RTLD_LOCAL);
+        if (!library) return false;
+#define AINO_XKB_LOAD(field, name) \
+        field = reinterpret_cast<decltype(field)>(dlsym(library, "xkb_" name)); \
+        if (!field) return false
+        AINO_XKB_LOAD(context_new, "context_new");
+        AINO_XKB_LOAD(context_unref, "context_unref");
+        AINO_XKB_LOAD(keymap_new, "keymap_new_from_string");
+        AINO_XKB_LOAD(keymap_unref, "keymap_unref");
+        AINO_XKB_LOAD(state_new, "state_new");
+        AINO_XKB_LOAD(state_unref, "state_unref");
+        AINO_XKB_LOAD(update_mask, "state_update_mask");
+        AINO_XKB_LOAD(sym, "state_key_get_one_sym");
+        AINO_XKB_LOAD(layout, "state_key_get_layout");
+        AINO_XKB_LOAD(symbols, "keymap_key_get_syms_by_level");
+        AINO_XKB_LOAD(utf8, "state_key_get_utf8");
+        AINO_XKB_LOAD(mod_active, "state_mod_name_is_active");
+        AINO_XKB_LOAD(repeats, "keymap_key_repeats");
+        AINO_XKB_LOAD(compose_table, "compose_table_new_from_locale");
+        AINO_XKB_LOAD(compose_table_unref, "compose_table_unref");
+        AINO_XKB_LOAD(compose_new, "compose_state_new");
+        AINO_XKB_LOAD(compose_unref, "compose_state_unref");
+        AINO_XKB_LOAD(compose_feed, "compose_state_feed");
+        AINO_XKB_LOAD(compose_status, "compose_state_get_status");
+        AINO_XKB_LOAD(compose_utf8, "compose_state_get_utf8");
+        AINO_XKB_LOAD(compose_reset, "compose_state_reset");
+#undef AINO_XKB_LOAD
+        return true;
+    }
+};
+inline Xkb& xkb() { static Xkb value; return value; }
+inline bool keyboard_available() { static const bool ready = xkb().load(); return ready; }
+
+struct CursorImage { uint32_t width, height, hotspot_x, hotspot_y, delay; };
+struct ThemeCursor { unsigned image_count; CursorImage** images; char* name; };
+struct CursorApi {
+    void* library = nullptr;
+    void* (*load)(const char*, int, Proxy*) = nullptr;
+    void (*destroy)(void*) = nullptr;
+    ThemeCursor* (*get)(void*, const char*) = nullptr;
+    Proxy* (*buffer)(CursorImage*) = nullptr;
+    CursorApi() {
+        library = dlopen("libwayland-cursor.so.0", RTLD_NOW | RTLD_LOCAL);
+        if (!library) return;
+        load = reinterpret_cast<decltype(load)>(dlsym(library, "wl_cursor_theme_load"));
+        destroy = reinterpret_cast<decltype(destroy)>(dlsym(library, "wl_cursor_theme_destroy"));
+        get = reinterpret_cast<decltype(get)>(dlsym(library, "wl_cursor_theme_get_cursor"));
+        buffer = reinterpret_cast<decltype(buffer)>(dlsym(library, "wl_cursor_image_get_buffer"));
+        if (!load || !destroy || !get || !buffer) load = nullptr;
+    }
+};
+inline CursorApi& cursors() { static CursorApi value; return value; }
+} // namespace wl
+
+struct WaylandState {
+    Window::Impl* owner = nullptr;
+    wl::Proxy *display = nullptr, *registry = nullptr, *compositor = nullptr, *shm = nullptr;
+    wl::Proxy *shell = nullptr, *surface = nullptr, *xdg_surface = nullptr, *toplevel = nullptr;
+    wl::Proxy *seat = nullptr, *pointer = nullptr, *keyboard = nullptr, *frame = nullptr;
+    wl::Proxy *data_manager = nullptr, *data_device = nullptr, *selection = nullptr;
+    wl::Proxy *text_manager = nullptr, *text_input = nullptr;
+    wl::Proxy *viewporter = nullptr, *viewport = nullptr, *fractional_manager = nullptr, *fractional = nullptr;
+    wl::Proxy *decoration_manager = nullptr, *decoration = nullptr, *cursor_surface = nullptr;
+    uint32_t seat_name = 0, compositor_name = 0, shm_name = 0, shell_name = 0;
+    struct Output { wl::Proxy* proxy = nullptr; int scale = 1; uint32_t name = 0; bool entered = false; };
+    std::list<Output> outputs;
+    struct Buffer {
+        wl::Proxy* proxy = nullptr;
+        void* pixels = MAP_FAILED;
+        size_t bytes = 0;
+        int width = 0, height = 0;
+        bool busy = false;
+        ~Buffer() { wl::destroy(proxy); if (pixels != MAP_FAILED) munmap(pixels, bytes); }
+    };
+    std::vector<std::unique_ptr<Buffer>> buffers;
+    std::vector<uint8_t> pixels;
+    struct Offer {
+        wl::Proxy* proxy;
+        std::string mime;
+        bool uri_list = false;
+        uint32_t action = 0;
+    };
+    std::list<Offer> offers;
+    std::function<bool(float, float)> file_drag;
+    std::function<std::function<void(std::string)>(float, float)> file_drop;
+    wl::Proxy* drag_offer = nullptr;
+    wl::Proxy* drop_offer = nullptr;
+    uint32_t drag_serial = 0;
+    float drag_x = 0, drag_y = 0;
+    bool drag_accepted = false;
+    int drop_fd = -1;
+    std::string drop_data;
+    std::function<void(std::string)> drop_complete;
+    std::chrono::steady_clock::time_point drop_deadline;
+    struct Source { wl::Proxy* proxy; std::shared_ptr<const std::string> text; };
+    std::list<Source> sources;
+    struct Send {
+        int fd; std::shared_ptr<const std::string> text; size_t offset = 0;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    std::list<Send> sends;
+    uint32_t serial = 0, pointer_serial = 0, text_serial = 0;
+    uint32_t content_hint = 0, content_purpose = 0, sent_hint = 0, sent_purpose = 0;
+    uint64_t text_focus = 0;
+    bool configured = false, failed = false, flush_blocked = false;
+    bool completed_frame = false;
+    bool pointer_inside = false, keyboard_inside = false, text_entered = false, text_enabled = false;
+    bool clipboard_reading = false;
+    bool preedit_pending = false, commit_pending = false;
+    std::string preedit, commit, text_in;
+    Rect caret, sent_caret{-1, -1, -1, -1};
+    int width = 1, height = 1, pending_width = 0, pending_height = 0;
+    int title_height = 32, header_rows = 0, buffer_height = 0, title_pressed = 0;
+    bool maximized = false;
+    int output_scale = 1, preferred_scale = 0;
+    bool resize_pending = true;
+    float mx = -1e6f, my = -1e6f, wheel = 0;
+    bool btn_down[3]{}, btn_pressed[3]{}, btn_released[3]{};
+    int clicks = 0;
+    uint32_t click_time = 0;
+    Vec2 click_position;
+    bool key_down[KEY_COUNT]{}, key_pressed[KEY_COUNT]{};
+    int mapped_keys[768]{};
+    bool key_ctrl[KEY_COUNT]{}, key_shift[KEY_COUNT]{}, key_alt[KEY_COUNT]{};
+    unsigned char key_repeat[KEY_COUNT]{};
+    void *context = nullptr, *keymap = nullptr, *xkb_state = nullptr;
+    void *compose_table = nullptr, *compose = nullptr, *cursor_theme = nullptr;
+    int cursor_scale = 0, cursor_index = -1;
+    int repeat_rate = 25, repeat_delay = 600;
+    uint32_t repeat_key = 0;
+    std::chrono::steady_clock::time_point repeat_at{};
+};
+inline std::vector<WaylandState*>& wayland_windows() {
+    thread_local std::vector<WaylandState*> windows;
+    return windows;
+}
+inline void wayland_fail(WaylandState* s, const char* message) {
+    if (!s->failed) std::fprintf(stderr, "[aino/wayland] %s\n", message);
+    s->failed = true;
+    s->owner->running = false;
+}
+inline void wayland_flush(WaylandState* s) {
+    if (s->failed) return;
+    s->flush_blocked = wl::api().flush(s->display) < 0;
+    if (s->flush_blocked && errno != EAGAIN) wayland_fail(s, "display flush failed");
+}
+
+inline void wayland_dispatch(WaylandState* s) {
+    if (!s->display || s->failed) return;
+    auto& api = wl::api();
+    // 单个 UI 线程拥有连接；prepare/read/cancel 成对，后台仅通过 WakeSignal 通知。
+    while (api.prepare_read(s->display) != 0) {
+        if (api.dispatch_pending(s->display) < 0) { wayland_fail(s, "display disconnected"); return; }
+    }
+    wayland_flush(s);
+    pollfd fd{api.get_fd(s->display), POLLIN, 0};
+    const int ready = ::poll(&fd, 1, 0);
+    if (ready > 0 && (fd.revents & (POLLIN | POLLHUP | POLLERR))) {
+        if (api.read_events(s->display) < 0) wayland_fail(s, "display read failed");
+    } else api.cancel_read(s->display);
+    if (!s->failed && api.dispatch_pending(s->display) < 0) wayland_fail(s, "display dispatch failed");
+}
+
+inline bool wayland_can_render(const WaylandState* s) {
+    if (!s || !s->configured || s->failed || s->frame) return false;
+    if (s->buffers.size() < 3) return true;
+    for (const auto& buffer : s->buffers) if (!buffer->busy) return true;
+    return false;
+}
+inline void wayland_scale_changed(WaylandState* s) {
+    s->resize_pending = true;
+    s->owner->need_frame = true;
+}
+inline bool wayland_resize(WaylandState* s) {
+    auto* o = s->owner;
+    if (!s->resize_pending || o->ui.impl->frame_open) return true;
+    if (s->pending_width > 0) s->width = s->pending_width;
+    if (s->pending_height > 0) s->height = std::max(1, s->pending_height - s->title_height);
+    s->pending_width = s->pending_height = 0;
+    float scale = 1;
+    if (o->cfg.high_dpi) scale = s->preferred_scale > 0 && s->viewport
+        ? s->preferred_scale / 120.f : float(s->output_scale);
+    scale = clampf(scale, .5f, 8.f);
+    const int width = int(std::ceil(s->width * scale));
+    const int height = int(std::ceil(s->height * scale));
+    const int header_rows = int(std::ceil(s->title_height * scale));
+    const int buffer_height = height + header_rows;
+    if (width <= 0 || height <= 0 || width > 16384 || height > 16384 ||
+        buffer_height > 16384 || uint64_t(width) * buffer_height > 16777216u) {
+        wayland_fail(s, "requested buffer exceeds CPU surface budget");
+        return false;
+    }
+    if (o->client_w != width || o->client_h != height || o->scale != scale || s->header_rows != header_rows) {
+        s->pixels.resize(size_t(width) * buffer_height * 4);
+        s->header_rows = header_rows;
+        s->buffer_height = buffer_height;
+        o->client_w = width;
+        o->client_h = height;
+        o->scale = scale;
+        o->canvas.w = width;
+        o->canvas.h = height;
+        o->canvas.stride = width * 4;
+        o->canvas.px = s->pixels.data() + size_t(header_rows) * width * 4;
+        o->canvas.clear_clip();
+        o->ui.impl->canvas = &o->canvas;
+        if (o->text) o->text->reconfigure(scale, o->theme.font_family, o->theme.font_family_mono);
+    }
+    s->resize_pending = false;
+    return true;
+}
+inline std::unique_ptr<WaylandState::Buffer> wayland_buffer(WaylandState* s) {
+    const int width = s->owner->client_w, height = s->buffer_height;
+    const size_t bytes = size_t(width) * height * 4;
+    // mkstemp + unlink 兼容旧内核；共享内存只活到 buffer release，不留下命名文件。
+    const char* runtime = std::getenv("XDG_RUNTIME_DIR");
+    if (!runtime || !*runtime) return {};
+    std::string path = std::string(runtime) + "/aino-shm-XXXXXX";
+    const int fd = mkstemp(&path[0]);
+    if (fd < 0) return {};
+    unlink(path.c_str());
+    ScopeExit close_fd([fd] { ::close(fd); });
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0 || ftruncate(fd, off_t(bytes)) < 0) return {};
+    auto buffer = std::make_unique<WaylandState::Buffer>();
+    buffer->pixels = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (buffer->pixels == MAP_FAILED) return {};
+    buffer->bytes = bytes;
+    auto* pool = wl::create(s->shm, 0, wl::wl_shm_pool, fd, int32_t(bytes));
+    if (!pool) return {};
+    buffer->proxy = wl::create(pool, 0, wl::wl_buffer, 0, width, height, width * 4, uint32_t(1));
+    wl::destroy(pool, 1);
+    if (!buffer->proxy) return {};
+    buffer->width = width;
+    buffer->height = height;
+    static const struct { void (*release)(void*, wl::Proxy*); } listener{
+        [](void* data, wl::Proxy*) {
+            auto* buffer = static_cast<WaylandState::Buffer*>(data);
+            buffer->busy = false;
+        }
+    };
+    wl::listen(buffer->proxy, listener, buffer.get());
+    return buffer;
+}
+inline void wayland_present(WaylandState* s) {
+    auto* o = s->owner;
+    WaylandState::Buffer* target = nullptr;
+    for (auto& buffer : s->buffers) if (!buffer->busy) {
+        if (buffer->width != o->client_w || buffer->height != s->buffer_height) {
+            buffer = wayland_buffer(s);
+            if (!buffer) { wayland_fail(s, "cannot allocate shared memory buffer"); return; }
+        }
+        target = buffer.get();
+        break;
+    }
+    if (!target && s->buffers.size() < 3) {
+        auto buffer = wayland_buffer(s);
+        if (!buffer) { wayland_fail(s, "cannot allocate shared memory buffer"); return; }
+        target = buffer.get();
+        s->buffers.push_back(std::move(buffer));
+    }
+    if (!target) return;
+#if AINO_BIG_ENDIAN
+    auto* output = static_cast<uint32_t*>(target->pixels);
+    for (size_t i = 0; i < target->bytes / 4; ++i) {
+        const auto* pixel = s->pixels.data() + i * 4;
+        output[i] = 0xff000000u | uint32_t(pixel[CH_R]) << 16 | uint32_t(pixel[CH_G]) << 8 | pixel[CH_B];
+    }
+#else
+    std::memcpy(target->pixels, s->pixels.data(), target->bytes);
+#endif
+    if (s->viewport) {
+        wl::request(s->surface, 8, 1);
+        wl::request(s->viewport, 2, s->width, s->height + s->title_height);
+    } else wl::request(s->surface, 8, int(o->scale));
+    wl::request(s->surface, 1, target->proxy, 0, 0);
+    wl::request(s->surface, 9, 0, 0, o->client_w, s->buffer_height);
+    wl::request(s->xdg_surface, 3, 0, 0, s->width, s->height + s->title_height);
+    s->frame = wl::create(s->surface, 3, wl::wl_callback);
+    static const struct { void (*done)(void*, wl::Proxy*, uint32_t); } listener{
+        [](void* data, wl::Proxy*, uint32_t) {
+            auto* s = static_cast<WaylandState*>(data);
+            wl::local_destroy(s->frame);
+        }
+    };
+    if (s->frame) wl::listen(s->frame, listener, s);
+    target->busy = true;
+    s->completed_frame = false;
+    wl::request(s->surface, 6);
+    wayland_flush(s);
+}
+
+inline int wayland_key(uint32_t symbol) {
+    if (symbol >= 'a' && symbol <= 'z') return int(symbol - 'a' + 'A');
+    if (symbol >= 32 && symbol <= 126) return int(symbol);
+    if (symbol >= 0xffbe && symbol <= 0xffc9) return KEY_F1 + int(symbol - 0xffbe);
+    if (symbol >= 0xffb0 && symbol <= 0xffb9) return '0' + int(symbol - 0xffb0);
+    switch (symbol) {
+    case 0xff08: return KEY_BACKSPACE;
+    case 0xff09: case 0xfe20: return KEY_TAB;
+    case 0xff0d: case 0xff8d: return KEY_ENTER;
+    case 0xffaa: return '*';
+    case 0xffab: return '+';
+    case 0xffad: return '-';
+    case 0xffae: return '.';
+    case 0xffaf: return '/';
+    case 0xff1b: return KEY_ESC;
+    case 0xffff: case 0xff9f: return KEY_DELETE;
+    case 0xff51: case 0xff96: return KEY_LEFT;
+    case 0xff53: case 0xff98: return KEY_RIGHT;
+    case 0xff52: case 0xff97: return KEY_UP;
+    case 0xff54: case 0xff99: return KEY_DOWN;
+    case 0xff50: case 0xff95: return KEY_HOME;
+    case 0xff57: case 0xff9c: return KEY_END;
+    case 0xff55: case 0xff9a: return KEY_PAGEUP;
+    case 0xff56: case 0xff9b: return KEY_PAGEDOWN;
+    case 0xffe1: case 0xffe2: return KEY_SHIFT;
+    case 0xffe3: case 0xffe4: return KEY_CTRL;
+    case 0xffe9: case 0xffea: case 0xfe03: return KEY_ALT;
+    case 0xffeb: case 0xffec: return KEY_SUPER;
+    default: return KEY_NONE;
+    }
+}
+inline void wayland_reset_input(WaylandState* s) {
+    std::fill_n(s->mapped_keys, 768, KEY_NONE);
+    std::fill_n(s->key_down, KEY_COUNT, false);
+    std::fill_n(s->key_pressed, KEY_COUNT, false);
+    std::fill_n(s->key_repeat, KEY_COUNT, 0);
+    std::fill_n(s->btn_down, 3, false);
+    std::fill_n(s->btn_pressed, 3, false);
+    std::fill_n(s->btn_released, 3, false);
+    s->repeat_key = 0;
+    s->text_in.clear();
+    s->owner->ui.impl->active = 0;
+    s->owner->ui.impl->ime_comp.clear();
+    if (s->compose) wl::xkb().compose_reset(s->compose);
+    s->owner->need_frame = true;
+}
+inline void wayland_modifiers(WaylandState* s) {
+    if (!s->xkb_state) return;
+    auto& xkb = wl::xkb();
+    s->key_down[KEY_SHIFT] = xkb.mod_active(s->xkb_state, "Shift", 8) > 0;
+    s->key_down[KEY_CTRL] = xkb.mod_active(s->xkb_state, "Control", 8) > 0;
+    s->key_down[KEY_ALT] = xkb.mod_active(s->xkb_state, "Mod1", 8) > 0;
+    s->key_down[KEY_SUPER] = xkb.mod_active(s->xkb_state, "Mod4", 8) > 0;
+}
+inline void wayland_key_event(WaylandState* s, uint32_t key, bool down, bool repeat) {
+    if (!s->xkb_state || key >= 768) return;
+    auto& xkb = wl::xkb();
+    const uint32_t symbol = xkb.sym(s->xkb_state, key + 8);
+    int mapped = s->mapped_keys[key];
+    if (down && !repeat) {
+        uint32_t base = symbol;
+        const uint32_t* symbols = nullptr;
+        if (xkb.symbols(s->keymap, key + 8, xkb.layout(s->xkb_state, key + 8), 0, &symbols) == 1 &&
+            symbols && symbols[0] >= 32 && symbols[0] <= 126) base = symbols[0];
+        mapped = s->mapped_keys[key] = wayland_key(base);
+    }
+    if (mapped > 0 && mapped < KEY_COUNT) {
+        if (repeat) {
+            if (s->key_repeat[mapped] < 255) ++s->key_repeat[mapped];
+        } else {
+            s->key_down[mapped] = down;
+            if (down) s->key_pressed[mapped] = true;
+        }
+        if (down) {
+            s->key_ctrl[mapped] = s->key_down[KEY_CTRL];
+            s->key_shift[mapped] = s->key_down[KEY_SHIFT];
+            s->key_alt[mapped] = s->key_down[KEY_ALT];
+        }
+    }
+    if (!down) s->mapped_keys[key] = KEY_NONE;
+    if (down && !s->key_down[KEY_CTRL] && !s->key_down[KEY_ALT] && !s->key_down[KEY_SUPER]) {
+        // v3 可用不代表输入法正在消费按键；普通输入仍走 xkb，预编辑期间由输入法提交。
+        if (s->owner->ui.impl->ime_comp.empty()) {
+            char buffer[128];
+            int length = 0;
+            bool composed = false;
+            if (s->compose) {
+                xkb.compose_feed(s->compose, symbol);
+                const int status = xkb.compose_status(s->compose);
+                if (status == 1) composed = true;
+                else if (status == 2) {
+                    length = xkb.compose_utf8(s->compose, buffer, sizeof buffer);
+                    xkb.compose_reset(s->compose);
+                    composed = true;
+                } else if (status == 3) { xkb.compose_reset(s->compose); composed = true; }
+            }
+            if (!composed) length = xkb.utf8(s->xkb_state, key + 8, buffer, sizeof buffer);
+            if (length > 0 && size_t(length) < sizeof buffer)
+                for (int i = 0; i < length; ++i) if (uint8_t(buffer[i]) >= 32 || buffer[i] == '\t')
+                    s->text_in.push_back(buffer[i]);
+        }
+    }
+    s->owner->need_frame = true;
+}
+inline void wayland_repeat(WaylandState* s) {
+    if (!s->repeat_key || s->repeat_rate <= 0 || !s->keyboard_inside) return;
+    const auto now = std::chrono::steady_clock::now();
+    const auto step = std::chrono::microseconds(1000000 / std::max(1, s->repeat_rate));
+    for (int count = 0; count < 32 && now >= s->repeat_at; ++count) {
+        wayland_key_event(s, s->repeat_key, true, true);
+        s->repeat_at += step;
+    }
+    if (now >= s->repeat_at) s->repeat_at = now + step;
+}
+
+inline void wayland_cursor(WaylandState* s) {
+    if (!s->pointer || !s->pointer_inside || !s->pointer_serial || !s->cursor_surface) return;
+    auto& api = wl::cursors();
+    if (!api.load) return;
+    const int scale = std::max(1, int(std::ceil(s->owner->scale)));
+    if (s->cursor_scale != scale) {
+        if (s->cursor_theme) api.destroy(s->cursor_theme);
+        const char* theme = std::getenv("XCURSOR_THEME");
+        int size = 24;
+        if (const char* value = std::getenv("XCURSOR_SIZE")) size = std::max(8, std::min(128, std::atoi(value)));
+        s->cursor_theme = api.load(theme, size * scale, s->shm);
+        s->cursor_scale = scale;
+        s->cursor_index = -1;
+    }
+    const int index = s->my < 0 ? 0 : std::max(0, std::min(5, int(s->owner->cursor)));
+    if (!s->cursor_theme || s->cursor_index == index) return;
+    const char* names[] = {"left_ptr", "hand2", "xterm", "sb_h_double_arrow", "sb_v_double_arrow", "xterm"};
+    auto* cursor = api.get(s->cursor_theme, names[index]);
+    if (!cursor) cursor = api.get(s->cursor_theme, "left_ptr");
+    if (!cursor || !cursor->image_count) return;
+    auto* image = cursor->images[0];
+    auto* buffer = api.buffer(image);
+    if (!buffer) return;
+    wl::request(s->pointer, 0, s->pointer_serial, s->cursor_surface,
+        int(image->hotspot_x / scale), int(image->hotspot_y / scale));
+    wl::request(s->cursor_surface, 8, scale);
+    wl::request(s->cursor_surface, 1, buffer, 0, 0);
+    wl::request(s->cursor_surface, 2, 0, 0, int(image->width), int(image->height));
+    wl::request(s->cursor_surface, 6);
+    s->cursor_index = index;
+}
+
+inline void wayland_set_ime_pos(WaylandState* s, float x, float top, float bottom) {
+    if (!s) return;
+    const float scale = s->owner->scale;
+    s->caret = {x / scale, top / scale + s->title_height, 1, std::max(1.f, (bottom - top) / scale)};
+}
+inline void wayland_text_state(WaylandState* s) {
+    if (!s->text_input) return;
+    const bool enabled = s->text_entered && s->owner->ui.impl->ime_owner;
+    const bool reset = enabled && s->text_focus != s->owner->ui.impl->focus_id;
+    bool changed = enabled != s->text_enabled || reset;
+    if (changed) {
+        wl::request(s->text_input, enabled ? 1 : 2);
+        s->text_enabled = enabled;
+        s->owner->ui.impl->ime_comp.clear();
+        if (s->compose) wl::xkb().compose_reset(s->compose);
+        s->text_focus = enabled ? s->owner->ui.impl->focus_id : 0;
+    }
+    if (enabled && (changed || s->content_hint != s->sent_hint || s->content_purpose != s->sent_purpose)) {
+        wl::request(s->text_input, 5, s->content_hint, s->content_purpose);
+        s->sent_hint = s->content_hint;
+        s->sent_purpose = s->content_purpose;
+        changed = true;
+    }
+    if (enabled && (changed || s->caret.x != s->sent_caret.x || s->caret.y != s->sent_caret.y ||
+        s->caret.h != s->sent_caret.h)) {
+        wl::request(s->text_input, 6, int(s->caret.x), int(s->caret.y), 1, int(std::ceil(s->caret.h)));
+        s->sent_caret = s->caret;
+        changed = true;
+    }
+    if (changed) { wl::request(s->text_input, 7); ++s->text_serial; }
+}
+
+inline void wayland_size_hints(WaylandState* s) {
+    const auto& cfg = s->owner->cfg;
+    const int width = std::max(1, cfg.width);
+    const int height = std::max(1, cfg.height);
+    const int min_w = cfg.resizable ? std::max(0, cfg.min_width) : width;
+    const int min_h = cfg.resizable ? std::max(0, cfg.min_height) : height;
+    const int max_w = cfg.resizable ? std::max(0, cfg.max_width) : width;
+    const int max_h = cfg.resizable ? std::max(0, cfg.max_height) : height;
+    wl::request(s->toplevel, 8, min_w, min_h ? min_h + s->title_height : 0);
+    wl::request(s->toplevel, 7, max_w ? std::max(min_w, max_w) : 0,
+        max_h ? std::max(min_h, max_h) + s->title_height : 0);
+}
+inline int wayland_title_button(const WaylandState* s) {
+    if (!s->title_height || s->my < -s->title_height || s->my >= 0) return 0;
+    const float y = s->my + s->title_height;
+    if (y < 6 || y >= 26) return 0;
+    if (s->mx >= 10 && s->mx < 30) return 1;
+    if (s->mx >= 30 && s->mx < 50) return 2;
+    if (s->mx >= 50 && s->mx < 70 && s->owner->cfg.resizable) return 3;
+    return 0;
+}
+inline bool wayland_title_event(WaylandState* s, uint32_t serial, uint32_t time, bool down) {
+    if (!s->title_height) return false;
+    if (s->title_pressed) {
+        if (!down) {
+            if (wayland_title_button(s) == s->title_pressed) {
+                if (s->title_pressed == 1) s->owner->running = false;
+                else if (s->title_pressed == 2) wl::request(s->toplevel, 13);
+                else wl::request(s->toplevel, s->maximized ? 10 : 9);
+            }
+            s->title_pressed = 0;
+        }
+        s->owner->need_frame = true;
+        return true;
+    }
+    if (!down) return false;
+    const float surface_y = s->my + s->title_height;
+    uint32_t edge = s->mx < 4 ? 4 : s->mx >= s->width - 4 ? 8 : 0;
+    if (surface_y < 4) edge |= 1;
+    else if (s->my >= s->height - 4) edge |= 2;
+    if (edge && s->owner->cfg.resizable && !s->maximized) {
+        wl::request(s->toplevel, 6, s->seat, serial, edge);
+        return true;
+    }
+    if (s->my >= 0) return false;
+    s->title_pressed = wayland_title_button(s);
+    if (!s->title_pressed) {
+        if (s->owner->cfg.resizable && time - s->click_time < 400 &&
+            std::abs(s->mx - s->click_position.x) < 5 && std::abs(s->my - s->click_position.y) < 5)
+            wl::request(s->toplevel, s->maximized ? 10 : 9);
+        else wl::request(s->toplevel, 5, s->seat, serial);
+        s->click_time = time;
+        s->click_position = {s->mx, s->my};
+    }
+    s->owner->need_frame = true;
+    return true;
+}
+inline void wayland_draw_title(WaylandState* s) {
+    if (!s->header_rows) return;
+    auto* o = s->owner;
+    Canvas canvas;
+    canvas.px = s->pixels.data();
+    canvas.w = o->client_w;
+    canvas.h = s->header_rows;
+    canvas.stride = o->canvas.stride;
+    const auto& theme = o->ui.theme();
+    const float scale = o->scale;
+    canvas.clear(theme.window_bg);
+    const Color colors[] = {Color::hex(0xff5f57), Color::hex(0xfebb2e), Color::hex(0x28c840)};
+    for (int i = 0; i < 3; ++i) {
+        Color color = i == 2 && !o->cfg.resizable ? theme.separator : colors[i];
+        if (s->title_pressed == i + 1) color = color.darken(.15f);
+        raster_rrect(canvas, Rect((14.f + i * 20) * scale, 10 * scale, 12 * scale, 12 * scale), color, 6 * scale);
+    }
+    const float font = 12 * scale;
+    const auto& title = o->cfg.title;
+    const float available = std::max(0.f, (s->width - 160.f) * scale);
+    std::string fitted = title;
+    if (o->text->measure(fitted, font, 600) > available) {
+        size_t first = 0, last = size_t(utf8_count(title));
+        while (first < last) {
+            const size_t count = first + (last - first + 1) / 2;
+            const auto candidate = title.substr(0, utf8_byte_offset(title, int(count))) + "…";
+            if (o->text->measure(candidate, font, 600) <= available) first = count;
+            else last = count - 1;
+        }
+        fitted = first ? title.substr(0, utf8_byte_offset(title, int(first))) + "…" : "";
+    }
+    const float text_width = o->text->measure(fitted, font, 600);
+    o->text->draw(canvas, fitted, (canvas.w - text_width) * .5f,
+        (s->header_rows - o->text->line_height(font, 600)) * .5f, font, 600, theme.label,
+        Rect(80 * scale, 0, available, float(s->header_rows)));
+    canvas.blend_row(s->header_rows - 1, 0, canvas.w, theme.separator);
+}
+
+inline void wayland_attach_input(WaylandState* s, uint32_t capabilities) {
+    if (!(capabilities & 1)) {
+        wl::destroy(s->pointer, 1);
+        s->pointer_inside = false;
+        std::fill_n(s->btn_down, 3, false);
+        s->owner->ui.impl->active = 0;
+    } else if (!s->pointer) {
+        s->pointer = wl::create(s->seat, 0, wl::wl_pointer);
+        static const struct {
+            void (*enter)(void*, wl::Proxy*, uint32_t, wl::Proxy*, int32_t, int32_t);
+            void (*leave)(void*, wl::Proxy*, uint32_t, wl::Proxy*);
+            void (*motion)(void*, wl::Proxy*, uint32_t, int32_t, int32_t);
+            void (*button)(void*, wl::Proxy*, uint32_t, uint32_t, uint32_t, uint32_t);
+            void (*axis)(void*, wl::Proxy*, uint32_t, uint32_t, int32_t);
+            void (*frame)(void*, wl::Proxy*);
+            void (*source)(void*, wl::Proxy*, uint32_t);
+            void (*stop)(void*, wl::Proxy*, uint32_t, uint32_t);
+            void (*discrete)(void*, wl::Proxy*, uint32_t, int32_t);
+        } listener{
+            [](void* data, wl::Proxy*, uint32_t serial, wl::Proxy*, int32_t x, int32_t y) {
+                auto* s = static_cast<WaylandState*>(data);
+                s->pointer_serial = serial;
+                s->pointer_inside = true;
+                s->mx = x / 256.f; s->my = y / 256.f - s->title_height;
+                s->cursor_index = -1;
+                wayland_cursor(s);
+                s->owner->need_frame = true;
+            },
+            [](void* data, wl::Proxy*, uint32_t, wl::Proxy*) {
+                auto* s = static_cast<WaylandState*>(data);
+                s->pointer_inside = false;
+                s->mx = s->my = -1e6f;
+                s->owner->need_frame = true;
+            },
+            [](void* data, wl::Proxy*, uint32_t, int32_t x, int32_t y) {
+                auto* s = static_cast<WaylandState*>(data);
+                s->mx = x / 256.f; s->my = y / 256.f - s->title_height;
+                if (!s->owner->hover_skip || s->title_pressed || s->owner->ui.impl->hover_would_change(s->mx, s->my)) {
+                    s->owner->need_frame = true;
+                    s->owner->move_only = true;
+                }
+            },
+            [](void* data, wl::Proxy*, uint32_t serial, uint32_t time, uint32_t button, uint32_t state) {
+                auto* s = static_cast<WaylandState*>(data);
+                s->serial = serial;
+                const int index = button == 0x110 ? 0 : button == 0x111 ? 1 : button == 0x112 ? 2 : -1;
+                if (index < 0) return;
+                if (index == 0 && wayland_title_event(s, serial, time, state != 0)) return;
+                s->btn_down[index] = state != 0;
+                if (state) {
+                    s->btn_pressed[index] = true;
+                    if (index == 0) {
+                        const float dx = s->mx - s->click_position.x, dy = s->my - s->click_position.y;
+                        s->clicks = time - s->click_time < 400 && dx * dx + dy * dy < 25 ? 2 : 1;
+                        s->click_time = time;
+                        s->click_position = {s->mx, s->my};
+                    }
+                } else s->btn_released[index] = true;
+                s->owner->move_only = false;
+                s->owner->need_frame = true;
+            },
+            [](void* data, wl::Proxy*, uint32_t, uint32_t axis, int32_t value) {
+                auto* s = static_cast<WaylandState*>(data);
+                if (axis == 0) { s->wheel -= value / 2560.f; s->owner->need_frame = true; }
+            },
+            [](void*, wl::Proxy*) {}, [](void*, wl::Proxy*, uint32_t) {},
+            [](void*, wl::Proxy*, uint32_t, uint32_t) {}, [](void*, wl::Proxy*, uint32_t, int32_t) {}
+        };
+        wl::listen(s->pointer, listener, s);
+    }
+    if (!(capabilities & 2)) {
+        wl::destroy(s->keyboard);
+        s->keyboard_inside = false;
+        wayland_reset_input(s);
+    } else if (!s->keyboard) {
+        s->keyboard = wl::create(s->seat, 1, wl::wl_keyboard);
+        static const struct {
+            void (*keymap)(void*, wl::Proxy*, uint32_t, int32_t, uint32_t);
+            void (*enter)(void*, wl::Proxy*, uint32_t, wl::Proxy*, wl::Array*);
+            void (*leave)(void*, wl::Proxy*, uint32_t, wl::Proxy*);
+            void (*key)(void*, wl::Proxy*, uint32_t, uint32_t, uint32_t, uint32_t);
+            void (*modifiers)(void*, wl::Proxy*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+            void (*repeat)(void*, wl::Proxy*, int32_t, int32_t);
+        } listener{
+            [](void* data, wl::Proxy*, uint32_t format, int32_t fd, uint32_t size) {
+                auto* s = static_cast<WaylandState*>(data);
+                ScopeExit close_fd([fd] { ::close(fd); });
+                if (format != 1 || !size || size > 16u * 1024 * 1024) return;
+                void* bytes = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+                if (bytes == MAP_FAILED) return;
+                ScopeExit unmap([=] { munmap(bytes, size); });
+                if (static_cast<const char*>(bytes)[size - 1] != 0) return;
+                auto& api = wl::xkb();
+                auto* keymap = api.keymap_new(s->context, static_cast<const char*>(bytes), 1, 0);
+                auto* state = keymap ? api.state_new(keymap) : nullptr;
+                if (!state) { if (keymap) api.keymap_unref(keymap); return; }
+                if (s->xkb_state) api.state_unref(s->xkb_state);
+                if (s->keymap) api.keymap_unref(s->keymap);
+                s->keymap = keymap; s->xkb_state = state;
+                wayland_reset_input(s);
+            },
+            [](void* data, wl::Proxy*, uint32_t serial, wl::Proxy*, wl::Array* keys) {
+                auto* s = static_cast<WaylandState*>(data);
+                s->serial = serial; s->keyboard_inside = true;
+                if (s->xkb_state && keys) for (size_t i = 0; i < keys->size / sizeof(uint32_t); ++i) {
+                    const auto key = static_cast<uint32_t*>(keys->data)[i];
+                    const int mapped = wayland_key(wl::xkb().sym(s->xkb_state, key + 8));
+                    if (mapped > 0 && mapped < KEY_COUNT && key < 768) {
+                        s->key_down[mapped] = true;
+                        s->mapped_keys[key] = mapped;
+                    }
+                }
+                wayland_modifiers(s);
+                s->owner->need_frame = true;
+            },
+            [](void* data, wl::Proxy*, uint32_t, wl::Proxy*) {
+                auto* s = static_cast<WaylandState*>(data);
+                s->keyboard_inside = false;
+                wayland_reset_input(s);
+            },
+            [](void* data, wl::Proxy*, uint32_t serial, uint32_t, uint32_t key, uint32_t state) {
+                auto* s = static_cast<WaylandState*>(data);
+                s->serial = serial;
+                wayland_key_event(s, key, state != 0, false);
+                if (state && s->keymap && wl::xkb().repeats(s->keymap, key + 8) && s->repeat_rate > 0) {
+                    s->repeat_key = key;
+                    s->repeat_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(s->repeat_delay);
+                } else if (!state && key == s->repeat_key) s->repeat_key = 0;
+            },
+            [](void* data, wl::Proxy*, uint32_t, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
+                auto* s = static_cast<WaylandState*>(data);
+                if (s->xkb_state) wl::xkb().update_mask(s->xkb_state, depressed, latched, locked, 0, 0, group);
+                wayland_modifiers(s);
+            },
+            [](void* data, wl::Proxy*, int32_t rate, int32_t delay) {
+                auto* s = static_cast<WaylandState*>(data);
+                s->repeat_rate = std::max(0, std::min(1000, rate));
+                s->repeat_delay = std::max(0, std::min(10000, delay));
+                if (!rate) s->repeat_key = 0;
+            }
+        };
+        wl::listen(s->keyboard, listener, s);
+    }
+}
+
+inline ssize_t wayland_write(int fd, const char* bytes, size_t size) {
+    // compositor 给出的通常是 pipe；局部屏蔽 SIGPIPE，不能修改应用的全局信号处理。
+    sigset_t blocked, old, pending;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGPIPE);
+    if (pthread_sigmask(SIG_BLOCK, &blocked, &old) != 0) { errno = EIO; return -1; }
+    sigpending(&pending);
+    const bool had_pipe = sigismember(&pending, SIGPIPE) == 1;
+    const auto written = ::write(fd, bytes, size);
+    const int saved = errno;
+    if (written < 0 && saved == EPIPE && !had_pipe) {
+        timespec timeout{};
+        while (sigtimedwait(&blocked, nullptr, &timeout) < 0 && errno == EINTR) {}
+    }
+    pthread_sigmask(SIG_SETMASK, &old, nullptr);
+    errno = saved;
+    return written;
+}
+inline void wayland_send_clipboard(WaylandState* s) {
+    const auto now = std::chrono::steady_clock::now();
+    for (auto it = s->sends.begin(); it != s->sends.end();) {
+        bool done = now >= it->deadline;
+        if (!done) {
+            const size_t remaining = it->text->size() - it->offset;
+            const auto written = wayland_write(it->fd, it->text->data() + it->offset, std::min<size_t>(remaining, 65536));
+            if (written > 0) it->offset += size_t(written);
+            else if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) done = true;
+            done |= it->offset == it->text->size();
+        }
+        if (done) { ::close(it->fd); it = s->sends.erase(it); }
+        else ++it;
+    }
+}
+inline void wayland_trim_offers(WaylandState* s) {
+    for (auto it = s->offers.begin(); it != s->offers.end();) {
+        if (it->proxy == s->selection || it->proxy == s->drag_offer || it->proxy == s->drop_offer) ++it;
+        else { wl::destroy(it->proxy, 2); it = s->offers.erase(it); }
+    }
+}
+
+inline void wayland_drag_update(WaylandState* s, int32_t x, int32_t y, bool enter) {
+    if (!s->drag_offer) return;
+    s->drag_x = x / 256.f;
+    s->drag_y = y / 256.f - s->title_height;
+    const auto offer = std::find_if(s->offers.begin(), s->offers.end(), [&](const WaylandState::Offer& item) {
+        return item.proxy == s->drag_offer;
+    });
+    const bool accept = offer != s->offers.end() && offer->uri_list && s->file_drag &&
+                        s->drop_fd < 0 && s->file_drag(s->drag_x, s->drag_y);
+    if (enter || accept != s->drag_accepted) {
+        wl::request(s->drag_offer, 0, s->drag_serial, accept ? "text/uri-list" : nullptr);
+        wl::request(s->drag_offer, 4, accept ? 1u : 0u, accept ? 1u : 0u);
+        s->drag_accepted = accept;
+    }
+}
+
+inline void wayland_drag_leave(WaylandState* s) {
+    if (s->file_drag) s->file_drag(-1, -1);
+    s->drag_offer = nullptr;
+    s->drag_accepted = false;
+    wayland_trim_offers(s);
+}
+
+inline void wayland_receive_drop(WaylandState* s) {
+    const auto offer = std::find_if(s->offers.begin(), s->offers.end(), [&](const WaylandState::Offer& item) {
+        return item.proxy == s->drag_offer;
+    });
+    if (!s->drag_accepted || !s->file_drop || offer == s->offers.end() || offer->action != 1) return;
+    auto complete = s->file_drop(s->drag_x, s->drag_y);
+    if (!complete) return;
+    int transfer[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, transfer) < 0) return;
+    if (fcntl(transfer[0], F_SETFL, O_NONBLOCK) < 0) {
+        ::close(transfer[0]);
+        ::close(transfer[1]);
+        return;
+    }
+    s->drop_offer = s->drag_offer;
+    s->drop_fd = transfer[0];
+    s->drop_complete = std::move(complete);
+    s->drop_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    wl::request(s->drop_offer, 1, "text/uri-list", transfer[1]);
+    ::close(transfer[1]);
+}
+
+inline void wayland_read_drop(WaylandState* s) {
+    if (s->drop_fd < 0) return;
+    bool received = false;
+    while (std::chrono::steady_clock::now() < s->drop_deadline) {
+        char chunk[8192];
+        const auto count = ::read(s->drop_fd, chunk, sizeof chunk);
+        if (count == 0) { received = true; break; }
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            break;
+        }
+        if (s->drop_data.size() + size_t(count) > (1u << 20)) break;
+        s->drop_data.append(chunk, size_t(count));
+    }
+    ::close(s->drop_fd);
+    s->drop_fd = -1;
+    if (received) wl::request(s->drop_offer, 3);
+    s->drop_offer = nullptr;
+    wayland_trim_offers(s);
+    auto complete = std::move(s->drop_complete);
+    std::string payload;
+    if (received) payload.swap(s->drop_data);
+    s->drop_data.clear();
+    complete(std::move(payload));
+}
+inline void wayland_attach_data(WaylandState* s) {
+    if (!s->data_manager || !s->seat || s->data_device) return;
+    s->data_device = wl::create(s->data_manager, 1, wl::wl_data_device, s->seat);
+    static const struct {
+        void (*offer)(void*, wl::Proxy*, wl::Proxy*);
+        void (*enter)(void*, wl::Proxy*, uint32_t, wl::Proxy*, int32_t, int32_t, wl::Proxy*);
+        void (*leave)(void*, wl::Proxy*);
+        void (*motion)(void*, wl::Proxy*, uint32_t, int32_t, int32_t);
+        void (*drop)(void*, wl::Proxy*);
+        void (*selection)(void*, wl::Proxy*, wl::Proxy*);
+    } listener{
+        [](void* data, wl::Proxy*, wl::Proxy* offer) {
+            auto* s = static_cast<WaylandState*>(data);
+            s->offers.push_back({offer, {}});
+            static const struct {
+                void (*mime)(void*, wl::Proxy*, const char*);
+                void (*actions)(void*, wl::Proxy*, uint32_t);
+                void (*action)(void*, wl::Proxy*, uint32_t);
+            } offer_listener{
+                [](void* data, wl::Proxy* offer, const char* mime) {
+                    auto* s = static_cast<WaylandState*>(data);
+                    if (!mime) return;
+                    for (auto& item : s->offers) if (item.proxy == offer) {
+                        if (std::strcmp(mime, "text/plain;charset=utf-8") == 0 ||
+                            (item.mime.empty() && std::strcmp(mime, "text/plain") == 0)) item.mime = mime;
+                        else if (std::strcmp(mime, "text/uri-list") == 0) item.uri_list = true;
+                    }
+                },
+                [](void*, wl::Proxy*, uint32_t) {},
+                [](void* data, wl::Proxy* proxy, uint32_t action) {
+                    auto* s = static_cast<WaylandState*>(data);
+                    for (auto& item : s->offers) if (item.proxy == proxy) item.action = action;
+                }
+            };
+            wl::listen(offer, offer_listener, s);
+        },
+        [](void* data, wl::Proxy*, uint32_t serial, wl::Proxy*, int32_t x, int32_t y, wl::Proxy* offer) {
+            auto* s = static_cast<WaylandState*>(data);
+            s->drag_offer = offer;
+            s->drag_serial = serial;
+            wayland_drag_update(s, x, y, true);
+            wayland_trim_offers(s);
+        },
+        [](void* data, wl::Proxy*) { wayland_drag_leave(static_cast<WaylandState*>(data)); },
+        [](void* data, wl::Proxy*, uint32_t, int32_t x, int32_t y) {
+            wayland_drag_update(static_cast<WaylandState*>(data), x, y, false);
+        },
+        [](void* data, wl::Proxy*) {
+            auto* s = static_cast<WaylandState*>(data);
+            wayland_receive_drop(s);
+            wayland_drag_leave(s);
+        },
+        [](void* data, wl::Proxy*, wl::Proxy* offer) {
+            auto* s = static_cast<WaylandState*>(data);
+            s->selection = offer;
+            wayland_trim_offers(s);
+        }
+    };
+    wl::listen(s->data_device, listener, s);
+}
+inline bool wayland_set_clipboard(WaylandState* s, const std::string& text) {
+    if (!s || s->failed || !s->data_device || !s->serial || !s->keyboard_inside ||
+        text.size() > (32u << 20) || s->sources.size() >= 8) return false;
+    auto* proxy = wl::create(s->data_manager, 0, wl::wl_data_source);
+    if (!proxy) return false;
+    s->sources.push_back({proxy, std::make_shared<const std::string>(text)});
+    static const struct {
+        void (*target)(void*, wl::Proxy*, const char*);
+        void (*send)(void*, wl::Proxy*, const char*, int32_t);
+        void (*cancelled)(void*, wl::Proxy*);
+        void (*drop)(void*, wl::Proxy*);
+        void (*finished)(void*, wl::Proxy*);
+        void (*action)(void*, wl::Proxy*, uint32_t);
+    } listener{
+        [](void*, wl::Proxy*, const char*) {},
+        [](void* data, wl::Proxy* proxy, const char* mime, int32_t fd) {
+            auto* s = static_cast<WaylandState*>(data);
+            const bool supported = mime && (std::strcmp(mime, "text/plain;charset=utf-8") == 0 ||
+                std::strcmp(mime, "text/plain") == 0);
+            if (supported && s->sends.size() < 8) for (const auto& source : s->sources) if (source.proxy == proxy) {
+                const int flags = fcntl(fd, F_GETFL);
+                if (flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 && fcntl(fd, F_SETFD, FD_CLOEXEC) == 0) {
+                    s->sends.push_back({fd, source.text, 0, std::chrono::steady_clock::now() + std::chrono::seconds(2)});
+                    return;
+                }
+                break;
+            }
+            ::close(fd);
+        },
+        [](void* data, wl::Proxy* proxy) {
+            auto* s = static_cast<WaylandState*>(data);
+            for (auto it = s->sources.begin(); it != s->sources.end(); ++it) if (it->proxy == proxy) {
+                wl::destroy(it->proxy, 1);
+                s->sources.erase(it);
+                break;
+            }
+        },
+        [](void*, wl::Proxy*) {}, [](void*, wl::Proxy*) {}, [](void*, wl::Proxy*, uint32_t) {}
+    };
+    wl::listen(proxy, listener, s);
+    wl::request(proxy, 0, "text/plain;charset=utf-8");
+    wl::request(proxy, 0, "text/plain");
+    wl::request(s->data_device, 1, proxy, s->serial);
+    wayland_flush(s);
+    return !s->failed;
+}
+
+inline void wayland_attach_text(WaylandState* s) {
+    if (!s->text_manager || !s->seat || s->text_input) return;
+    s->text_input = wl::create(s->text_manager, 1, wl::zwp_text_input_v3, s->seat);
+    static const struct {
+        void (*enter)(void*, wl::Proxy*, wl::Proxy*);
+        void (*leave)(void*, wl::Proxy*, wl::Proxy*);
+        void (*preedit)(void*, wl::Proxy*, const char*, int32_t, int32_t);
+        void (*commit)(void*, wl::Proxy*, const char*);
+        void (*remove)(void*, wl::Proxy*, uint32_t, uint32_t);
+        void (*done)(void*, wl::Proxy*, uint32_t);
+    } listener{
+        [](void* data, wl::Proxy*, wl::Proxy*) {
+            auto* s = static_cast<WaylandState*>(data);
+            s->text_entered = true;
+            s->owner->need_frame = true;
+        },
+        [](void* data, wl::Proxy*, wl::Proxy*) {
+            auto* s = static_cast<WaylandState*>(data);
+            s->text_entered = false;
+            s->preedit_pending = s->commit_pending = false;
+            s->preedit.clear(); s->commit.clear();
+            s->owner->ui.impl->ime_comp.clear();
+            wayland_text_state(s);
+            s->owner->need_frame = true;
+        },
+        [](void* data, wl::Proxy*, const char* text, int32_t, int32_t) {
+            auto* s = static_cast<WaylandState*>(data);
+            s->preedit = text ? text : "";
+            s->preedit_pending = true;
+        },
+        [](void* data, wl::Proxy*, const char* text) {
+            auto* s = static_cast<WaylandState*>(data);
+            s->commit = text ? text : "";
+            s->commit_pending = true;
+        },
+        // 未声明 surrounding-text 能力；compositor 不应发送依赖上下文的删除。
+        [](void*, wl::Proxy*, uint32_t, uint32_t) {},
+        [](void* data, wl::Proxy*, uint32_t serial) {
+            auto* s = static_cast<WaylandState*>(data);
+            if (s->text_entered && s->text_enabled && serial == s->text_serial) {
+                if (s->commit_pending) {
+                    s->text_in += s->commit;
+                    s->owner->ui.impl->ime_comp.clear();
+                }
+                if (s->preedit_pending) s->owner->ui.impl->ime_comp = s->preedit;
+                if (s->commit_pending || s->preedit_pending) s->owner->need_frame = true;
+            }
+            s->preedit_pending = s->commit_pending = false;
+            s->preedit.clear(); s->commit.clear();
+        }
+    };
+    wl::listen(s->text_input, listener, s);
+}
+
+inline void wayland_output_scale(WaylandState* s) {
+    int scale = 1;
+    for (const auto& output : s->outputs) if (output.entered) scale = std::max(scale, output.scale);
+    if (s->output_scale != scale) { s->output_scale = scale; wayland_scale_changed(s); }
+}
+inline void wayland_registry(WaylandState* s) {
+    static const struct {
+        void (*global)(void*, wl::Proxy*, uint32_t, const char*, uint32_t);
+        void (*remove)(void*, wl::Proxy*, uint32_t);
+    } listener{
+        [](void* data, wl::Proxy*, uint32_t name, const char* interface, uint32_t version) {
+            auto* s = static_cast<WaylandState*>(data);
+            auto bind = [&](const wl::Interface& type, uint32_t cap) {
+                const uint32_t bound = std::min(version, cap);
+                return wl::api().marshal(s->registry, 0, &type, bound, 0, name, type.name, bound, nullptr);
+            };
+            if (std::strcmp(interface, "wl_compositor") == 0 && !s->compositor && version >= 4) {
+                s->compositor = bind(wl::wl_compositor, 4); s->compositor_name = name;
+            } else if (std::strcmp(interface, "wl_shm") == 0 && !s->shm) {
+                s->shm = bind(wl::wl_shm, 1); s->shm_name = name;
+                static const struct { void (*format)(void*, wl::Proxy*, uint32_t); } formats{
+                    [](void*, wl::Proxy*, uint32_t) {}
+                };
+                wl::listen(s->shm, formats, s);
+            } else if (std::strcmp(interface, "xdg_wm_base") == 0 && !s->shell) {
+                s->shell = bind(wl::xdg_wm_base, 1); s->shell_name = name;
+                static const struct { void (*ping)(void*, wl::Proxy*, uint32_t); } shell{
+                    [](void*, wl::Proxy* object, uint32_t serial) { wl::request(object, 3, serial); }
+                };
+                wl::listen(s->shell, shell, s);
+            } else if (std::strcmp(interface, "wl_seat") == 0 && !s->seat && version >= 5) {
+                s->seat = bind(wl::wl_seat, 7); s->seat_name = name;
+                static const struct {
+                    void (*capabilities)(void*, wl::Proxy*, uint32_t);
+                    void (*name)(void*, wl::Proxy*, const char*);
+                } seat{
+                    [](void* data, wl::Proxy*, uint32_t caps) { wayland_attach_input(static_cast<WaylandState*>(data), caps); },
+                    [](void*, wl::Proxy*, const char*) {}
+                };
+                wl::listen(s->seat, seat, s);
+                wayland_attach_data(s);
+                wayland_attach_text(s);
+            } else if (std::strcmp(interface, "wl_data_device_manager") == 0 && !s->data_manager && version >= 3) {
+                s->data_manager = bind(wl::wl_data_device_manager, 3);
+                wayland_attach_data(s);
+            } else if (std::strcmp(interface, "zwp_text_input_manager_v3") == 0 && !s->text_manager) {
+                s->text_manager = bind(wl::zwp_text_input_manager_v3, 1);
+                wayland_attach_text(s);
+            } else if (std::strcmp(interface, "wp_viewporter") == 0 && !s->viewporter) {
+                s->viewporter = bind(wl::wp_viewporter, 1);
+            } else if (std::strcmp(interface, "wp_fractional_scale_manager_v1") == 0 && !s->fractional_manager) {
+                s->fractional_manager = bind(wl::wp_fractional_scale_manager_v1, 1);
+            } else if (std::strcmp(interface, "zxdg_decoration_manager_v1") == 0 && !s->decoration_manager) {
+                s->decoration_manager = bind(wl::zxdg_decoration_manager_v1, 1);
+            } else if (std::strcmp(interface, "wl_output") == 0) {
+                auto* proxy = bind(wl::wl_output, 2);
+                s->outputs.push_back({proxy, 1, name, false});
+                static const struct {
+                    void (*geometry)(void*, wl::Proxy*, int32_t, int32_t, int32_t, int32_t, int32_t, const char*, const char*, int32_t);
+                    void (*mode)(void*, wl::Proxy*, uint32_t, int32_t, int32_t, int32_t);
+                    void (*done)(void*, wl::Proxy*);
+                    void (*scale)(void*, wl::Proxy*, int32_t);
+                } output{
+                    [](void*, wl::Proxy*, int32_t, int32_t, int32_t, int32_t, int32_t, const char*, const char*, int32_t) {},
+                    [](void*, wl::Proxy*, uint32_t, int32_t, int32_t, int32_t) {},
+                    [](void* data, wl::Proxy*) { wayland_output_scale(static_cast<WaylandState*>(data)); },
+                    [](void* data, wl::Proxy* proxy, int32_t factor) {
+                        auto* s = static_cast<WaylandState*>(data);
+                        for (auto& output : s->outputs) if (output.proxy == proxy) output.scale = std::max(1, std::min(8, factor));
+                    }
+                };
+                wl::listen(proxy, output, s);
+            }
+        },
+        [](void* data, wl::Proxy*, uint32_t name) {
+            auto* s = static_cast<WaylandState*>(data);
+            if (name == s->compositor_name || name == s->shm_name || name == s->shell_name)
+                wayland_fail(s, "required compositor global removed");
+            if (name == s->seat_name) {
+                wayland_attach_input(s, 0);
+                wl::destroy(s->text_input);
+                wl::destroy(s->data_device, 2);
+                wl::destroy(s->seat, 3);
+                s->seat_name = 0;
+                s->serial = s->pointer_serial = s->text_serial = 0;
+                s->text_entered = s->text_enabled = false;
+                s->selection = nullptr;
+                wayland_trim_offers(s);
+            }
+            for (auto it = s->outputs.begin(); it != s->outputs.end(); ++it) if (it->name == name) {
+                wl::local_destroy(it->proxy);
+                s->outputs.erase(it);
+                wayland_output_scale(s);
+                break;
+            }
+        }
+    };
+    wl::listen(s->registry, listener, s);
+}
+
+inline void wayland_destroy(Window* self) {
+    auto* o = self->impl;
+    auto* s = static_cast<WaylandState*>(o->native);
+    if (!s) return;
+    auto& windows = wayland_windows();
+    windows.erase(std::remove(windows.begin(), windows.end(), s), windows.end());
+    for (const auto& send : s->sends) ::close(send.fd);
+    if (s->drop_fd >= 0) ::close(s->drop_fd);
+    for (auto& source : s->sources) wl::destroy(source.proxy, 1);
+    s->selection = nullptr;
+    s->drag_offer = s->drop_offer = nullptr;
+    wayland_trim_offers(s);
+    wl::local_destroy(s->frame);
+    wl::destroy(s->text_input);
+    wl::destroy(s->data_device, 2);
+    wl::destroy(s->pointer, 1);
+    wl::destroy(s->keyboard);
+    wl::destroy(s->seat, 3);
+    wl::destroy(s->fractional);
+    wl::destroy(s->viewport);
+    wl::destroy(s->decoration);
+    wl::destroy(s->toplevel);
+    wl::destroy(s->xdg_surface);
+    wl::destroy(s->surface);
+    wl::destroy(s->cursor_surface);
+    if (s->cursor_theme) wl::cursors().destroy(s->cursor_theme);
+    s->buffers.clear();
+    for (auto& output : s->outputs) wl::local_destroy(output.proxy);
+    wl::destroy(s->decoration_manager);
+    wl::destroy(s->fractional_manager);
+    wl::destroy(s->viewporter);
+    wl::destroy(s->text_manager);
+    wl::local_destroy(s->data_manager);
+    wl::destroy(s->shell);
+    wl::local_destroy(s->compositor);
+    wl::local_destroy(s->shm);
+    wl::local_destroy(s->registry);
+    if (s->display) { wl::api().flush(s->display); wl::api().disconnect(s->display); }
+    auto& xkb = wl::xkb();
+    if (s->compose) xkb.compose_unref(s->compose);
+    if (s->compose_table) xkb.compose_table_unref(s->compose_table);
+    if (s->xkb_state) xkb.state_unref(s->xkb_state);
+    if (s->keymap) xkb.keymap_unref(s->keymap);
+    if (s->context) xkb.context_unref(s->context);
+    o->canvas.px = nullptr;
+    o->canvas.w = o->canvas.h = o->canvas.stride = 0;
+    delete s;
+    o->native = nullptr;
+}
+
+inline void wayland_create(Window* self, const WindowConfig& cfg) {
+    if (!wl::available() || !wl::keyboard_available()) {
+        std::fprintf(stderr, "[aino/wayland] requires libwayland-client >= 1.20 and libxkbcommon\n");
+        return;
+    }
+    auto* o = self->impl;
+    auto state = std::make_unique<WaylandState>();
+    auto* s = state.get();
+    s->owner = o;
+    s->display = wl::api().connect(nullptr);
+    if (!s->display) { std::fprintf(stderr, "[aino/wayland] cannot connect to WAYLAND_DISPLAY\n"); return; }
+    o->native = state.release();
+    bool ready = false;
+    ScopeExit cleanup([&] { if (!ready) wayland_destroy(self); });
+    s->context = wl::xkb().context_new(0);
+    if (!s->context) return;
+    const char* locale = std::setlocale(LC_CTYPE, nullptr);
+    if (!locale || std::strcmp(locale, "C") == 0) {
+        locale = std::getenv("LC_ALL");
+        if (!locale || !*locale) locale = std::getenv("LC_CTYPE");
+        if (!locale || !*locale) locale = std::getenv("LANG");
+    }
+    s->compose_table = wl::xkb().compose_table(s->context, locale && *locale ? locale : "C.UTF-8", 0);
+    if (s->compose_table) s->compose = wl::xkb().compose_new(s->compose_table, 0);
+    s->registry = wl::create(s->display, 1, wl::wl_registry);
+    if (!s->registry) return;
+    wayland_registry(s);
+    if (wl::api().roundtrip(s->display) < 0 || !s->compositor || !s->shm || !s->shell) {
+        std::fprintf(stderr, "[aino/wayland] compositor v4, wl_shm and xdg-shell are required\n");
+        return;
+    }
+    s->width = std::max(1, cfg.width);
+    s->height = std::max(1, cfg.height);
+    s->surface = wl::create(s->compositor, 0, wl::wl_surface);
+    s->cursor_surface = wl::create(s->compositor, 0, wl::wl_surface);
+    if (!s->surface || !s->cursor_surface) return;
+    static const struct {
+        void (*enter)(void*, wl::Proxy*, wl::Proxy*);
+        void (*leave)(void*, wl::Proxy*, wl::Proxy*);
+    } surface{
+        [](void* data, wl::Proxy*, wl::Proxy* proxy) {
+            auto* s = static_cast<WaylandState*>(data);
+            for (auto& output : s->outputs) if (output.proxy == proxy) output.entered = true;
+            wayland_output_scale(s);
+        },
+        [](void* data, wl::Proxy*, wl::Proxy* proxy) {
+            auto* s = static_cast<WaylandState*>(data);
+            for (auto& output : s->outputs) if (output.proxy == proxy) output.entered = false;
+            wayland_output_scale(s);
+        }
+    };
+    wl::listen(s->surface, surface, s);
+    if (s->viewporter) s->viewport = wl::create(s->viewporter, 1, wl::wp_viewport, s->surface);
+    if (s->fractional_manager && s->viewport) {
+        s->fractional = wl::create(s->fractional_manager, 1, wl::wp_fractional_scale_v1, s->surface);
+        static const struct { void (*scale)(void*, wl::Proxy*, uint32_t); } listener{
+            [](void* data, wl::Proxy*, uint32_t scale) {
+                auto* s = static_cast<WaylandState*>(data);
+                if (scale >= 60 && scale <= 960 && int(scale) != s->preferred_scale) {
+                    s->preferred_scale = int(scale); wayland_scale_changed(s);
+                }
+            }
+        };
+        if (s->fractional) wl::listen(s->fractional, listener, s);
+    }
+    s->xdg_surface = wl::create(s->shell, 2, wl::xdg_surface, s->surface);
+    if (!s->xdg_surface) return;
+    static const struct { void (*configure)(void*, wl::Proxy*, uint32_t); } configure{
+        [](void* data, wl::Proxy* object, uint32_t serial) {
+            auto* s = static_cast<WaylandState*>(data);
+            wl::request(object, 4, serial);
+            s->configured = true;
+            wayland_scale_changed(s);
+        }
+    };
+    wl::listen(s->xdg_surface, configure, s);
+    s->toplevel = wl::create(s->xdg_surface, 1, wl::xdg_toplevel);
+    if (!s->toplevel) return;
+    static const struct {
+        void (*configure)(void*, wl::Proxy*, int32_t, int32_t, wl::Array*);
+        void (*close)(void*, wl::Proxy*);
+    } toplevel{
+        [](void* data, wl::Proxy*, int32_t width, int32_t height, wl::Array* states) {
+            auto* s = static_cast<WaylandState*>(data);
+            if (width > 0) s->pending_width = width;
+            if (height > 0) s->pending_height = height;
+            s->maximized = false;
+            if (states) for (size_t i = 0; i < states->size / sizeof(uint32_t); ++i)
+                if (static_cast<uint32_t*>(states->data)[i] == 1) s->maximized = true;
+        },
+        [](void* data, wl::Proxy*) {
+            auto* s = static_cast<WaylandState*>(data);
+            if (s->owner->cfg.close_requested && !s->owner->cfg.close_requested()) return;
+            s->owner->running = false;
+        }
+    };
+    wl::listen(s->toplevel, toplevel, s);
+    wl::request(s->toplevel, 2, cfg.title.c_str());
+    wl::request(s->toplevel, 3, cfg.app_id.empty() ? "aino" : cfg.app_id.c_str());
+    wayland_size_hints(s);
+    if (s->decoration_manager) {
+        s->decoration = wl::create(s->decoration_manager, 1, wl::zxdg_toplevel_decoration_v1, s->toplevel);
+        static const struct { void (*configure)(void*, wl::Proxy*, uint32_t); } decoration{
+            [](void* data, wl::Proxy*, uint32_t mode) {
+                auto* s = static_cast<WaylandState*>(data);
+                const int height = mode == 2 ? 0 : 32;
+                if (s->title_height != height) {
+                    s->title_height = height;
+                    wayland_size_hints(s);
+                    wayland_scale_changed(s);
+                }
+            }
+        };
+        if (s->decoration) {
+            wl::listen(s->decoration, decoration, s);
+            wl::request(s->decoration, 1, uint32_t(2));
+        }
+    }
+    auto text = std::make_unique<UnixTextRenderer>();
+    text->init(1, o->theme.font_family, o->theme.font_family_mono);
+    if (!text->ready()) {
+        std::fprintf(stderr, "[aino/wayland] requires FreeType and fontconfig runtime libraries\n");
+        return;
+    }
+    o->text = text.release();
+    o->ui.impl->text = o->text;
+    o->ui.impl->ime_content_type = [s](bool password, bool multiline) {
+        s->content_hint = password ? 64u | 128u : multiline ? 512u : 0u;
+        s->content_purpose = password ? 8u : 0u;
+    };
+    if (!wayland_resize(s)) return;
+    wl::request(s->surface, 6);
+    wayland_flush(s);
+    wayland_windows().push_back(s);
+    ready = !s->failed;
+}
+
+inline void wayland_feed_input(WaylandState* s) {
+    Input& input = s->owner->ui.impl->input;
+    input.mouse_prev = input.mouse;
+    input.mouse = {s->mx, s->my};
+    input.mouse_delta = input.mouse - input.mouse_prev;
+    for (int i = 0; i < 3; ++i) {
+        input.down[i] = s->btn_down[i];
+        input.pressed[i] = s->btn_pressed[i];
+        input.released[i] = s->btn_released[i];
+        s->btn_pressed[i] = s->btn_released[i] = false;
+    }
+    input.wheel = s->wheel; s->wheel = 0;
+    input.click_count = s->clicks; input.double_click = s->clicks >= 2; s->clicks = 0;
+    input.dragging = s->btn_down[0];
+    input.text_input.swap(s->text_in); s->text_in.clear();
+    for (int i = 0; i < KEY_COUNT; ++i) {
+        input.key_down[i] = s->key_down[i];
+        input.key_pressed[i] = s->key_pressed[i];
+        input.key_repeat[i] = s->key_repeat[i];
+        input.key_ctrl[i] = s->key_ctrl[i];
+        input.key_shift[i] = s->key_shift[i];
+        input.key_alt[i] = s->key_alt[i];
+        s->key_pressed[i] = false; s->key_repeat[i] = 0;
+    }
+}
+
+inline void wayland_wait_fds(WaylandState* s, std::vector<pollfd>& fds, int& timeout, bool input = true) {
+    if (!s || s->failed) return;
+    const auto now = std::chrono::steady_clock::now();
+    auto deadline = [&](std::chrono::steady_clock::time_point end) {
+        const int delay = int(std::max<int64_t>(0, std::chrono::ceil<std::chrono::milliseconds>(end - now).count()));
+        if (timeout < 0 || delay < timeout) timeout = delay;
+    };
+    if (input && s->repeat_key && s->keyboard_inside && s->repeat_rate > 0) deadline(s->repeat_at);
+    fds.push_back({wl::api().get_fd(s->display), short(POLLIN | (s->flush_blocked ? POLLOUT : 0)), 0});
+    if (input) fds.push_back({s->owner->wake_signal.read_descriptor(), POLLIN, 0});
+    for (const auto& send : s->sends) { fds.push_back({send.fd, POLLOUT, 0}); deadline(send.deadline); }
+    if (input && s->drop_fd >= 0) { fds.push_back({s->drop_fd, POLLIN, 0}); deadline(s->drop_deadline); }
+}
+} // namespace detail
+
+int Window::width() const {
+    auto* s = static_cast<const detail::WaylandState*>(impl->native);
+    return s ? s->width : 0;
+}
+int Window::height() const {
+    auto* s = static_cast<const detail::WaylandState*>(impl->native);
+    return s ? s->height : 0;
+}
+bool Window::poll() {
+    auto* s = static_cast<detail::WaylandState*>(impl->native);
+    if (!s || !impl->running) return false;
+    if (impl->wake_signal.consume()) impl->need_frame = true;
+    detail::wayland_dispatch(s);
+    detail::wayland_send_clipboard(s);
+    detail::wayland_read_drop(s);
+    detail::wayland_repeat(s);
+    if (s->completed_frame && s->resize_pending && !impl->ui.impl->frame_open) {
+        const int width = impl->client_w;
+        const int height = impl->client_h;
+        const int header = s->header_rows;
+        const float scale = impl->scale;
+        if (!detail::wayland_resize(s)) return false;
+        // 已完成的图像属于旧尺寸，不能在确认新 configure 后作为新尺寸的帧提交。
+        if (width != impl->client_w || height != impl->client_h || header != s->header_rows || scale != impl->scale) {
+            s->completed_frame = false;
+            impl->need_frame = true;
+        }
+    }
+    if (s->completed_frame && !impl->ui.impl->frame_open && detail::wayland_can_render(s))
+        detail::wayland_present(s);
+    detail::wayland_flush(s);
+    return impl->running;
+}
+void Window::render() {
+    auto* o = impl;
+    auto* s = static_cast<detail::WaylandState*>(o->native);
+    if (!s || o->ui.impl->frame_open) return;
+    if (s->failed) return;
+    if (!detail::wayland_resize(s)) return;
+    const auto now = detail::prof_now() / 1000;
+    float dt = o->last_frame_ms ? (now - o->last_frame_ms) / 1000.f : 1.f / 60;
+    if (dt > .25f) { o->ui.impl->caret_blink += dt - .25f; dt = .25f; }
+    o->last_frame_ms = now;
+    detail::wayland_feed_input(s);
+    o->need_frame = false;
+    detail::ScopeExit cleanup([o] {
+        if (o->ui.impl->frame_open) { o->ui.impl->abort_frame(); o->need_frame = true; }
+    });
+    o->ui.begin_frame(float(s->width), float(s->height), dt, o->scale);
+    if (o->frame_cb_ptr) o->frame_cb_ptr();
+    o->ui.end_frame();
+    detail::wayland_draw_title(s);
+    detail::wayland_text_state(s);
+    o->cursor = o->ui.cursor();
+    detail::wayland_cursor(s);
+    s->completed_frame = true;
+    if (detail::wayland_can_render(s)) detail::wayland_present(s);
+    else detail::wayland_flush(s);
+}
+void Window::set_title(const std::string& title) {
+    auto* s = static_cast<detail::WaylandState*>(impl->native);
+    if (s && !s->failed) {
+        impl->cfg.title = title;
+        impl->need_frame = true;
+        detail::wl::request(s->toplevel, 2, title.c_str());
+        detail::wayland_flush(s);
+    }
+}
+void Window::set_size(int width, int height) {
+    auto* s = static_cast<detail::WaylandState*>(impl->native);
+    if (!s || s->failed) return;
+    auto clamp = [](int value, int minimum, int maximum) {
+        return std::max(std::max(1, minimum), maximum > 0 ? std::min(value, maximum) : value);
+    };
+    s->pending_width = clamp(width, impl->cfg.min_width, impl->cfg.max_width);
+    s->pending_height = clamp(height, impl->cfg.min_height, impl->cfg.max_height);
+    impl->cfg.width = s->pending_width;
+    impl->cfg.height = s->pending_height;
+    s->pending_height += s->title_height;
+    if (!impl->cfg.resizable) detail::wayland_size_hints(s);
+    detail::wayland_scale_changed(s);
+}
+void Window::set_clipboard(const std::string& text) { (void)try_set_clipboard(text); }
+bool Window::try_set_clipboard(const std::string& text) {
+    return detail::wayland_set_clipboard(static_cast<detail::WaylandState*>(impl->native), text);
+}
+std::string Window::clipboard() const {
+    auto* s = static_cast<detail::WaylandState*>(impl->native);
+    if (!s || s->failed || !s->selection || s->clipboard_reading) return {};
+    std::string mime;
+    for (const auto& offer : s->offers) if (offer.proxy == s->selection) mime = offer.mime;
+    if (mime.empty()) return {};
+    int sockets[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) < 0) return {};
+    if (fcntl(sockets[0], F_SETFL, O_NONBLOCK) < 0) { ::close(sockets[0]); ::close(sockets[1]); return {}; }
+    detail::ScopeExit cleanup([&] { ::close(sockets[0]); s->clipboard_reading = false; });
+    s->clipboard_reading = true;
+    detail::wl::request(s->selection, 1, mime.c_str(), sockets[1]);
+    ::close(sockets[1]);
+    detail::wayland_flush(s);
+    std::string result;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline && !s->failed) {
+        char bytes[65536];
+        const auto count = ::read(sockets[0], bytes, sizeof bytes);
+        if (count == 0) return result;
+        if (count > 0) {
+            if (result.size() + size_t(count) > (32u << 20)) return {};
+            result.append(bytes, size_t(count));
+            continue;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return {};
+        std::vector<pollfd> fds{{sockets[0], POLLIN, 0}};
+        int timeout = int(std::max<int64_t>(0,
+            std::chrono::ceil<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count()));
+        // 同线程其他窗口可能是选区 owner；仅派发协议，resize 延迟到下一帧。
+        for (auto* window : detail::wayland_windows()) {
+            detail::wayland_dispatch(window);
+            detail::wayland_send_clipboard(window);
+            detail::wayland_flush(window);
+            detail::wayland_wait_fds(window, fds, timeout, false);
+        }
+        ::poll(fds.data(), fds.size(), timeout);
+    }
+    return {};
+}
+#endif // AINO_PLATFORM_WAYLAND
+
+
+// =============================================================================
+//  8.21  macOS 后端
+//        纯 C++ 通过 objc runtime 调 AppKit；绘制用 CoreGraphics，文字用 CoreText。
+//        尚未经真机验证。
 // =============================================================================
 #if defined(AINO_PLATFORM_MACOS)
 // 这些 objc runtime 函数由 <objc/runtime.h> / <objc/message.h> 提供，别再手写声明
@@ -13713,19 +16530,38 @@ template <class R, class Recv, class... Args>
 inline R oc_send(Recv recv, SEL op, Args... args) {
     // 接收者类型也不能写死成 id —— objc_getClass 返回的是 Class，
     // 这是纯 C++ 编译单元，Class → id 没有隐式转换，所以先 reinterpret_cast。
+#if defined(__x86_64__)
+    if constexpr (std::is_same<R, CGRect>::value) {
+        R result{};
+        reinterpret_cast<void (*)(R*, id, SEL, Args...)>(objc_msgSend_stret)(
+            &result, reinterpret_cast<id>(recv), op, args...);
+        return result;
+    }
+#endif
     return reinterpret_cast<R (*)(id, SEL, Args...)>(objc_msgSend)(
         reinterpret_cast<id>(recv), op, args...);
 }
 
 class CoreTextRenderer : public TextRenderer {
 public:
-    void init(float, const std::string& family, const std::string&) override {
+    void init(float, const std::string& family, const std::string& mono) override {
         family_ = family.empty() ? std::string("Helvetica Neue") : family;
+        mono_ = mono.empty() ? std::string("Menlo") : mono;
     }
-    void release() override { for (auto& kv : fonts_) if (kv.second) CFRelease(kv.second); fonts_.clear(); }
+    void release() override {
+        for (auto& entry : lines_) CFRelease(entry.second.line);
+        lines_.clear(); line_bytes_ = 0;
+        for (auto& kv : fonts_) if (kv.second) CFRelease(kv.second);
+        fonts_.clear();
+    }
 
-    float measure(const std::string& utf8, float size, int weight) override {
-        CTLineRef line = make_line(utf8, size, weight, Color(0, 0, 0));
+    float measure_mono(const std::string& text, float size, int weight) override { return measure_impl(text, size, weight, true); }
+    float ascent_mono(float size, int weight) override {
+        CTFontRef f = font(size, weight, true); return f ? float(CTFontGetAscent(f)) : size * .8f;
+    }
+    float measure(const std::string& text, float size, int weight) override { return measure_impl(text, size, weight, false); }
+    float measure_impl(const std::string& utf8, float size, int weight, bool mono) {
+        CTLineRef line = make_line(utf8, size, weight, Color(0, 0, 0), mono);
         if (!line) return 0.0f;
         double w = CTLineGetTypographicBounds(line, nullptr, nullptr, nullptr);
         CFRelease(line);
@@ -13743,9 +16579,17 @@ public:
     }
     void draw(Canvas& cv, const std::string& utf8, float x, float y_top,
               float size, int weight, const Color& c, const Rect& clip) override {
+        draw_impl(cv, utf8, x, y_top, size, weight, c, clip, false);
+    }
+    void draw_mono(Canvas& cv, const std::string& utf8, float x, float y_top,
+                   float size, int weight, const Color& c, const Rect& clip) override {
+        draw_impl(cv, utf8, x, y_top, size, weight, c, clip, true);
+    }
+    void draw_impl(Canvas& cv, const std::string& utf8, float x, float y_top,
+                   float size, int weight, const Color& c, const Rect& clip, bool mono) {
         CGContextRef ctx = reinterpret_cast<CGContextRef>(cv.platform_dc);
         if (!ctx) return;
-        CTLineRef line = make_line(utf8, size, weight, c);
+        CTLineRef line = make_line(utf8, size, weight, c, mono);
         if (!line) return;
 
         CGContextSaveGState(ctx);
@@ -13760,51 +16604,83 @@ public:
         CGContextSetTextMatrix(ctx, CGAffineTransformIdentity);
         CGContextTranslateCTM(ctx, 0.0, CGFloat(cv.h));
         CGContextScaleCTM(ctx, 1.0, -1.0);
-        CGContextSetTextPosition(ctx, x, y_top + ascent(size, weight));
+        CGContextSetTextPosition(ctx, x, y_top + (mono ? ascent_mono(size, weight) : ascent(size, weight)));
         CTLineDraw(line, ctx);
         CGContextRestoreGState(ctx);
         CFRelease(line);
     }
 
 private:
-    CTFontRef font(float size, int weight) {
+    CTFontRef font(float size, int weight, bool mono = false) {
         int q = int(size * 2.0f + 0.5f);
-        uint64_t key = (uint64_t(uint32_t(q)) << 32) | uint32_t(weight < 0 ? 400 : weight);
+        uint64_t key = (uint64_t(uint32_t(q)) << 32) | (mono ? (uint64_t(1) << 63) : 0) | uint32_t(weight < 0 ? 400 : weight);
         auto it = fonts_.find(key);
         if (it != fonts_.end()) return it->second;
-        CFStringRef name = CFStringCreateWithCString(kCFAllocatorDefault, family_.c_str(), kCFStringEncodingUTF8);
+        CFStringRef name = CFStringCreateWithCString(kCFAllocatorDefault, (mono ? mono_ : family_).c_str(), kCFStringEncodingUTF8);
         const CTFontSymbolicTraits traits = (weight >= 600) ? kCTFontBoldTrait : 0;
-        CTFontRef base = CTFontCreateWithName(name, CGFloat(float(q) / 2.0f), nullptr);
-        CTFontRef f = traits ? CTFontCreateCopyWithSymbolicTraits(base, 0.0, nullptr, traits, traits) : base;
-        if (f != base) CFRelease(base);
+        CTFontRef base = CTFontCreateWithName(name ? name : CFSTR("Helvetica"), CGFloat(float(q) / 2.0f), nullptr);
+        CTFontRef f = traits && base ? CTFontCreateCopyWithSymbolicTraits(base, 0.0, nullptr, traits, traits) : base;
+        if (f != base && base) CFRelease(base);
         if (!f) f = CTFontCreateWithName(CFSTR("Helvetica"), CGFloat(float(q) / 2.0f), nullptr);
-        CFRelease(name);
+        if (name) CFRelease(name);
+        if (fonts_.size() >= 128) { auto old = fonts_.begin(); if (old->second) CFRelease(old->second); fonts_.erase(old); }
         fonts_[key] = f;
         return f;
     }
-    CTLineRef make_line(const std::string& utf8, float size, int weight, const Color& c) {
-        CTFontRef f = font(size, weight);
+    CTLineRef make_line(const std::string& utf8, float size, int weight, const Color& c, bool mono) {
+        std::string key;
+        if (utf8.size() <= 4096) {
+            key = std::to_string(int(size * 2.0f + .5f)) + ":" + std::to_string(weight) + ":"
+                + (mono ? "m:" : "p:") + std::to_string(c.r) + ":" + std::to_string(c.g) + ":"
+                + std::to_string(c.b) + ":" + std::to_string(c.a) + ":" + utf8;
+            auto found = lines_.find(key);
+            if (found != lines_.end()) {
+                found->second.used = ++line_serial_;
+                CFRetain(found->second.line); return found->second.line;
+            }
+        }
+        CTFontRef f = font(size, weight, mono);
         if (!f) return nullptr;
         CFStringRef str = CFStringCreateWithBytes(kCFAllocatorDefault,
             reinterpret_cast<const UInt8*>(utf8.c_str()), CFIndex(utf8.size()),
             kCFStringEncodingUTF8, false);
         if (!str) return nullptr;
         CFMutableAttributedStringRef attr = CFAttributedStringCreateMutable(kCFAllocatorDefault, 0);
+        if (!attr) { CFRelease(str); return nullptr; }
         CFAttributedStringReplaceString(attr, CFRangeMake(0, 0), str);
         CFRange full = CFRangeMake(0, CFStringGetLength(str));
         CFAttributedStringSetAttribute(attr, full, kCTFontAttributeName, f);
         CGFloat comps[4] = { CGFloat(c.r) / 255.0, CGFloat(c.g) / 255.0, CGFloat(c.b) / 255.0, CGFloat(c.a) / 255.0 };
         CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+        if (!space) { CFRelease(str); CFRelease(attr); return nullptr; }
         CGColorRef cg = CGColorCreate(space, comps);
+        if (!cg) { CGColorSpaceRelease(space); CFRelease(str); CFRelease(attr); return nullptr; }
         CFAttributedStringSetAttribute(attr, full, kCTForegroundColorAttributeName, cg);
         CTLineRef line = CTLineCreateWithAttributedString(attr);
         CGColorRelease(cg);
         CGColorSpaceRelease(space);
         CFRelease(str);
         CFRelease(attr);
+        if (line && !key.empty()) {
+            // CFLine 的 glyph/run 分配不可直接查询，按 UTF-8 字节计保守预算并限制条目数。
+            const size_t cost = 512 + key.capacity() + utf8.size() * 128;
+            while (!lines_.empty() && (lines_.size() >= 256 || line_bytes_ + cost > (2u << 20))) {
+                auto oldest = lines_.begin();
+                for (auto it = lines_.begin(); it != lines_.end(); ++it)
+                    if (it->second.used < oldest->second.used) oldest = it;
+                line_bytes_ -= oldest->second.cost;
+                CFRelease(oldest->second.line); lines_.erase(oldest);
+            }
+            lines_.emplace(std::move(key), Line{line, cost, ++line_serial_});
+            line_bytes_ += cost; CFRetain(line);
+        }
         return line;
     }
-    std::string family_;
+    struct Line { CTLineRef line; size_t cost; uint64_t used; };
+    std::unordered_map<std::string, Line> lines_;
+    size_t line_bytes_ = 0;
+    uint64_t line_serial_ = 0;
+    std::string family_, mono_;
     std::unordered_map<uint64_t, CTFontRef> fonts_;
 };
 
@@ -13816,6 +16692,15 @@ struct CocoaState {
     std::vector<uint8_t> buffer;
     int pw = 0, ph = 0;
 
+    bool geometry_dirty = true, closed = false;
+    std::string marked_text;
+    CFIndex marked_units = 0;
+    CGRect ime_rect = CGRectMake(0, 0, 1, 18);
+    id tracking = nullptr;
+    CFFileDescriptorRef wake_descriptor = nullptr;
+    CFRunLoopSourceRef wake_source = nullptr;
+    unsigned char key_repeat[KEY_COUNT] = {};
+
     float mx = -1e6f, my = -1e6f;
     bool  btn_down[3] = {false, false, false};
     bool  btn_pressed[3] = {false, false, false};
@@ -13826,7 +16711,6 @@ struct CocoaState {
     bool  key_down[KEY_COUNT] = {};
     bool  key_pressed[KEY_COUNT] = {};
     // 修饰键锁存：和 Windows / X11 后端保持同一套语义（Input::ctrl_of 靠它）。
-    // ⚠ 目前 macOS 侧还没有代码往里写值 —— 能编译，但 ctrl_of() 恒为 false。
     bool  key_ctrl[KEY_COUNT]  = {};
     bool  key_shift[KEY_COUNT] = {};
     bool  key_alt[KEY_COUNT]   = {};
@@ -13834,16 +16718,19 @@ struct CocoaState {
     CGImageRef pending_image = nullptr;
 };
 
-inline void cocoa_create_backbuffer(CocoaState* s, int w, int h) {
-    if (w <= 0 || h <= 0) return;
-    if (s->pw == w && s->ph == h && s->ctx) return;
-    if (s->ctx) { CGContextRelease(s->ctx); s->ctx = nullptr; }
-    s->buffer.assign(size_t(w) * size_t(h) * 4u, 0);
+inline bool cocoa_create_backbuffer(CocoaState* s, int w, int h) {
+    if (w <= 0 || h <= 0) return false;
+    if (s->pw == w && s->ph == h && s->ctx) return true;
+    // 先准备新缓冲，失败时保留仍被 Canvas 引用的原始资源。
+    std::vector<uint8_t> buffer(size_t(w) * size_t(h) * 4u, 0);
     CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
-    s->ctx = CGBitmapContextCreate(s->buffer.data(), size_t(w), size_t(h), 8, size_t(w) * 4u,
+    if (!space) return false;
+    CGContextRef context = CGBitmapContextCreate(buffer.data(), size_t(w), size_t(h), 8, size_t(w) * 4u,
                                    space, kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
     CGColorSpaceRelease(space);
-    if (!s->ctx) return;
+    if (!context) return false;
+    if (s->ctx) CGContextRelease(s->ctx);
+    s->buffer.swap(buffer); s->ctx = context;
     s->pw = w; s->ph = h;
     Window::Impl* o = s->owner;
     o->canvas.px = s->buffer.data();
@@ -13852,6 +16739,7 @@ inline void cocoa_create_backbuffer(CocoaState* s, int w, int h) {
     o->canvas.platform_dc = s->ctx;
     o->canvas.clear_clip();
     o->client_w = w; o->client_h = h;
+    return true;
 }
 
 inline void cocoa_present(CocoaState* s) {
@@ -13869,6 +16757,7 @@ inline void cocoa_feed_input(CocoaState* s) {
     Window::Impl* o = s->owner;
     Ui::Impl* u = o->ui.impl;
     Input& in = u->input;
+    u->ime_comp = s->marked_text;
     const Vec2 prev = in.mouse;
     in.mouse = Vec2(s->mx / o->scale, s->my / o->scale);
     in.mouse_prev = prev;
@@ -13880,12 +16769,13 @@ inline void cocoa_feed_input(CocoaState* s) {
     in.text_input = s->text_in;
     for (int i = 0; i < KEY_COUNT; ++i) {
         in.key_down[i] = s->key_down[i]; in.key_pressed[i] = s->key_pressed[i];
+        in.key_repeat[i] = s->key_repeat[i];
         in.key_ctrl[i] = s->key_ctrl[i]; in.key_shift[i] = s->key_shift[i]; in.key_alt[i] = s->key_alt[i];
     }
     in.dragging = s->btn_down[0];
     for (int i = 0; i < 3; ++i) { s->btn_pressed[i] = false; s->btn_released[i] = false; }
     s->wheel = 0.0f; s->clicks = 0; s->text_in.clear();
-    for (int i = 0; i < KEY_COUNT; ++i) s->key_pressed[i] = false;
+    for (int i = 0; i < KEY_COUNT; ++i) { s->key_pressed[i] = false; s->key_repeat[i] = 0; }
 }
 
 // --- NSView 子类的事件回调（C 函数，通过 class_addMethod 注册）---
@@ -13902,17 +16792,17 @@ inline CocoaState* cocoa_state_of(id self) {
     return it == m.end() ? nullptr : it->second;
 }
 
-inline void cocoa_view_draw(id self, SEL, id) {
+inline void cocoa_view_draw(id self, SEL, CGRect) {
     CocoaState* s = cocoa_state_of(self);
     if (!s) return;
     id ctx_obj = oc_send<id>(objc_getClass("NSGraphicsContext"), sel_registerName("currentContext"));
     CGContextRef cg = oc_send<CGContextRef>(ctx_obj, sel_registerName("CGContext"));
     if (!cg || !s->pending_image) return;
     CGImageRef img = s->pending_image;
-    CGRect r = CGRectMake(0, 0, s->pw, s->ph);
+    CGRect r = CGRectMake(0, 0, s->pw / s->owner->scale, s->ph / s->owner->scale);
     // NSView 默认原点在左下，图片需要翻转
     CGContextSaveGState(cg);
-    CGContextTranslateCTM(cg, 0, CGFloat(s->ph));
+    CGContextTranslateCTM(cg, 0, CGFloat(s->ph / s->owner->scale));
     CGContextScaleCTM(cg, 1, -1);
     CGContextDrawImage(cg, r, img);
     CGContextRestoreGState(cg);
@@ -13922,8 +16812,9 @@ inline void cocoa_mouse_moved(id self, SEL, id ev) {
     CocoaState* s = cocoa_state_of(self);
     if (!s) return;
     CGPoint p = oc_send<CGPoint>(ev, sel_registerName("locationInWindow"));
-    s->mx = float(p.x);
-    s->my = float(s->ph) - float(p.y);
+    p = oc_send<CGPoint>(self, sel_registerName("convertPoint:fromView:"), p, (id)nullptr);
+    s->mx = float(p.x) * s->owner->scale;
+    s->my = float(s->ph) - float(p.y) * s->owner->scale;
     // 与 Windows / X11 同一条规则：悬停目标没变就不排帧。
     if (!s->owner->need_frame && s->owner->hover_skip &&
         !s->owner->ui.impl->hover_would_change(s->mx / s->owner->scale,
@@ -13935,7 +16826,9 @@ inline void cocoa_mouse_down(id self, SEL, id ev) {
     CocoaState* s = cocoa_state_of(self);
     if (!s) return;
     cocoa_mouse_moved(self, nullptr, ev);
-    s->btn_down[0] = true; s->btn_pressed[0] = true;
+    const int button = int(oc_send<long>(ev, sel_registerName("buttonNumber")));
+    if (button >= 0 && button < 3) { s->btn_down[button] = true; s->btn_pressed[button] = true; }
+    s->clicks = int(oc_send<long>(ev, sel_registerName("clickCount")));
     s->owner->need_frame = true;
     (void)ev;
 }
@@ -13944,36 +16837,167 @@ inline void cocoa_mouse_up(id self, SEL, id ev) {
     CocoaState* s = cocoa_state_of(self);
     if (!s) return;
     cocoa_mouse_moved(self, nullptr, ev);
-    s->btn_down[0] = false; s->btn_released[0] = true;
+    const int button = int(oc_send<long>(ev, sel_registerName("buttonNumber")));
+    if (button >= 0 && button < 3) { s->btn_down[button] = false; s->btn_released[button] = true; }
     s->owner->need_frame = true;
 }
 
-inline void cocoa_key_down(id self, SEL, id ev) {
-    CocoaState* s = cocoa_state_of(self);
+struct CocoaRange { uintptr_t location, length; };
+inline std::string cocoa_string(id value) {
+    if (!value) return {};
+    if (oc_send<BOOL>(value, sel_registerName("isKindOfClass:"), objc_getClass("NSAttributedString")))
+        value = oc_send<id>(value, sel_registerName("string"));
+    const auto str = reinterpret_cast<CFStringRef>(value);
+    const CFIndex size = CFStringGetMaximumSizeForEncoding(CFStringGetLength(str), kCFStringEncodingUTF8) + 1;
+    if (size <= 0 || size > (32 << 20)) return {};
+    std::vector<char> buffer(size_t(size), '\0');
+    return CFStringGetCString(str, buffer.data(), size, kCFStringEncodingUTF8) ? std::string(buffer.data()) : std::string();
+}
+inline void cocoa_modifiers(CocoaState* s, id event) {
+    const auto flags = oc_send<unsigned long>(event, sel_registerName("modifierFlags"));
+    s->key_down[KEY_SHIFT] = (flags & (1ul << 17)) != 0;
+    s->key_down[KEY_CTRL] = (flags & ((1ul << 18) | (1ul << 20))) != 0;
+    s->key_down[KEY_ALT] = (flags & (1ul << 19)) != 0;
+    s->key_down[KEY_SUPER] = (flags & (1ul << 20)) != 0;
+}
+inline int cocoa_key(id event) {
+    const auto code = oc_send<unsigned short>(event, sel_registerName("keyCode"));
+    switch (code) {
+    case 51: return KEY_BACKSPACE; case 48: return KEY_TAB; case 36: case 76: return KEY_ENTER;
+    case 53: return KEY_ESC; case 49: return KEY_SPACE; case 117: return KEY_DELETE;
+    case 123: return KEY_LEFT; case 124: return KEY_RIGHT; case 125: return KEY_DOWN; case 126: return KEY_UP;
+    case 115: return KEY_HOME; case 119: return KEY_END; case 116: return KEY_PAGEUP; case 121: return KEY_PAGEDOWN;
+    case 122: return KEY_F1; case 120: return KEY_F2; case 99: return KEY_F3; case 118: return KEY_F4;
+    case 96: return KEY_F5; case 97: return KEY_F6; case 98: return KEY_F7; case 100: return KEY_F8;
+    case 101: return KEY_F9; case 109: return KEY_F10; case 103: return KEY_F11; case 111: return KEY_F12;
+    default: break;
+    }
+    const auto chars = oc_send<CFStringRef>(event, sel_registerName("charactersIgnoringModifiers"));
+    if (!chars || !CFStringGetLength(chars)) return KEY_NONE;
+    const UniChar c = CFStringGetCharacterAtIndex(chars, 0);
+    return c < 128 ? ((c >= 'a' && c <= 'z') ? c - 'a' + 'A' : c) : KEY_NONE;
+}
+inline void cocoa_flags_changed(id self, SEL, id event) {
+    if (auto* s = cocoa_state_of(self)) { cocoa_modifiers(s, event); s->owner->need_frame = true; }
+}
+inline void cocoa_key_down(id self, SEL, id event) {
+    auto* s = cocoa_state_of(self);
     if (!s) return;
-    CFStringRef chars = oc_send<CFStringRef>(ev, sel_registerName("characters"));
-    if (chars) {
-        CFIndex n = CFStringGetLength(chars);
-        char buf[8];
-        for (CFIndex i = 0; i < n; ++i) {
-            UniChar u = CFStringGetCharacterAtIndex(chars, i);
-            if (u >= 32) {
-                int len = 0;
-                if (u < 0x80) { buf[0] = char(u); len = 1; }
-                else if (u < 0x800) { buf[0] = char(0xC0 | (u >> 6)); buf[1] = char(0x80 | (u & 0x3F)); len = 2; }
-                else { buf[0] = char(0xE0 | (u >> 12)); buf[1] = char(0x80 | ((u >> 6) & 0x3F)); buf[2] = char(0x80 | (u & 0x3F)); len = 3; }
-                s->text_in.append(buf, size_t(len));
-            }
-        }
+    cocoa_modifiers(s, event);
+    const int key = cocoa_key(event);
+    if (key > 0 && key < KEY_COUNT) {
+        if (oc_send<BOOL>(event, sel_registerName("isARepeat"))) {
+            s->key_repeat[key] = uint8_t(std::min(255, int(s->key_repeat[key]) + 1));
+        } else s->key_pressed[key] = true;
+        s->key_down[key] = true;
+        s->key_ctrl[key] = s->key_down[KEY_CTRL];
+        s->key_shift[key] = s->key_down[KEY_SHIFT];
+        s->key_alt[key] = s->key_down[KEY_ALT];
+    }
+    if (!s->key_down[KEY_CTRL] || s->marked_units) {
+        id events = oc_send<id>(objc_getClass("NSArray"), sel_registerName("arrayWithObject:"), event);
+        oc_send<void>(self, sel_registerName("interpretKeyEvents:"), events);
     }
     s->owner->need_frame = true;
-    (void)ev;
+}
+inline void cocoa_key_up(id self, SEL, id event) {
+    if (auto* s = cocoa_state_of(self)) {
+        const int key = cocoa_key(event);
+        if (key > 0 && key < KEY_COUNT) s->key_down[key] = false;
+        cocoa_modifiers(s, event); s->owner->need_frame = true;
+    }
+}
+inline void cocoa_insert_text(id self, SEL, id text, CocoaRange) {
+    if (auto* s = cocoa_state_of(self)) {
+        const std::string value = cocoa_string(text);
+        for (unsigned char c : value) if (c >= 32 && c != 127) s->text_in.push_back(char(c));
+        s->marked_text.clear(); s->marked_units = 0; s->owner->need_frame = true;
+    }
+}
+inline void cocoa_mark_text(id self, SEL, id text, CocoaRange, CocoaRange) {
+    if (auto* s = cocoa_state_of(self)) {
+        s->marked_text = cocoa_string(text);
+        CFStringRef str = CFStringCreateWithBytes(nullptr,
+            reinterpret_cast<const UInt8*>(s->marked_text.data()), CFIndex(s->marked_text.size()), kCFStringEncodingUTF8, false);
+        s->marked_units = str ? CFStringGetLength(str) : 0;
+        if (str) CFRelease(str);
+        s->owner->need_frame = true;
+    }
+}
+inline void cocoa_unmark_text(id self, SEL) {
+    if (auto* s = cocoa_state_of(self)) { s->marked_text.clear(); s->marked_units = 0; s->owner->need_frame = true; }
+}
+inline BOOL cocoa_has_marked(id self, SEL) { auto* s = cocoa_state_of(self); return s && s->marked_units ? YES : NO; }
+inline CocoaRange cocoa_marked_range(id self, SEL) {
+    auto* s = cocoa_state_of(self);
+    return {s && s->marked_units ? 0u : uintptr_t(-1) >> 1, s ? uintptr_t(s->marked_units) : 0u};
+}
+inline CocoaRange cocoa_selected_range(id, SEL) { return {0, 0}; }
+inline id cocoa_marked_attributes(id, SEL) { return oc_send<id>(objc_getClass("NSArray"), sel_registerName("array")); }
+inline id cocoa_substring(id, SEL, CocoaRange, CocoaRange* actual) {
+    if (actual) *actual = {uintptr_t(-1) >> 1, 0};
+    return nullptr;
+}
+inline uintptr_t cocoa_character_index(id, SEL, CGPoint) { return 0; }
+inline CGRect cocoa_first_rect(id self, SEL, CocoaRange range, CocoaRange* actual) {
+    auto* s = cocoa_state_of(self);
+    if (actual) *actual = range;
+    if (!s) return CGRectZero;
+    CGRect rect = s->ime_rect;
+    rect.origin.y = s->ph / s->owner->scale - rect.origin.y - rect.size.height;
+    rect = oc_send<CGRect>(self, sel_registerName("convertRect:toView:"), rect, (id)nullptr);
+    return oc_send<CGRect>(s->window, sel_registerName("convertRectToScreen:"), rect);
+}
+inline void cocoa_command(id, SEL, SEL) {} // 命令键由统一 Input 消费，文本提交只走 insertText。
+inline BOOL cocoa_accepts_first(id, SEL) { return YES; }
+inline void cocoa_scroll(id self, SEL, id event) {
+    if (auto* s = cocoa_state_of(self)) {
+        const bool precise = oc_send<BOOL>(event, sel_registerName("hasPreciseScrollingDeltas"));
+        s->wheel += float(oc_send<CGFloat>(event, sel_registerName("scrollingDeltaY"))) / (precise ? 10.0f : 1.0f);
+        s->owner->need_frame = true;
+    }
+}
+inline void cocoa_mouse_exited(id self, SEL, id) {
+    if (auto* s = cocoa_state_of(self)) { s->mx = s->my = -1e6f; s->owner->need_frame = true; }
+}
+inline void cocoa_window_closed(id self, SEL, id) {
+    if (auto* s = cocoa_state_of(self)) { s->closed = true; s->owner->running = false; s->owner->wake_signal.notify(); }
+}
+inline void cocoa_window_changed(id self, SEL, id) {
+    if (auto* s = cocoa_state_of(self)) { s->geometry_dirty = true; s->owner->need_frame = true; }
+}
+inline void cocoa_window_blur(id self, SEL, id) {
+    if (auto* s = cocoa_state_of(self)) {
+        for (int i = 0; i < KEY_COUNT; ++i) { s->key_down[i] = s->key_pressed[i] = false; s->key_repeat[i] = 0; }
+        for (int i = 0; i < 3; ++i) { s->btn_released[i] = s->btn_down[i]; s->btn_down[i] = false; }
+        s->marked_text.clear(); s->marked_units = 0;
+        s->owner->ui.impl->active = 0; drop_focus(s->owner->ui.impl);
+        s->owner->need_frame = true;
+    }
+}
+inline void cocoa_sync_geometry(CocoaState* s) {
+    if (!s->geometry_dirty || s->closed || s->owner->ui.impl->frame_open) return;
+    const CGRect bounds = oc_send<CGRect>(s->view, sel_registerName("bounds"));
+    const float scale = std::max(1.0f, float(oc_send<CGFloat>(s->window, sel_registerName("backingScaleFactor"))));
+    if (s->owner->scale != scale && s->owner->text)
+        s->owner->text->reconfigure(scale, s->owner->ui.theme().font_family, s->owner->ui.theme().font_family_mono);
+    s->owner->scale = scale;
+    if (cocoa_create_backbuffer(s, std::max(1, int(bounds.size.width * scale + .5)),
+        std::max(1, int(bounds.size.height * scale + .5)))) s->geometry_dirty = false;
+}
+inline void cocoa_wake(CFFileDescriptorRef descriptor, CFOptionFlags, void* context) {
+    auto* s = static_cast<CocoaState*>(context);
+    if (s->owner->wake_signal.consume()) s->owner->need_frame = true;
+    CFFileDescriptorEnableCallBacks(descriptor, kCFFileDescriptorReadCallBack);
 }
 
 inline void cocoa_create(Window* self, const WindowConfig& cfg) {
     Window::Impl* o = self->impl;
     const int w = cfg.width > 0 ? cfg.width : 880;
     const int h = cfg.height > 0 ? cfg.height : 560;
+    if (!pthread_main_np()) { std::fprintf(stderr, "[aino] AppKit windows require the main thread\n"); return; }
+    id pool = oc_send<id>(oc_send<id>(objc_getClass("NSAutoreleasePool"), sel_registerName("alloc")), sel_registerName("init"));
+    ScopeExit drain([&] { oc_send<void>(pool, sel_registerName("drain")); });
     CocoaState* s = new CocoaState();
     s->owner = o;
     o->native = s;
@@ -13998,18 +17022,45 @@ inline void cocoa_create(Window* self, const WindowConfig& cfg) {
     static Class view_cls = nullptr;
     if (!view_cls) {
         view_cls = objc_allocateClassPair(objc_getClass("NSView"), "AinoView", 0);
-        class_addMethod(view_cls, sel_registerName("drawRect:"), reinterpret_cast<IMP>(cocoa_view_draw), "v@:@");
+        class_addMethod(view_cls, sel_registerName("drawRect:"), reinterpret_cast<IMP>(cocoa_view_draw), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
         class_addMethod(view_cls, sel_registerName("mouseMoved:"), reinterpret_cast<IMP>(cocoa_mouse_moved), "v@:@");
         class_addMethod(view_cls, sel_registerName("mouseDown:"), reinterpret_cast<IMP>(cocoa_mouse_down), "v@:@");
         class_addMethod(view_cls, sel_registerName("mouseUp:"), reinterpret_cast<IMP>(cocoa_mouse_up), "v@:@");
         class_addMethod(view_cls, sel_registerName("keyDown:"), reinterpret_cast<IMP>(cocoa_key_down), "v@:@");
+        if (auto* protocol = objc_getProtocol("NSTextInputClient")) class_addProtocol(view_cls, protocol);
+        class_addMethod(view_cls, sel_registerName("acceptsFirstResponder"), reinterpret_cast<IMP>(cocoa_accepts_first), "c@:");
+        class_addMethod(view_cls, sel_registerName("keyUp:"), reinterpret_cast<IMP>(cocoa_key_up), "v@:@");
+        class_addMethod(view_cls, sel_registerName("flagsChanged:"), reinterpret_cast<IMP>(cocoa_flags_changed), "v@:@");
+        class_addMethod(view_cls, sel_registerName("scrollWheel:"), reinterpret_cast<IMP>(cocoa_scroll), "v@:@");
+        class_addMethod(view_cls, sel_registerName("rightMouseDown:"), reinterpret_cast<IMP>(cocoa_mouse_down), "v@:@");
+        class_addMethod(view_cls, sel_registerName("rightMouseUp:"), reinterpret_cast<IMP>(cocoa_mouse_up), "v@:@");
+        class_addMethod(view_cls, sel_registerName("otherMouseDown:"), reinterpret_cast<IMP>(cocoa_mouse_down), "v@:@");
+        class_addMethod(view_cls, sel_registerName("otherMouseUp:"), reinterpret_cast<IMP>(cocoa_mouse_up), "v@:@");
+        for (const char* method : {"mouseDragged:", "rightMouseDragged:", "otherMouseDragged:"})
+            class_addMethod(view_cls, sel_registerName(method), reinterpret_cast<IMP>(cocoa_mouse_moved), "v@:@");
+        class_addMethod(view_cls, sel_registerName("mouseExited:"), reinterpret_cast<IMP>(cocoa_mouse_exited), "v@:@");
+        class_addMethod(view_cls, sel_registerName("insertText:replacementRange:"), reinterpret_cast<IMP>(cocoa_insert_text), "v@:@{_NSRange=QQ}");
+        class_addMethod(view_cls, sel_registerName("setMarkedText:selectedRange:replacementRange:"), reinterpret_cast<IMP>(cocoa_mark_text), "v@:@{_NSRange=QQ}{_NSRange=QQ}");
+        class_addMethod(view_cls, sel_registerName("unmarkText"), reinterpret_cast<IMP>(cocoa_unmark_text), "v@:");
+        class_addMethod(view_cls, sel_registerName("hasMarkedText"), reinterpret_cast<IMP>(cocoa_has_marked), "c@:");
+        class_addMethod(view_cls, sel_registerName("markedRange"), reinterpret_cast<IMP>(cocoa_marked_range), "{_NSRange=QQ}@:");
+        class_addMethod(view_cls, sel_registerName("selectedRange"), reinterpret_cast<IMP>(cocoa_selected_range), "{_NSRange=QQ}@:");
+        class_addMethod(view_cls, sel_registerName("validAttributesForMarkedText"), reinterpret_cast<IMP>(cocoa_marked_attributes), "@@:");
+        class_addMethod(view_cls, sel_registerName("attributedSubstringForProposedRange:actualRange:"), reinterpret_cast<IMP>(cocoa_substring), "@@:{_NSRange=QQ}^{_NSRange=QQ}");
+        class_addMethod(view_cls, sel_registerName("characterIndexForPoint:"), reinterpret_cast<IMP>(cocoa_character_index), "Q@:{CGPoint=dd}");
+        class_addMethod(view_cls, sel_registerName("firstRectForCharacterRange:actualRange:"), reinterpret_cast<IMP>(cocoa_first_rect), "{CGRect={CGPoint=dd}{CGSize=dd}}@:{_NSRange=QQ}^{_NSRange=QQ}");
+        class_addMethod(view_cls, sel_registerName("doCommandBySelector:"), reinterpret_cast<IMP>(cocoa_command), "v@::");
+        class_addMethod(view_cls, sel_registerName("windowWillClose:"), reinterpret_cast<IMP>(cocoa_window_closed), "v@:@");
+        class_addMethod(view_cls, sel_registerName("windowDidResize:"), reinterpret_cast<IMP>(cocoa_window_changed), "v@:@");
+        class_addMethod(view_cls, sel_registerName("windowDidChangeBackingProperties:"), reinterpret_cast<IMP>(cocoa_window_changed), "v@:@");
+        class_addMethod(view_cls, sel_registerName("windowDidResignKey:"), reinterpret_cast<IMP>(cocoa_window_blur), "v@:@");
         objc_registerClassPair(view_cls);
     }
 
     CGRect rect = CGRectMake(0, 0, CGFloat(w), CGFloat(h));
     // styleMask 15 = Titled(1) | Closable(2) | Miniaturizable(4) | Resizable(8)。
-    // 不可缩放就把 Resizable 位拿掉（13）—— 和 Win32 去掉 WS_THICKFRAME 对齐。
-    const unsigned long style_mask = cfg.resizable ? 15ul : 13ul;
+    // 不可缩放就把 Resizable 位拿掉（7）—— 和 Win32 去掉 WS_THICKFRAME 对齐。
+    const unsigned long style_mask = cfg.resizable ? 15ul : 7ul;
     id window = oc_send<id>(oc_send<id>(objc_getClass("NSWindow"), sel_registerName("alloc")),
                             sel_registerName("initWithContentRect:styleMask:backing:defer:"),
                             rect, style_mask, (unsigned long)2, (BOOL)NO);
@@ -14018,6 +17069,13 @@ inline void cocoa_create(Window* self, const WindowConfig& cfg) {
     cocoa_view_map()[reinterpret_cast<void*>(view)] = s;
     oc_send<void>(view, sel_registerName("setWantsLayer:"), (BOOL)YES);
     oc_send<void>(window, sel_registerName("setContentView:"), view);
+    oc_send<void>(window, sel_registerName("setReleasedWhenClosed:"), (BOOL)NO);
+    oc_send<void>(window, sel_registerName("setDelegate:"), view);
+    oc_send<void>(window, sel_registerName("setAcceptsMouseMovedEvents:"), (BOOL)YES);
+    oc_send<void>(window, sel_registerName("makeFirstResponder:"), view);
+    s->tracking = oc_send<id>(oc_send<id>(objc_getClass("NSTrackingArea"), sel_registerName("alloc")),
+        sel_registerName("initWithRect:options:owner:userInfo:"), CGRectZero, (unsigned long)(1 | 2 | 32 | 512), view, (id)nullptr);
+    if (s->tracking) oc_send<void>(view, sel_registerName("addTrackingArea:"), s->tracking);
 
     // 尺寸约束用 content 版本：NSWindow 的 setMinSize: 算的是**窗口**尺寸，
     // 而我们手里的 min/max 是客户区（= 逻辑像素），用 setContentMinSize: 才对齐。
@@ -14043,7 +17101,10 @@ inline void cocoa_create(Window* self, const WindowConfig& cfg) {
                                                    kCFStringEncodingUTF8);
         id img = oc_send<id>(oc_send<id>(objc_getClass("NSImage"), sel_registerName("alloc")),
                              sel_registerName("initWithContentsOfFile:"), ip);
-        if (img) oc_send<void>(app, sel_registerName("setApplicationIconImage:"), img);
+        if (img) {
+            oc_send<void>(app, sel_registerName("setApplicationIconImage:"), img);
+            oc_send<void>(img, sel_registerName("release"));
+        } else std::fprintf(stderr, "[aino] Cannot load icon: %s\n", cfg.icon_path.c_str());
         CFRelease(ip);
     }
 
@@ -14059,19 +17120,40 @@ inline void cocoa_create(Window* self, const WindowConfig& cfg) {
     o->text = tr;
     o->ui.impl->text = tr;
 
-    cocoa_create_backbuffer(s, w, h);
+    cocoa_sync_geometry(s);
+    CFFileDescriptorContext context{0, s, nullptr, nullptr, nullptr};
+    s->wake_descriptor = CFFileDescriptorCreate(nullptr, o->wake_signal.read_descriptor(), false, cocoa_wake, &context);
+    if (s->wake_descriptor) {
+        s->wake_source = CFFileDescriptorCreateRunLoopSource(nullptr, s->wake_descriptor, 0);
+        if (s->wake_source) CFRunLoopAddSource(CFRunLoopGetMain(), s->wake_source, kCFRunLoopCommonModes);
+        CFFileDescriptorEnableCallBacks(s->wake_descriptor, kCFFileDescriptorReadCallBack);
+    }
+    o->ui.impl->ime_pos = [s](float x, float top, float bottom) {
+        const float scale = s->owner->scale;
+        s->owner->ui.impl->ime_owner = true;
+        s->ime_rect = CGRectMake(x / scale, top / scale, 1, std::max(1.0f, (bottom - top) / scale));
+    };
     o->ui.impl->canvas = &o->canvas;
     o->need_frame = true;
 }
 
 inline void cocoa_destroy(Window* self) {
-    Window::Impl* o = self->impl;
-    CocoaState* s = reinterpret_cast<CocoaState*>(o->native);
+    auto* o = self->impl;
+    auto* s = reinterpret_cast<CocoaState*>(o->native);
     if (!s) return;
-    if (s->ctx) { CGContextRelease(s->ctx); s->ctx = nullptr; }
-    if (s->pending_image) { CGImageRelease(s->pending_image); s->pending_image = nullptr; }
-    if (s->view) cocoa_view_map().erase(reinterpret_cast<void*>(s->view));
-    if (s->window) oc_send<void>(s->window, sel_registerName("close"));
+    id pool = oc_send<id>(oc_send<id>(objc_getClass("NSAutoreleasePool"), sel_registerName("alloc")), sel_registerName("init"));
+    ScopeExit drain([&] { oc_send<void>(pool, sel_registerName("drain")); });
+    if (s->wake_source) { CFRunLoopRemoveSource(CFRunLoopGetMain(), s->wake_source, kCFRunLoopCommonModes); CFRelease(s->wake_source); }
+    if (s->wake_descriptor) { CFFileDescriptorInvalidate(s->wake_descriptor); CFRelease(s->wake_descriptor); }
+    if (s->ctx) CGContextRelease(s->ctx);
+    if (s->pending_image) CGImageRelease(s->pending_image);
+    if (s->window) oc_send<void>(s->window, sel_registerName("setDelegate:"), (id)nullptr);
+    if (s->view) {
+        cocoa_view_map().erase(reinterpret_cast<void*>(s->view));
+        if (s->tracking) { oc_send<void>(s->view, sel_registerName("removeTrackingArea:"), s->tracking); oc_send<void>(s->tracking, sel_registerName("release")); }
+    }
+    if (s->window) { oc_send<void>(s->window, sel_registerName("close")); oc_send<void>(s->window, sel_registerName("release")); }
+    if (s->view) oc_send<void>(s->view, sel_registerName("release"));
     delete s;
     o->native = nullptr;
 }
@@ -14083,11 +17165,12 @@ using detail::oc_send;   // 下面 Window::xxx 在 aino 命名空间里，别每
 bool Window::poll() {
     Window::Impl* o = impl;
     detail::CocoaState* s = reinterpret_cast<detail::CocoaState*>(o->native);
-    if (!s) return false;
+    if (!s || !o->running) return false;
+    id pool = oc_send<id>(oc_send<id>(objc_getClass("NSAutoreleasePool"), sel_registerName("alloc")), sel_registerName("init"));
+    detail::ScopeExit drain([&] { oc_send<void>(pool, sel_registerName("drain")); });
     if (o->wake_signal.consume()) o->need_frame = true;
     // 抽干一次 runloop
-    id distant = oc_send<id>(oc_send<id>(objc_getClass("NSDate"), sel_registerName("alloc")),
-                             sel_registerName("init"));
+    id distant = oc_send<id>(objc_getClass("NSDate"), sel_registerName("distantPast"));
     while (true) {
         id ev = oc_send<id>(oc_send<id>(objc_getClass("NSApplication"), sel_registerName("sharedApplication")),
                             sel_registerName("nextEventMatchingMask:untilDate:inMode:dequeue:"),
@@ -14101,6 +17184,7 @@ bool Window::poll() {
     }
     oc_send<void>(oc_send<id>(objc_getClass("NSApplication"), sel_registerName("sharedApplication")),
                   sel_registerName("updateWindows"));
+    detail::cocoa_sync_geometry(s);
     return o->running;
 }
 
@@ -14108,6 +17192,7 @@ void Window::render() {
     Window::Impl* o = impl;
     detail::CocoaState* s = reinterpret_cast<detail::CocoaState*>(o->native);
     if (!s || !s->ctx) return;
+    if (o->ui.impl->frame_open) { o->need_frame = true; return; }
     timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
     uint64_t now = uint64_t(ts.tv_sec) * 1000u + uint64_t(ts.tv_nsec / 1000000);
@@ -14117,40 +17202,25 @@ void Window::render() {
 
     detail::cocoa_feed_input(s);
     o->need_frame = false;   // 同 Windows：帧前清
+    detail::ScopeExit frame_cleanup([o] {
+        if (o->ui.impl->frame_open) { o->ui.impl->abort_frame(); o->need_frame = true; }
+    });
     Ui& ui = o->ui;
     ui.begin_frame(float(s->pw) / o->scale, float(s->ph) / o->scale, dt, o->scale);
     if (o->frame_cb_ptr) o->frame_cb_ptr();
     ui.end_frame();
     o->cursor = ui.cursor();
+    if (s->view && oc_send<BOOL>(s->window, sel_registerName("isKeyWindow"))) {
+        const char* selector = "arrowCursor";
+        if (o->cursor == Cursor::Hand) selector = "pointingHandCursor";
+        else if (o->cursor == Cursor::IBeam || o->cursor == Cursor::Text) selector = "IBeamCursor";
+        else if (o->cursor == Cursor::ResizeH) selector = "resizeLeftRightCursor";
+        else if (o->cursor == Cursor::ResizeV) selector = "resizeUpDownCursor";
+        oc_send<void>(oc_send<id>(objc_getClass("NSCursor"), sel_registerName(selector)), sel_registerName("set"));
+    }
     detail::cocoa_present(s);
 }
 
-void Window::run(const std::function<void(Ui&)>& frame) {
-    Window::Impl* o = impl;
-    detail::CocoaState* s = reinterpret_cast<detail::CocoaState*>(o->native);
-    if (!s) return;
-    o->frame_cb_ptr = [&frame, o]() { frame(o->ui); };
-    while (o->running) {
-        if (!poll()) break;
-        const bool anim = o->ui.animating();
-        if (o->need_frame || anim || o->ui.impl->repaint_timeout_ms() == 0) {
-            o->self_repaint = false;
-            timespec t0{}; clock_gettime(CLOCK_MONOTONIC, &t0);
-            const uint64_t s0 = uint64_t(t0.tv_sec) * 1000000u + uint64_t(t0.tv_nsec / 1000);
-            render();
-            // 所有帧统一节流到 anim_fps（同 Windows/X11）：鼠标每动一次就是
-            // 一个事件，不封顶就被输入频率牵着走。
-            timespec t1{}; clock_gettime(CLOCK_MONOTONIC, &t1);
-            const uint64_t s1 = uint64_t(t1.tv_sec) * 1000000u + uint64_t(t1.tv_nsec / 1000);
-            const uint64_t el_us = s1 - s0;
-            const uint64_t budget_us = uint64_t(o->anim_budget_ms) * 1000u;
-            if (el_us < budget_us) usleep(useconds_t(budget_us - el_us));
-        } else {
-            usleep(2000);
-        }
-    }
-    o->frame_cb_ptr = nullptr;
-}
 
 void Window::set_title(const std::string& title) {
     detail::CocoaState* s = reinterpret_cast<detail::CocoaState*>(impl->native);
@@ -14161,22 +17231,153 @@ void Window::set_title(const std::string& title) {
 }
 void Window::set_size(int w, int h) {
     detail::CocoaState* s = reinterpret_cast<detail::CocoaState*>(impl->native);
-    if (s && s->window)
-        oc_send<void>(s->window, sel_registerName("setContentSize:"), CGSizeMake(CGFloat(w), CGFloat(h)));
+    if (s && s->window) {
+        oc_send<void>(s->window, sel_registerName("setContentSize:"), CGSizeMake(CGFloat(std::max(1, w)), CGFloat(std::max(1, h))));
+        s->geometry_dirty = true; s->owner->need_frame = true;
+        detail::cocoa_sync_geometry(s);
+    }
 }
-void Window::activate() {
-    if (!impl) return;
-    auto* s = reinterpret_cast<detail::CocoaState*>(impl->native);
-    if (!s || !s->window) return;
-    auto app = oc_send<id>(objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
-    oc_send<void>(app, sel_registerName("activateIgnoringOtherApps:"), (BOOL)YES);
-    oc_send<void>(s->window, sel_registerName("makeKeyAndOrderFront:"), (id)nullptr);
+void Window::set_clipboard(const std::string& text) { (void)try_set_clipboard(text); }
+bool Window::try_set_clipboard(const std::string& text) {
+    if (!pthread_main_np()) return false;
+    id pool = oc_send<id>(oc_send<id>(objc_getClass("NSAutoreleasePool"), sel_registerName("alloc")), sel_registerName("init"));
+    detail::ScopeExit drain([&] { oc_send<void>(pool, sel_registerName("drain")); });
+    CFStringRef value = CFStringCreateWithBytes(nullptr, reinterpret_cast<const UInt8*>(text.data()),
+        CFIndex(text.size()), kCFStringEncodingUTF8, false);
+    if (!value) return false;
+    detail::ScopeExit release([&] { CFRelease(value); });
+    id pasteboard = oc_send<id>(objc_getClass("NSPasteboard"), sel_registerName("generalPasteboard"));
+    if (!pasteboard) return false;
+    oc_send<long>(pasteboard, sel_registerName("clearContents"));
+    return oc_send<BOOL>(pasteboard, sel_registerName("setString:forType:"), value, CFSTR("public.utf8-plain-text"));
 }
-
-void Window::set_clipboard(const std::string&) {}
-std::string Window::clipboard() const { return std::string(); }
+std::string Window::clipboard() const {
+    if (!pthread_main_np()) return {};
+    id pool = oc_send<id>(oc_send<id>(objc_getClass("NSAutoreleasePool"), sel_registerName("alloc")), sel_registerName("init"));
+    detail::ScopeExit drain([&] { oc_send<void>(pool, sel_registerName("drain")); });
+    id pasteboard = oc_send<id>(objc_getClass("NSPasteboard"), sel_registerName("generalPasteboard"));
+    return detail::cocoa_string(oc_send<id>(pasteboard, sel_registerName("stringForType:"), CFSTR("public.utf8-plain-text")));
+}
 
 #endif // AINO_PLATFORM_MACOS
+
+
+void Window::set_frame_callback(std::function<void(Ui&)> frame) {
+    auto& windows = detail::scheduled_windows();
+    if (frame) {
+        impl->frame_cb_ptr = [this, callback = std::move(frame)] { callback(impl->ui); };
+        impl->render_fn = [this] { render(); };
+        if (std::find(windows.begin(), windows.end(), this) == windows.end()) windows.push_back(this);
+        impl->need_frame = true;
+    } else {
+        windows.erase(std::remove(windows.begin(), windows.end(), this), windows.end());
+        impl->frame_cb_ptr = nullptr;
+        impl->render_fn = nullptr;
+    }
+}
+
+void Window::run(const std::function<void(Ui&)>& frame) {
+    if (!ok()) return;
+    auto& windows = detail::scheduled_windows();
+    const bool registered = std::find(windows.begin(), windows.end(), this) != windows.end();
+    detail::ScopeExit restore([this, registered, previous = std::move(impl->frame_cb_ptr),
+                               render_fn = std::move(impl->render_fn)]() mutable {
+        if (!registered) {
+            auto& list = detail::scheduled_windows();
+            list.erase(std::remove(list.begin(), list.end(), this), list.end());
+        }
+        impl->frame_cb_ptr = std::move(previous);
+        impl->render_fn = std::move(render_fn);
+    });
+    set_frame_callback([&frame](Ui& ui) { frame(ui); });
+    using Clock = std::chrono::steady_clock;
+    while (impl->running) {
+        // 回调可以创建或销毁其他窗口；快照只用于遍历，每次解引用前验证注册仍存在。
+        const auto snapshot = windows;
+        auto live = [&](Window* window) {
+            return std::find(windows.begin(), windows.end(), window) != windows.end();
+        };
+        auto notify_closed = [&] {
+            bool closed = false;
+            for (Window* window : snapshot) if (live(window) && !window->impl->running
+                && !window->impl->close_reported) { window->impl->close_reported = true; closed = true; }
+            if (closed) for (Window* window : windows) window->impl->need_frame = true;
+        };
+        for (Window* window : snapshot) if (live(window) && window->impl->running) {
+            window->poll();
+        }
+        notify_closed();
+        if (!impl->running) break;
+        for (Window* window : snapshot) {
+            if (!live(window)) continue;
+            auto* o = window->impl;
+            if (!o->running || !o->frame_cb_ptr) continue;
+#ifdef AINO_PLATFORM_WAYLAND
+            if (!detail::wayland_can_render(static_cast<detail::WaylandState*>(o->native))) continue;
+#endif
+            const auto now = Clock::now();
+            if ((o->need_frame || o->ui.animating() || o->ui.impl->repaint_timeout_ms() == 0)
+                && now >= o->next_frame_at) {
+                const auto budget = (o->move_only && !o->ui.impl->active)
+                    ? std::max(o->anim_budget_ms, o->move_budget_ms) : o->anim_budget_ms;
+                o->self_repaint = false;
+                window->render();
+#ifdef AINO_PLATFORM_WINDOWS
+                if (o->frame_log) detail::win_frame_log(o, uint64_t(
+                    std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - now).count()));
+#endif
+                o->move_only = false;
+                o->next_frame_at = now + std::chrono::milliseconds(budget);
+            }
+        }
+        if (!impl->running) break;
+        notify_closed();
+        if (snapshot != windows) continue;
+        int timeout = -1;
+        auto limit = [&](int delay) { if (delay >= 0 && (timeout < 0 || delay < timeout)) timeout = delay; };
+        for (Window* window : windows) {
+            auto* o = window->impl;
+            if (!o->running || !o->frame_cb_ptr) continue;
+            if (o->wake_signal.pending()) limit(0);
+#ifdef AINO_PLATFORM_WAYLAND
+            if (!detail::wayland_can_render(static_cast<detail::WaylandState*>(o->native))) continue;
+#endif
+            const int until_frame = int(std::max<int64_t>(0,
+                std::chrono::ceil<std::chrono::milliseconds>(o->next_frame_at - Clock::now()).count()));
+            const int timer = o->ui.impl->repaint_timeout_ms();
+            if (o->need_frame || o->ui.animating()) limit(until_frame);
+            else if (timer >= 0) limit(std::max(timer, until_frame));
+        }
+#ifdef AINO_PLATFORM_WINDOWS
+        // MsgWait 的句柄上限为 MAXIMUM_WAIT_OBJECTS - 1；每组之外的窗口用一个有界等待兜底。
+        std::vector<HANDLE> handles;
+        for (Window* window : windows) if (window->impl->running) {
+            HANDLE event = window->impl->wake_signal.wait_handle();
+            if (event && handles.size() < MAXIMUM_WAIT_OBJECTS - 2) handles.push_back(event);
+            else limit(16);
+        }
+        HANDLE timer = detail::win_timer().arm_ms(timeout);
+        if (timer) handles.push_back(timer);
+        MsgWaitForMultipleObjectsEx(DWORD(handles.size()), handles.data(),
+            timer || timeout < 0 ? INFINITE : DWORD(timeout), QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+#elif defined(AINO_PLATFORM_X11)
+        std::vector<pollfd> descriptors;
+        for (Window* window : windows) if (window->impl->running) {
+            auto* state = reinterpret_cast<detail::X11State*>(window->impl->native);
+            if (state) descriptors.push_back({ConnectionNumber(state->dpy), POLLIN, 0});
+            descriptors.push_back({window->impl->wake_signal.read_descriptor(), POLLIN, 0});
+        }
+        ::poll(descriptors.data(), descriptors.size(), timeout);
+#elif defined(AINO_PLATFORM_WAYLAND)
+        std::vector<pollfd> descriptors;
+        for (Window* window : windows) if (window->impl->running)
+            detail::wayland_wait_fds(static_cast<detail::WaylandState*>(window->impl->native), descriptors, timeout);
+        ::poll(descriptors.data(), descriptors.size(), timeout);
+#elif defined(AINO_PLATFORM_MACOS)
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, timeout < 0 ? 1e9 : double(timeout) / 1000.0, true);
+#endif
+    }
+}
 
 namespace detail {
 struct SystemIconMask {
@@ -14184,11 +17385,12 @@ struct SystemIconMask {
     std::vector<uint8_t> alpha;
 };
 
-#if defined(AINO_PLATFORM_X11)
+#if defined(AINO_PLATFORM_UNIX)
 // 只使用 GdkPixbuf 的图像加载，不初始化 GTK 或创建额外窗口。
 struct X11IconPixels {
     void* lib = nullptr;
     void* (*load)(const char*, int, int, int, void**) = nullptr;
+    void* (*file_info)(const char*, int*, int*) = nullptr;
     int (*width)(const void*) = nullptr;
     int (*height)(const void*) = nullptr;
     int (*stride)(const void*) = nullptr;
@@ -14200,6 +17402,7 @@ struct X11IconPixels {
         lib = dlopen("libgdk_pixbuf-2.0.so.0", RTLD_LAZY | RTLD_LOCAL);
         if (!lib) return;
         load = reinterpret_cast<decltype(load)>(dlsym(lib, "gdk_pixbuf_new_from_file_at_scale"));
+        file_info = reinterpret_cast<decltype(file_info)>(dlsym(lib, "gdk_pixbuf_get_file_info"));
         width = reinterpret_cast<decltype(width)>(dlsym(lib, "gdk_pixbuf_get_width"));
         height = reinterpret_cast<decltype(height)>(dlsym(lib, "gdk_pixbuf_get_height"));
         stride = reinterpret_cast<decltype(stride)>(dlsym(lib, "gdk_pixbuf_get_rowstride"));
@@ -14207,7 +17410,7 @@ struct X11IconPixels {
         has_alpha = reinterpret_cast<decltype(has_alpha)>(dlsym(lib, "gdk_pixbuf_get_has_alpha"));
         pixels = reinterpret_cast<decltype(pixels)>(dlsym(lib, "gdk_pixbuf_get_pixels"));
         unref = reinterpret_cast<decltype(unref)>(dlsym(lib, "g_object_unref"));
-        if (!load || !width || !height || !stride || !channels || !has_alpha || !pixels || !unref) {
+        if (!load || !file_info || !width || !height || !stride || !channels || !has_alpha || !pixels || !unref) {
             dlclose(lib); lib = nullptr;
         }
     }
@@ -14588,7 +17791,7 @@ inline SystemIconMask load_system_icon(SystemIcon icon, int size) {
     }
     if (name) CFRelease(name);
     oc_send<void>(pool, sel_registerName("drain"));
-#elif defined(AINO_PLATFORM_X11)
+#elif defined(AINO_PLATFORM_UNIX)
     return x11_load_system_icon(icon, size);
 #else
     (void)icon; (void)size;
@@ -14597,8 +17800,189 @@ inline SystemIconMask load_system_icon(SystemIcon icon, int size) {
 }
 } // namespace detail
 
+std::string executable_directory() {
+    std::string path;
+#if defined(AINO_PLATFORM_WINDOWS)
+    std::vector<wchar_t> buffer(32768);
+    const DWORD n = GetModuleFileNameW(nullptr, buffer.data(), DWORD(buffer.size()));
+    if (n && n < buffer.size()) path = detail::from_wide(std::wstring(buffer.data(), n));
+#elif defined(AINO_PLATFORM_MACOS)
+    uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::vector<char> buffer(size);
+    if (size && _NSGetExecutablePath(buffer.data(), &size) == 0) path = buffer.data();
+#elif defined(AINO_PLATFORM_UNIX)
+    std::vector<char> buffer(4096);
+    const ssize_t n = readlink("/proc/self/exe", buffer.data(), buffer.size() - 1);
+    if (n > 0 && size_t(n) < buffer.size() - 1) path.assign(buffer.data(), size_t(n));
+#endif
+    const auto separator = path.find_last_of("/\\");
+    if (separator == std::string::npos) {
+        std::fprintf(stderr, "[aino] Cannot locate executable directory\n");
+        return {};
+    }
+    return path.substr(0, separator + 1);
+}
+
+#if defined(AINO_PLATFORM_WINDOWS)
+namespace detail {
+// 文件与资源共用解码状态机；任一步失败或分配异常都释放 COM 所有权。
+struct WicDecode {
+    HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    IWICImagingFactory* factory = nullptr;
+    IWICStream* stream = nullptr;
+    IWICBitmapDecoder* decoder = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICFormatConverter* converter = nullptr;
+    WicDecode() = default;
+    WicDecode(const WicDecode&) = delete;
+    WicDecode& operator=(const WicDecode&) = delete;
+    ~WicDecode() {
+        if (converter) converter->Release();
+        if (frame) frame->Release();
+        if (decoder) decoder->Release();
+        if (stream) stream->Release();
+        if (factory) factory->Release();
+        if (SUCCEEDED(initialized)) CoUninitialize();
+    }
+    HRESULT create() {
+        if (FAILED(initialized) && initialized != RPC_E_CHANGED_MODE) return initialized;
+        return CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+            IID_IWICImagingFactory, reinterpret_cast<void**>(&factory));
+    }
+    HRESULT pixels(Image& result) {
+        UINT w = 0, h = 0;
+        HRESULT hr = decoder ? decoder->GetFrame(0, &frame) : E_FAIL;
+        if (SUCCEEDED(hr)) hr = frame->GetSize(&w, &h);
+        if (SUCCEEDED(hr) && (!w || !h || w > 16384 || h > 16384 || uint64_t(w) * h > 67108864u)) hr = E_FAIL;
+        if (SUCCEEDED(hr)) hr = factory->CreateFormatConverter(&converter);
+        if (SUCCEEDED(hr)) hr = converter->Initialize(frame, GUID_WICPixelFormat32bppRGBA,
+            WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom);
+        if (SUCCEEDED(hr)) {
+            result.width = int(w); result.height = int(h);
+            result.pixels.resize(size_t(w) * size_t(h) * 4u);
+            hr = converter->CopyPixels(nullptr, w * 4u, UINT(result.pixels.size()), result.pixels.data());
+        }
+        if (FAILED(hr)) result = Image{};
+        return hr;
+    }
+};
+} // namespace detail
+#endif
+
+bool Image::load(const std::string& path, std::string* error) {
+    Image result;
+    if (error) error->clear();
+#if defined(AINO_PLATFORM_WINDOWS)
+    detail::WicDecode decode;
+    HRESULT hr = decode.create();
+    if (SUCCEEDED(hr)) hr = decode.factory->CreateDecoderFromFilename(detail::to_wide(path).c_str(),
+        nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &decode.decoder);
+    if (SUCCEEDED(hr)) hr = decode.pixels(result);
+#elif defined(AINO_PLATFORM_MACOS)
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(nullptr,
+        reinterpret_cast<const UInt8*>(path.data()), CFIndex(path.size()), false);
+    CGImageSourceRef source = url ? CGImageSourceCreateWithURL(url, nullptr) : nullptr;
+    CFDictionaryRef properties = source ? CGImageSourceCopyPropertiesAtIndex(source, 0, nullptr) : nullptr;
+    int64_t metadata_w = 0, metadata_h = 0;
+    if (properties) {
+        auto width = static_cast<CFNumberRef>(CFDictionaryGetValue(properties, kCGImagePropertyPixelWidth));
+        auto height = static_cast<CFNumberRef>(CFDictionaryGetValue(properties, kCGImagePropertyPixelHeight));
+        if (width && CFGetTypeID(width) == CFNumberGetTypeID()) CFNumberGetValue(width, kCFNumberSInt64Type, &metadata_w);
+        if (height && CFGetTypeID(height) == CFNumberGetTypeID()) CFNumberGetValue(height, kCFNumberSInt64Type, &metadata_h);
+        CFRelease(properties);
+    }
+    const bool bounded = metadata_w > 0 && metadata_h > 0 && metadata_w <= 16384 && metadata_h <= 16384
+        && uint64_t(metadata_w) * uint64_t(metadata_h) <= 67108864u;
+    CGImageRef image = source && bounded ? CGImageSourceCreateImageAtIndex(source, 0, nullptr) : nullptr;
+    const size_t w = image ? CGImageGetWidth(image) : 0, h = image ? CGImageGetHeight(image) : 0;
+    if (w && h && w <= 16384 && h <= 16384 && w * h <= 67108864u) {
+        result.width = int(w); result.height = int(h);
+        result.pixels.resize(w * h * 4u);
+        CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+        CGContextRef context = space ? CGBitmapContextCreate(result.pixels.data(), w, h, 8, w * 4u,
+            space, kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big) : nullptr;
+        if (context) {
+            CGContextTranslateCTM(context, 0, CGFloat(h));
+            CGContextScaleCTM(context, 1, -1);
+            CGContextDrawImage(context, CGRectMake(0, 0, w, h), image);
+            CGContextRelease(context);
+            for (size_t i = 0; i < result.pixels.size(); i += 4) {
+                const unsigned a = result.pixels[i + 3];
+                if (a) for (int c = 0; c < 3; ++c)
+                    result.pixels[i + c] = uint8_t(std::min(255u, (unsigned(result.pixels[i + c]) * 255u + a / 2) / a));
+            }
+        } else result = Image{};
+        if (space) CGColorSpaceRelease(space);
+    }
+    if (image) CGImageRelease(image);
+    if (source) CFRelease(source);
+    if (url) CFRelease(url);
+#elif defined(AINO_PLATFORM_UNIX)
+    static detail::X11IconPixels api;
+    int metadata_w = 0, metadata_h = 0;
+    const bool bounded = api.lib && api.file_info(path.c_str(), &metadata_w, &metadata_h)
+        && metadata_w > 0 && metadata_h > 0 && metadata_w <= 16384 && metadata_h <= 16384
+        && uint64_t(metadata_w) * uint64_t(metadata_h) <= 67108864u;
+    void* image = bounded ? api.load(path.c_str(), -1, -1, 1, nullptr) : nullptr;
+    if (image) {
+        const int w = api.width(image), h = api.height(image), n = api.channels(image);
+        const int stride = api.stride(image);
+        const auto* src = api.pixels(image);
+        if (src && w > 0 && h > 0 && w <= 16384 && h <= 16384 &&
+            uint64_t(w) * uint64_t(h) <= 67108864u && (n == 3 || n == 4) && stride >= w * n) {
+            result.width = w; result.height = h;
+            result.pixels.resize(size_t(w) * size_t(h) * 4u);
+            const bool alpha = n == 4 && api.has_alpha(image);
+            for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
+                const auto* p = src + size_t(y) * size_t(stride) + size_t(x) * size_t(n);
+                auto* d = &result.pixels[(size_t(y) * size_t(w) + size_t(x)) * 4u];
+                d[0] = p[0]; d[1] = p[1]; d[2] = p[2]; d[3] = alpha ? p[3] : 255;
+            }
+        }
+        api.unref(image);
+    }
+#endif
+    if (!result.valid()) {
+        if (error) *error = "Unable to decode image: " + path;
+        return false;
+    }
+    *this = std::move(result);
+    return true;
+}
+
+bool Image::load_resource(int resource_id, std::string* error) {
+    if (error) error->clear();
+#if defined(AINO_PLATFORM_WINDOWS)
+    Image result;
+    HMODULE module = GetModuleHandleW(nullptr);
+    HRSRC resource = resource_id > 0
+        ? FindResourceW(module, MAKEINTRESOURCEW(resource_id), MAKEINTRESOURCEW(10)) : nullptr;
+    HGLOBAL loaded = resource ? LoadResource(module, resource) : nullptr;
+    const DWORD size = resource ? SizeofResource(module, resource) : 0;
+    const BYTE* bytes = loaded && size ? static_cast<const BYTE*>(LockResource(loaded)) : nullptr;
+    detail::WicDecode decode;
+    HRESULT hr = bytes && size ? decode.create() : E_FAIL;
+    if (SUCCEEDED(hr)) hr = decode.factory->CreateStream(&decode.stream);
+    if (SUCCEEDED(hr)) hr = decode.stream->InitializeFromMemory(const_cast<BYTE*>(bytes), size);
+    if (SUCCEEDED(hr)) hr = decode.factory->CreateDecoderFromStream(decode.stream, nullptr,
+        WICDecodeMetadataCacheOnDemand, &decode.decoder);
+    if (SUCCEEDED(hr)) hr = decode.pixels(result);
+    if (!result.valid()) {
+        if (error) *error = "Unable to decode Windows image resource " + std::to_string(resource_id);
+        return false;
+    }
+    *this = std::move(result);
+    return true;
+#else
+    if (error) *error = "Image resources are only supported on Windows";
+    (void)resource_id;
+    return false;
+#endif
+}
+
 int system_icon_worker_entry(int argc, char** argv) {
-#if defined(AINO_PLATFORM_X11) && defined(__linux__)
+#if defined(AINO_PLATFORM_UNIX) && defined(__linux__)
     if (argc > 1 && std::strcmp(argv[1], "--aino-system-icons-v1") == 0) {
         if (argc != 4 || !argv[2] || !*argv[2]) return 2;
         char* end = nullptr; const long size = std::strtol(argv[2], &end, 10);
@@ -14627,13 +18011,13 @@ int system_icon_worker_entry(int argc, char** argv) {
 bool Ui::system_icon(SystemIcon icon, const Rect& box, const Color& color) {
     if (impl->measure_on) { impl->measure_add(box); return true; }
     if (!impl->canvas || box.empty() || color.a == 0) return false;
-#if defined(AINO_PLATFORM_WINDOWS) || defined(AINO_PLATFORM_MACOS) || defined(AINO_PLATFORM_X11)
+#if defined(AINO_PLATFORM_WINDOWS) || defined(AINO_PLATFORM_MACOS) || defined(AINO_PLATFORM_UNIX)
     const Rect physical = impl->xf_phys(box);
     const int size = std::max(1, int(std::floor(std::min(physical.w, physical.h))));
     const uint64_t key = uint64_t(icon) << 32 | uint32_t(size);
     // 按线程缓存栅格化结果，复用时只混合像素；尺寸变化不保留系统 DC、字体或 NSImage。
     static thread_local std::unordered_map<uint64_t, detail::SystemIconMask> masks;
-#ifdef AINO_PLATFORM_X11
+#ifdef AINO_PLATFORM_UNIX
     static thread_local std::string last_theme;
     const auto current_theme = detail::x11_effective_icon_theme();
     if (last_theme != current_theme) { masks.clear(); last_theme = current_theme; }

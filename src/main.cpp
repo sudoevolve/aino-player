@@ -1,6 +1,6 @@
 #define AINO_IMPLEMENTATION
 #include "aino.hpp"
-#ifdef AINO_PLATFORM_X11
+#if defined(AINO_PLATFORM_X11) || defined(AINO_PLATFORM_WAYLAND)
 #include <X11/Xlib.h>
 // Xlib 的遗留宏不能污染后续 JSON / C++ 业务头文件。
 #undef Bool
@@ -112,7 +112,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 #endif
-#ifdef AINO_PLATFORM_X11
+#if defined(AINO_PLATFORM_X11) || defined(AINO_PLATFORM_WAYLAND)
     // 后台任务调用 wake() 前，必须先初始化 Xlib 的线程支持。
     if (!XInitThreads()) { std::fprintf(stderr, "Xlib thread initialization failed\n"); return 1; }
 #endif
@@ -186,6 +186,7 @@ int main(int argc, char** argv) {
     cfg.min_width = 980;
     cfg.min_height = 640;
     cfg.title = "aino player";
+    cfg.app_id = "aino-player";
     cfg.center = true;
     cfg.close_requested = [&] {
         if (smoke_test || startup_ui.close_behavior == 2) return true;
@@ -208,6 +209,13 @@ int main(int argc, char** argv) {
         bool smoke_test;
         ~ApplicationLifetime() { desktop.stop(); shutdown(smoke_test); }
     } lifetime{desktop, smoke_test};
+    const auto activate_window = [&win] {
+#ifndef AINO_PLATFORM_WAYLAND
+        win.activate();
+#else
+        (void)win;
+#endif
+    };
     background::start([] { prov::Host::instance().ensure_loaded(); });
 #ifdef _WIN32
     const auto window_handle = static_cast<aino::detail::Win32State*>(win.impl->native)->hwnd;
@@ -250,8 +258,10 @@ int main(int argc, char** argv) {
         desktop.set_shortcuts(startup_ui.shortcuts);
 #ifdef _WIN32
         desktop.start(window_handle, nullptr, 0, [&win] { win.wake(); });
-#else
+#elif defined(AINO_PLATFORM_X11)
         desktop.start(nullptr, native->dpy, native->win, [&win] { win.wake(); });
+#else
+        desktop.start(nullptr, nullptr, 0, [&win] { win.wake(); });
 #endif
         const auto& image = brand_icon(); desktop.set_icon(image.w, image.h, image.rgba);
     }
@@ -259,7 +269,7 @@ int main(int argc, char** argv) {
     win.set_theme(theme_dark ? aino::Theme::dark() : aino::Theme::light());
     win.set_anim_fps(60.0f);
 
-    start({[&win] { win.wake(); }, [&win, &desktop] { desktop.show(); win.activate(); }, [&win] { win.close(); }, [&win]() -> void* {
+    start({[&win] { win.wake(); }, [&desktop, &activate_window] { desktop.show(); activate_window(); }, [&win] { win.close(); }, [&win]() -> void* {
 #ifdef _WIN32
         return static_cast<aino::detail::Win32State*>(win.impl->native)->hwnd;
 #else
@@ -271,14 +281,14 @@ int main(int argc, char** argv) {
         const auto begin = std::chrono::steady_clock::now();
         std::vector<std::string> opened_files;
         for (const auto& event : desktop.events()) {
-            if (event.action == platform::MediaAction::Show) { desktop.show(); win.activate(); }
+            if (event.action == platform::MediaAction::Show) { desktop.show(); activate_window(); }
             else if (event.action == platform::MediaAction::Quit) win.close();
             else if (event.action == platform::MediaAction::OpenFiles) {
                 opened_files.insert(opened_files.end(), event.files.begin(), event.files.end());
-                desktop.show(); win.activate();
+                desktop.show(); activate_window();
             }
             else if (event.action == platform::MediaAction::Search) {
-                desktop.show(); win.activate(); startup_ui.query = event.track; startup_ui.tab = 0; start_search();
+                desktop.show(); activate_window(); startup_ui.query = event.track; startup_ui.tab = 0; start_search();
             } else media_action(event);
         }
         startup_ui.window_hidden = desktop.hidden();

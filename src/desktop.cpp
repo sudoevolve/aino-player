@@ -1636,7 +1636,13 @@ std::vector<MediaEvent> Desktop::events() {
     std::lock_guard<std::mutex> lock(impl_->queue->mutex);
     std::vector<MediaEvent> out(impl_->queue->pending.begin(), impl_->queue->pending.end()); impl_->queue->pending.clear(); return out;
 }
-bool Desktop::tray_available() const { return impl_->tray.load() && impl_->enabled.load(); }
+bool Desktop::tray_available() const {
+#ifdef _WIN32
+    return impl_->tray.load() && impl_->enabled.load();
+#else
+    return impl_->display && impl_->window && impl_->tray.load() && impl_->enabled.load();
+#endif
+}
 bool Desktop::media_available() const { return impl_->media.load(); }
 bool Desktop::hidden() const { return impl_->hidden.load(); }
 void Desktop::hide() {
@@ -1653,7 +1659,7 @@ void Desktop::show() {
 #ifdef _WIN32
     ShowWindow(impl_->window, SW_RESTORE); SetForegroundWindow(impl_->window);
 #else
-    XMapRaised(impl_->display, impl_->window); XFlush(impl_->display);
+    if (impl_->display && impl_->window) { XMapRaised(impl_->display, impl_->window); XFlush(impl_->display); }
 #endif
     if (impl_->queue->wake) impl_->queue->wake();
 }

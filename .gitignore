@@ -1,5 +1,7 @@
 # ---- 构建产物 ----
 build/
+build-wayland/
+build-x11/
 *.obj
 *.pdb
 *.ilk
