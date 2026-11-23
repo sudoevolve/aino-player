@@ -63,7 +63,7 @@ static void linux_backend_checks() {
         unsetenv("AINO_SCALE");
     }
     XDestroyWindow(desktop, owner); XCloseDisplay(desktop);
-    detail::X11TextRenderer renderer; renderer.init(1, "sans", "monospace");
+    detail::UnixTextRenderer renderer; renderer.init(1, "sans", "monospace");
     const auto width = renderer.measure("字体共享 Memory", 14, 400);
     check(width > 0, "FreeType text metrics");
     for (int size = 10; size <= 40; ++size) renderer.measure("字体共享 Memory", float(size), 400);
