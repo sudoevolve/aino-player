@@ -9096,7 +9096,8 @@ bool Ui::dialog(const std::string& title, const std::string& body, bool* open,
                        const Rect& box, const Style& st) {
     if (!open || !*open) return false;
     const Theme& th = impl->theme;
-    const uint64_t z_first = impl->seq + 1;
+    // 面板自身占用输入层级；紧随其后的滚轮读取没有 interact()，也必须位于闸门之上。
+    const uint64_t z_first = ++impl->seq;
     // 参考资料 `Alert/3 Options + Cancel`：面板 r10、无描边（层次全靠 Primary 投影）、
     // 内边距 16/20、标题 13 Bold、正文 **11 Regular 85%**（不是 50% 的次要灰）。
     const float rad = st.radius >= 0.0f ? st.radius : 10.0f;

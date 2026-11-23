@@ -2451,7 +2451,9 @@ static void shortcuts_settings(Ctx& c, const Rect& area) {
 }
 static void tab_settings(Ctx& c) {
     const float available = c.W - kSidebar - right_panel_width(c);
-    const float w = std::min(680.0f, available - 48);
+    // 内容在视口内留出焦点环的空间，首行按钮与左右边缘控件都不能贴着裁剪边界。
+    constexpr float focus_padding = 4.0f;
+    const float w = std::min(680.0f, available - 48) - 2 * focus_padding;
     const float x = kSidebar + (available - w) * 0.5f;
     c.ui.draw_text("设置", {x, 26, w, 34}, c.th.label, Style().font(25).weight(700));
     auto& selected = c.model.ui.settings_tab;
@@ -2464,20 +2466,20 @@ static void tab_settings(Ctx& c) {
         if (selected == 4) list_backups();
     }
     const float content_height = selected == 6 ? shortcuts_content_height(w) : selected == 4 ? 1070.0f : selected == 5 ? 510.0f : selected == 3 ? 500.0f : selected == 2 ? (c.model.ui.audio_effects_open ? 720.0f : 1210.0f) : selected == 1 ? 360.0f : c.model.ui.overlay_settings ? 1090.0f : c.model.ui.update_settings ? 454.0f + update_notes(c, x, w, 0, false) : 752.0f;
-    const Rect viewport{x, 132, w, c.bar_y - 148};
+    const Rect viewport{x - focus_padding, 132, w + 2 * focus_padding, c.bar_y - 148};
     const int page = selected == 0 ? (c.model.ui.overlay_settings ? 10 : c.model.ui.update_settings ? 11 : 0)
         : selected == 2 && c.model.ui.audio_effects_open ? 12 : selected;
     static int previous_page = -1;
     static ListGeometry geometry;
     static float saved_offset = 0;
     const bool resized = geometry.changed(viewport);
-    auto scroll = c.ui.scroll(viewport, content_height);
+    auto scroll = c.ui.scroll(viewport, content_height + 2 * focus_padding);
     if (changed || page != previous_page) { scroll.to(0); c.ui.set_focus(nullptr); }
     else if (resized) scroll.to(saved_offset);
     previous_page = page;
     saved_offset = scroll.offset;
     const auto draw_page = [&] {
-        const float y = viewport.y - scroll.offset;
+        const float y = viewport.y + focus_padding - scroll.offset;
         if (selected == 6) { shortcuts_settings(c, {x, y, w, content_height}); return; }
         if (selected == 4) { storage_settings(c, x, w, y); return; }
         if (selected == 5) { about_settings(c, x, w, y); return; }
