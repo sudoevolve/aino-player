@@ -107,3 +107,21 @@ provider.playlist_search = function (args) {
   const result = r.body.result;
   return {items: result.playlists.map(playlistCard), more: result.playlistCount === undefined ? result.playlists.length >= limit : (page + 1) * limit < Number(result.playlistCount)};
 };
+provider.daily = function () {
+  const r = http('https://music.163.com/api/v1/discovery/recommend/songs?limit=30', {
+    headers: {Referer: 'https://music.163.com/', 'User-Agent': 'Mozilla/5.0', Cookie: cookieHeader()}
+  });
+  if (r.error || !r.body || Number(r.body.code) !== 200 || !Array.isArray(r.body.recommend))
+    throw new Error(r.error || '每日推荐需要网易云登录，或接口暂不可用');
+  return r.body.recommend.map(songFrom).filter(Boolean);
+};
+provider.similar = function (args) {
+  const id = String((args || {}).id || '');
+  if (!/^\d+$/.test(id)) throw new Error('网易云歌曲 ID 无效');
+  const r = http('https://music.163.com/api/v1/discovery/simiSong?songid=' + encodeURIComponent(id), {
+    headers: {Referer: 'https://music.163.com/', 'User-Agent': 'Mozilla/5.0', Cookie: cookieHeader()}
+  });
+  if (r.error || !r.body || Number(r.body.code) !== 200 || !Array.isArray(r.body.songs))
+    throw new Error(r.error || '相似歌曲暂不可用');
+  return r.body.songs.map(songFrom).filter(function (song) { return song && song.id !== id; }).slice(0, 30);
+};

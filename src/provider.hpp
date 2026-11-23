@@ -160,11 +160,13 @@ public:
     bool has_search() const { return has_search_; }
     bool has_board() const { return has_board_; }
     bool has_resolve() const { return has_resolve_; }
+    bool has_similar() const { return has_similar_; }
 
     bool load(const std::string& path, const std::string& code, std::string& err);
     bool search(const std::string& keyword, int page, int limit, std::vector<Song>& out, std::string& err);
     bool board(const std::string& board_id, int page, int limit, std::vector<Song>& out, std::string& err,
                bool* more = nullptr, int* total = nullptr);
+    bool songs(const char* method, const std::string& args, std::vector<Song>& out, std::string& err);
     bool resolve(const Song& song, const std::string& quality, std::string& url, std::string& err);
     bool request(const char* method, const std::string& args, js::Value& out, std::string& err);
 
@@ -202,7 +204,7 @@ private:
     JSContext* ctx_ = nullptr;
     JSValue provider_ = JS_UNDEFINED;
     std::string key_, name_, file_;
-    bool has_search_ = false, has_board_ = false, has_resolve_ = false;
+    bool has_search_ = false, has_board_ = false, has_resolve_ = false, has_similar_ = false;
 };
 
 inline bool Provider::eval(const std::string& code, const char* name, std::string& err) {
@@ -307,6 +309,7 @@ inline bool Provider::load(const std::string& path, const std::string& code, std
     has_search_ = has("search");
     has_board_ = has("board");
     has_resolve_ = has("resolve");
+    has_similar_ = has("similar");
     if (key_.empty()) key_ = path;
     if (name_.empty()) name_ = key_;
     return true;
@@ -430,6 +433,19 @@ inline bool Provider::search(const std::string& keyword, int page, int limit, st
     JSValue args[3] = {mk_str(ctx_, keyword), JS_NewInt32(ctx_, page), JS_NewInt32(ctx_, limit)};
     const bool ok = call("search", 3, args, out, err);
     for (auto& a : args) JS_FreeValue(ctx_, a);
+    return ok;
+}
+
+inline bool Provider::songs(const char* method, const std::string& args, std::vector<Song>& out,
+                            std::string& err) {
+    Operation operation(*this, true);
+    if (!operation) { err = "平台请求已取消或等待超时"; return false; }
+    if (!ctx_) { err = "provider 未加载"; return false; }
+    JS_UpdateStackTop(rt_);
+    JSValue arg = JS_ParseJSON(ctx_, args.c_str(), args.size(), "<platform-args>");
+    if (JS_IsException(arg)) { err = lx::detail::take_exception(ctx_); JS_FreeValue(ctx_, arg); return false; }
+    const bool ok = call(method, 1, &arg, out, err);
+    JS_FreeValue(ctx_, arg);
     return ok;
 }
 
@@ -599,6 +615,13 @@ public:
         return false;
     }
 
+    bool songs(const std::string& key, const char* method, const std::string& args,
+               std::vector<Song>& out, std::string& err) {
+        if (auto p = get(key)) return p->songs(method, args, out, err);
+        err = "没有 " + key + " 的平台适配器";
+        return false;
+    }
+
     bool resolve(const std::string& key, const Song& song, const std::string& quality, std::string& url,
                  std::string& err) {
         if (auto p = get(key)) return p->resolve(song, quality, url, err);
@@ -618,6 +641,10 @@ public:
 
     bool has(const std::string& key) {
         return bool(get(key));
+    }
+    bool has_similar(const std::string& key) {
+        auto provider = get(key);
+        return provider && provider->has_similar();
     }
 
 private:

@@ -12,6 +12,7 @@
 #include "netease_api.hpp"
 #include "platform.hpp"
 #include "qqapi.hpp"
+#include "radio.hpp"
 #include "sources.hpp"
 #include "tag.hpp"
 #include "../assets/aino_icon.hpp"
@@ -317,6 +318,9 @@ struct UiState {
     ClearAction clear_action = ClearAction::None;
     // 发现页平台（0=网易云，1=QQ）
     int disc_site = 0;   // kDiscoveryPlatforms 的界面索引
+    bool recommendation_loading = false;
+    bool radio_active = false, radio_loading = false;
+    std::string radio_method;
     PlayMode play_mode = PlayMode::RepeatAll;
     unsigned long long sleep_deadline = 0;
     unsigned sleep_remaining_seconds = 0;
@@ -487,6 +491,7 @@ void start_search();
 void search_more();
 void retry_search_source(int source);
 void start_play(int index);
+void play_with_source(const music::Track& track, int lane, std::string source_file);
 void toggle_pause();
 void media_action(const platform::MediaEvent& event);
 void play_step(int delta, bool automatic = false);
@@ -546,6 +551,9 @@ void disc_more();
 void search_playlists(bool append = false);
 void open_playlist_card(const disc::Card& card);
 void disc_open(int idx);
+void daily_recommendations();
+void play_similar(const music::Track& track);
+void stop_radio();
 void favorite_toggle(const music::Track& track);
 enum class BatchAction { Enqueue, Favorite, Download, RemovePlaylist, RemoveQueue };
 void batch_tracks(std::vector<music::Track> tracks, BatchAction action, std::string playlist_key = {});
@@ -821,6 +829,8 @@ namespace player {
 // 异步区：这些字段由后台线程写，主线程每帧拷快照读
 struct AsyncState : PlaybackState {
     bool searching = false;
+    int forced_lane = -1;
+    std::string forced_source; // 当前歌曲的手动选源；恢复取流与 seek 沿用，不持久化。
     bool queue_cursor_known = false; // 删除队首后 -1 是有效的前驱位置，不等同于丢失当前位置。
     library::SharedTracks tracks; // 读取使用 const；UI、队列保存共享版本，编辑时分离。
     std::vector<music::Track> results;
@@ -1632,7 +1642,7 @@ static void do_play(HostCallbacks* win, music::Track track, music::Settings st, 
         return (cancel && cancel()) || std::chrono::steady_clock::now() >= playback_deadline;
     });
     std::shared_lock<std::shared_mutex> cache_write(g_play_cache_mutex);
-    if (!track.variants.empty() && track.current().source != music::Source::Local && g_prefer_downloaded.load()) {
+    if (st.forced_lane < 0 && !track.variants.empty() && track.current().source != music::Source::Local && g_prefer_downloaded.load()) {
         const auto path = downloaded_path(track);
         if (!path.empty()) {
             std::string playable, error;
@@ -2477,6 +2487,7 @@ void queue_remove(int idx) {
 }
 
 void queue_clear() {
+    stop_radio();
     QueueEditState before;
     {
         std::lock_guard<std::mutex> lk(g_mu); before = queue_edit_state_locked();
@@ -2577,6 +2588,20 @@ struct DiscState {
 };
 static DiscState g_disc, g_playlist_search;
 static DiscSnap g_disc_snap, g_playlist_search_snap;
+static std::atomic<unsigned> g_recommendation_generation{0};
+// 会话由 UI 线程持有；后台只读取 generation 并通过 post_ui 追加推荐。
+struct RadioSession {
+    bool loading = false, waiting = false, error_shown = false;
+    unsigned empty_batches = 0;
+    unsigned long long retry_at = 0;
+    std::deque<music::Track> seeds;
+    std::unordered_set<std::string> seen;
+    std::deque<std::string> seen_order;
+    std::map<std::string, int> search_pages;
+};
+static RadioSession g_radio;
+static std::atomic<unsigned> g_radio_generation{0};
+static void refill_radio();
 
 static void request_cards(DiscState& state, int site, std::string query, bool append, bool with_heats) {
     if (site < 0 || site >= music::kDiscoveryCount) return;
@@ -3414,7 +3439,8 @@ static void cleanup_temp(int keep_gen) {
 }
 
 static void start_play_attempt(int index, bool keep_failures, PlaybackTrigger trigger = PlaybackTrigger::User,
-                               const music::Track* restore = nullptr, bool initially_paused = false) {
+                               const music::Track* restore = nullptr, bool initially_paused = false,
+                               int forced_lane = -1, std::string forced_source = {}) {
     music::Track track;
     music::Settings st;
     int gen = 0;
@@ -3433,8 +3459,18 @@ static void start_play_attempt(int index, bool keep_failures, PlaybackTrigger tr
             track = std::as_const(g_as.tracks)[size_t(index)];
         }
         if (track.variants.empty()) return;
+        g_radio.waiting = false;
         if (!keep_failures) g_failed_tracks.clear();
+        if (forced_lane < 0 && (trigger == PlaybackTrigger::Resume || trigger == PlaybackTrigger::SystemPlay) &&
+            track_uid(track) == g_as.now_uid) {
+            forced_lane = g_as.forced_lane;
+            forced_source = g_as.forced_source;
+        }
         st = g_ui.settings;
+        st.forced_lane = forced_lane;
+        st.forced_source = std::move(forced_source);
+        g_as.forced_lane = st.forced_lane;
+        g_as.forced_source = st.forced_source;
         for (int i = 0; i < music::kSourceCount; ++i) st.enable[i] = (g_ui.src_mask >> i) & 1u;
         gen = ++g_as.gen; g_play_generation.store(gen);
         record_queue_transition_locked(g_as.playing, index, trigger);
@@ -3472,7 +3508,7 @@ static void start_play_attempt(int index, bool keep_failures, PlaybackTrigger tr
     g_ui.dur_ms = float(track.duration_ms);
     g_player.close();  // 播放设备只由主线程操作。
     g_gapless = {};
-    g_current_media = take_preloaded(track, st);
+    g_current_media = st.forced_lane < 0 ? take_preloaded(track, st) : nullptr;
     cleanup_temp(gen);
     if (g_ui.lyrics_open || g_ui.lyric_overlay.enabled) request_lyrics(track);
     if (g_current_media && g_current_media->stream && g_pending_seek > 0) g_current_media.reset();
@@ -3495,6 +3531,18 @@ static void start_play_attempt(int index, bool keep_failures, PlaybackTrigger tr
 }
 
 void start_play(int index) { start_play_attempt(index, false); }
+
+void play_with_source(const music::Track& track, int lane, std::string source_file) {
+    int index;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        if (track.variants.empty() || track_uid(track) != g_as.now_uid ||
+            (lane != int(music::Lane::Builtin) && lane != int(music::Lane::JsSource)) ||
+            (lane == int(music::Lane::JsSource) && source_file.empty())) return;
+        index = g_as.playing;
+    }
+    start_play_attempt(index, false, PlaybackTrigger::User, &track, false, lane, std::move(source_file));
+}
 
 // 请求队列仅由 UI 线程持有；一次只扫描一批，标签读取始终留在后台。
 struct LocalOpenRequest { std::vector<std::string> paths; unsigned serial; int play_generation; };
@@ -3683,6 +3731,11 @@ static int next_queue_index(int delta, bool automatic, bool consume = true, cons
         }
         if (consume) g_play_next.clear();
     }
+    if (g_ui.radio_active) {
+        for (int next = cur < 0 ? 0 : cur + delta; next >= 0 && next < count; next += delta)
+            if (allowed(next)) return next;
+        return -1; // 电台等待新推荐，不循环旧队列。
+    }
     if (automatic && g_ui.play_mode == PlayMode::RepeatOne && cur >= 0 && allowed(cur)) return cur;
     if (g_ui.play_mode == PlayMode::Shuffle) {
         if (delta < 0) {
@@ -3797,6 +3850,7 @@ static void adopt_gapless_transition() {
         g_as.queue_cursor_known = g_as.playing >= 0;
         record_queue_transition_locked(previous, g_as.playing, PlaybackTrigger::Gapless);
         g_as.now_track = track; g_as.now_uid = track_uid(track); g_as.now_title = track.title;
+        g_as.forced_lane = -1; g_as.forced_source.clear();
         g_as.now_artist = track.artist; g_as.now_cover = track.cover_url;
         g_as.now_lane = media->resolved.ok ? int(media->resolved.lane) : -1; g_as.now_engine = media->resolved.engine;
         g_as.now_origin = int(track.current().source); g_as.now_swapped = false;
@@ -3826,6 +3880,7 @@ static void adopt_gapless_transition() {
     queue_mark_dirty();
 }
 static void stop_playback() {
+    stop_radio();
     {
         std::lock_guard<std::mutex> lock(g_mu);
         ++g_as.gen; g_play_generation.store(g_as.gen); // 拒绝仍在解析/缓冲的旧任务，避免定时停止后重新起播。
@@ -3843,6 +3898,7 @@ void play_step(int delta, bool automatic) {
     auto trigger = automatic ? PlaybackTrigger::NaturalEnd : PlaybackTrigger::User;
     const int next = next_queue_index(delta, automatic, true, nullptr, &trigger);
     if (next >= 0) start_play_attempt(next, false, trigger);
+    else if (delta > 0 && g_ui.radio_active) { g_radio.waiting = true; refill_radio(); }
     else if (automatic) stop_playback();
 }
 void set_play_mode(PlayMode mode) {
@@ -4417,9 +4473,11 @@ void refresh_output_devices() {
 }
 void select_output_device(const std::string& id) {
     music::Track track; bool paused, active; int index; long long position;
+    int forced_lane; std::string forced_source;
     {
         std::lock_guard<std::mutex> lock(g_mu);
         track = g_as.now_track; const auto state = g_as.ps; index = g_as.playing;
+        forced_lane = g_as.forced_lane; forced_source = g_as.forced_source;
         active = state == PlayState::Playing || state == PlayState::Paused || state == PlayState::Buffering || state == PlayState::Resolving || state == PlayState::Ready;
         paused = state == PlayState::Paused || ((state == PlayState::Buffering || state == PlayState::Resolving || state == PlayState::Ready) && g_play_ready_paused);
         position = (state == PlayState::Playing || state == PlayState::Paused) ? g_player.position_ms() : g_as.position_ms;
@@ -4428,7 +4486,7 @@ void select_output_device(const std::string& id) {
     g_player.set_device(id); g_ui.output_device = id; g_ui.config_dirty = true;
     if (!track.variants.empty() && active) {
         { std::lock_guard<std::mutex> lock(g_mu); g_resume_on_start = position; }
-        start_play_attempt(index, false, PlaybackTrigger::DeviceRestore, &track, paused);
+        start_play_attempt(index, false, PlaybackTrigger::DeviceRestore, &track, paused, forced_lane, std::move(forced_source));
     }
 }
 void playlist_filter_rows() {
@@ -4954,8 +5012,118 @@ void catalog_retry() {
     catalog_request(albums, failed && (albums ? g_playlist_view.albums_retry_append : g_playlist_view.tracks_retry_append));
 }
 
+void stop_radio() {
+    if (g_ui.radio_active) { cancel_preload(); g_gapless = {}; }
+    ++g_radio_generation;
+    g_radio = {};
+    g_ui.radio_active = g_ui.radio_loading = false;
+    g_ui.radio_method.clear();
+}
+
+static void radio_remember(const std::string& uid) {
+    if (!g_radio.seen.insert(uid).second) return;
+    g_radio.seen_order.push_back(uid);
+    constexpr size_t history_limit = 2048;
+    while (g_radio.seen_order.size() > history_limit) {
+        g_radio.seen.erase(g_radio.seen_order.front());
+        g_radio.seen_order.pop_front();
+    }
+}
+
+static void refill_radio() {
+    constexpr int refill_threshold = 10;
+    if (!g_ui.radio_active || g_radio.loading || g_shutdown.load() || platform::ticks() < g_radio.retry_at) return;
+    music::Track seed;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        if (int(g_as.tracks.size()) - g_as.playing - 1 > refill_threshold) return;
+        seed = g_as.now_track;
+    }
+    if (!g_radio.seeds.empty()) { seed = std::move(g_radio.seeds.front()); g_radio.seeds.pop_front(); }
+    if (seed.variants.empty()) return;
+    const auto generation = g_radio_generation.load();
+    const auto settings = g_ui.settings;
+    const auto query_key = radio::query_key(seed);
+    if (g_radio.search_pages.size() >= 128 && !g_radio.search_pages.count(query_key)) g_radio.search_pages.erase(g_radio.search_pages.begin());
+    const int page = g_radio.search_pages[query_key];
+    const bool explore = g_radio.empty_batches != 0;
+    g_radio.loading = g_ui.radio_loading = true;
+    run_task([seed, generation, settings, query_key, page, explore] {
+        prov::Host::instance().set_credentials(settings.netease_cookie, settings.qq_cookie);
+        net::CancelScope cancel([generation] {
+            return g_shutdown.load() || generation != g_radio_generation.load();
+        });
+        auto result = radio::recommend(seed, settings, page, explore);
+        if (net::cancelled()) return;
+        post_ui([seed, generation, query_key, page, result = std::move(result)]() mutable {
+            if (generation != g_radio_generation.load() || !g_ui.radio_active) return;
+            g_radio.loading = g_ui.radio_loading = false;
+            g_ui.radio_method = result.method;
+            if (!result.error.empty()) {
+                g_radio.seeds.push_back(seed);
+                g_radio.retry_at = platform::ticks() + 10000;
+                if (!g_radio.error_shown) toast("漫游电台补歌失败，将稍后重试：" + result.error, 7000);
+                g_radio.error_shown = true;
+                return;
+            }
+            int added = 0;
+            bool queue_changed = false;
+            bool paused;
+            if (result.searched) g_radio.search_pages[query_key] = result.exhausted || page >= 99 ? 0 : page + 1;
+            if (!result.alias.empty()) radio_remember(result.alias);
+            {
+                std::lock_guard<std::mutex> lock(g_mu);
+                paused = g_as.ps == PlayState::Paused || g_play_ready_paused;
+                std::unordered_set<std::string> queued;
+                for (const auto& track : std::as_const(g_as.tracks)) queued.insert(radio::identity(track));
+                for (auto& track : result.tracks) {
+                    if (track.variants.empty() || !music::is_platform(track.current().source)) continue;
+                    const auto uid = radio::identity(track);
+                    if (g_radio.seen.count(uid) || !queued.insert(uid).second) continue;
+                    radio_remember(uid);
+                    g_radio.seeds.push_back(track);
+                    g_as.tracks.push_back(std::move(track));
+                    ++added;
+                }
+                // 长时间漫游只保留最近 100 首已播队列和有限的去重记录。
+                constexpr int played_history = 100;
+                const int trim = std::max(0, g_as.playing - played_history);
+                if (trim) { g_as.tracks.erase(g_as.tracks.begin(), g_as.tracks.begin() + trim); g_as.playing -= trim; }
+                queue_changed = added || trim;
+                if (queue_changed) ++g_as.tracks_version;
+            }
+            while (g_radio.seeds.size() > 128) g_radio.seeds.pop_front();
+            if (queue_changed) queue_mark_dirty();
+            if (added) {
+                g_radio.empty_batches = 0;
+                g_radio.retry_at = 0; g_radio.error_shown = false;
+                if (g_radio.waiting) {
+                    g_radio.waiting = false;
+                    if (!paused) play_step(1, true);
+                }
+            } else {
+                ++g_radio.empty_batches;
+                g_radio.retry_at = platform::ticks() + (g_radio.seeds.empty() ? 30000 : 500);
+                if (g_radio.seeds.empty() && !g_radio.error_shown) {
+                    toast("漫游电台暂时没有新的相似歌曲，将稍后重试", 6000);
+                    g_radio.error_shown = true;
+                }
+            }
+        });
+    }, [generation, seed] {
+        if (generation != g_radio_generation.load() || !g_ui.radio_active) return;
+        g_radio.loading = g_ui.radio_loading = false;
+        g_radio.seeds.push_back(seed);
+        g_radio.retry_at = platform::ticks() + 10000;
+        if (!g_radio.error_shown) toast("漫游电台补歌失败，将稍后重试", 6000);
+        g_radio.error_shown = true;
+    });
+}
+
 static void replace_queue_and_play(std::vector<music::Track> tracks, int index) {
     if (index < 0 || index >= int(tracks.size())) return;
+    stop_radio();
+    ++g_recommendation_generation; g_ui.recommendation_loading = false;
     {
         std::lock_guard<std::mutex> lock(g_mu);
         ++g_as.gen; g_play_generation.store(g_as.gen);
@@ -4963,6 +5131,62 @@ static void replace_queue_and_play(std::vector<music::Track> tracks, int index) 
         g_play_next.clear(); g_shuffle_remaining.clear(); g_shuffle_history.clear(); g_shuffle_cursor = -1;
     }
     queue_mark_dirty(); start_play_attempt(index, false, PlaybackTrigger::QueueReplace);
+}
+static void request_recommendations(const char* method, const std::string& args, std::string label) {
+    const auto generation = ++g_recommendation_generation;
+    g_ui.recommendation_loading = true;
+    const auto settings = g_ui.settings;
+    run_task([method = std::string(method), args, label, generation, settings] {
+        prov::Host::instance().set_credentials(settings.netease_cookie, settings.qq_cookie);
+        net::CancelScope cancel([generation] {
+            return g_shutdown.load() || generation != g_recommendation_generation.load();
+        });
+        std::vector<music::Track> tracks;
+        std::string error;
+        music::songs_via_provider(music::Source::Netease, method.c_str(), args, tracks, error);
+        if (net::cancelled() || g_shutdown.load()) return;
+        post_ui([generation, label, tracks = std::move(tracks), error = std::move(error)]() mutable {
+            if (generation != g_recommendation_generation.load()) return;
+            g_ui.recommendation_loading = false;
+            if (!error.empty()) { toast(label + "读取失败：" + error, 7000); return; }
+            if (tracks.empty()) { toast(label + "暂无可播放歌曲"); return; }
+            toast("开始播放" + label + " · " + std::to_string(tracks.size()) + " 首");
+            replace_queue_and_play(std::move(tracks), 0);
+        });
+    }, [generation, label] {
+        if (generation == g_recommendation_generation.load()) {
+            g_ui.recommendation_loading = false;
+            toast(label + "读取失败，请重试");
+        }
+    });
+}
+void daily_recommendations() {
+    stop_radio();
+    request_recommendations("daily", "{}", "网易云每日推荐");
+}
+void play_similar(const music::Track& track) {
+    if (track.variants.empty()) return;
+    if (track.title.empty()) { toast("这首歌曲缺少歌名，无法创建漫游电台"); return; }
+    stop_radio();
+    ++g_recommendation_generation; g_ui.recommendation_loading = false;
+    g_ui.radio_active = true;
+    music::Track seed = track;
+    bool retained;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        retained = track_uid(track) == g_as.now_uid && g_as.ps != PlayState::Idle && g_as.ps != PlayState::Failed;
+        if (retained) seed = g_as.now_track;
+        g_as.tracks = std::vector<music::Track>{seed};
+        g_as.playing = retained ? 0 : -1; g_as.queue_cursor_known = retained;
+        ++g_as.tracks_version;
+        g_play_next.clear(); g_shuffle_remaining.clear(); g_shuffle_history.clear(); g_shuffle_cursor = -1;
+    }
+    cancel_preload(); g_gapless = {};
+    radio_remember(radio::identity(seed)); g_radio.seeds.push_back(seed);
+    queue_mark_dirty();
+    if (!retained) start_play_attempt(0, false, PlaybackTrigger::QueueReplace);
+    refill_radio();
+    toast("已开启漫游电台，当前歌曲继续播放，后续自动补充相似歌曲", 6000);
 }
 void bilibili_open_parts(const music::Track& track) {
     for (const auto& variant : track.variants) if (variant.source == music::Source::Bilibili) {
@@ -5803,9 +6027,11 @@ void tick() {
             const auto error = g_player.error();
             g_player.close(); cancel_preload(); g_current_media.reset();
             music::Track track; int gen; unsigned attempts;
+            auto settings = g_ui.settings;
             {
                 std::lock_guard<std::mutex> lock(g_mu);
                 track = g_as.now_track; gen = g_as.gen;
+                settings.forced_lane = g_as.forced_lane; settings.forced_source = g_as.forced_source;
                 g_as.ps = PlayState::Buffering; g_as.pending_path.clear(); g_as.buffer = 0;
                 g_as.position_ms = position; g_pending_seek = position; g_play_ready_paused = snap.ps == PlayState::Paused;
                 g_active_stream_spec = {}; g_pending_stream.reset();
@@ -5815,7 +6041,6 @@ void tick() {
             }
             playback_stage(gen, PlaybackStage::Recovering, playback_failure(error));
             toast(error + (retry_stream(attempts) ? "，正在刷新播放地址并从断点恢复" : attempts == 3 ? "，正在恢复完整文件播放" : "，恢复失败，已停止重试"), 6000);
-            auto settings = g_ui.settings;
             for (int i = 0; i < music::kSourceCount; ++i) settings.enable[i] = (g_ui.src_mask >> i) & 1u;
             if (attempts <= 3) run_task([=]() mutable { do_play(g_win, std::move(track), std::move(settings), gen, retry_stream(attempts)); }, [gen] { std::lock_guard<std::mutex> lock(g_mu); if (g_as.gen == gen) { g_as.ps = PlayState::Failed; g_track_failure_gen = gen; } }, true);
             else { std::lock_guard<std::mutex> lock(g_mu); g_as.ps = PlayState::Failed; g_as.error = error; g_track_failure_gen = gen; }
@@ -5831,7 +6056,7 @@ void tick() {
                 handled_failure = snap.gen;
                 bool skip, paused;
                 { std::lock_guard<std::mutex> lock(g_mu);
-                  skip = g_track_failure_gen == snap.gen; paused = g_play_ready_paused; }
+                  skip = g_track_failure_gen == snap.gen && g_as.forced_lane < 0; paused = g_play_ready_paused; }
                 if (skip && !paused && !g_ui.sleep_after_track) {
                     g_failed_tracks.insert(snap.now_uid);
                     auto trigger = PlaybackTrigger::FailureSkip;
@@ -5841,7 +6066,8 @@ void tick() {
                         start_play_attempt(next, true, trigger);
                     } else {
                         cancel_preload();
-                        toast("没有可继续播放的歌曲，已停止。" + snap.error, 9000);
+                        if (g_ui.radio_active) { g_radio.waiting = true; refill_radio(); }
+                        else toast("没有可继续播放的歌曲，已停止。" + snap.error, 9000);
                     }
                 } else {
                     if (g_ui.sleep_after_track) g_ui.sleep_after_track = false;
@@ -5851,6 +6077,7 @@ void tick() {
             }
         }
 
+        refill_radio();
         // ---- 每帧同步播放位置 ----
         if (snap.ps == PlayState::Playing || snap.ps == PlayState::Paused) {
             playback_stage(snap.gen, snap.ps == PlayState::Paused ? PlaybackStage::Paused : g_player.buffering() ? PlaybackStage::Buffering : PlaybackStage::Playing);
@@ -5972,6 +6199,7 @@ void finish_frame(float frame_ms) {
             } else if (snap.ps == PlayState::Buffering || snap.ps == PlayState::Resolving) {
                 fps = 30;
             }
+            if (g_ui.radio_active) fps = std::max(fps, 1); // 暂停或等待推荐时也能按时重试。
             if (g_ui.window_hidden && !(g_ui.lyric_overlay.enabled && snap.ps == PlayState::Playing)) fps = 1;
             g_fps_hint.store(fps);
         }
@@ -6005,8 +6233,10 @@ void shutdown(bool smoke_test) {
 void cancel_login(int site) { if (site >= 0 && site < 3) login::cancel(login_site(site)); }
 void seek_playback(int milliseconds) {
     audio::StreamSpec spec; music::Track track; int gen = 0;
+    auto settings = g_ui.settings;
     {
         std::lock_guard<std::mutex> lock(g_mu);
+        settings.forced_lane = g_as.forced_lane; settings.forced_source = g_as.forced_source;
         spec = g_active_stream_spec;
         if (!spec.url.empty() || !spec.local_path.empty()) {
             spec.start_ms = std::clamp<long long>(milliseconds, 0, spec.duration_ms > 0 ? spec.duration_ms - 1 : std::max(0,milliseconds));
@@ -6023,7 +6253,6 @@ void seek_playback(int milliseconds) {
         return;
     }
     g_player.close(); cancel_preload(); g_current_media.reset(); g_ui.pos_ms = float(spec.start_ms);
-    auto settings = g_ui.settings;
     for (int i = 0; i < music::kSourceCount; ++i) settings.enable[i] = (g_ui.src_mask >> i) & 1u;
     run_task([spec, track, settings, gen]() mutable {
         auto cancelled = [gen] { return g_shutdown.load() || gen != g_play_generation.load(); };

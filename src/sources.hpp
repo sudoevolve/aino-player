@@ -185,6 +185,8 @@ struct Settings {
     int lane_pref = 0;
     bool lane_enable[kLaneCount] = {true, true};
     bool source_smart_switch = true; // 开启按平台路由；关闭固定使用同一个第三方脚本。
+    int forced_lane = -1;             // 单次手动选源；-1 表示按常规顺序选择。
+    std::string forced_source;        // 第三方音源文件；仅 forced_lane 为 JsSource 时使用。
     // 下载时把封面 / 歌词写进文件（mp3 走 ID3v2.3，m4a 走 ilst）
     bool embed_cover = false;
     bool embed_lyrics = false;
@@ -1241,6 +1243,28 @@ inline void attach_provider_song(Variant& v, const prov::Song& s) {
         v.quality_hashes[item.first] = item.second.str();
 }
 
+inline bool songs_via_provider(Source src, const char* method, const std::string& args,
+                               std::vector<Track>& out, std::string& err) {
+    const char* key = provider_key_of(src);
+    if (!key) { err = "平台不支持此目录接口"; return false; }
+    std::vector<prov::Song> songs;
+    if (!prov::Host::instance().songs(key, method, args, songs, err)) return false;
+    out.clear();
+    out.reserve(songs.size());
+    for (const auto& song : songs) {
+        if (song.id.empty() || song.title.empty()) continue;
+        Variant variant;
+        variant.source = src;
+        attach_provider_song(variant, song);
+        Track track;
+        track.title = variant.title; track.artist = variant.artist; track.album = variant.album;
+        track.duration_ms = variant.duration_ms; track.cover_url = variant.cover_url;
+        track.variants.push_back(std::move(variant));
+        out.push_back(std::move(track));
+    }
+    return true;
+}
+
 inline bool search_via_provider(Source src, const std::string& keyword, int limit, int page,
                                 std::vector<Variant>& out, std::string& err) {
     const char* key = provider_key_of(src);
@@ -1372,7 +1396,8 @@ inline std::string lx_music_info(const Variant& v, const char* key) {
 //  免登录，档位由脚本自己决定（多源聚合脚本通常 320k / 无损都能给）。
 // ============================================================================
 inline bool resolve_via_source(const Variant& v, int quality, ResolveResult& out, std::string* why,
-                               const ResolveAccept& accept = {}, bool smart_switch = true) {
+                               const ResolveAccept& accept = {}, bool smart_switch = true,
+                               const std::string& only_file = {}) {
     const char* key = lx_platform_key(v.source);
     if (!key) {
         if (why) *why = std::string(source_name(v.source)) + " 不在音源支持的平台内";
@@ -1402,7 +1427,7 @@ inline bool resolve_via_source(const Variant& v, int quality, ResolveResult& out
             timing->verified = bool(accept);
             out = std::move(rr);
             return true;
-        }, timing.get(), smart_switch)) {
+        }, timing.get(), smart_switch, only_file)) {
         if (why) *why = err.empty() ? "音源没有返回链接" : err;
         return false;
     }
@@ -1482,6 +1507,22 @@ inline ResolveResult resolve(const Variant& v, const Settings& st, const Resolve
     net::CancelScope network([parent = net::cancel_current, cancelled = st.cancelled] {
         return (parent && parent()) || (cancelled && cancelled());
     });
+    if (st.forced_lane == int(Lane::JsSource) || st.forced_lane == int(Lane::Builtin)) {
+        ResolveResult result;
+        std::string error;
+        if (st.forced_lane == int(Lane::JsSource) && st.forced_source.empty()) {
+            result.reason = "未指定第三方音源";
+            return result;
+        }
+        const bool ok = st.forced_lane == int(Lane::JsSource)
+            ? resolve_via_source(v, st.quality, result, &error, accept, true, st.forced_source)
+            : resolve_via_builtin(v, st, result, &error, accept);
+        if (!ok) {
+            result.ok = false;
+            result.reason = error.empty() ? "所选音源没有返回可播放地址" : std::move(error);
+        }
+        return result;
+    }
     std::string why[2];
     auto trace = std::make_shared<lx::Engine::LoadTiming>();
     const bool fixed_only = !st.source_smart_switch && st.lane_on(Lane::JsSource) && lx_platform_key(v.source);

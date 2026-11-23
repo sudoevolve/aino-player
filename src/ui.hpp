@@ -367,6 +367,35 @@ struct SongMenuState {
     std::string playlist_key;
 };
 static SongMenuState song_menu;
+struct PlaybackSourceOption {
+    std::string name, detail, file;
+    music::Lane lane = music::Lane::Builtin;
+};
+struct PlaybackSourceChooser {
+    bool open = false;
+    music::Track track;
+    std::vector<PlaybackSourceOption> options;
+};
+static PlaybackSourceChooser playback_source_chooser;
+
+static void open_playback_source_chooser(const music::Track& track) {
+    playback_source_chooser = {};
+    playback_source_chooser.open = true;
+    playback_source_chooser.track = track;
+    if (track.variants.empty()) return;
+    const auto& variant = track.current();
+    const bool official = variant.source == music::Source::Netease || variant.source == music::Source::QQ ||
+                          variant.source == music::Source::Bilibili;
+    if (official) playback_source_chooser.options.push_back({
+        std::string(music::source_name(variant.source)) + " · 官方接口", "按当前账号权限和音质播放", {}, music::Lane::Builtin});
+    if (const char* key = music::lx_platform_key(variant.source)) {
+        auto& engine = lx::Engine::instance();
+        for (const auto& entry : engine.entries()) if (engine.supports(key, entry.second)) {
+            playback_source_chooser.options.push_back({entry.first + " · 第三方音源", entry.second, entry.second, music::Lane::JsSource});
+        }
+    }
+}
+
 static void capture_song_menu(Ctx& c, const music::Track& track, const Rect& row, const Rect& viewport) {
     const auto& in = c.ui.input();
     const auto visible = row.intersect(viewport);
@@ -413,7 +442,17 @@ static void draw_song_menu(Ctx& c) {
     if (has_artist) items.push_back(bili ? "查看 UP 主" : "查看歌手");
     if (has_album) items.push_back(bili ? "查看视频分 P" : "查看专辑");
     const int add_index = int(items.size()); items.push_back("添加到歌单…");
-    const int route_index = int(items.size()); if (track_uid(song_menu.track) == c.s.now_uid) items.push_back("本次选源…");
+    const bool has_route = !group && track_uid(song_menu.track) == c.s.now_uid;
+    const int route_index = int(items.size()); if (has_route) items.push_back("查看本次路线");
+    const int source_picker_index = int(items.size());
+    const bool has_source_picker = has_route && !local;
+    if (has_source_picker) items.push_back("选择播放音源…");
+    const int similar_index = int(items.size());
+    const bool has_similar = !group && !song_menu.track.variants.empty();
+    if (has_similar) items.push_back("播放相似歌曲");
+    const int stop_radio_index = int(items.size());
+    const bool can_stop_radio = has_route && c.model.ui.radio_active;
+    if (can_stop_radio) items.push_back("停止漫游电台");
     int chosen = -1;
     const bool picked = c.ui.context_menu(song_menu.anchor, items, &chosen, Style().font(12));
     // 与原生菜单使用相同的边界，关闭后释放快照；不在按下菜单项时提前关闭。
@@ -426,14 +465,19 @@ static void draw_song_menu(Ctx& c) {
     if (picked) {
         const auto track = song_menu.track;
         if (chosen == add_index) begin_playlist_add(group ? song_menu.selected : std::vector<music::Track>{track});
-        else if (chosen == route_index) error_details = {true, "本次选源", playback_route()};
-        else if (group) batch_tracks(song_menu.selected, chosen == 0 ? BatchAction::Enqueue : chosen == 1 ? BatchAction::Favorite : chosen == 2 ? BatchAction::Download : song_menu.removal, song_menu.playlist_key);
-        else if (chosen == 0) queue_play_next(track);
-        else if (chosen == 1) toast(queue_push(track) ? "已添加到播放列表：" + track.title : "播放列表中已有这首歌曲");
-        else if (chosen == 2) favorite_toggle(track);
-        else if (chosen == 3) { if (local) reveal_local_track(track); else if (downloading) cancel_download(track_uid(track)); else start_download(track, c.model.ui.settings); }
-        else if (has_artist && chosen == 4) choose_track_artist(track);
-        else if (has_album && chosen == (has_artist ? 5 : 4)) open_track_album(track);
+        else if (has_route && chosen == route_index) error_details = {true, "本次路由", playback_route()};
+        else {
+            if (has_source_picker && chosen == source_picker_index) open_playback_source_chooser(c.s.now_track);
+            else if (has_similar && chosen == similar_index) play_similar(track);
+            else if (can_stop_radio && chosen == stop_radio_index) { stop_radio(); toast("已停止漫游电台，队列中的歌曲会继续播放"); }
+            else if (group) batch_tracks(song_menu.selected, chosen == 0 ? BatchAction::Enqueue : chosen == 1 ? BatchAction::Favorite : chosen == 2 ? BatchAction::Download : song_menu.removal, song_menu.playlist_key);
+            else if (chosen == 0) queue_play_next(track);
+            else if (chosen == 1) toast(queue_push(track) ? "已添加到播放列表：" + track.title : "播放列表中已有这首歌曲");
+            else if (chosen == 2) favorite_toggle(track);
+            else if (chosen == 3) { if (local) reveal_local_track(track); else if (downloading) cancel_download(track_uid(track)); else start_download(track, c.model.ui.settings); }
+            else if (has_artist && chosen == 4) choose_track_artist(track);
+            else if (has_album && chosen == (has_artist ? 5 : 4)) open_track_album(track);
+        }
     }
     if (picked || in.key_pressed[KEY_ESC] || ((in.pressed[0] || in.pressed[1]) && !menu.contains(in.mouse.x, in.mouse.y)))
         song_menu = {};
@@ -972,6 +1016,9 @@ static void tab_discover(Ctx& c) {
 
     // ---- 热搜 ----
     c.ui.subheading("热搜", {mx, 100, 120, 22});
+    Style daily = Style().font(10.5f); daily.disabled = c.model.ui.recommendation_loading;
+    if (c.ui.button(c.model.ui.recommendation_loading ? "读取推荐…" : "每日推荐",
+                    {mx + mw - 112, 97, 112, 26}, daily)) daily_recommendations();
     const Rect chip_box{mx, 126, mw, mw < 470 ? 62.0f : 92.0f};
     float used = 0.0f;
     if (d.loading && d.heats.words.empty()) {
@@ -2704,6 +2751,8 @@ static void player_bar(Ctx& c) {
         (c.s.stage == PlaybackStage::Downloading ? " " + std::to_string(int(c.s.buffer * 100)) + "%" : "…");
     else if (c.s.ps == PlayState::Playing && c.s.stage == PlaybackStage::Buffering) status = "正在缓冲 · 已缓冲 " + std::to_string(c.s.buffered_ms) + " ms";
     else if (c.s.ps == PlayState::Failed) status = "播放失败 · 点击播放重试：" + c.s.error;
+    if (c.model.ui.radio_active) status = std::string(c.model.ui.radio_loading ? "漫游电台 · 正在补充相似歌曲 · " : "漫游电台 · ") + status;
+    if (c.model.ui.radio_active && !c.model.ui.radio_method.empty()) status += " · " + c.model.ui.radio_method;
     c.ui.tooltip(cover, status);
     auto* selection = row_selection; row_selection = nullptr;
     capture_song_menu(c, track, song, song);
@@ -3005,7 +3054,7 @@ static void listening_panel(Ctx& c, const Rect& box) {
     c.ui.fill_rect(box, c.th.control_bg);
     c.ui.fill_rect({box.x, box.y, 1, box.h}, c.th.separator.scaled_alpha(0.7f));
     int selected = c.model.ui.lyrics_open ? 1 : 0;
-    if (c.ui.segmented({"待播清单", "歌词"}, &selected, {box.x + 16, box.y + 16, box.w - 68, 30}, Style().font(11.5f))) {
+    if (c.ui.segmented({c.model.ui.radio_active ? "漫游电台" : "待播清单", "歌词"}, &selected, {box.x + 16, box.y + 16, box.w - 68, 30}, Style().font(11.5f))) {
         c.model.ui.lyrics_open = selected == 1; c.model.ui.queue_open = selected == 0;
         if (selected == 1) request_current_lyrics();
     }
@@ -3028,6 +3077,32 @@ static void artist_chooser_dialog(Ctx& c) {
         if (c.ui.item(artists[size_t(i)].name, "", "", row, Style().font(12))) picked = i;
     });
     if (picked >= 0) { artist_chooser.open = false; open_track_artist(artist_chooser.track, picked); }
+}
+
+static void playback_source_dialog(Ctx& c) {
+    auto& state = playback_source_chooser;
+    if (!state.open) return;
+    if (track_uid(state.track) != c.s.now_uid) { state.open = false; return; }
+    const float height = std::min(c.H - 40.0f, 152.0f + std::min(7.0f, float(state.options.size())) * 50.0f);
+    const Rect box = Rect::centered(c.W / 2, c.H / 2, std::min(560.0f, c.W - 40.0f), height);
+    c.ui.dialog("选择播放音源", state.track.title + " · " + state.track.artist, &state.open, box);
+    if (!state.open) return;
+    const Rect content{box.x + 20, box.y + 82, box.w - 40, std::max(30.0f, box.h - 138)};
+    if (state.options.empty()) {
+        c.ui.empty_state("没有可用音源", "当前歌曲平台没有可用的官方接口或已加载的第三方音源", content);
+    } else {
+        int picked = -1;
+        c.ui.scroll(content, int(state.options.size()), 50, [&](int i, const Rect& row) {
+            const auto& option = state.options[size_t(i)];
+            if (c.ui.item(option.name, option.detail, "", row, Style().font(11.5f))) picked = i;
+        });
+        if (picked >= 0) {
+            const auto option = state.options[size_t(picked)];
+            state.open = false;
+            play_with_source(state.track, int(option.lane), option.file);
+        }
+    }
+    if (c.ui.button("关闭", {box.right() - 100, box.bottom() - 42, 80, 28}, Style().ghost().font(11))) state.open = false;
 }
 
 static void remove_playlist_dialog(Ctx& c) {
@@ -3234,7 +3309,7 @@ static void compose(aino::Ui& ui, Ctx& c) {
     static std::string previous_scope;
     const auto current_scope = std::to_string(c.model.ui.tab) + "/" + c.model.playlist.playlist.key + "/" + c.model.playlist.catalog.id + (c.model.ui.queue_open ? "/queue" : "");
     if (previous_scope != current_scope) { focused_selection = nullptr; c.model.ui.keyboard_list_target.clear(); previous_scope = current_scope; }
-    const bool modal = c.model.ui.close_dialog || artist_chooser.open || error_details.open || c.model.ui.notifications_open || c.model.ui.restore_preview_open || c.model.ui.lyric_match_open || c.model.ui.shortcuts_open || c.model.ui.playlist_add_open || !c.model.ui.remove_playlist_key.empty() || c.model.ui.clear_action != ClearAction::None;
+    const bool modal = c.model.ui.close_dialog || artist_chooser.open || playback_source_chooser.open || error_details.open || c.model.ui.notifications_open || c.model.ui.restore_preview_open || c.model.ui.lyric_match_open || c.model.ui.shortcuts_open || c.model.ui.playlist_add_open || !c.model.ui.remove_playlist_key.empty() || c.model.ui.clear_action != ClearAction::None;
     const bool escape_focus = !modal && !c.model.ui.quick_open && ui.input().key_pressed[KEY_ESC] && ui.focused_id();
     list_keyboard_blocked = modal || c.model.ui.quick_open || song_menu.active || escape_focus;
     if (escape_focus) ui.set_focus(nullptr);
@@ -3275,6 +3350,7 @@ static void compose(aino::Ui& ui, Ctx& c) {
     if (c.model.ui.close_dialog) close_window_dialog(c);
     else if (c.model.ui.lyric_match_open) lyric_match_dialog(c);
     else if (c.model.ui.restore_preview_open && !error_details.open) restore_preview_dialog(c);
+    else if (playback_source_chooser.open) playback_source_dialog(c);
     else if (c.model.ui.playlist_add_open) playlist_add_dialog(c);
     else if (c.model.ui.quick_open) quick_search_dialog(c);
     else if (c.model.ui.shortcuts_open) shortcuts_dialog(c);

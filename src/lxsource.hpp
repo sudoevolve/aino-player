@@ -2080,11 +2080,13 @@ public:
     bool resolve(const std::string& key, const std::string& quality, const std::string& info_json,
                  std::string& url, std::string& err, std::string* by = nullptr,
                  const std::function<bool(const std::string&, const std::string&, const std::string&, std::string&)>& accept = {},
-                 LoadTiming* load_timing = nullptr, bool smart_switch = true) {
+                 LoadTiming* load_timing = nullptr, bool smart_switch = true,
+                 const std::string& only_file = {}) {
         const int wanted = quality == "128k" ? 0 : quality == "flac" || quality == "flac24bit" ? 2 : 1;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
         const auto fixed = smart_switch ? FixedSource{} : choose_fixed_source(wanted);
-        if (load_timing) load_timing->add(smart_switch ? "智能路由：优先已验证，再按样本加载延迟排序；测速未知排后" : "固定音源：本次不自动切换其他脚本");
+        if (load_timing) load_timing->add(!only_file.empty() ? "手动选源：仅使用 " + route_file(only_file) :
+            smart_switch ? "智能路由：优先已验证，再按样本加载延迟排序；测速未知排后" : "固定音源：本次不自动切换其他脚本");
         std::set<std::string> explained;
         const auto trace = [&](const Selection& rank, const std::string& status) {
             if (load_timing && explained.insert(rank.file).second) load_timing->add(route_file(rank.file) + " · " + rank.quality + " · " + status);
@@ -2126,15 +2128,17 @@ public:
                 std::lock_guard<std::mutex> lock(mu_);
                 // 每次换源重新排序，不能继续使用检测完成前的旧候选顺序。
                 for (const auto& candidate : list_) {
+                    if (!only_file.empty() && file_key(candidate->path()) != file_key(only_file)) continue;
                     if (!smart_switch && file_key(candidate->path()) != fixed.file) continue;
                     if (candidate->retired() || !candidate->supports(key, "musicUrl") ||
                         attempted.count(file_key(candidate->path()))) continue;
                     const auto rank = selection_locked(candidate, key, wanted);
-                    if (rank.availability == 2) { excluded_failed = true; trace(rank, "跳过：双样本失败，冷却中"); continue; }
-                    if (rank.availability == 4) { cooling_down = true; trace(rank, "跳过：临时网络冷却"); continue; }
+                    // 手动选择表示主动重试，仍检查平台/音质能力，但不受自动路由的失败冷却限制。
+                    if (only_file.empty() && rank.availability == 2) { excluded_failed = true; trace(rank, "跳过：双样本失败，冷却中"); continue; }
+                    if (only_file.empty() && rank.availability == 4) { cooling_down = true; trace(rank, "跳过：临时网络冷却"); continue; }
                     if (rank.availability == 3) { trace(rank, "跳过：不支持当前音质"); continue; }
                     const auto failure = song_failures_.find(song_failure_key(rank.file, key, rank.quality, info_json));
-                    if (failure != song_failures_.end() && platform::ticks() < failure->second.until) { skipped_song = true; trace(rank, "跳过：近期此歌曲失败，不影响其他歌曲"); continue; }
+                    if (only_file.empty() && failure != song_failures_.end() && platform::ticks() < failure->second.until) { skipped_song = true; trace(rank, "跳过：近期此歌曲失败，不影响其他歌曲"); continue; }
                     if (!s || std::tie(rank.availability, rank.latency_ms, rank.file) <
                         std::tie(score.availability, score.latency_ms, score.file)) { s = candidate; score = rank; }
                 }
@@ -2145,7 +2149,7 @@ public:
             if (load_timing) load_timing->add("尝试 " + route_file(score.file) + " · " + (score.availability == 0 ? "已验证" : "未验证") + " · " +
                 (score.latency_ms < 300001 ? std::to_string(score.latency_ms) + " ms" + (score.estimated ? "（历史 / 估算）" : "（样本）") : "未测速"));
             if (net::cancelled()) { err = "取流已取消"; return false; }
-            if (std::chrono::steady_clock::now() >= deadline) { last += smart_switch ? "；音源解析已达到 30 秒，尝试其他渠道" : "；固定音源解析超时"; break; }
+            if (std::chrono::steady_clock::now() >= deadline) { last += !only_file.empty() ? "；所选音源解析超时" : smart_switch ? "；音源解析已达到 30 秒，尝试其他渠道" : "；固定音源解析超时"; break; }
             if (s->retired()) continue;
             std::string u, e;
             const std::string q = s->pick_quality(key, wanted);
@@ -2174,7 +2178,7 @@ public:
                     return s->retired() || (parent && parent());
                 });
                 if (accept && !accept(u, s->info().name, q, e)) {
-                    if (load_timing) load_timing->add("候选加载或解码失败，继续同平台候选");
+                    if (load_timing) load_timing->add(only_file.empty() ? "候选加载或解码失败，继续同平台候选" : "所选音源加载或解码失败");
                     last = s->info().name + ": " + (e.empty() ? "候选音频不可用" : e);
                     // 候选预算到期属于临时超时，不能当成该曲长期不可用。
                     if (!s->retired() && !(owner_cancelled && owner_cancelled()) && std::chrono::steady_clock::now() >= candidate_deadline) report(s, q, "音源启动超时：" + last);
@@ -2188,7 +2192,7 @@ public:
                 if (by) *by = s->info().name;
                 return true;
             }
-            if (!resolved && load_timing) load_timing->add("取址失败，继续同平台候选");
+            if (!resolved && load_timing) load_timing->add(only_file.empty() ? "取址失败，继续同平台候选" : "所选音源取址失败");
             if (!resolved && e.empty()) e = "音源未返回有效播放地址";
             if (!e.empty()) {
                 if (!net::cancelled() || (!(owner_cancelled && owner_cancelled()) && std::chrono::steady_clock::now() >= candidate_deadline)) report(s, q, e);

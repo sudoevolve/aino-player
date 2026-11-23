@@ -20,7 +20,7 @@ function jsonEscape(s) {
 
 function songFrom(item) {
   const mid = item.mid || item.songmid || ''
-  const name = item.name || item.songname || ''
+  const name = item.name || item.songname || item.title || ''
   if (!mid || !name) return null
   const singers = item.singer || []
   let artist = ''
@@ -41,7 +41,7 @@ function songFrom(item) {
     album: album,
     duration_ms: (Number(item.interval) || 0) * 1000,
     bitrate: 128000,
-    native_id: mid,
+    native_id: String(item.id || item.songid || mid),
     cover: pmid ? 'https://y.gtimg.cn/music/photo_new/T002R300x300M000' + pmid + '.jpg' : ''
   }
 }
@@ -81,6 +81,28 @@ globalThis.provider = {
     return out
   }
 }
+
+provider.similar = function (args) {
+  const headers = {'Content-Type': 'application/json', Referer: 'https://y.qq.com/', 'User-Agent': 'Mozilla/5.0'};
+  const cookie = ctx.cookie('qq') || ''; if (cookie) headers.Cookie = cookie;
+  function request(module, method, param) {
+    const r = http('https://u.y.qq.com/cgi-bin/musicu.fcg', {method: 'POST', headers,
+      body: JSON.stringify({comm: {ct: 24, cv: 0, format: 'json'}, req: {module, method, param}})});
+    const root = r.body || {}, req = root.req || {};
+    if (r.error || Number(root.code || 0) !== 0 || Number(req.code) !== 0 || !req.data)
+      throw new Error(r.error || 'QQ 相似歌曲接口拒绝请求（code ' + req.code + '）');
+    return req.data;
+  }
+  let id = String(args.native_id || '');
+  if (!/^\d+$/.test(id)) {
+    const detail = request('music.pf_song_detail_svr', 'get_song_detail_yqq', {song_mid: args.id, song_type: 0});
+    id = String((detail.track_info || {}).id || '');
+  }
+  if (!/^\d+$/.test(id)) throw new Error('QQ 未提供相似推荐所需的歌曲编号');
+  const result = request('rcmusic.similarSongRadioServer', 'get_simsongs', {songid: Number(id)});
+  if (!Array.isArray(result.songInfoList)) throw new Error('QQ 未返回相似歌曲列表');
+  return result.songInfoList.map(s => songFrom(s.songInfo || s)).filter(s => s && s.id !== args.id);
+};
 
 provider.heats = function () {
   const headers = {'User-Agent': 'Mozilla/5.0', Referer: 'https://y.qq.com/portal/player.html'};
