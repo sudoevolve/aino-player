@@ -63,11 +63,12 @@ curl -fsSL https://sudoevolve.github.io/aino-player/install-arch.sh | bash
 - 默认播放器：在「设置 → 通用 → 本地播放」设置文件关联；Windows 还需在弹出的系统设置中确认。支持系统双击 / 打开方式，已有播放器运行时会优先交给现有窗口。
 - 官网登录自动回传支持 Chrome / Edge / Chromium；平台会员和地区限制照常生效。
 - Linux 默认使用 X11；可用 `-DAINO_LINUX_WAYLAND=ON` 构建原生 Wayland 窗口。X11 桌面集成仍依赖 XWayland，建议安装 `fonts-noto-cjk`。
+- 漫游使用平台相似歌曲接口并限制连续重复歌手；上游暂无新推荐时会延后重试。歌词缺失时自动到已启用的五个平台匹配同曲，失败后限次重试；这不会更换实际播放音源。
 - 设置 → 数据可查看存储位置、清理缓存和登录信息、导出或选择性恢复资料库、查看自动备份与缺失文件、手动重试失败封面。
 - 在线更新：在「设置 → 通用 → 检查更新」查看。Windows 安装版校验安装包后覆盖升级，便携版下载 EXE 后需退出并替换原文件；Linux 系统安装可复制包管理器命令，未配置软件源或同步滞后时可直接下载对应包。下载期间可取消，系统安装开始后请等待完成。
 
 ## 开发与许可
 
-[构建指南](docs/BUILDING.md) · [架构与验证记录](docs/ADR-001-portable-player.md) · [Linux 内存实测](docs/Linux-memory-profile.md) · [第三方依赖](vendor/README.md)
+[构建指南](docs/BUILDING.md) · [架构与验证记录](docs/ADR-001-portable-player.md) · [代码审查记录](docs/CODEBASE_AUDIT_2026-11-24.md) · [Linux 内存实测](docs/Linux-memory-profile.md) · [第三方依赖](vendor/README.md)
 
 Apache-2.0 · 作者 [sudoevolve](https://github.com/sudoevolve) · [aino UI 库](https://github.com/sudoevolve/aino)

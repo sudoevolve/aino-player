@@ -1263,9 +1263,9 @@ inline bool Script::music_url(const std::string& platform, const std::string& qu
 
 // 音源脚本目录：AINO_LX_DIR 优先；其余平台统一使用用户配置目录。
 inline std::string default_dir() {
-    if (const char* e = std::getenv("AINO_LX_DIR")) {
-        if (*e) return e;
-    }
+    const auto override = platform::env("AINO_LX_DIR");
+    if (!override.empty())
+        return override;
     const auto config = platform::config_dir();
     return config.empty() ? std::string{} : platform::join(config, "sources");
 }
@@ -1277,14 +1277,14 @@ class Engine {
 public:
     struct Check {
         std::string platform, info;
-        std::function<std::string()> alternate_info;
+        std::function<std::string()> alternate_info{};
     };
     struct Health {
         // 0 等待检测，1 检测中，2 样本通过，3 双样本失败暂时冷却，4 未声明支持，5 检测未完成。
         int state = 0;
         std::string reason;
         int resolve_ms = 0, load_ms = 0;
-        std::string quality;
+        std::string quality{};
         unsigned long long checked_revision = 0;
         unsigned failed_samples = 0;
         unsigned long long retry_at = 0;
@@ -1450,14 +1450,18 @@ public:
             std::lock_guard<std::mutex> lock(mu_);
             bool first = true;
             for (const auto& script : list_) {
-                if (!first) text += ','; first = false;
+                if (!first)
+                    text += ',';
+                first = false;
                 text += "{\"file\":" + detail::js_quote(file_key(script->path())) + ",\"hash\":" + detail::js_quote(script->info().fingerprint) + ",\"timings\":[";
                 bool first_timing = true;
                 const auto found = timings_.find(file_key(script->path()));
                 if (found != timings_.end()) for (const auto& platform : found->second) for (const auto& quality : platform.second) {
                     const auto& value = quality.second;
                     if (!value.verified || value.failures) continue;
-                    if (!first_timing) text += ','; first_timing = false;
+                    if (!first_timing)
+                        text += ',';
+                    first_timing = false;
                     text += "{\"platform\":" + detail::js_quote(platform.first) + ",\"quality\":" + detail::js_quote(quality.first) +
                         ",\"load\":" + std::to_string(value.load_ms) + ",\"ready\":" + std::to_string(value.ready_ms) + ",\"resolve\":" + std::to_string(value.resolve_ms) + "}";
                 }

@@ -125,7 +125,9 @@ inline std::string encode_track(const music::Track& t) {
             ",\"album_id\":" + quote(v.album_id) + ",\"album_audio_id\":" + quote(v.album_audio_id) + ",\"quality_hashes\":{";
         bool first_hash = true;
         for (const auto& h : v.quality_hashes) {
-            if (!first_hash) out += ','; first_hash = false;
+            if (!first_hash)
+                out += ',';
+            first_hash = false;
             out += quote(h.first) + ":" + quote(h.second);
         }
         out += "},\"artists\":[";
@@ -394,7 +396,14 @@ public:
     std::vector<music::Track> recent;
     std::map<std::string, LyricPreference> lyric_preferences;
     Library() { reset(); }
-    void reset() { playlists = {{"favorites", "本地收藏", {}, {}, music::Source::Netease, {}}}; recent.clear(); lyric_preferences.clear(); }
+    void reset() {
+        Playlist favorites;
+        favorites.key = "favorites";
+        favorites.name = "本地收藏";
+        playlists = {std::move(favorites)};
+        recent.clear();
+        lyric_preferences.clear();
+    }
     void remember(const music::Track& track) {
         recent.erase(std::remove_if(recent.begin(), recent.end(), [&](const auto& t) { return same_track(t, track); }), recent.end());
         recent.insert(recent.begin(), track);
@@ -434,7 +443,9 @@ public:
             out += "],\"files\":{";
             bool first_file = true;
             for (const auto& file : p.files) {
-                if (!first_file) out += ','; first_file = false;
+                if (!first_file)
+                    out += ',';
+                first_file = false;
                 out += quote(file.first) + ":[" + quote(std::to_string(file.second.size)) + "," + quote(file.second.modified) + "]";
             }
             out += "}}";
@@ -444,7 +455,9 @@ public:
         for (const auto& track : recent) { if (!first) out += ','; first = false; out += encode_track(track); }
         out += "],\"lyrics\":["; first = true;
         for (const auto& entry : lyric_preferences) {
-            if (!first) out += ','; first = false;
+            if (!first)
+                out += ',';
+            first = false;
             out += "{\"uid\":" + quote(entry.first) + ",\"offset\":" + std::to_string(entry.second.offset_ms) + ",\"path\":" + quote(entry.second.path) + ",\"netease_id\":" + quote(entry.second.netease_id) + "}";
         }
         out += "]";
@@ -520,11 +533,14 @@ public:
             loaded.recent.push_back(std::move(track));
         }
         for (const auto& row : root["lyrics"].array) {
-            const auto uid = row["uid"].str(), path = row["path"].str();
-            if (uid.empty() || uid.size() > 8192 || path.size() > 8192 || !std::isfinite(row["offset"].num())) { err = "歌词配置损坏"; return false; }
+            const auto uid = row["uid"].str(), lyric_path = row["path"].str();
+            if (uid.empty() || uid.size() > 8192 || lyric_path.size() > 8192 || !std::isfinite(row["offset"].num())) {
+                err = "歌词配置损坏";
+                return false;
+            }
             const auto id = row["netease_id"].str();
             if (id.size() > 32 || id.find_first_not_of("0123456789") != std::string::npos) { err = "歌词匹配标识损坏"; return false; }
-            loaded.lyric_preferences[uid] = {int(std::clamp(row["offset"].num(), -60000.0, 60000.0)), path, id};
+            loaded.lyric_preferences[uid] = {int(std::clamp(row["offset"].num(), -60000.0, 60000.0)), lyric_path, id};
         }
         *this = std::move(loaded); return true;
     }

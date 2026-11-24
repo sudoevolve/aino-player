@@ -33,7 +33,44 @@ static void radio_recommendation_checks() {
     const auto filtered = radio::different_artist_tracks(seed, {same_artist, other_artist});
     check(filtered.size() == 1 && filtered.front().artist == other_artist.artist,
         "roaming recommendations exclude the seed artist while retaining different artists");
-    check(radio::query(seed) == seed.title, "fallback radio search uses the song title instead of the singer");
+    check(music::matches_recording(seed, seed_variant), "exact recording can seed another platform");
+    auto cover = seed_variant;
+    cover.artist = "Cover artist";
+    check(!music::matches_recording(seed, cover), "same-title cover cannot supply lyrics or seed recommendations");
+    auto live = seed_variant;
+    live.title += " (Live)";
+    check(!music::matches_recording(seed, live), "live version cannot be matched to a studio recording");
+    auto truncated = seed_variant;
+    truncated.duration_ms = 70000;
+    check(!music::matches_recording(seed, truncated), "short excerpt cannot match full recording");
+    auto chosen = seed;
+    auto last_variant = seed_variant;
+    last_variant.id = "last-variant";
+    chosen.variants.push_back(last_variant);
+    chosen.chosen = -1;
+    check(chosen.current().id == seed_variant.id, "negative variant index safely uses first variant");
+    chosen.chosen = 999;
+    check(chosen.current().id == last_variant.id, "large variant index safely uses last variant");
+    {
+        const auto saved = player::g_radio;
+        player::g_radio = {};
+        auto duet = other_artist;
+        duet.variants.front().artists.push_back({"guest", "Guest artist"});
+        player::radio_remember_artist(duet);
+        player::radio_remember_artist(duet);
+        music::Track guest = other_artist;
+        guest.variants.front().artists = {{"guest", "Guest artist"}};
+        check(!player::radio_artist_allowed(guest), "guest singers count toward recent artist limit");
+        for (int i = 0; i < 12; ++i)
+            player::radio_remember_artist({});
+        check(player::radio_artist_allowed(guest), "artist counts expire after twelve queued tracks");
+        player::g_radio = saved;
+    }
+    {
+        net::CancelScope cancelled([] { return true; });
+        check(radio::recommend(seed, {}).tracks.empty(),
+              "cancelled recommendations cannot produce title-search substitutes");
+    }
 }
 
 // 不访问音乐网站，覆盖平台编码差异、译文对齐与同曲匹配的拒绝条件。

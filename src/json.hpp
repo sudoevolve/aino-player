@@ -248,7 +248,10 @@ struct Parser {
         if (p < end && *p == '.') { ++p; if (!digit()) return fail("fraction"); while (digit()) ++p; }
         if (p < end && (*p == 'e' || *p == 'E')) {
             ++p; if (p < end && (*p == '-' || *p == '+')) ++p;
-            if (!digit()) return fail("exponent"); while (digit()) ++p;
+            if (!digit())
+                return fail("exponent");
+            while (digit())
+                ++p;
         }
         if (p < end && (*p == '.' || *p == 'e' || *p == 'E' || (*p >= '0' && *p <= '9'))) return fail("number suffix");
         if (!finite_number(std::string(start, p), v.number)) return fail("number range");

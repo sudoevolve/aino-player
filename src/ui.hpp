@@ -405,7 +405,11 @@ static void capture_song_menu(Ctx& c, const music::Track& track, const Rect& row
             row_selection->ids.clear(); row_selection->anchor = track_uid(track); row_selection->ids.insert(row_selection->anchor);
         }
         // 菜单不依赖虚拟列表的行索引；滚动、搜索刷新后仍操作右键时的歌曲。
-        song_menu = {true, track, visible, in.mouse};
+        song_menu = {};
+        song_menu.active = true;
+        song_menu.track = track;
+        song_menu.anchor = visible;
+        song_menu.position = in.mouse;
         if (row_selection && row_selection->ids.size() > 1 && row_selection->ids.count(track_uid(track))) {
             const bool queue = row_selection == &batch_selections["queue"];
             const bool search = row_selection == &batch_selections["search"];
@@ -2026,10 +2030,13 @@ static void storage_settings(Ctx& c, float x, float w, float y) {
     if (c.ui.button("刷新备份列表", {x, data.bottom() + 364, 120, 28}, Style().font(11))) list_backups();
     if (c.ui.button("重试失败封面", {x + 136, data.bottom() + 364, 120, 28}, Style().font(11))) refresh_covers();
     if (!c.model.ui.backup_files.empty()) {
-        std::vector<std::string> names; for (const auto& file : c.model.ui.backup_files) names.push_back(file.first);
-        c.ui.combobox(names, &c.model.ui.backup_selected, {x, data.bottom() + 408, w - 124, 30}, Style().font(11));
+        std::vector<std::string> backup_names;
+        for (const auto &file : c.model.ui.backup_files)
+            backup_names.push_back(file.first);
+        c.ui.combobox(backup_names, &c.model.ui.backup_selected, {x, data.bottom() + 408, w - 124, 30},
+                      Style().font(11));
         if (c.ui.button("预览所选", {x + w - 110, data.bottom() + 408, 110, 30}, picker)) {
-            const int i = std::clamp(c.model.ui.backup_selected, 0, int(names.size()) - 1);
+            const int i = std::clamp(c.model.ui.backup_selected, 0, int(backup_names.size()) - 1);
             c.model.ui.library_transfer_path = c.model.ui.backup_files[size_t(i)].second; library_restore();
         }
     } else c.ui.muted_text("暂无自动备份", {x, data.bottom() + 408, w, 26}, Style().font(11));

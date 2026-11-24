@@ -235,7 +235,7 @@ public:
 #endif
         return moved;
     }
-    void close(bool final = false) {
+    void close([[maybe_unused]] bool final = false) {
 #ifdef _WIN32
         stop_shell_watch();
         closing_ = true;
@@ -256,7 +256,10 @@ public:
         }
         display_ = nullptr; handle_ = 0; gc_ = nullptr; colormap_ = 0;
         std::vector<uint8_t>().swap(pixels_);
-        if (extension_) dlclose(extension_); extension_ = nullptr; shape_ = nullptr;
+        if (extension_)
+            dlclose(extension_);
+        extension_ = nullptr;
+        shape_ = nullptr;
 #endif
         dragging_ = false; drag_started_ = false; exposed_ = true;
     }
@@ -505,7 +508,11 @@ private:
         Atom type{}; int format = 0; unsigned long count = 0, extra = 0; unsigned char* data = nullptr;
         unsigned long desktop = 0;
         if (XGetWindowProperty(display_, DefaultRootWindow(display_), XInternAtom(display_, "_NET_CURRENT_DESKTOP", False), 0, 1, False, XA_CARDINAL, &type, &format, &count, &extra, &data) == Success) {
-            if (data && count == 1 && format == 32) desktop = *reinterpret_cast<unsigned long*>(data); if (data) XFree(data); data = nullptr;
+            if (data && count == 1 && format == 32)
+                desktop = *reinterpret_cast<unsigned long *>(data);
+            if (data)
+                XFree(data);
+            data = nullptr;
         }
         int top = int(28 * scale_);
         if (desktop < 256 && XGetWindowProperty(display_, DefaultRootWindow(display_), XInternAtom(display_, "_NET_WORKAREA", False), desktop * 4, 4, False, XA_CARDINAL, &type, &format, &count, &extra, &data) == Success) {
@@ -1573,7 +1580,8 @@ bool set_default_music_player(std::string& error, const std::function<bool()>& c
 }
 Desktop::Desktop() : impl_(std::make_unique<Impl>()) {}
 Desktop::~Desktop() { stop(); }
-void Desktop::start(void* window, void* display, unsigned long xid, std::function<void()> wake) {
+void Desktop::start([[maybe_unused]] void *window, [[maybe_unused]] void *display, [[maybe_unused]] unsigned long xid,
+                    std::function<void()> wake) {
     impl_->queue->wake = std::move(wake);
     impl_->lyrics.wake = [events = impl_->queue] { events->notify(); };
 #ifdef _WIN32
@@ -1663,7 +1671,8 @@ void Desktop::show() {
 #endif
     if (impl_->queue->wake) impl_->queue->wake();
 }
-void Desktop::set_icon(int width, int height, const std::vector<uint8_t>& rgba) {
+void Desktop::set_icon([[maybe_unused]] int width, [[maybe_unused]] int height,
+                       [[maybe_unused]] const std::vector<uint8_t> &rgba) {
 #ifndef _WIN32
     if (width <= 0 || height <= 0 || width > 128 || height > 128 || rgba.size() != size_t(width) * height * 4) return;
     std::lock_guard<std::mutex> lock(impl_->mutex);

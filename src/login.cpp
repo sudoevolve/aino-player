@@ -327,8 +327,15 @@ class BrowserConnection {
     bool send_frame(unsigned char opcode, const std::string& message) {
         std::string frame(1, char(0x80 | opcode));
         if (message.size() < 126) frame += char(0x80 | message.size());
-        else if (message.size() <= 65535) { frame += char(0xfe); frame += char(message.size() >> 8); frame += char(message.size()); }
-        else { frame += char(0xff); for (int i = 7; i >= 0; --i) frame += char(uint64_t(message.size()) >> (i * 8)); }
+        else if (message.size() <= 65535) {
+            frame += static_cast<char>(static_cast<unsigned char>(0xfe));
+            frame += char(message.size() >> 8);
+            frame += char(message.size());
+        } else {
+            frame += static_cast<char>(static_cast<unsigned char>(0xff));
+            for (int i = 7; i >= 0; --i)
+                frame += char(uint64_t(message.size()) >> (i * 8));
+        }
         std::random_device random;
         unsigned char mask[4];
         for (auto& byte : mask) { byte = uint8_t(random()); frame += char(byte); }
@@ -455,7 +462,9 @@ bool browser_credentials(Site site, const js::Value& result, std::string& cookie
         const bool allowed = site == Site::QQ ? domain == "qq.com" || domain == "y.qq.com" : domain == "music.163.com" || domain == "163.com";
         const auto name = item["name"].str(), value = item["value"].str();
         if (!allowed || name.empty() || name.find_first_of(";=\r\n\0", 0, 5) != std::string::npos || value.find_first_of(";\r\n\0", 0, 4) != std::string::npos) continue;
-        if (!cookie.empty()) cookie += "; "; cookie += name + "=" + value;
+        if (!cookie.empty())
+            cookie += "; ";
+        cookie += name + "=" + value;
     }
     std::string accepted, error;
     if (!parse_credentials(site, "{\"cookie\":" + json_string(cookie) + "}", accepted, uid, error)) { cookie.clear(); return false; }

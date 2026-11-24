@@ -150,7 +150,7 @@ struct Track {  // 合并后的"同一首歌"
     const Variant& current() const {
         static const Variant empty;
         if (variants.empty()) return empty;
-        return variants[size_t(std::min<int>(chosen, int(variants.size()) - 1))];
+        return variants[size_t(std::clamp(chosen, 0, int(variants.size()) - 1))];
     }
 };
 
@@ -169,7 +169,6 @@ struct SearchResult {
     std::vector<Track> tracks;
     std::vector<SourceReport> reports;
     int elapsed_ms = 0;
-    std::array<std::string, kSourceCount> continuation;
 };
 
 struct Settings {
@@ -205,14 +204,6 @@ inline const char* quality_name(int q) {
         case 0: return "标准";
         case 2: return "无损";
         default: return "高";
-    }
-}
-
-inline const char* quality_short(int q) {
-    switch (q) {
-        case 0: return "128k";
-        case 2: return "无损";
-        default: return "320k";
     }
 }
 
@@ -479,6 +470,23 @@ inline bool same_song(const Track& t, const Variant& v) {
     for (const auto& x : a)
         for (const auto& y : b)
             if (!x.empty() && x == y) return true;
+    return false;
+}
+
+/** @brief 跨平台定位同一录音：标题、版本和歌手必须相符；双方有时长时允许五秒误差。 */
+inline bool matches_recording(const Track &track, const Variant &candidate) {
+    const auto title = text::normalize_title(track.title);
+    if (candidate.id.empty() || title.empty() || title != text::normalize_title(candidate.title) ||
+        version_signature(track.title) != version_signature(candidate.title))
+        return false;
+    if (track.duration_ms > 0 && candidate.duration_ms > 0 &&
+        std::abs(double(track.duration_ms) - candidate.duration_ms) > 5000)
+        return false;
+    const auto artists = text::split_artists(track.artist);
+    const auto other_artists = text::split_artists(candidate.artist);
+    for (const auto &artist : artists)
+        if (!artist.empty() && std::find(other_artists.begin(), other_artists.end(), artist) != other_artists.end())
+            return true;
     return false;
 }
 
@@ -876,8 +884,6 @@ inline std::vector<Variant> interleave(std::vector<std::vector<Variant>> per_sou
 // 定义在下面（provider 桥接段），这里先声明给 run_search 用
 inline bool search_via_provider(Source src, const std::string& keyword, int limit, int page,
                                 std::vector<Variant>& out, std::string& err);
-inline bool board_via_provider(Source src, const std::string& board_id, int page, int limit,
-                               std::vector<Variant>& out, std::string& err);
 
 struct Job {
     std::mutex m;
@@ -891,14 +897,12 @@ struct Job {
 // 并发检索：每个源一个线程，9 秒软超时；超时/失败的源降级成 SourceReport 里的红字
 inline SearchResult run_search(const std::string& keyword, const Settings& st, int limit_per_source = 12,
                                int soft_timeout_ms = 9000, int page = 0,
-                               const std::array<std::string, kSourceCount>& continuations = {},
                                 const std::function<void(const SearchResult&)>& publish = {},
                                 const std::array<int, kSourceCount>* pages = nullptr) {
     using clock = std::chrono::steady_clock;
     const auto t_start = clock::now();
     auto job = std::make_shared<Job>();
     job->per_source.resize(kSourceCount); job->reports.resize(kSourceCount); job->finished.assign(kSourceCount, 0);
-    std::array<std::string, kSourceCount> next;
     std::atomic<bool> stopped{false};
     background::ThreadGroup workers;
     for (int i = 0; i < kSourceCount; ++i) {
@@ -915,7 +919,7 @@ inline SearchResult run_search(const std::string& keyword, const Settings& st, i
         if (!st.enable[i]) continue;
         workers.emplace_back([&, i] {
             net::CancelScope cancellation([&] { return stopped.load() || (st.cancelled && st.cancelled()); });
-            std::string error, cursor;
+            std::string error;
             std::vector<Variant> got;
             const int source_page = pages ? (*pages)[size_t(i)] : page;
             const auto began = clock::now();
@@ -928,14 +932,18 @@ inline SearchResult run_search(const std::string& keyword, const Settings& st, i
             report.pending = false; report.count = int(got.size()); report.ok = !got.empty() || error.empty(); report.err = error;
             report.has_more = int(got.size()) >= limit_per_source;
             report.ms = int(std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - began).count());
-            job->per_source[size_t(i)] = std::move(got); next[size_t(i)] = std::move(cursor);
+            job->per_source[size_t(i)] = std::move(got);
             job->finished[size_t(i)] = 1; ++job->done; job->cv.notify_all();
         });
     }
     auto snapshot = [&] {
         SearchResult result; result.keyword = keyword;
         std::vector<std::vector<Variant>> per_source;
-        { std::lock_guard<std::mutex> lock(job->m); per_source = job->per_source; result.reports = job->reports; result.continuation = next; }
+        {
+            std::lock_guard<std::mutex> lock(job->m);
+            per_source = job->per_source;
+            result.reports = job->reports;
+        }
     // 合并 → 排序
     const std::string kw_norm = core_title(keyword);
     std::vector<Track> tracks;
@@ -1079,7 +1087,9 @@ inline std::string wbi_query(std::map<std::string, std::string> params, const st
     for (auto& pair : params) {
         auto& value = pair.second;
         value.erase(std::remove_if(value.begin(), value.end(), [](char c) { return c == '!' || c == '\'' || c == '(' || c == ')' || c == '*'; }), value.end());
-        if (!query.empty()) query += '&'; query += net::url_encode(pair.first) + '=' + net::url_encode(value);
+        if (!query.empty())
+            query += '&';
+        query += net::url_encode(pair.first) + '=' + net::url_encode(value);
     }
     return query + "&w_rid=" + Md5Hex(query + key);
 }
@@ -1378,7 +1388,9 @@ inline std::string lx_music_info(const Variant& v, const char* key) {
         s += ",\"_types\":{";
         bool first = true;
         for (const auto& h : v.quality_hashes) {
-            if (!first) s += ","; first = false;
+            if (!first)
+                s += ",";
+            first = false;
             s += lx::detail::js_quote(h.first) + ":{\"hash\":" + lx::detail::js_quote(h.second) + "}";
         }
         s += "}";
@@ -1560,7 +1572,7 @@ struct CatalogPage {
     CatalogTarget target;
     std::vector<Track> tracks;
     std::vector<CatalogTarget> albums;
-    std::string description, error, continuation;
+    std::string description, error;
     int next_offset = 0;
     bool more = false;
 };
@@ -1580,7 +1592,9 @@ inline Track catalog_track(Source source, const js::Value& input) {
         v.title = text::decode_entities(song["name"].str());
         const auto& artists = song["ar"].is_array() ? song["ar"] : song["artists"];
         for (const auto& artist : artists.array) {
-            if (!v.artist.empty()) v.artist += " / "; v.artist += text::decode_entities(artist["name"].str());
+            if (!v.artist.empty())
+                v.artist += " / ";
+            v.artist += text::decode_entities(artist["name"].str());
         }
         const auto& album = song["al"].is_object() ? song["al"] : song["album"];
         v.album = text::decode_entities(album["name"].str()); v.cover_url = album["picUrl"].str();
@@ -1590,7 +1604,9 @@ inline Track catalog_track(Source source, const js::Value& input) {
         v.id = song["mid"].str(song["songmid"].str()); v.native_id = catalog_id(song["id"]);
         v.title = text::decode_entities(song["name"].str(song["songname"].str(song["title"].str())));
         for (const auto& artist : song["singer"].array) {
-            if (!v.artist.empty()) v.artist += " / "; v.artist += text::decode_entities(artist["name"].str());
+            if (!v.artist.empty())
+                v.artist += " / ";
+            v.artist += text::decode_entities(artist["name"].str());
         }
         v.album = text::decode_entities(song["album"]["name"].str(song["albumname"].str()));
         v.duration_ms = int(std::min<long long>(song["interval"].milliseconds(), std::numeric_limits<int>::max()));
@@ -1678,8 +1694,7 @@ inline CatalogTarget catalog_album(Source source, const js::Value& album) {
     out.subtitle = album["publishTime"].str(album["pubTime"].str(album["releaseDate"].str(album["pub_time"].str())));
     return out;
 }
-inline CatalogPage fetch_catalog(CatalogTarget target, const Settings& st, bool albums = false, int offset = 0,
-                                 const std::string& continuation = {}) {
+inline CatalogPage fetch_catalog(CatalogTarget target, const Settings &st, bool albums = false, int offset = 0) {
     CatalogPage out; out.target = std::move(target);
     auto& t = out.target;
     if (!valid_catalog_id(t.id) || offset < 0 || offset > 5000) { out.error = "目录参数无效或超过 5000 条"; return out; }

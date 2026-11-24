@@ -26,6 +26,7 @@
 #include <utility>
 #include <vector>
 #include <memory>
+#include "platform.hpp"
 namespace net {
 inline std::string ascii_lower(std::string value) {
     for (auto& c : value) if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
@@ -80,7 +81,7 @@ struct CancelScope {
 // 本机浏览器 WebSocket 握手使用 SHA-1；不用于密码存储。
 inline std::array<unsigned char, 20> sha1(std::string input) {
     const uint64_t bits = uint64_t(input.size()) * 8;
-    input += char(0x80);
+    input += static_cast<char>(static_cast<unsigned char>(0x80));
     while (input.size() % 64 != 56) input += '\0';
     for (int i = 7; i >= 0; --i) input += char(bits >> (i * 8));
     uint32_t hash[] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0};
@@ -622,7 +623,7 @@ inline bool download(const std::string& url, const std::string& path,
 
     // 必须用 _wfopen：fopen 按 ANSI(GBK) 解释路径，而 path 是 UTF-8，
     // 中文文件名（"周杰伦 - 屋顶.mp3"）会直接开不出来，报"无法创建临时文件"。
-    std::FILE* f = sink ? nullptr : _wfopen(widen(path).c_str(), L"wb");
+    std::FILE *f = sink ? nullptr : platform::fopen(path, "wb");
     if (!sink && !f) {
         err = "无法创建临时文件";
         detail::close_request(hreq);

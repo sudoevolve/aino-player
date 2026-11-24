@@ -1,6 +1,6 @@
 // lyrics.hpp —— 歌词抓取与 LRC 解析
 //
-// 优先使用曲目所属平台的歌词；失败后按标题、歌手和时长反查网易云。
+// 优先读取已有平台版本，失败后在已启用的平台中按同一录音匹配；不改变播放音源。
 #pragma once
 
 #include <algorithm>
@@ -333,33 +333,43 @@ inline bool supplement_translation(Doc& primary, const Doc& translated) {
 
 // ---------------------------------------------------------------- 按名反查
 //
-// 平台没有返回这首歌的歌词时，去网易云按
-// 「歌名 + 歌手」反查一条 —— 同一首歌的歌词在各平台基本一致。
-// 反查结果常混着翻唱（搜「花海 周杰伦」前两条是 70 秒改编版），所以判据要严格：
-// **原始标题**完全相等才算强命中，时长差是主要过滤器。
-inline std::string search_netease_id(const music::Track& t, const music::Settings& st) {
-    const auto title = music::text::normalize_title(t.title);
-    const auto artists = music::text::split_artists(t.artist);
-    if (title.empty() || artists.empty()) return {};
-    std::string err;
-    const auto got = music::search_netease(t.title + " " + t.artist, 16, 6000, err, st);
-    std::string best_id; double best_score = -1;
-    for (const auto& v : got) {
-        if (v.id.empty() || music::text::normalize_title(v.title) != title || music::version_signature(v.title) != music::version_signature(t.title)) continue;
-        const auto candidates = music::text::split_artists(v.artist);
-        bool same_artist = false;
-        for (const auto& a : artists) for (const auto& b : candidates) if (!a.empty() && a == b) same_artist = true;
-        if (!same_artist) continue;
-        double score = 100;
-        if (!t.album.empty() && music::core_title(t.album) == music::core_title(v.album)) score += 8;
-        if (t.duration_ms > 0 && v.duration_ms > 0) {
-            const double delta = std::abs(double(t.duration_ms) - v.duration_ms);
-            if (delta > 5000) continue;
-            score -= delta / 1000;
-        }
-        if (score > best_score) { best_score = score; best_id = v.id; }
+// 反查只接收同一录音，优先同专辑和接近的时长；不能把翻唱歌词自动套到原曲上。
+inline std::vector<music::Variant> search_lyric_variants(const music::Track &track, music::Source source,
+                                                         const music::Settings &settings, std::string &error) {
+    if (track.title.empty() || track.artist.empty())
+        return {};
+    auto candidates = music::search_platform(source, track.title + " " + track.artist, 16, 4000, error, settings);
+    candidates.erase(
+        std::remove_if(candidates.begin(), candidates.end(),
+                       [&](const music::Variant &candidate) { return !music::matches_recording(track, candidate); }),
+        candidates.end());
+    const auto score = [&](const music::Variant &candidate) {
+        double value =
+            !track.album.empty() && music::core_title(track.album) == music::core_title(candidate.album) ? 8 : 0;
+        if (track.duration_ms > 0 && candidate.duration_ms > 0)
+            value -= std::abs(double(track.duration_ms) - candidate.duration_ms) / 1000;
+        return value;
+    };
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [&](const auto &a, const auto &b) { return score(a) > score(b); });
+    if (candidates.size() > 3)
+        candidates.resize(3);
+    return candidates;
+}
+
+inline Doc fetch_variant(const music::Variant &variant, const music::Settings &settings, int timeout_ms) {
+    switch (variant.source) {
+    case music::Source::Netease:
+        return fetch_netease_lyric(variant.id, settings, timeout_ms);
+    case music::Source::QQ:
+        return fetch_qq_lyric(variant.id, settings.qq_cookie, timeout_ms);
+    case music::Source::Kuwo:
+    case music::Source::Kugou:
+    case music::Source::Migu:
+        return fetch_provider_lyric(variant, timeout_ms);
+    default:
+        return {};
     }
-    return best_id;
 }
 
 inline Doc fetch(const music::Track& t, const music::Settings& st, int timeout_ms = 8000,
@@ -389,7 +399,9 @@ inline Doc fetch(const music::Track& t, const music::Settings& st, int timeout_m
             if (i != first) order.push_back(i);
     }
 
-    std::string last_err = std::move(local_error); Doc primary; std::set<std::string> tried_netease;
+    std::string last_err = std::move(local_error);
+    Doc primary;
+    std::set<std::string> tried;
     auto take = [&](Doc doc) {
         if (doc.empty()) { if (!doc.error.empty()) last_err = doc.origin + "：" + doc.error; return false; }
         if (primary.empty()) { primary = std::move(doc); if (publish) publish(primary); }
@@ -399,25 +411,31 @@ inline Doc fetch(const music::Track& t, const music::Settings& st, int timeout_m
     for (int i : order) {
         if (net::cancelled()) break;
         const auto& v = t.variants[size_t(i)];
-        if (v.id.empty()) continue;
-        Doc doc;
-        switch (v.source) {
-            case music::Source::Netease: tried_netease.insert(v.id); doc = fetch_netease_lyric(v.id, st, timeout_ms); break;
-            case music::Source::QQ: doc = fetch_qq_lyric(v.id, st.qq_cookie, timeout_ms); break;
-            case music::Source::Kuwo: case music::Source::Kugou: case music::Source::Migu:
-                doc = fetch_provider_lyric(v, timeout_ms); break;
-            default: continue;
-        }
-        if (take(std::move(doc))) return primary;
+        if (v.id.empty() || !tried.insert(music::variant_uid(v)).second)
+            continue;
+        if (take(fetch_variant(v, st, timeout_ms)))
+            return primary;
     }
-    if (!net::cancelled()) {
-        const auto id = search_netease_id(t, st);
-        if (!id.empty() && !tried_netease.count(id)) {
-            auto doc = fetch_netease_lyric(id, st, timeout_ms);
-            doc.origin = "网易云（同曲匹配）";
-            take(std::move(doc));
-        } else if (t.current().source == music::Source::Local && !last_err.empty())
-            last_err += "；未匹配到在线歌词版本";
+    for (const auto source :
+         {music::Source::Netease, music::Source::QQ, music::Source::Kuwo, music::Source::Kugou, music::Source::Migu}) {
+        if (net::cancelled())
+            break;
+        if (!st.enable[int(source)])
+            continue;
+        std::string error;
+        const auto candidates = search_lyric_variants(t, source, st, error);
+        if (!error.empty())
+            last_err = std::string(music::source_name(source)) + "：" + error;
+        for (const auto &candidate : candidates) {
+            if (net::cancelled())
+                break;
+            if (!tried.insert(music::variant_uid(candidate)).second)
+                continue;
+            auto doc = fetch_variant(candidate, st, timeout_ms);
+            doc.origin = std::string(music::source_name(source)) + "（同曲匹配）";
+            if (take(std::move(doc)))
+                return primary;
+        }
     }
     if (!primary.empty()) return primary;
     primary.error = net::cancelled() ? "歌词加载已取消" : last_err.empty() ? "没有找到可用的歌词" : last_err;

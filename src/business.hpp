@@ -397,7 +397,6 @@ struct PlaylistView {
     int tracks_offset = 0, albums_offset = 0;
     int remote_total = -1;
     std::string more_error;
-    std::string tracks_continuation, albums_continuation;
 };
 struct ViewModel {
     UiState& ui;
@@ -869,13 +868,11 @@ static std::atomic<bool> g_shutdown{false};
 struct SearchRequest {
     std::string keyword; music::Settings settings; int generation = 0; bool append = false;
     std::array<int, music::kSourceCount> pages{};
-    std::array<std::string, music::kSourceCount> continuation;
 };
 struct SearchState {
     std::atomic<int> generation{0};
     std::string keyword;
     std::array<int, music::kSourceCount> pages{};
-    std::array<std::string, music::kSourceCount> continuation, page_input;
     SearchRequest pending;
     bool worker = false;
 };
@@ -1093,6 +1090,8 @@ struct LyricState {
     std::string for_uid;
     std::shared_ptr<const lyr::Doc> doc;
     bool loading = false;
+    unsigned attempts = 0;
+    unsigned long long retry_at = 0;
 };
 static LyricState g_lyr;
 
@@ -1179,7 +1178,9 @@ static void downloads_save(bool force = false) {
       tasks = g_dls; files = g_downloaded_files; revision = g_download_persist_revision; }
     std::string text = "{\"version\":1,\"provenance_version\":2,\"tasks\":["; bool first = true;
     for (const auto& row : tasks) {
-        if (!first) text += ','; first = false;
+        if (!first)
+            text += ',';
+        first = false;
         const auto& item = row.second;
         text += "{\"track\":" + library::encode_track(item.track) + ",\"source_key\":" + library::quote(item.source_key) + ",\"path\":" + library::quote(item.path) +
             ",\"name\":" + library::quote(item.name) + ",\"done\":" + ((item.done || item.missing) ? "true" : "false") +
@@ -1189,7 +1190,9 @@ static void downloads_save(bool force = false) {
     }
     text += "],\"files\":["; first = true;
     for (const auto& row : files) {
-        if (!first) text += ','; first = false;
+        if (!first)
+            text += ',';
+        first = false;
         text += "{\"key\":" + library::quote(row.first) + ",\"path\":" + library::quote(row.second.path) +
             ",\"bytes\":" + std::to_string(row.second.bytes) + ",\"exact\":" + (row.second.exact ? "true" : "false") + "}";
     }
@@ -1354,14 +1357,13 @@ static void do_search(HostCallbacks* win, SearchRequest request) {
         g_as.results = std::move(merged);
         if (done) for (int i = 0; i < music::kSourceCount; ++i) if (st.enable[i]) {
             g_search.pages[size_t(i)] = request.pages[size_t(i)];
-            g_search.page_input[size_t(i)] = request.continuation[size_t(i)];
-            g_search.continuation[size_t(i)] = result.continuation[size_t(i)];
         }
         ++g_as.results_version;
         if (win) win->wake();
     };
-    auto result = music::run_search(request.keyword, st, 12, 9000, 0, request.continuation,
-        [&](const music::SearchResult& partial) { publish(partial, false); }, &request.pages);
+    auto result = music::run_search(
+        request.keyword, st, 12, 9000, 0, [&](const music::SearchResult &partial) { publish(partial, false); },
+        &request.pages);
     if (st.cancelled()) return;
     publish(result, true);
     music::fill_covers(result.tracks, st);
@@ -1393,7 +1395,11 @@ void start_search() {
     g_ui.search_scroll_to_top = true;
     SearchRequest request; request.keyword = g_ui.query; request.settings = g_ui.settings;
     for (int i = 0; i < music::kSourceCount; ++i) request.settings.enable[i] = (g_ui.src_mask >> i) & 1u;
-    { std::lock_guard<std::mutex> lock(g_mu); g_search.keyword = request.keyword; g_search.pages = {}; g_search.continuation = {}; g_search.page_input = {}; }
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        g_search.keyword = request.keyword;
+        g_search.pages = {};
+    }
     dispatch_search(std::move(request));
 }
 void search_more() {
@@ -1402,7 +1408,6 @@ void search_more() {
         std::lock_guard<std::mutex> lock(g_mu);
         if (g_as.searching || g_search.keyword.empty()) return;
         request.keyword = g_search.keyword; request.settings = g_ui.settings; request.append = true;
-        request.continuation = g_search.continuation;
         bool any = false;
         for (int i = 0; i < music::kSourceCount; ++i) {
             bool more = false;
@@ -1421,7 +1426,7 @@ void retry_search_source(int source) {
         std::lock_guard<std::mutex> lock(g_mu);
         if (g_as.searching || g_search.keyword.empty()) return;
         request.keyword = g_search.keyword; request.settings = g_ui.settings; request.append = true;
-        request.pages = g_search.pages; request.continuation = g_search.page_input;
+        request.pages = g_search.pages;
         for (int i = 0; i < music::kSourceCount; ++i) request.settings.enable[i] = i == source;
     }
     dispatch_search(std::move(request));
@@ -1871,7 +1876,7 @@ void toast(const std::string& text, int ms, unsigned long long undo_id) {
 }
 
 // ---------------- 歌词 ----------------
-// 取一次就缓存住：同一个 uid 不重复请求。切歌后旧结果会被丢弃（比对 for_uid）。
+// 同一 uid 的有效歌词复用；失败最多自动尝试三轮，切歌或手选后按 generation 丢弃旧结果。
 static lyr::Doc fetch_automatic_lyrics(const music::Track& track, const music::Settings& settings,
                                        const std::string& uid, unsigned long long generation) {
     return lyr::fetch(track, settings, 8000, [uid, generation](const lyr::Doc& partial) {
@@ -1890,7 +1895,14 @@ static void request_lyrics(const music::Track& track, bool force = false) {
     if (uid.empty()) return;
     {
         std::lock_guard<std::mutex> lk(g_lyr.m);
-        if (!force && g_lyr.for_uid == uid && (g_lyr.doc || g_lyr.loading)) return;
+        if (!force && g_lyr.for_uid == uid) {
+            if (g_lyr.loading || (g_lyr.doc && !g_lyr.doc->empty()) || g_lyr.attempts >= 3 ||
+                platform::ticks() < g_lyr.retry_at)
+                return;
+        } else
+            g_lyr.attempts = 0;
+        ++g_lyr.attempts;
+        g_lyr.retry_at = 0;
         generation = ++g_lyr.generation;
         g_lyr.for_uid = uid;
         g_lyr.doc.reset();
@@ -1901,43 +1913,77 @@ static void request_lyrics(const music::Track& track, bool force = false) {
     const std::string local = found == g_library->lyric_preferences.end() ? "" : found->second.path;
     const auto matched = found == g_library->lyric_preferences.end() ? "" : found->second.netease_id;
     music::Settings st = g_ui.settings;
-    run_task([t, st, uid, local, matched, generation] {
-        net::CancelScope signal([uid, generation] {
-            if (g_shutdown.load()) return true;
-            std::lock_guard<std::mutex> lock(g_lyr.m);
-            return g_lyr.for_uid != uid || g_lyr.generation != generation;
-        });
-        lyr::Doc d;
-        if (local.empty() && !matched.empty()) {
-            d = lyr::fetch_netease_lyric(matched, st, 8000);
-            d.origin = "手动匹配 · " + d.origin;
-            if (d.empty() && !net::cancelled()) d = fetch_automatic_lyrics(t, st, uid, generation);
-        } else if (local.empty()) d = fetch_automatic_lyrics(t, st, uid, generation);
-        else {
-            d.origin = "自选本地 LRC";
-            const auto size = platform::file_size(local);
-            if (size <= 0 || size > 4 * 1024 * 1024) d.error = "本地歌词不存在、为空或超过 4 MiB，可重新选择或恢复默认";
+    for (int i = 0; i < music::kSourceCount; ++i)
+        st.enable[i] = (g_ui.src_mask >> i) & 1u;
+    run_task(
+        [t, st, uid, local, matched, generation] {
+            net::CancelScope signal([uid, generation] {
+                if (g_shutdown.load())
+                    return true;
+                std::lock_guard<std::mutex> lock(g_lyr.m);
+                return g_lyr.for_uid != uid || g_lyr.generation != generation;
+            });
+            lyr::Doc d;
+            if (local.empty() && !matched.empty()) {
+                d = lyr::fetch_netease_lyric(matched, st, 8000);
+                d.origin = "手动匹配 · " + d.origin;
+                if (d.empty() && !net::cancelled())
+                    d = fetch_automatic_lyrics(t, st, uid, generation);
+            } else if (local.empty())
+                d = fetch_automatic_lyrics(t, st, uid, generation);
             else {
-                std::ifstream file(platform::fs::u8path(local), std::ios::binary);
-                std::string text(4 * 1024 * 1024 + 1, '\0');
-                file.read(text.data(), std::streamsize(text.size())); text.resize(size_t(file.gcount()));
-                if (text.size() > 4 * 1024 * 1024) { d.error = "本地歌词超过 4 MiB"; text.clear(); }
-                if (text.rfind("\xef\xbb\xbf", 0) == 0) text.erase(0, 3);
-                d.lines = lyr::parse(text, &d.synced);
-                if (d.lines.empty()) d.error = "本地歌词没有可显示内容";
+                d.origin = "自选本地 LRC";
+                const auto size = platform::file_size(local);
+                if (size <= 0 || size > 4 * 1024 * 1024)
+                    d.error = "本地歌词不存在、为空或超过 4 MiB，可重新选择或恢复默认";
+                else {
+                    std::ifstream file(platform::fs::u8path(local), std::ios::binary);
+                    std::string text(4 * 1024 * 1024 + 1, '\0');
+                    file.read(text.data(), std::streamsize(text.size()));
+                    text.resize(size_t(file.gcount()));
+                    if (text.size() > 4 * 1024 * 1024) {
+                        d.error = "本地歌词超过 4 MiB";
+                        text.clear();
+                    }
+                    if (text.rfind("\xef\xbb\xbf", 0) == 0)
+                        text.erase(0, 3);
+                    d.lines = lyr::parse(text, &d.synced);
+                    if (d.lines.empty())
+                        d.error = "本地歌词没有可显示内容";
+                }
+                if (d.empty() && !net::cancelled())
+                    d = fetch_automatic_lyrics(t, st, uid, generation);
             }
-            if (d.empty() && !net::cancelled()) d = fetch_automatic_lyrics(t, st, uid, generation);
-        }
-        if (g_shutdown.load()) return;
-        auto shared = std::make_shared<const lyr::Doc>(std::move(d));
-        {
-            std::lock_guard<std::mutex> lk(g_lyr.m);
-            if (g_lyr.for_uid != uid || g_lyr.generation != generation) return; // 切歌或重选歌词后丢弃旧请求。
-            g_lyr.doc = shared;
+            if (g_shutdown.load())
+                return;
+            auto shared = std::make_shared<const lyr::Doc>(std::move(d));
+            {
+                std::lock_guard<std::mutex> lk(g_lyr.m);
+                if (g_lyr.for_uid != uid || g_lyr.generation != generation)
+                    return; // 切歌或重选歌词后丢弃旧请求。
+                g_lyr.doc = shared;
+                g_lyr.loading = false;
+                g_lyr.retry_at = shared->empty() ? platform::ticks() + 15000 : 0;
+            }
+            if (g_win)
+                g_win->wake();
+        },
+        [uid, generation] {
+            std::lock_guard<std::mutex> lock(g_lyr.m);
+            if (g_lyr.for_uid != uid || g_lyr.generation != generation)
+                return;
+            // 补译失败不能覆盖已先行发布的有效原文。
+            if (g_lyr.doc && !g_lyr.doc->empty()) {
+                g_lyr.loading = false;
+                g_lyr.retry_at = 0;
+                return;
+            }
+            lyr::Doc failed;
+            failed.error = "歌词加载失败，可手动重试";
+            g_lyr.doc = std::make_shared<const lyr::Doc>(std::move(failed));
             g_lyr.loading = false;
-        }
-        if (g_win) g_win->wake();
-    }, [uid, generation] { std::lock_guard<std::mutex> lock(g_lyr.m); if (g_lyr.for_uid == uid && g_lyr.generation == generation) g_lyr.loading = false; });
+            g_lyr.retry_at = platform::ticks() + 15000;
+        });
 }
 
 // ---------------- 下载 ----------------
@@ -2605,8 +2651,7 @@ struct RadioSession {
     std::deque<music::Track> seeds;
     std::unordered_set<std::string> seen;
     std::deque<std::string> seen_order;
-    std::map<std::string, int> search_pages;
-    std::deque<std::string> artist_order;
+    std::deque<std::vector<std::string>> artist_order;
     std::map<std::string, unsigned> recent_artist_counts;
 };
 static RadioSession g_radio;
@@ -2927,11 +2972,12 @@ const std::vector<LxSourceView>& lx_source_status() {
         const auto health = checks.find(key);
         for (size_t i = 0; i < platforms.size(); ++i) {
             const auto source = platforms[i];
-            const auto* platform = music::lx_platform_key(source);
-            if (!platform) continue;
+            const auto *platform_key = music::lx_platform_key(source);
+            if (!platform_key)
+                continue;
             const lx::Engine::Health* h = nullptr;
             if (health != checks.end()) {
-                const auto found = health->second.find(platform);
+                const auto found = health->second.find(platform_key);
                 if (found != health->second.end()) h = &found->second;
             }
             if (!v.health.empty()) v.health += " · ";
@@ -2969,18 +3015,29 @@ const std::vector<LxSourceView>& lx_source_status() {
             }
         }
         const auto metrics = timings.find(key);
-        if (metrics != timings.end()) for (const auto& platform : metrics->second) for (const auto& quality : platform.second) {
-            const auto& value = quality.second;
-            if (!value.samples && !value.failures) continue;
-            std::string name = platform.first;
-            for (const auto& p : music::kPlatformInfo) if (p.lx_key && platform.first == p.lx_key) { name = p.name; break; }
-            if (!v.error.empty()) v.error += "\n";
-            v.error += name + " · " + quality.first + "：平滑取址 " + std::to_string(value.resolve_ms) + "ms";
-            if (value.load_ms) v.error += "，样本加载 " + std::to_string(value.load_ms) + "ms";
-            if (value.ready_ms) v.error += "，实际首段就绪 " + std::to_string(value.ready_ms) + "ms";
-            v.error += "，有效测速 " + std::to_string(value.samples) + " 次";
-            if (value.failures) v.error += "，近期失败 " + std::to_string(value.failures) + " 次";
-        }
+        if (metrics != timings.end())
+            for (const auto &platform_metrics : metrics->second)
+                for (const auto &quality : platform_metrics.second) {
+                    const auto &value = quality.second;
+                    if (!value.samples && !value.failures)
+                        continue;
+                    std::string name = platform_metrics.first;
+                    for (const auto &p : music::kPlatformInfo)
+                        if (p.lx_key && platform_metrics.first == p.lx_key) {
+                            name = p.name;
+                            break;
+                        }
+                    if (!v.error.empty())
+                        v.error += "\n";
+                    v.error += name + " · " + quality.first + "：平滑取址 " + std::to_string(value.resolve_ms) + "ms";
+                    if (value.load_ms)
+                        v.error += "，样本加载 " + std::to_string(value.load_ms) + "ms";
+                    if (value.ready_ms)
+                        v.error += "，实际首段就绪 " + std::to_string(value.ready_ms) + "ms";
+                    v.error += "，有效测速 " + std::to_string(value.samples) + " 次";
+                    if (value.failures)
+                        v.error += "，近期失败 " + std::to_string(value.failures) + " 次";
+                }
         const auto rank = std::find_if(order.begin(), order.end(), [&](const auto& item) { return item.file == key; });
         v.health_rank = rank == order.end() ? 3 : rank->availability;
         v.latency_ms = rank == order.end() ? 300001 : rank->latency_ms;
@@ -4286,7 +4343,10 @@ static music::Track local_download_track(music::Track track, const std::string& 
 void play_download(const std::string& uid, bool enqueue) {
     DlItem item;
     { std::lock_guard<std::mutex> lock(g_dlm); const auto found = g_dls.find(uid);
-      if (found == g_dls.end() || !found->second.done || found->second.publishing) return; item = found->second; }
+        if (found == g_dls.end() || !found->second.done || found->second.publishing)
+            return;
+        item = found->second;
+    }
     if (item.path.empty() || !platform::exists(item.path)) { toast("下载文件已移动或删除，请重新下载"); return; }
     const auto track = local_download_track(item.track, item.path);
     queue_push(track);
@@ -4311,7 +4371,10 @@ static void add_download_to_library(const music::Track& track, const std::string
 void save_download_playlist(const std::string& uid) {
     DlItem item;
     { std::lock_guard<std::mutex> lock(g_dlm); const auto found = g_dls.find(uid);
-      if (found == g_dls.end() || !found->second.done || found->second.publishing) return; item = found->second; }
+        if (found == g_dls.end() || !found->second.done || found->second.publishing)
+            return;
+        item = found->second;
+    }
     if (!platform::exists(item.path)) { toast("下载文件已移动或删除"); return; }
     add_download_to_library(item.track, item.path, g_ui.download_playlist_key.empty() ? "downloads" : g_ui.download_playlist_key);
     toast("已提交添加到本地歌单");
@@ -4904,7 +4967,6 @@ static void catalog_request(bool albums, bool append) {
     const auto seed = view.catalog_seed;
     const int artist_index = view.catalog_artist_index;
     const int offset = append ? (albums ? view.albums_offset : view.tracks_offset) : 0;
-    const auto continuation = append ? (albums ? view.albums_continuation : view.tracks_continuation) : std::string();
     if (append && !(albums ? view.albums_more : view.tracks_more)) return;
     if (albums || append || !view.playlist.tracks.empty()) view.loading_more = true; else view.loading = true;
     if (albums) { view.albums_error.clear(); view.albums_retry_append = append; }
@@ -4914,68 +4976,103 @@ static void catalog_request(bool albums, bool append) {
     const auto saved = g_library;
     std::vector<music::Track> queue;
     if (target.source == music::Source::Local) { std::lock_guard<std::mutex> lock(g_mu); queue = g_as.tracks; }
-    run_task([generation, target, seed, artist_index, offset, continuation, settings, saved, queue = std::move(queue), albums, append]() mutable {
-        net::CancelScope scope(settings.cancelled);
-        music::CatalogPage page; page.target = target;
-        auto resolved = target;
-        if (resolved.id.empty() && !music::catalog_target_from_track(seed, target.kind, artist_index, settings, resolved, page.error)) {
-            // Preserve the requested identity so retry resolves this song again.
-        } else if (!settings.cancelled()) {
-            page = resolved.source == music::Source::Local ? local_catalog(resolved, *saved, queue, seed, albums) :
-                music::fetch_catalog(std::move(resolved), settings, albums, offset, continuation);
-        }
-        if (settings.cancelled()) return;
-        if (page.more && (page.next_offset <= offset || page.next_offset >= 5000)) page.more = false;
-        post_ui([generation, page = std::move(page), albums, append]() mutable {
-            if (generation != g_playlist_generation.load() || !g_playlist_view.catalog_open) return;
-            auto& view = g_playlist_view; view.loading = false; view.loading_more = false;
-            if (!page.error.empty()) {
-                if (albums) view.albums_error = page.error; else view.error = page.error;
-                toast(page.error, 7000); return;
+    run_task(
+        [generation, target, seed, artist_index, offset, settings, saved, queue = std::move(queue), albums,
+         append]() mutable {
+            net::CancelScope scope(settings.cancelled);
+            music::CatalogPage page;
+            page.target = target;
+            auto resolved = target;
+            if (resolved.id.empty() &&
+                !music::catalog_target_from_track(seed, target.kind, artist_index, settings, resolved, page.error)) {
+                // Preserve the requested identity so retry resolves this song again.
+            } else if (!settings.cancelled()) {
+                page = resolved.source == music::Source::Local
+                           ? local_catalog(resolved, *saved, queue, seed, albums)
+                           : music::fetch_catalog(std::move(resolved), settings, albums, offset);
             }
-            view.catalog = std::move(page.target);
-            view.playlist.name = view.catalog.name; view.playlist.cover = view.catalog.cover;
-            view.playlist.source = view.catalog.source;
-            view.playlist.key = std::string(view.catalog.kind == music::CatalogKind::Artist ? "artist#" : "album#") +
-                music::source_key(view.catalog.source) + "#" + view.catalog.id +
-                (view.catalog.source == music::Source::Local ? "#" + view.catalog.name : "");
-            if (!page.description.empty()) view.description = music::providers::strip_tags(page.description);
-            if (albums) {
-                if (!append) view.albums.clear();
-                const auto before = view.albums.size();
-                std::set<std::string> ids;
-                const auto key = [](const music::CatalogTarget& album) { return album.source == music::Source::Local ? album.id + "\n" + album.name : album.id; };
-                for (const auto& album : view.albums) ids.insert(key(album));
-                for (auto& album : page.albums) if (ids.insert(key(album)).second) view.albums.push_back(std::move(album));
-                if (append && !page.albums.empty() && view.albums.size() == before) {
-                    page.more = false; view.albums_retry_append = false;
-                    view.albums_error = "平台分页返回重复内容，已保留现有专辑";
+            if (settings.cancelled())
+                return;
+            if (page.more && (page.next_offset <= offset || page.next_offset >= 5000))
+                page.more = false;
+            post_ui([generation, page = std::move(page), albums, append]() mutable {
+                if (generation != g_playlist_generation.load() || !g_playlist_view.catalog_open)
+                    return;
+                auto &view = g_playlist_view;
+                view.loading = false;
+                view.loading_more = false;
+                if (!page.error.empty()) {
+                    if (albums)
+                        view.albums_error = page.error;
+                    else
+                        view.error = page.error;
+                    toast(page.error, 7000);
+                    return;
                 }
-                view.albums_loaded = true; view.albums_more = page.more;
-                view.albums_offset = page.next_offset; view.albums_continuation = std::move(page.continuation);
-            } else {
-                if (!append) view.playlist.tracks.clear();
-                const auto before = view.playlist.tracks.size();
-                std::set<std::string> ids;
-                for (const auto& track : view.playlist.tracks) ids.insert(track_uid(track));
-                for (auto& track : page.tracks) if (ids.insert(track_uid(track)).second) view.playlist.tracks.push_back(std::move(track));
-                if (append && !page.tracks.empty() && view.playlist.tracks.size() == before) {
-                    page.more = false; view.tracks_retry_append = false;
-                    view.error = "平台分页返回重复内容，已保留现有歌曲";
+                view.catalog = std::move(page.target);
+                view.playlist.name = view.catalog.name;
+                view.playlist.cover = view.catalog.cover;
+                view.playlist.source = view.catalog.source;
+                view.playlist.key =
+                    std::string(view.catalog.kind == music::CatalogKind::Artist ? "artist#" : "album#") +
+                    music::source_key(view.catalog.source) + "#" + view.catalog.id +
+                    (view.catalog.source == music::Source::Local ? "#" + view.catalog.name : "");
+                if (!page.description.empty())
+                    view.description = music::providers::strip_tags(page.description);
+                if (albums) {
+                    if (!append)
+                        view.albums.clear();
+                    const auto before = view.albums.size();
+                    std::set<std::string> ids;
+                    const auto key = [](const music::CatalogTarget &album) {
+                        return album.source == music::Source::Local ? album.id + "\n" + album.name : album.id;
+                    };
+                    for (const auto &album : view.albums)
+                        ids.insert(key(album));
+                    for (auto &album : page.albums)
+                        if (ids.insert(key(album)).second)
+                            view.albums.push_back(std::move(album));
+                    if (append && !page.albums.empty() && view.albums.size() == before) {
+                        page.more = false;
+                        view.albums_retry_append = false;
+                        view.albums_error = "平台分页返回重复内容，已保留现有专辑";
+                    }
+                    view.albums_loaded = true;
+                    view.albums_more = page.more;
+                    view.albums_offset = page.next_offset;
+                } else {
+                    if (!append)
+                        view.playlist.tracks.clear();
+                    const auto before = view.playlist.tracks.size();
+                    std::set<std::string> ids;
+                    for (const auto &track : view.playlist.tracks)
+                        ids.insert(track_uid(track));
+                    for (auto &track : page.tracks)
+                        if (ids.insert(track_uid(track)).second)
+                            view.playlist.tracks.push_back(std::move(track));
+                    if (append && !page.tracks.empty() && view.playlist.tracks.size() == before) {
+                        page.more = false;
+                        view.tracks_retry_append = false;
+                        view.error = "平台分页返回重复内容，已保留现有歌曲";
+                    }
+                    view.tracks_more = page.more;
+                    view.tracks_offset = page.next_offset;
                 }
-                view.tracks_more = page.more; view.tracks_offset = page.next_offset;
-                view.tracks_continuation = std::move(page.continuation);
-            }
-            playlist_filter_rows();
-            if (!append && g_ui.catalog_section == (albums ? 1 : 0)) g_ui.playlist_scroll_to_top = true;
-            if (!albums && g_ui.catalog_section == 1 && !view.albums_loaded && view.albums_error.empty()) catalog_request(true, false);
+                playlist_filter_rows();
+                if (!append && g_ui.catalog_section == (albums ? 1 : 0))
+                    g_ui.playlist_scroll_to_top = true;
+                if (!albums && g_ui.catalog_section == 1 && !view.albums_loaded && view.albums_error.empty())
+                    catalog_request(true, false);
+            });
+        },
+        [generation, albums, append] {
+            if (generation != g_playlist_generation.load())
+                return;
+            g_playlist_view.loading = false;
+            g_playlist_view.loading_more = false;
+            auto &error = albums ? g_playlist_view.albums_error : g_playlist_view.error;
+            error = "加载失败，请重试；完整原因见通知";
         });
-    }, [generation, albums, append] {
-        if (generation != g_playlist_generation.load()) return;
-        g_playlist_view.loading = false; g_playlist_view.loading_more = false;
-        auto& error = albums ? g_playlist_view.albums_error : g_playlist_view.error;
-        error = "加载失败，请重试；完整原因见通知";
-    });
 }
 static void open_catalog(music::CatalogTarget target, music::Track seed = {}, int artist_index = 0) {
     detail_begin();
@@ -5049,14 +5146,16 @@ static bool radio_artist_allowed(const music::Track& track) {
 }
 static void radio_remember_artist(const music::Track& track) {
     const auto artists = radio::artist_keys(track);
-    if (artists.empty()) return;
-    g_radio.artist_order.push_back(artists.front());
-    ++g_radio.recent_artist_counts[artists.front()];
+    g_radio.artist_order.push_back(artists);
+    for (const auto &artist : artists)
+        ++g_radio.recent_artist_counts[artist];
     while (g_radio.artist_order.size() > 12) {
-        const auto old = g_radio.artist_order.front();
+        for (const auto &artist : g_radio.artist_order.front()) {
+            const auto found = g_radio.recent_artist_counts.find(artist);
+            if (found != g_radio.recent_artist_counts.end() && --found->second == 0)
+                g_radio.recent_artist_counts.erase(found);
+        }
         g_radio.artist_order.pop_front();
-        const auto found = g_radio.recent_artist_counts.find(old);
-        if (found != g_radio.recent_artist_counts.end() && --found->second == 0) g_radio.recent_artist_counts.erase(found);
     }
 }
 static void refill_radio() {
@@ -5071,83 +5170,102 @@ static void refill_radio() {
     if (!g_radio.seeds.empty()) { seed = std::move(g_radio.seeds.front()); g_radio.seeds.pop_front(); }
     if (seed.variants.empty()) return;
     const auto generation = g_radio_generation.load();
-    const auto settings = g_ui.settings;
-    const auto query_key = radio::query_key(seed);
-    if (g_radio.search_pages.size() >= 128 && !g_radio.search_pages.count(query_key)) g_radio.search_pages.erase(g_radio.search_pages.begin());
-    const int page = g_radio.search_pages[query_key];
-    const bool explore = g_radio.empty_batches != 0;
+    auto settings = g_ui.settings;
+    for (int i = 0; i < music::kSourceCount; ++i)
+        settings.enable[i] = (g_ui.src_mask >> i) & 1u;
+    const bool cross_platform_first = g_radio.empty_batches != 0;
     g_radio.loading = g_ui.radio_loading = true;
-    run_task([seed, generation, settings, query_key, page, explore] {
-        prov::Host::instance().set_credentials(settings.netease_cookie, settings.qq_cookie);
-        net::CancelScope cancel([generation] {
-            return g_shutdown.load() || generation != g_radio_generation.load();
-        });
-        auto result = radio::recommend(seed, settings, page, explore);
-        if (net::cancelled()) return;
-        post_ui([seed, generation, query_key, page, result = std::move(result)]() mutable {
-            if (generation != g_radio_generation.load() || !g_ui.radio_active) return;
-            g_radio.loading = g_ui.radio_loading = false;
-            g_ui.radio_method = result.method;
-            if (!result.error.empty()) {
-                g_radio.seeds.push_back(seed);
-                g_radio.retry_at = platform::ticks() + 10000;
-                if (!g_radio.error_shown) toast("漫游电台补歌失败，将稍后重试：" + result.error, 7000);
-                g_radio.error_shown = true;
+    run_task(
+        [seed, generation, settings, cross_platform_first] {
+            prov::Host::instance().set_credentials(settings.netease_cookie, settings.qq_cookie);
+            net::CancelScope cancel(
+                [generation] { return g_shutdown.load() || generation != g_radio_generation.load(); });
+            auto result = radio::recommend(seed, settings, cross_platform_first);
+            if (net::cancelled())
                 return;
-            }
-            int added = 0;
-            bool queue_changed = false;
-            bool paused;
-            if (result.searched) g_radio.search_pages[query_key] = result.exhausted || page >= 99 ? 0 : page + 1;
-            if (!result.alias.empty()) radio_remember(result.alias);
-            {
-                std::lock_guard<std::mutex> lock(g_mu);
-                paused = g_as.ps == PlayState::Paused || g_play_ready_paused;
-                std::unordered_set<std::string> queued;
-                for (const auto& track : std::as_const(g_as.tracks)) queued.insert(radio::identity(track));
-                for (auto& track : result.tracks) {
-                    if (track.variants.empty() || !music::is_platform(track.current().source)) continue;
-                    const auto uid = radio::identity(track);
-                    if (g_radio.seen.count(uid) || !queued.insert(uid).second || !radio_artist_allowed(track)) continue;
-                    radio_remember(uid);
-                    radio_remember_artist(track);
-                    g_radio.seeds.push_back(track);
-                    g_as.tracks.push_back(std::move(track));
-                    ++added;
-                }
-                // 长时间漫游只保留最近 100 首已播队列和有限的去重记录。
-                constexpr int played_history = 100;
-                const int trim = std::max(0, g_as.playing - played_history);
-                if (trim) { g_as.tracks.erase(g_as.tracks.begin(), g_as.tracks.begin() + trim); g_as.playing -= trim; }
-                queue_changed = added || trim;
-                if (queue_changed) ++g_as.tracks_version;
-            }
-            while (g_radio.seeds.size() > 128) g_radio.seeds.pop_front();
-            if (queue_changed) queue_mark_dirty();
-            if (added) {
-                g_radio.empty_batches = 0;
-                g_radio.retry_at = 0; g_radio.error_shown = false;
-                if (g_radio.waiting) {
-                    g_radio.waiting = false;
-                    if (!paused) play_step(1, true);
-                }
-            } else {
-                ++g_radio.empty_batches;
-                g_radio.retry_at = platform::ticks() + (g_radio.seeds.empty() ? 30000 : 500);
-                if (g_radio.seeds.empty() && !g_radio.error_shown) {
-                    toast("漫游电台暂时没有新的相似歌曲，将稍后重试", 6000);
+            post_ui([seed, generation, cross_platform_first, result = std::move(result)]() mutable {
+                if (generation != g_radio_generation.load() || !g_ui.radio_active)
+                    return;
+                g_radio.loading = g_ui.radio_loading = false;
+                g_ui.radio_method = result.method;
+                if (!result.error.empty()) {
+                    g_radio.seeds.push_back(seed);
+                    ++g_radio.empty_batches;
+                    g_radio.retry_at = platform::ticks() + 10000;
+                    if (!g_radio.error_shown)
+                        toast("漫游电台补歌失败，将稍后重试：" + result.error, 7000);
                     g_radio.error_shown = true;
+                    return;
                 }
-            }
+                int added = 0;
+                bool queue_changed = false;
+                bool paused;
+                if (!result.alias.empty())
+                    radio_remember(result.alias);
+                {
+                    std::lock_guard<std::mutex> lock(g_mu);
+                    paused = g_as.ps == PlayState::Paused || g_play_ready_paused;
+                    std::unordered_set<std::string> queued;
+                    for (const auto &track : std::as_const(g_as.tracks))
+                        queued.insert(radio::identity(track));
+                    for (auto &track : result.tracks) {
+                        if (track.variants.empty() || !music::is_platform(track.current().source))
+                            continue;
+                        const auto uid = radio::identity(track);
+                        if (g_radio.seen.count(uid) || !queued.insert(uid).second || !radio_artist_allowed(track))
+                            continue;
+                        radio_remember(uid);
+                        radio_remember_artist(track);
+                        g_radio.seeds.push_back(track);
+                        g_as.tracks.push_back(std::move(track));
+                        ++added;
+                    }
+                    // 长时间漫游只保留最近 100 首已播队列和有限的去重记录。
+                    constexpr int played_history = 100;
+                    const int trim = std::max(0, g_as.playing - played_history);
+                    if (trim) {
+                        g_as.tracks.erase(g_as.tracks.begin(), g_as.tracks.begin() + trim);
+                        g_as.playing -= trim;
+                    }
+                    queue_changed = added || trim;
+                    if (queue_changed)
+                        ++g_as.tracks_version;
+                }
+                while (g_radio.seeds.size() > 128)
+                    g_radio.seeds.pop_front();
+                if (queue_changed)
+                    queue_mark_dirty();
+                if (added) {
+                    g_radio.empty_batches = 0;
+                    g_radio.retry_at = 0;
+                    g_radio.error_shown = false;
+                    if (g_radio.waiting) {
+                        g_radio.waiting = false;
+                        if (!paused)
+                            play_step(1, true);
+                    }
+                } else {
+                    ++g_radio.empty_batches;
+                    if (!cross_platform_first)
+                        g_radio.seeds.push_back(seed);
+                    g_radio.retry_at = platform::ticks() + (g_radio.seeds.empty() ? 30000 : 500);
+                    if (g_radio.seeds.empty() && !g_radio.error_shown) {
+                        toast("漫游电台暂时没有新的相似歌曲，将稍后重试", 6000);
+                        g_radio.error_shown = true;
+                    }
+                }
+            });
+        },
+        [generation, seed] {
+            if (generation != g_radio_generation.load() || !g_ui.radio_active)
+                return;
+            g_radio.loading = g_ui.radio_loading = false;
+            g_radio.seeds.push_back(seed);
+            g_radio.retry_at = platform::ticks() + 10000;
+            if (!g_radio.error_shown)
+                toast("漫游电台补歌失败，将稍后重试", 6000);
+            g_radio.error_shown = true;
         });
-    }, [generation, seed] {
-        if (generation != g_radio_generation.load() || !g_ui.radio_active) return;
-        g_radio.loading = g_ui.radio_loading = false;
-        g_radio.seeds.push_back(seed);
-        g_radio.retry_at = platform::ticks() + 10000;
-        if (!g_radio.error_shown) toast("漫游电台补歌失败，将稍后重试", 6000);
-        g_radio.error_shown = true;
-    });
 }
 
 static void replace_queue_and_play(std::vector<music::Track> tracks, int index) {
@@ -6133,10 +6251,15 @@ void tick() {
             std::lock_guard<std::mutex> lock(state.m);
             g_login_view[size_t(site)].note = state.note;
         }
+        bool retry_lyrics = false;
         {
             std::lock_guard<std::mutex> lock(g_lyr.m);
+            retry_lyrics = !g_lyr.loading && g_lyr.doc && g_lyr.doc->empty() && g_lyr.attempts < 3 &&
+                           g_lyr.for_uid == snap.now_uid && platform::ticks() >= g_lyr.retry_at;
             g_lyric_view = {g_lyr.doc, g_lyr.for_uid, g_lyr.loading};
         }
+        if (retry_lyrics && (snap.ps == PlayState::Playing || snap.ps == PlayState::Paused))
+            request_current_lyrics();
         static int recorded_generation = -1;
         if (snap.ps == PlayState::Playing && g_ui.pos_ms >= 5000 && !snap.now_uid.empty() && recorded_generation != snap.gen) {
             recorded_generation = snap.gen;

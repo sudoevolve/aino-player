@@ -64,6 +64,12 @@ private:
 };
 /** @brief 退出时等待已取消的流完成回收；须先停止提交播放任务并解除设备对流的引用。 */
 void wait_for_stream_cleanup();
+/**
+ * @brief 持有播放设备、当前音频段及下一曲，设备操作由调用方串行执行。
+ *
+ * 播放器业务在 UI 线程使用此对象；后台先准备文件或 Stream，再投递给 UI 打开。
+ * 音频回调读取内部发布的音频段，不得直接操作业务队列。此类不提供通用的跨线程调用保证。
+ */
 class Player {
 public:
     explicit Player(bool offline = false);
@@ -105,6 +111,7 @@ public:
     /** @brief 读取设备通知，UI 线程据此恢复播放，音频回调不接触业务状态。 */
     bool take_device_change();
     bool take_device_fallback();
+    /** @brief 返回对象内部错误文本的引用；后续操作或再次读取可更新文本，需要保留时请复制。 */
     const std::string& error() const;
 private:
     struct Impl;

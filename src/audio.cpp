@@ -37,7 +37,7 @@ std::string decoder_info() {
     return "开发构建未内置 FFmpeg；AAC/M4A 使用系统 FFmpeg";
 #endif
 }
-static std::string ffmpeg_path(std::string& error) {
+static std::string ffmpeg_path([[maybe_unused]] std::string &error) {
     const auto override = platform::env("AINO_FFMPEG");
     if (!override.empty()) return override;
 #ifdef AINO_BUNDLED_FFMPEG

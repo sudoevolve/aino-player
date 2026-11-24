@@ -49,21 +49,14 @@ inline void wr32(std::string& s, size_t at, uint32_t v) {
     s[at + 3] = char(v & 0xFF);
 }
 
-inline void wr_be32(char* p, uint32_t v) {
-    p[0] = char((v >> 24) & 0xFF);
-    p[1] = char((v >> 16) & 0xFF);
-    p[2] = char((v >> 8) & 0xFF);
-    p[3] = char(v & 0xFF);
-}
-
 inline std::string utf16le_bom(const std::string& utf8) {
     std::string out;
     if (utf8.empty()) return out;
     std::u16string w;
     try { w = std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t>{}.from_bytes(utf8); }
     catch (...) { return out; }
-    out += char(0xFF);
-    out += char(0xFE);
+    out += static_cast<char>(static_cast<unsigned char>(0xFF));
+    out += static_cast<char>(static_cast<unsigned char>(0xFE));
     for (char16_t c : w) {
         out += char(c & 0xFF);
         out += char((c >> 8) & 0xFF);
@@ -121,9 +114,6 @@ template<class Writer> inline bool write_replace_stream(const std::string& path,
     const bool flushed = written && (!cancel || !cancel()) && platform::flush_file(output.get());
     const bool closed = std::fclose(output.release()) == 0;
     return flushed && closed && (!cancel || !cancel()) && platform::replace_file(tmp, path);
-}
-inline bool write_replace(const std::string& path, const std::string& bytes) {
-    return write_replace_stream(path, [&](std::FILE* file) { return std::fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size(); });
 }
 
 // 只读取有界标签块，扫描不把整首音频或 mdat 载入内存。
@@ -619,23 +609,6 @@ inline bool update_moov(std::string& moov, const std::string& items) {
         p += a.size;
     }
     return replace_child(meta, "ilst", ilst, 4) && replace_child(udta, "meta", meta) && replace_child(moov, "udta", udta);
-}
-inline bool inject_mp4_tags(std::string& file, const std::string& items, std::string& err) {
-    size_t off = 0, size = 0; MediaRanges media;
-    if (!find_atom(file, 0, file.size(), "moov", off, size)) { err = "没有有效 moov"; return false; }
-    for (size_t p = 0; p < file.size();) {
-        Atom a; if (!read_atom(file, p, file.size(), a)) { err = "MP4 atom 越界"; return false; }
-        const auto type = file.substr(p+4, 4);
-        if ((type == "moov" && p != off) || type == "moof" || type == "mfra" || type == "sidx") { err = "不支持此 MP4 偏移结构"; return false; }
-        if (type == "mdat") media.emplace_back(p+a.header, p+a.size);
-        p += a.size;
-    }
-    auto moov = file.substr(off, size);
-    if (media.empty() || !shift_chunk_offsets(moov, 0, moov.size(), 0, 0, &media) || !update_moov(moov, items) ||
-        !shift_chunk_offsets(moov, 0, moov.size(), int64_t(moov.size())-int64_t(size), off+size, &media)) {
-        err = "MP4 元数据或偏移校验失败，保留原文件"; return false;
-    }
-    file.replace(off, size, moov); return true;
 }
 inline bool verify_mp4(const std::string& file) {
     MediaRanges media; size_t moov = 0; unsigned count = 0;

@@ -61,6 +61,31 @@ Windows 消息泵另有播放器修补：`Window::poll` 在原生消息派发后
 Windows 使用 Ninja 时须确认 `/showIncludes` 本地化前缀被正确识别；如果改了头文件却出现 `no work to do`，不能把旧产物当作本轮编译通过，应使用干净的独立目录重新构建。日常构建和发布构建建议使用不同目录，避免缓存中的测试选项相互影响。
 
 
+## 修改与接入
+
+首次取得源码可用 `git clone https://github.com/sudoevolve/aino-player.git`，进入仓库后执行上面的平台构建步骤。UI 库、miniaudio 和 QuickJS 已随源码提供，精简 FFmpeg 则由脚本单独构建并嵌入。编译前先阅读根目录 `AGENTS.md`，普通维护使用独立目录并显式设置 `-DAINO_BUILD_TESTS=OFF`；若只核对接口可编译已有测试目标，但不要执行测试程序。
+
+| 修改内容 | 责任边界与接入位置 |
+| --- | --- |
+| UI 与交互 | `ui.hpp` 读取 `ViewModel` 并调用业务动作；不要直接操作后台状态或播放器设备 |
+| 播放、队列及异步结果 | `business.hpp` 持有会话；后台任务通过 UI 邮箱发布结果，须校验 generation 并响应取消 |
+| 平台目录与同曲匹配 | `sources.hpp` 维护数据模型及适配；平台协议放在 `providers/*.js`，契约见 [Provider 文档](../providers/README.md) |
+| 相似推荐与歌词 | `radio.hpp` / `lyrics.hpp` 只返回结果；队列追加、重试和播放音源选择归业务层 |
+| 解码与设备 | `audio.hpp` 是调用边界；工作线程准备 `Stream`，UI 串行使用 `Player`，音频回调不访问业务队列 |
+| 持久化 | `library.hpp` 负责格式与恢复校验；持久化的平台枚举值不能重排，新增字段须兼容旧资料库 |
+
+自有 C++ 使用四空格、UTF-8 和 LF，类型沿用 `PascalCase`，函数与局部变量沿用 `snake_case`，仅在正在修改的范围整理格式。新增接口应说明失败、取消、所有权及线程约束；平台脚本至少保留真实 ID、版本和时长，禁止以不相符的搜索候选填补缺失功能。不要为了消除告警全局关闭检查或修改 vendor。
+
+日常可使用下面的静态检查，它们不启动播放器、不执行回归：
+
+```bash
+git diff --check
+python tools/check_file_associations.py
+node --check providers/netease.js  # 修改哪个 JS 就检查哪个；Node 仅为可选开发工具
+```
+
+代码审查应覆盖空结果、网络失败、取消后的旧结果、分页推进、队列与当前曲目一致性。`tests/controller_tests.cpp` 保存这些边界的自动化检查，本轮是否允许运行仍以 `AGENTS.md` 为准。不要把编译通过等同于真实平台可用或输入法实机正常。
+
 ## 发布流程
 
 `CMakeLists.txt` 中的项目版本是版本号来源。仅在明确要求发布新版本时运行回归，普通提交不触发 CI。推送对应 `v*` 标签后，`release.yml` 执行 Windows、Ubuntu/Debian、Fedora/RPM、Arch 四项验证；四项成功后发布 Windows 安装器、deb、rpm、Arch 包、FFmpeg 官方原始源码包、构建信息、许可及 `SHA256SUMS.txt`。各任务使用嵌入解码器，Linux 包还验证安装和 Xvfb 启动。项目版本如 `0.2.9` 对应标签 `v0.2.9`，标签与程序版本不符或缺少内置解码器会中止发布；不会覆盖旧版标签或安装包。

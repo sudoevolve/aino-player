@@ -37,7 +37,7 @@ struct Request {
     int timeout_ms = 8000;
     bool follow_redirects = true;
     size_t max_body = 8u * 1024 * 1024;
-    std::string method;
+    std::string method{};
     bool script_transport_compatibility = false; // 仅脚本桥设置，保留脚本自有凭据的传输契约。
 };
 namespace detail {
