@@ -137,7 +137,7 @@ jobs:
         with:
           ref: refs/tags/${{ inputs.tag || github.ref_name }}
       - name: Install build dependencies
-        run: dnf install -y git cmake gcc gcc-c++ make python3 pkgconf-pkg-config libX11-devel wayland-devel wayland-protocols-devel dbus-devel libcurl-devel rpm-build xorg-x11-server-Xvfb weston libwayland-client libxkbcommon xdg-utils google-noto-sans-cjk-ttc-fonts adwaita-icon-theme gdk-pixbuf2 librsvg2 dbus-libs alsa-lib curl ca-certificates fontconfig freetype
+        run: dnf install -y git cmake gcc gcc-c++ make python3 pkgconf-pkg-config libX11-devel wayland-devel wayland-protocols-devel dbus-devel dbus-daemon libcurl-devel rpm-build xorg-x11-server-Xvfb weston libwayland-client libxkbcommon xdg-utils google-noto-sans-cjk-ttc-fonts adwaita-icon-theme gdk-pixbuf2 librsvg2 dbus-libs alsa-lib curl ca-certificates fontconfig freetype
       - run: python3 tools/check_file_associations.py
       - run: python3 tools/build_ffmpeg.py --jobs 2
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DAINO_BUILD_TESTS=ON -DAINO_RELEASE_PROFILE=rpm
