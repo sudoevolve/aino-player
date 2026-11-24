@@ -73,7 +73,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ inputs.tag || github.ref_name }}
-      - run: sudo apt-get update && sudo apt-get install -y build-essential python3 libx11-dev libdbus-1-dev pkg-config libgdk-pixbuf-2.0-0 librsvg2-common adwaita-icon-theme libcurl4-openssl-dev libfreetype6 libfontconfig1 fonts-noto-cjk libasound2 libwayland-client0 libxkbcommon0 weston xvfb xdg-utils dpkg-dev appstream
+      - run: sudo apt-get update && sudo apt-get install -y build-essential python3 libx11-dev libdbus-1-dev pkg-config libwayland-dev wayland-protocols libgdk-pixbuf-2.0-0 librsvg2-common adwaita-icon-theme libcurl4-openssl-dev libfreetype6 libfontconfig1 fonts-noto-cjk libasound2 libwayland-client0 libxkbcommon0 weston sway xvfb xdg-utils dpkg-dev appstream
       - run: python3 tools/check_file_associations.py
       - run: python3 tools/build_ffmpeg.py --jobs 2
       # 只调整临时 CI 虚拟机的 userns 策略，不给浏览器添加 --no-sandbox。
@@ -81,28 +81,14 @@ jobs:
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DAINO_BUILD_TESTS=ON -DAINO_RELEASE_PROFILE=linux -DAINO_TEST_BROWSER=/usr/bin/google-chrome
       - run: cmake --build build --parallel 2
       - run: ctest --test-dir build --output-on-failure --no-tests=error
-      - name: Build and smoke test the native Wayland backend
+      - name: Build and smoke test the optional X11 backend
         shell: bash
         run: |
-          cmake -S . -B build-wayland -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DAINO_LINUX_WAYLAND=ON -DAINO_BUILD_TESTS=OFF -DAINO_BUNDLE_FFMPEG=ON -DAINO_FFMPEG_EXECUTABLE="$PWD/build/codec/ffmpeg"
-          cmake --build build-wayland --target aino_player --parallel 2
-          runtime="$(mktemp -d)"
-          chmod 700 "$runtime"
-          export XDG_RUNTIME_DIR="$runtime"
-          socket="aino-release-$$"
-          export WAYLAND_DISPLAY="$socket"
-          weston --backend=headless-backend.so --socket="$socket" --idle-time=0 --log="$runtime/weston.log" &
-          weston_pid=$!
-          trap 'kill "$weston_pid" 2>/dev/null || true; wait "$weston_pid" 2>/dev/null || true; rm -rf "$runtime"' EXIT
-          for _ in $(seq 1 100); do
-            test -S "$runtime/$socket" && break
-            kill -0 "$weston_pid"
-            sleep 0.1
-          done
-          test -S "$runtime/$socket"
-          build-wayland/aino_player --smoke-test
+          cmake -S . -B build-x11 -DCMAKE_BUILD_TYPE=Release -DAINO_LINUX_WAYLAND=OFF -DAINO_BUILD_TESTS=OFF -DAINO_BUNDLE_FFMPEG=ON -DAINO_FFMPEG_EXECUTABLE="$PWD/build/codec/ffmpeg"
+          cmake --build build-x11 --target aino_player --parallel 2
+          xvfb-run -a build-x11/aino_player --smoke-test
       - name: Report Linux DPI and resident memory
-        run: xvfb-run -a build/aino_player --diagnostics
+        run: python3 tools/run_wayland.py build/aino_player --diagnostics
       - name: Build and verify Debian package
         env:
           GH_TOKEN: ${{ github.token }}
@@ -129,7 +115,7 @@ jobs:
           test "$(dpkg-query -W -f='${Version}' aino-player)" = "${RELEASE_TAG#v}"
           test -f /usr/share/metainfo/io.github.sudoevolve.AinoPlayer.metainfo.xml
           test "$(/usr/bin/aino_player --version)" = "aino player ${RELEASE_TAG#v}"
-          xvfb-run -a /usr/bin/aino_player --smoke-test
+          python3 tools/run_wayland.py /usr/bin/aino_player --smoke-test
           cp build/codec-build/ffmpeg-*.tar.xz dist/
           cp build/codec/FFmpeg-BUILD.txt dist/FFmpeg-BUILD-linux.txt
           cp vendor/LICENSE.FFmpeg.txt dist/
@@ -151,7 +137,7 @@ jobs:
         with:
           ref: refs/tags/${{ inputs.tag || github.ref_name }}
       - name: Install build dependencies
-        run: dnf install -y git cmake gcc gcc-c++ make python3 pkgconf-pkg-config libX11-devel dbus-devel libcurl-devel rpm-build xorg-x11-server-Xvfb weston libwayland-client libxkbcommon xdg-utils google-noto-sans-cjk-ttc-fonts adwaita-icon-theme gdk-pixbuf2 librsvg2 dbus-libs alsa-lib curl ca-certificates fontconfig freetype
+        run: dnf install -y git cmake gcc gcc-c++ make python3 pkgconf-pkg-config libX11-devel wayland-devel wayland-protocols-devel dbus-devel libcurl-devel rpm-build xorg-x11-server-Xvfb weston libwayland-client libxkbcommon xdg-utils google-noto-sans-cjk-ttc-fonts adwaita-icon-theme gdk-pixbuf2 librsvg2 dbus-libs alsa-lib curl ca-certificates fontconfig freetype
       - run: python3 tools/check_file_associations.py
       - run: python3 tools/build_ffmpeg.py --jobs 2
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DAINO_BUILD_TESTS=ON -DAINO_RELEASE_PROFILE=rpm
@@ -168,7 +154,7 @@ jobs:
           dnf install -y ./dist/*.rpm
           test -f /usr/share/metainfo/io.github.sudoevolve.AinoPlayer.metainfo.xml
           test "$(/usr/bin/aino_player --version)" = "aino player ${RELEASE_TAG#v}"
-          xvfb-run -a /usr/bin/aino_player --smoke-test
+          python3 tools/run_wayland.py /usr/bin/aino_player --smoke-test
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-rpm
@@ -183,7 +169,7 @@ jobs:
         with:
           ref: refs/tags/${{ inputs.tag || github.ref_name }}
       - name: Install build dependencies
-        run: pacman -Syu --noconfirm --needed sudo git cmake python libx11 dbus curl fontconfig freetype2 gdk-pixbuf2 librsvg adwaita-icon-theme alsa-lib libpulse wayland libxkbcommon weston xorg-server-xvfb noto-fonts-cjk xdg-utils
+        run: pacman -Syu --noconfirm --needed sudo git cmake python libx11 dbus curl fontconfig freetype2 gdk-pixbuf2 librsvg adwaita-icon-theme alsa-lib libpulse wayland wayland-protocols libxkbcommon weston xorg-server-xvfb noto-fonts-cjk xdg-utils
       - name: Prepare makepkg workspace
         shell: bash
         run: |
@@ -208,7 +194,7 @@ jobs:
           test "$(/usr/bin/aino_player --version)" = "aino player ${RELEASE_TAG#v}"
           /usr/bin/aino_player --codec-info | grep -F embedded
           test -f /usr/share/metainfo/io.github.sudoevolve.AinoPlayer.metainfo.xml
-          xvfb-run -a /usr/bin/aino_player --smoke-test
+          python3 "$GITHUB_WORKSPACE/tools/run_wayland.py" /usr/bin/aino_player --smoke-test
           mkdir -p "$GITHUB_WORKSPACE/dist"
           cp aino-player-*.pkg.tar.zst "$GITHUB_WORKSPACE/dist/"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

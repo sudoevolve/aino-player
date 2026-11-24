@@ -20,14 +20,20 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <dbus/dbus.h>
+#ifndef AINO_DESKTOP_WAYLAND
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
+#endif
 #include <dlfcn.h>
 #include <poll.h>
 #ifdef __GLIBC__
 #include <malloc.h>
+#endif
+#ifdef AINO_DESKTOP_WAYLAND
+#include "wayland_lyrics.hpp"
+#include "wayland_shortcuts.hpp"
 #endif
 #undef None
 #undef Status
@@ -128,6 +134,9 @@ std::vector<std::string> local_uri_list(const std::string& value) {
 namespace {
 constexpr uintptr_t kOpenFilesMessage = 0x41494e4f;
 // 原生浮层只负责窗口、吸附与位图提交；字体由主窗口共享，避免第二套字体缓存或渲染循环。
+#ifdef AINO_DESKTOP_WAYLAND
+using LyricWindow = WaylandLyrics;
+#else
 class LyricWindow {
 public:
     LyricOverlaySettings settings;
@@ -613,7 +622,8 @@ private:
 #endif
     }
 };
-#ifndef _WIN32
+#endif // !AINO_DESKTOP_WAYLAND
+#if !defined(_WIN32) && !defined(AINO_DESKTOP_WAYLAND)
 // 拖拽源可随时关闭窗口；只忽略独立拖放连接上的 BadWindow，其他连接仍使用原处理器。
 std::atomic<Display*> drop_error_display{nullptr};
 std::atomic<XErrorHandler> previous_x_error{nullptr};
@@ -646,6 +656,7 @@ struct EventQueue {
 };
 }
 struct Desktop::Impl {
+    std::function<void(bool)> visibility;
     LyricWindow lyrics;
     std::shared_ptr<EventQueue> queue = std::make_shared<EventQueue>();
     std::mutex mutex;
@@ -656,6 +667,17 @@ struct Desktop::Impl {
     int icon_w = 0, icon_h = 0;
     std::vector<uint8_t> icon;
     void sync_shortcuts() {
+#ifdef AINO_DESKTOP_WAYLAND
+        ShortcutSettings settings;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!shortcuts_dirty)
+                return;
+            settings = shortcut_settings;
+            shortcuts_dirty = false;
+        }
+        portal_shortcuts.configure(settings);
+#else
 #ifdef _WIN32
         if (!window) return;
 #else
@@ -698,6 +720,7 @@ struct Desktop::Impl {
         }
 #ifndef _WIN32
         XFlush(drops);
+#endif
 #endif
     }
 #ifdef _WIN32
@@ -861,6 +884,7 @@ struct Desktop::Impl {
         } catch (const winrt::hresult_error&) { media.store(false); }
     }
 #else
+#ifndef AINO_DESKTOP_WAYLAND
     Display* display = nullptr;
     ::Window window = 0;
     std::thread worker;
@@ -882,6 +906,10 @@ struct Desktop::Impl {
         else if (drop_version >= 5) reply.xclient.data.l[2] = accepted ? copy_action : 0;
         XSendEvent(drops, drop_source, False, NoEventMask, &reply); XFlush(drops);
     }
+#else
+    std::thread worker;
+    WaylandShortcuts portal_shortcuts{[this](MediaEvent event) { queue->push(std::move(event)); }};
+#endif
     void poll_power() {
         if (!power_bus) return;
         dbus_connection_read_write(power_bus, 0);
@@ -894,6 +922,9 @@ struct Desktop::Impl {
         }
     }
     void start_drops() {
+#ifdef AINO_DESKTOP_WAYLAND
+        sync_shortcuts();
+#else
         drops = XOpenDisplay(nullptr); if (!drops) return;
         drop_error_display.store(drops); previous_x_error = XSetErrorHandler(drop_x_error);
         drop_proxy = XCreateSimpleWindow(drops, DefaultRootWindow(drops), 0, 0, 1, 1, 0, 0, 0);
@@ -908,9 +939,13 @@ struct Desktop::Impl {
         XChangeProperty(drops, drop_proxy, aware, XA_ATOM, 32, PropModeReplace, reinterpret_cast<const unsigned char*>(&version), 1);
         sync_shortcuts();
         XFlush(drops);
+#endif
     }
     void poll_drops() {
         poll_power(); sync_shortcuts();
+#ifdef AINO_DESKTOP_WAYLAND
+        portal_shortcuts.poll();
+#else
         while (drops && XPending(drops)) {
             XEvent event{}; XNextEvent(drops, &event);
             if (event.type == KeyRelease) {
@@ -970,8 +1005,12 @@ struct Desktop::Impl {
             }
         }
         if (drop_waiting && ticks() > drop_deadline) { drop_reply(xdnd_finished, false); drop_waiting = false; drop_source = 0; }
+#endif
     }
     void stop_drops() {
+#ifdef AINO_DESKTOP_WAYLAND
+        portal_shortcuts.close();
+#else
         if (!drops) return;
         if (drop_waiting) drop_reply(xdnd_finished, false);
         XDeleteProperty(drops, window, XInternAtom(drops, "XdndProxy", False));
@@ -979,6 +1018,7 @@ struct Desktop::Impl {
         if (drop_proxy) XDestroyWindow(drops, drop_proxy);
         XCloseDisplay(drops); drops = nullptr;
         XSetErrorHandler(previous_x_error.load()); drop_error_display.store(nullptr);
+#endif
     }
     DBusConnection* power_bus = nullptr;
     DBusConnection* bus = nullptr; // 只由 worker 使用和关闭。
@@ -1044,7 +1084,14 @@ struct Desktop::Impl {
             else if (key == "IconThemePath" || key == "OverlayIconName" || key == "AttentionIconName" || key == "AttentionMovieName") str("");
             else if (key == "ItemIsMenu") b(false);
             else if (key == "Menu") str("/Menu", "o");
-            else if (key == "WindowId") container(it, DBUS_TYPE_VARIANT, "i", [&](auto& v) { integer(v, int32_t(window)); });
+            else if (key == "WindowId")
+                container(it, DBUS_TYPE_VARIANT, "i", [&](auto &v) {
+#ifdef AINO_DESKTOP_WAYLAND
+                    integer(v, 0); // StatusNotifierItem 规范允许没有 X11 window ID。
+#else
+                integer(v, int32_t(window));
+#endif
+                });
             else if (key == "IconPixmap" || key == "OverlayIconPixmap" || key == "AttentionIconPixmap") container(it, DBUS_TYPE_VARIANT, "a(iiay)", [&](auto& v) {
                 container(v, DBUS_TYPE_ARRAY, "(iiay)", [&](auto& array) {
                     if (key != "IconPixmap" || icon.empty()) return;
@@ -1581,7 +1628,8 @@ bool set_default_music_player(std::string& error, const std::function<bool()>& c
 Desktop::Desktop() : impl_(std::make_unique<Impl>()) {}
 Desktop::~Desktop() { stop(); }
 void Desktop::start([[maybe_unused]] void *window, [[maybe_unused]] void *display, [[maybe_unused]] unsigned long xid,
-                    std::function<void()> wake) {
+                    std::function<void()> wake, std::function<void(bool)> visibility) {
+    impl_->visibility = std::move(visibility);
     impl_->queue->wake = std::move(wake);
     impl_->lyrics.wake = [events = impl_->queue] { events->notify(); };
 #ifdef _WIN32
@@ -1597,7 +1645,9 @@ void Desktop::start([[maybe_unused]] void *window, [[maybe_unused]] void *displa
     impl_->sync_shortcuts();
     impl_->taskbar_created = RegisterWindowMessageW(L"TaskbarCreated"); impl_->sync_tray(); impl_->start_media();
 #else
+#ifndef AINO_DESKTOP_WAYLAND
     impl_->display = static_cast<Display*>(display); impl_->window = xid;
+#endif
     impl_->worker = std::thread([this] { impl_->run(); });
 #endif
 }
@@ -1645,7 +1695,7 @@ std::vector<MediaEvent> Desktop::events() {
     std::vector<MediaEvent> out(impl_->queue->pending.begin(), impl_->queue->pending.end()); impl_->queue->pending.clear(); return out;
 }
 bool Desktop::tray_available() const {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(AINO_DESKTOP_WAYLAND)
     return impl_->tray.load() && impl_->enabled.load();
 #else
     return impl_->display && impl_->window && impl_->tray.load() && impl_->enabled.load();
@@ -1658,6 +1708,9 @@ void Desktop::hide() {
     impl_->hidden.store(true);
 #ifdef _WIN32
     ShowWindow(impl_->window, SW_HIDE);
+#elif defined(AINO_DESKTOP_WAYLAND)
+    if (impl_->visibility)
+        impl_->visibility(false);
 #else
     XUnmapWindow(impl_->display, impl_->window); XFlush(impl_->display);
 #endif
@@ -1666,6 +1719,9 @@ void Desktop::show() {
     impl_->hidden.store(false);
 #ifdef _WIN32
     ShowWindow(impl_->window, SW_RESTORE); SetForegroundWindow(impl_->window);
+#elif defined(AINO_DESKTOP_WAYLAND)
+    if (impl_->visibility)
+        impl_->visibility(true);
 #else
     if (impl_->display && impl_->window) { XMapRaised(impl_->display, impl_->window); XFlush(impl_->display); }
 #endif

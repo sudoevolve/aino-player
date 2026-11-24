@@ -2268,6 +2268,8 @@ static void floating_lyrics_settings(Ctx& c, float x, float w, float y) {
     label(7, "停靠位置");
 #ifdef _WIN32
     const char* dock = "任务栏（可拖入）";
+#elif defined(AINO_DESKTOP_WAYLAND)
+    const char* dock = "屏幕顶边（需桌面支持）";
 #else
     const char* dock = "顶栏（可拖入）";
 #endif
@@ -2309,7 +2311,11 @@ static void floating_lyrics_settings(Ctx& c, float x, float w, float y) {
     color_row(13, "已唱颜色", settings.sung_color);
     color_row(14, "未唱颜色", settings.unsung_color);
     color_row(15, "背景颜色", settings.background_color);
+#ifdef AINO_DESKTOP_WAYLAND
+    const std::string hint = "桌面支持 layer-shell 时可透明置顶、锁定穿透和拖动；停靠选项将歌词放到屏幕顶边。其他桌面使用普通歌词窗口，位置与堆叠由桌面管理。填色按行时间估算。";
+#else
     const std::string hint = "解锁后拖到任务栏／顶栏，松手固定；向外拖可恢复悬浮。停靠时保持置顶。填色按当前行与下一行的时间推进；普通 LRC 不含逐字时间，属于行内估算。";
+#endif
     c.ui.muted_text(c.model.ui.lyric_overlay_error.empty() ? hint : c.model.ui.lyric_overlay_error,
         {x + 2, group.bottom() + 14, w - 4, 66}, Style().font(10.5f).wrap_text().top());
 }
@@ -2436,7 +2442,13 @@ static void shortcuts_settings(Ctx& c, const Rect& area) {
     const bool compact = area.w < 500;
     const float info_h = compact ? 110.0f : 76.0f;
     c.ui.draw_text("Ctrl+K 快速查找 · Ctrl+F 筛选 · Ctrl+O 打开音乐 · Ctrl+Z 撤销\n列表：↑↓ / Home / End 移动，Shift 连选，Ctrl+A 全选当前结果，Enter 播放，Delete 移除；Esc 取消选择或关闭面板。输入框内保留系统文字编辑快捷键。", {area.x, area.y, area.w - 16, info_h}, c.th.label2, Style().font(11).wrap_text().top());
-    bool changed = c.ui.checkbox(&state.shortcuts.enabled, "启用全局快捷键（Windows / X11）", {area.x, area.y + info_h + 10, area.w - 16, 28}, Style().font(12));
+    bool changed = c.ui.checkbox(&state.shortcuts.enabled, "启用全局快捷键",
+                                 {area.x, area.y + info_h + 10, area.w - 16, 28}, Style().font(12));
+#ifdef AINO_DESKTOP_WAYLAND
+    c.ui.tooltip(
+        {area.x, area.y + info_h + 10, area.w - 16, 28},
+        "由桌面 Portal 授权和分配快捷键；实际组合键以桌面确认结果为准。不支持该 Portal 时仍可使用系统媒体控制。");
+#endif
     const char* actions[] = {"播放 / 暂停", "上一首", "下一首", "悬浮歌词"};
     const float row_h = compact ? 72.0f : 44.0f;
     const float rows_y = area.y + info_h + 52;
@@ -2453,7 +2465,8 @@ static void shortcuts_settings(Ctx& c, const Rect& area) {
     const float reset_y = rows_y + 4 * row_h + 8;
     if (c.ui.button("恢复默认", {area.x, reset_y, 96, 28}, Style().font(11))) { state.shortcuts = {}; changed = true; }
     if (changed) { state.config_dirty = true; state.shortcut_error.clear(); }
-    const auto detail = state.shortcut_error.empty() ? "若组合键被其他程序占用会在这里提示。Wayland 请在桌面键盘设置中配置媒体快捷键。" : state.shortcut_error;
+    const auto detail = !state.shortcut_error.empty() ? state.shortcut_error : !state.shortcut_status.empty() ? state.shortcut_status :
+        "若组合键被占用会在这里提示。Wayland 需要桌面 Portal 授权，实际组合键以桌面确认结果为准。";
     c.ui.draw_text(detail, {area.x, reset_y + 42, area.w - 16, compact ? 100.0f : 64.0f}, state.shortcut_error.empty() ? c.th.label2 : c.th.red, Style().font(11).wrap_text().top());
 }
 static void tab_settings(Ctx& c) {

@@ -244,6 +244,7 @@ struct UiState {
     bool quick_scroll_to_top = true;
     platform::ShortcutSettings shortcuts;
     std::string shortcut_error;
+    std::string shortcut_status;
     std::string quick_query, download_playlist_key;
     std::vector<QuickResult> quick_results;
     bool quick_loading = false;
@@ -4487,7 +4488,8 @@ void media_action(const platform::MediaEvent& event) {
     }
     switch (event.action) {
         case platform::MediaAction::ToggleLyrics: set_floating_lyrics_enabled(!g_ui.lyric_overlay.enabled); break;
-        case platform::MediaAction::ShortcutError: g_ui.shortcut_error = event.track; toast(event.track, 7000); break;
+        case platform::MediaAction::ShortcutError: g_ui.shortcut_error = event.track; g_ui.shortcut_status.clear(); toast(event.track, 7000); break;
+        case platform::MediaAction::ShortcutStatus: g_ui.shortcut_status = event.track; g_ui.shortcut_error.clear(); break;
         case platform::MediaAction::Suspend: {
             std::lock_guard<std::mutex> lock(g_mu);
             resume_suspended = g_ui.pause_on_suspend && (state == PlayState::Playing || ((state == PlayState::Resolving || state == PlayState::Buffering || state == PlayState::Ready) && !g_play_ready_paused));

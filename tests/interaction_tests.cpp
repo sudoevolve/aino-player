@@ -1,8 +1,12 @@
 // 默认不创建窗口；平台窗口检查通过 --linux-backend / --windows-events / --ime-backend 显式启用。
 #define AINO_IMPLEMENTATION
 #include "../src/aino.hpp"
+#ifdef AINO_PLATFORM_WAYLAND
+#include "../src/wayland_window.hpp"
+#endif
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 
 static void check(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
 static std::vector<unsigned char> scale_settings(bool little, unsigned dpi, unsigned factor) {
@@ -17,6 +21,45 @@ static std::vector<unsigned char> scale_settings(bool little, unsigned dpi, unsi
     }
     return data;
 }
+#ifdef AINO_PLATFORM_WAYLAND
+static void wayland_backend_checks() {
+    using namespace aino;
+    WindowConfig config;
+    config.width = 480;
+    config.height = 240;
+    config.app_id = "aino-player";
+    Window window(config);
+    check(window.ok(), "native Wayland window is created without DISPLAY");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool rendered = false;
+    while (!rendered && std::chrono::steady_clock::now() < deadline && window.poll()) {
+        if (static_cast<detail::WaylandState*>(window.impl->native)->configured) window.render([&](Ui &ui) {
+            ui.label("原生 Wayland 中文", {12, 12, 400, 40});
+            rendered = true;
+        });
+        if (!rendered)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    check(rendered && window.width() > 0 && window.height() > 0, "configured Wayland surface renders");
+    auto *text = static_cast<detail::UnixTextRenderer *>(window.impl->text);
+    const auto initial = text->cache_stats();
+    for (int i = 0; i < 12; ++i) {
+        window.poll();
+        window.render([](Ui &ui) { ui.label("原生 Wayland 中文", {12, 12, 400, 40}); });
+    }
+    check(text->cache_stats().faces <= initial.faces + 1, "Wayland text reuses bounded font faces");
+    player::set_wayland_visibility(window, false);
+    auto* state = static_cast<detail::WaylandState*>(window.impl->native);
+    check(!state->visible && detail::wayland_can_render(state), "hidden window continues business scheduling");
+    window.render([](Ui&) {});
+    check(!state->frame, "hidden window never submits a frame callback");
+    player::set_wayland_visibility(window, true);
+    const auto remap_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!state->configured && std::chrono::steady_clock::now() < remap_deadline && window.poll())
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    check(state->visible && state->configured && !state->failed, "remapping waits for a fresh configure");
+}
+#endif
 #ifdef AINO_PLATFORM_X11
 static void linux_backend_checks() {
     using namespace aino;
@@ -347,6 +390,10 @@ int main(int argc, char** argv) {
         check(desktop_scale(nullptr, nullptr, {}, 0) == 1 && parse_scale_number("1,5") == 0, "safe default and locale independent scale");
 #ifdef AINO_PLATFORM_X11
         if (argc > 1 && std::string(argv[1]) == "--linux-backend") linux_backend_checks();
+#endif
+#ifdef AINO_PLATFORM_WAYLAND
+        if (argc > 1 && std::string(argv[1]) == "--wayland-backend")
+            wayland_backend_checks();
 #endif
 #ifdef _WIN32
         if (argc > 1 && std::string(argv[1]) == "--windows-events") windows_event_wakeup_checks();

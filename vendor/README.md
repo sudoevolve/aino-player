@@ -24,4 +24,10 @@ FFmpeg 原始源码包 SHA-256：`7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c11
 
 `tests/fixtures/audio-formats.zip` 为本项目生成的一秒钟静音测试样本（CC0），仅供回归，不含音乐作品，也不打入播放器。样本生成命令和格式列表见 `tests/audio_formats_test.py` 的 `--ffmpeg` 参数。
 
-Linux 的 libcurl、X11、fontconfig 和 FreeType 由系统提供，各自保留上游许可。
+Linux 的 libcurl、Wayland、可选 X11、fontconfig 和 FreeType 由系统提供，各自保留上游许可。
+
+`wayland/wlr-layer-shell-unstable-v1.xml` 来自 swaywm/wlr-protocols 提交
+`b010a03648b88d143236de193bddbfea0c08bc84`，SHA-256 为
+`996b8c66e1c2276c443336d4cb174634e8e5948823779042f244930525b79cc2`。
+协议原文保留 MIT 许可；构建时仅将参数标识符 `namespace` 改名，避免生成的 C++ 头文件使用关键字，wire ABI 不变。
+xdg-shell 使用系统 wayland-protocols 的稳定协议，由 wayland-scanner 生成，不引入额外窗口工具包。

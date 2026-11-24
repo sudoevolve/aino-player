@@ -1,6 +1,9 @@
 #define AINO_IMPLEMENTATION
 #include "aino.hpp"
-#if defined(AINO_PLATFORM_X11) || defined(AINO_PLATFORM_WAYLAND)
+#ifdef AINO_PLATFORM_WAYLAND
+#include "wayland_window.hpp"
+#endif
+#ifdef AINO_PLATFORM_X11
 #include <X11/Xlib.h>
 // Xlib 的遗留宏不能污染后续 JSON / C++ 业务头文件。
 #undef Bool
@@ -112,7 +115,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 #endif
-#if defined(AINO_PLATFORM_X11) || defined(AINO_PLATFORM_WAYLAND)
+#ifdef AINO_PLATFORM_X11
     // 后台任务调用 wake() 前，必须先初始化 Xlib 的线程支持。
     if (!XInitThreads()) { std::fprintf(stderr, "Xlib thread initialization failed\n"); return 1; }
 #endif
@@ -120,7 +123,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> arguments;
     for (int i = 1; i < argc; ++i) arguments.emplace_back(argv[i]);
     bool smoke_test = argc > 1 && std::string(argv[1]) == "--smoke-test";
-#ifdef AINO_PLATFORM_X11
+#if defined(AINO_PLATFORM_X11) || defined(AINO_PLATFORM_WAYLAND)
     const bool diagnostics = argc > 1 && std::string(argv[1]) == "--diagnostics";
     smoke_test = smoke_test || diagnostics;
 #endif
@@ -261,7 +264,19 @@ int main(int argc, char** argv) {
 #elif defined(AINO_PLATFORM_X11)
         desktop.start(nullptr, native->dpy, native->win, [&win] { win.wake(); });
 #else
-        desktop.start(nullptr, nullptr, 0, [&win] { win.wake(); });
+        auto *wayland = static_cast<aino::detail::WaylandState *>(win.impl->native);
+        // 文件传输沿用 aino 有界异步管线，回调在窗口所属 UI 线程交付。
+        wayland->file_drag = [](float, float) { return true; };
+        wayland->file_drop = [](float, float) {
+            return [](std::string payload) {
+                auto files = platform::local_uri_list(payload);
+                if (!files.empty())
+                    open_local_files(std::move(files));
+            };
+        };
+        desktop.start(
+            nullptr, nullptr, 0, [&win] { win.wake(); },
+            [&win](bool visible) { set_wayland_visibility(win, visible); });
 #endif
         const auto& image = brand_icon(); desktop.set_icon(image.w, image.h, image.rgba);
     }
@@ -327,7 +342,7 @@ int main(int argc, char** argv) {
             if (!overlay.enabled) ui::clear_floating_lyric_cache();
         }
         if (!desktop.hidden()) ui::draw(ui, model);
-#ifdef AINO_PLATFORM_X11
+#if defined(AINO_PLATFORM_X11) || defined(AINO_PLATFORM_WAYLAND)
         if (diagnostics) {
             const auto stats = static_cast<aino::detail::UnixTextRenderer*>(win.impl->text)->cache_stats();
             std::printf("scale=%.3f logical=%dx%d physical=%dx%d fonts=%zu faces=%zu glyph_bytes=%zu\n",

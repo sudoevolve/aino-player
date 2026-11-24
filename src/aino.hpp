@@ -14987,6 +14987,7 @@ struct WaylandState {
     uint32_t content_hint = 0, content_purpose = 0, sent_hint = 0, sent_purpose = 0;
     uint64_t text_focus = 0;
     bool configured = false, failed = false, flush_blocked = false;
+    bool visible = true; // 播放器隐藏窗口时继续调度业务帧，但不重新提交表面。
     bool completed_frame = false;
     bool pointer_inside = false, keyboard_inside = false, text_entered = false, text_enabled = false;
     bool clipboard_reading = false;
@@ -15046,6 +15047,7 @@ inline void wayland_dispatch(WaylandState* s) {
 }
 
 inline bool wayland_can_render(const WaylandState* s) {
+    if (s && !s->visible) return !s->failed;
     if (!s || !s->configured || s->failed || s->frame) return false;
     if (s->buffers.size() < 3) return true;
     for (const auto& buffer : s->buffers) if (!buffer->busy) return true;
@@ -15125,6 +15127,7 @@ inline std::unique_ptr<WaylandState::Buffer> wayland_buffer(WaylandState* s) {
     return buffer;
 }
 inline void wayland_present(WaylandState* s) {
+    if (!s->visible) { s->completed_frame = false; return; }
     auto* o = s->owner;
     WaylandState::Buffer* target = nullptr;
     for (auto& buffer : s->buffers) if (!buffer->busy) {
@@ -16013,6 +16016,63 @@ inline void wayland_destroy(Window* self) {
     o->native = nullptr;
 }
 
+// 取消映射后可重新创建 xdg 角色，避免 compositor 保留旧的配置状态。
+inline void wayland_create_role(WaylandState* s) {
+    s->xdg_surface = wl::create(s->shell, 2, wl::xdg_surface, s->surface);
+    if (!s->xdg_surface) return;
+    static const struct { void (*configure)(void*, wl::Proxy*, uint32_t); } configure{
+        [](void* data, wl::Proxy* object, uint32_t serial) {
+            auto* s = static_cast<WaylandState*>(data);
+            wl::request(object, 4, serial);
+            s->configured = true;
+            wayland_scale_changed(s);
+        }
+    };
+    wl::listen(s->xdg_surface, configure, s);
+    s->toplevel = wl::create(s->xdg_surface, 1, wl::xdg_toplevel);
+    if (!s->toplevel) return;
+    static const struct {
+        void (*configure)(void*, wl::Proxy*, int32_t, int32_t, wl::Array*);
+        void (*close)(void*, wl::Proxy*);
+    } toplevel{
+        [](void* data, wl::Proxy*, int32_t width, int32_t height, wl::Array* states) {
+            auto* s = static_cast<WaylandState*>(data);
+            if (width > 0) s->pending_width = width;
+            if (height > 0) s->pending_height = height;
+            s->maximized = false;
+            if (states) for (size_t i = 0; i < states->size / sizeof(uint32_t); ++i)
+                if (static_cast<uint32_t*>(states->data)[i] == 1) s->maximized = true;
+        },
+        [](void* data, wl::Proxy*) {
+            auto* s = static_cast<WaylandState*>(data);
+            if (s->owner->cfg.close_requested && !s->owner->cfg.close_requested()) return;
+            s->owner->running = false;
+        }
+    };
+    wl::listen(s->toplevel, toplevel, s);
+    wl::request(s->toplevel, 2, s->owner->cfg.title.c_str());
+    wl::request(s->toplevel, 3, s->owner->cfg.app_id.empty() ? "aino" : s->owner->cfg.app_id.c_str());
+    wayland_size_hints(s);
+    if (s->decoration_manager) {
+        s->decoration = wl::create(s->decoration_manager, 1, wl::zxdg_toplevel_decoration_v1, s->toplevel);
+        static const struct { void (*configure)(void*, wl::Proxy*, uint32_t); } decoration{
+            [](void* data, wl::Proxy*, uint32_t mode) {
+                auto* s = static_cast<WaylandState*>(data);
+                const int height = mode == 2 ? 0 : 32;
+                if (s->title_height != height) {
+                    s->title_height = height;
+                    wayland_size_hints(s);
+                    wayland_scale_changed(s);
+                }
+            }
+        };
+        if (s->decoration) {
+            wl::listen(s->decoration, decoration, s);
+            wl::request(s->decoration, 1, uint32_t(2));
+        }
+    }
+}
+
 inline void wayland_create(Window* self, const WindowConfig& cfg) {
     if (!wl::available() || !wl::keyboard_available()) {
         std::fprintf(stderr, "[aino/wayland] requires libwayland-client >= 1.20 and libxkbcommon\n");
@@ -16078,59 +16138,8 @@ inline void wayland_create(Window* self, const WindowConfig& cfg) {
         };
         if (s->fractional) wl::listen(s->fractional, listener, s);
     }
-    s->xdg_surface = wl::create(s->shell, 2, wl::xdg_surface, s->surface);
-    if (!s->xdg_surface) return;
-    static const struct { void (*configure)(void*, wl::Proxy*, uint32_t); } configure{
-        [](void* data, wl::Proxy* object, uint32_t serial) {
-            auto* s = static_cast<WaylandState*>(data);
-            wl::request(object, 4, serial);
-            s->configured = true;
-            wayland_scale_changed(s);
-        }
-    };
-    wl::listen(s->xdg_surface, configure, s);
-    s->toplevel = wl::create(s->xdg_surface, 1, wl::xdg_toplevel);
-    if (!s->toplevel) return;
-    static const struct {
-        void (*configure)(void*, wl::Proxy*, int32_t, int32_t, wl::Array*);
-        void (*close)(void*, wl::Proxy*);
-    } toplevel{
-        [](void* data, wl::Proxy*, int32_t width, int32_t height, wl::Array* states) {
-            auto* s = static_cast<WaylandState*>(data);
-            if (width > 0) s->pending_width = width;
-            if (height > 0) s->pending_height = height;
-            s->maximized = false;
-            if (states) for (size_t i = 0; i < states->size / sizeof(uint32_t); ++i)
-                if (static_cast<uint32_t*>(states->data)[i] == 1) s->maximized = true;
-        },
-        [](void* data, wl::Proxy*) {
-            auto* s = static_cast<WaylandState*>(data);
-            if (s->owner->cfg.close_requested && !s->owner->cfg.close_requested()) return;
-            s->owner->running = false;
-        }
-    };
-    wl::listen(s->toplevel, toplevel, s);
-    wl::request(s->toplevel, 2, cfg.title.c_str());
-    wl::request(s->toplevel, 3, cfg.app_id.empty() ? "aino" : cfg.app_id.c_str());
-    wayland_size_hints(s);
-    if (s->decoration_manager) {
-        s->decoration = wl::create(s->decoration_manager, 1, wl::zxdg_toplevel_decoration_v1, s->toplevel);
-        static const struct { void (*configure)(void*, wl::Proxy*, uint32_t); } decoration{
-            [](void* data, wl::Proxy*, uint32_t mode) {
-                auto* s = static_cast<WaylandState*>(data);
-                const int height = mode == 2 ? 0 : 32;
-                if (s->title_height != height) {
-                    s->title_height = height;
-                    wayland_size_hints(s);
-                    wayland_scale_changed(s);
-                }
-            }
-        };
-        if (s->decoration) {
-            wl::listen(s->decoration, decoration, s);
-            wl::request(s->decoration, 1, uint32_t(2));
-        }
-    }
+    wayland_create_role(s);
+    if (!s->xdg_surface || !s->toplevel) return;
     auto text = std::make_unique<UnixTextRenderer>();
     text->init(1, o->theme.font_family, o->theme.font_family_mono);
     if (!text->ready()) {

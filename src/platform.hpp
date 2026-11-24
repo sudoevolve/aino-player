@@ -47,7 +47,7 @@ extern char** environ;
 namespace platform {
 inline constexpr const char* audio_extensions[]{".mp3", ".flac", ".wav", ".wave", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".webm"};
 inline constexpr const char* audio_mimes[]{"audio/mpeg", "audio/flac", "audio/x-flac", "audio/wav", "audio/x-wav", "audio/mp4", "audio/x-m4a", "audio/aac", "audio/x-aac", "audio/ogg", "audio/x-vorbis+ogg", "application/ogg", "audio/opus", "audio/webm"};
-enum class MediaAction { Toggle, Play, Pause, Stop, Next, Previous, SeekRelative, SeekAbsolute, Volume, Show, Quit, Shuffle, Loop, OpenFiles, Search, ToggleLyrics, Suspend, ResumeSystem, ShortcutError };
+enum class MediaAction { Toggle, Play, Pause, Stop, Next, Previous, SeekRelative, SeekAbsolute, Volume, Show, Quit, Shuffle, Loop, OpenFiles, Search, ToggleLyrics, Suspend, ResumeSystem, ShortcutError, ShortcutStatus };
 struct MediaEvent {
     MediaAction action;
     long long value = 0;
@@ -102,7 +102,9 @@ public:
     ~Desktop();
     Desktop(const Desktop&) = delete;
     Desktop& operator=(const Desktop&) = delete;
-    void start(void* window, void* display, unsigned long xid, std::function<void()> wake);
+    // visibility 只由 UI 线程调用；Wayland 使用所属窗口连接完成隐藏与重新映射。
+    void start(void *window, void *display, unsigned long xid, std::function<void()> wake,
+               std::function<void(bool)> visibility = {});
     void stop();
     void update(const MediaState& state, bool tray_enabled);
     void set_shortcuts(const ShortcutSettings& settings);

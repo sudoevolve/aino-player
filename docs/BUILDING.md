@@ -13,24 +13,24 @@ python tools/build_ffmpeg.py
 cmake -S . -B build -A x64
 cmake --build build --config Release
 
-# Ubuntu / Debian（默认 X11；Wayland 窗口仍使用 X11 桌面集成）
-sudo apt-get install build-essential python3 cmake pkg-config libdbus-1-dev libx11-dev libcurl4-openssl-dev libfreetype6 libfontconfig1 libgdk-pixbuf-2.0-0 librsvg2-common adwaita-icon-theme fonts-noto-cjk xdg-utils xdg-desktop-portal
+# Ubuntu / Debian（源码默认纯 Wayland；不需要 XWayland）
+sudo apt-get install build-essential python3 cmake pkg-config libdbus-1-dev libwayland-dev wayland-protocols libcurl4-openssl-dev libfreetype6 libfontconfig1 libgdk-pixbuf-2.0-0 librsvg2-common adwaita-icon-theme fonts-noto-cjk xdg-utils xdg-desktop-portal
 python3 tools/build_ffmpeg.py
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 
-# 原生 Wayland 窗口（运行时需 Wayland compositor）
+# 原生 Wayland（运行时需 Wayland compositor；所有桌面模块均为原生路径）
 cmake -S . -B build-wayland -DCMAKE_BUILD_TYPE=Release -DAINO_LINUX_WAYLAND=ON
 cmake --build build-wayland --target aino_player --parallel
 
 # 仅在用户明确要求发布新版本时开启并运行回归；普通构建默认只编译播放器
 cmake -S . -B build -DAINO_BUILD_TESTS=ON
 cmake --build build --config Release --parallel 2
-# Linux 可加装 xvfb 运行窗口、DPI 与字体缓存检查
+# Linux 需 Weston 和 dbus-run-session；可选 X11 验收另需 Xvfb
 ctest --test-dir build -C Release --output-on-failure --no-tests=error
 ```
 
-Windows 桌面媒体接入使用 Windows SDK 自带 C++/WinRT，需要 MSVC；仅桌面接入编译单元启用 C++20，其余为 C++17。产物为 `build/aino_player.exe`（MSVC 为 `build/Release/aino_player.exe`），Linux 为 `build/aino_player`。Windows 静态链接 C/C++ 运行库；Linux 使用系统 libcurl、X11、libdbus-1 和动态加载的字体/音频库；系统媒体与托盘不加载 GTK/Qt。文件选择器使用系统 xdg-desktop-portal，未安装时仍可输入路径。
+Windows 桌面媒体接入使用 Windows SDK 自带 C++/WinRT，需要 MSVC；仅桌面接入编译单元启用 C++20，其余为 C++17。产物为 `build/aino_player.exe`（MSVC 为 `build/Release/aino_player.exe`），Linux 为 `build/aino_player`。Windows 静态链接 C/C++ 运行库；Linux 使用系统 libcurl、Wayland、libdbus-1 和动态加载的字体/音频库，显式关闭 Wayland 后才需要 X11；系统媒体与托盘不加载 GTK/Qt。文件选择器使用系统 xdg-desktop-portal，未安装时仍可输入路径。
 
 Windows 安装器使用构建时的 Inno Setup 6，不作为播放器运行依赖：
 
@@ -54,7 +54,9 @@ Windows 消息泵另有播放器修补：`Window::poll` 在原生消息派发后
 
 自有代码使用 `.editorconfig` 和 `.clang-format` 约定，只整理正在修改的范围。上游 `aino.hpp`、miniaudio、vendor、资源和构建产物排除在格式化之外；纯格式修改独立提交，不对整个仓库自动格式化。`python tools/check_file_associations.py` 静态核对扫描器公共格式清单、Windows 安装器和 Linux desktop 的文件关联声明，安装器构建与下次 Linux 发布都会执行它。
 
-日常 Linux 编译可手动运行 `desktop-build.yml`，仅在 Ubuntu 22.04 / 24.04 编译 `aino_player`，明确关闭测试，不执行发布和桌面交互。回归仍只在用户明确要求发布时运行。
+原生歌词通过系统 `wayland-scanner` 从 xdg-shell / layer-shell 协议生成 ABI；仅增加构建依赖，不使用 GTK/Qt。X11 兼容构建须额外安装 `libx11-dev` 并设置 `-DAINO_LINUX_WAYLAND=OFF`。详见 [Wayland 支持与桌面差异](WAYLAND.md)。
+
+日常 Linux 编译可手动运行 `desktop-build.yml`，仅在 Ubuntu 22.04 / 24.04 编译 `aino_player` 的 Wayland 与 X11 两种配置，明确关闭测试，不执行发布和桌面交互。回归仍只在用户明确要求发布时运行。
 
 自有应用目标显式启用 MSVC `/W4` 或 GCC/Clang `-Wall -Wextra -Wpedantic`，现有告警逐步清理，不对 vendor 一刀切 `-Werror`。需要静态分析时可在独立构建目录配置 `-DAINO_STATIC_ANALYSIS=ON -DAINO_BUILD_TESTS=OFF`：MSVC 使用 `/analyze`，其他编译器要求本机安装 clang-tidy。启用选项不会运行回归或安装新工具。
 
@@ -88,7 +90,7 @@ node --check providers/netease.js  # 修改哪个 JS 就检查哪个；Node 仅�
 
 ## 发布流程
 
-`CMakeLists.txt` 中的项目版本是版本号来源。仅在明确要求发布新版本时运行回归，普通提交不触发 CI。推送对应 `v*` 标签后，`release.yml` 执行 Windows、Ubuntu/Debian、Fedora/RPM、Arch 四项验证；四项成功后发布 Windows 安装器、deb、rpm、Arch 包、FFmpeg 官方原始源码包、构建信息、许可及 `SHA256SUMS.txt`。各任务使用嵌入解码器，Linux 包还验证安装和 Xvfb 启动。项目版本如 `0.2.9` 对应标签 `v0.2.9`，标签与程序版本不符或缺少内置解码器会中止发布；不会覆盖旧版标签或安装包。
+`CMakeLists.txt` 中的项目版本是版本号来源。仅在明确要求发布新版本时运行回归，普通提交不触发 CI。推送对应 `v*` 标签后，`release.yml` 执行 Windows、Ubuntu/Debian、Fedora/RPM、Arch 四项验证；四项成功后发布 Windows 安装器、deb、rpm、Arch 包、FFmpeg 官方原始源码包、构建信息、许可及 `SHA256SUMS.txt`。各任务使用嵌入解码器，Linux 包还在清除 `DISPLAY` 的独立 Weston 会话中验证安装和启动，并拒绝链接 X11 的主程序。项目版本如 `0.2.9` 对应标签 `v0.2.9`，标签与程序版本不符或缺少内置解码器会中止发布；不会覆盖旧版标签或安装包。
 
 发布配置显式设置 `AINO_RELEASE_PROFILE=windows|linux|rpm|arch`，同时要求 `AINO_BUILD_TESTS=ON` 和 `AINO_BUNDLE_FFMPEG=ON`。配置阶段生成 `release-test-manifest.txt`，必需依赖或测试缺失即失败，不再只靠 `ctest --no-tests=error` 判断集合完整。验收职责如下：
 
@@ -97,7 +99,7 @@ node --check providers/netease.js  # 修改哪个 JS 就检查哪个；Node 仅�
 | 全部四项 | UI 生命周期、player 核心回归、包仓库元数据、嵌入解码、浏览器登录 HTTP、无窗口控制器 |
 | windows、linux | 另需已安装 Chromium 浏览器及官网交接测试；可用 `AINO_TEST_BROWSER` 指定路径 |
 | windows | 另需消息派发期间唤醒检查 `windows_event_wakeup`（原生窗口，不操作用户托盘） |
-| linux、rpm、arch | 另需 Xvfb、Linux 窗口及 DPI/字体缓存检查 |
+| linux、rpm、arch | 另需 Weston、dbus-run-session、纯 Wayland 窗口、字体缓存及桌面集成检查；X11 兼容构建单独使用 Xvfb |
 
 RPM/Arch 不声称执行了完整浏览器交接验收，该项由 Windows/Ubuntu 任务承担。Arch 的普通 `makepkg` 关闭测试；发布任务显式传入 `AINO_RELEASE_VALIDATION=1` 才开启 profile 和 `check()`。不要为了日常编译设置该变量。
 
@@ -115,4 +117,4 @@ ctest --test-dir build --output-on-failure --no-tests=error
 cpack --config build/CPackConfig.cmake -G DEB -B dist
 ```
 
-上面的本地 Debian 验收同样只适用于获准发布时，并要求安装 Chrome/Chromium 和 Xvfb。`tools/probe_*.cpp` 是手动诊断工具，不属于自动发布测试，也不是无用源码；部分探针会读本机配置、访问真实音乐服务并下载文件，普通编译检查不要运行它们。
+上面的本地 Debian 验收同样只适用于获准发布时，并要求安装 Chrome/Chromium、Weston 和 dbus-run-session；可选 X11 验收另需 Xvfb。`tools/probe_*.cpp` 是手动诊断工具，不属于自动发布测试，也不是无用源码；部分探针会读本机配置、访问真实音乐服务并下载文件，普通编译检查不要运行它们。
