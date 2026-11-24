@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(aino_player VERSION 0.5.4 LANGUAGES CXX C)
+project(aino_player VERSION 0.5.5 LANGUAGES CXX C)
 option(AINO_LINUX_WAYLAND "Use aino's native Wayland window backend on Linux" OFF)
 set(AINO_LOCAL_REVISION "0" CACHE STRING "Local Windows build revision; zero uses the official version")
 if(NOT AINO_LOCAL_REVISION MATCHES "^[0-9]+$" OR AINO_LOCAL_REVISION GREATER 65535)
