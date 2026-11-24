@@ -17,11 +17,31 @@ inline std::string identity(const music::Track& track) {
 }
 
 inline std::string query(const music::Track& seed) {
-    const auto artists = music::track_artists(seed);
-    return artists.empty() ? seed.title : artists.front().name;
+    return seed.title;
 }
 inline std::string query_key(const music::Track& seed) {
     return std::string(music::source_key(seed.current().source)) + "#" + music::text::normalize_title(query(seed));
+}
+inline std::vector<std::string> artist_keys(const music::Track& track) {
+    std::vector<std::string> keys;
+    for (const auto& artist : music::track_artists(track)) {
+        const auto key = music::text::normalize_title(artist.name);
+        if (!key.empty() && std::find(keys.begin(), keys.end(), key) == keys.end()) keys.push_back(key);
+    }
+    return keys;
+}
+inline bool shares_artist(const music::Track& a, const music::Track& b) {
+    const auto left = artist_keys(a);
+    const auto right = artist_keys(b);
+    for (const auto& artist : left)
+        if (std::find(right.begin(), right.end(), artist) != right.end()) return true;
+    return false;
+}
+inline std::vector<music::Track> different_artist_tracks(const music::Track& seed, std::vector<music::Track> tracks) {
+    tracks.erase(std::remove_if(tracks.begin(), tracks.end(), [&](const music::Track& candidate) {
+        return candidate.variants.empty() || music::same_variant(seed.current(), candidate.current()) || shares_artist(seed, candidate);
+    }), tracks.end());
+    return tracks;
 }
 inline music::Track track_from_variant(music::Variant variant) {
     music::Track track;
@@ -72,6 +92,7 @@ inline Recommendations recommend(const music::Track& seed, const music::Settings
             } else native_error = root["message"].str("B 站相关推荐暂不可用");
         }
         result.method = "B 站相关推荐";
+        result.tracks = different_artist_tracks(seed, std::move(result.tracks));
         if (!result.tracks.empty()) return result;
     } else if (!explore) {
         const char* key = music::provider_key_of(source);
@@ -79,12 +100,32 @@ inline Recommendations recommend(const music::Track& seed, const music::Settings
             music::songs_via_provider(source, "similar", "{\"id\":" + lx::detail::js_quote(variant.id) +
                 ",\"native_id\":" + lx::detail::js_quote(variant.native_id) + "}", result.tracks, native_error);
             result.method = std::string(music::source_name(source)) + "相似推荐";
+            result.tracks = different_artist_tracks(seed, std::move(result.tracks));
             if (!result.tracks.empty()) return result;
         }
     }
-    // 没有相似接口或推荐图暂时耗尽时，用原平台的歌手检索分页拓展候选。
+
+    if (!explore && source != music::Source::Netease && settings.enable[int(music::Source::Netease)]) {
+        std::string match_error;
+        const auto matches = music::search_netease(seed.title + " " + seed.artist, 20, 8000, match_error, settings);
+        for (const auto& match : matches) {
+            auto reference = seed;
+            if (reference.duration_ms <= 0 || match.duration_ms <= 0) reference.duration_ms = match.duration_ms;
+            if (match.id.empty() || !music::same_song(reference, match)) continue;
+            std::string similar_error;
+            music::songs_via_provider(music::Source::Netease, "similar",
+                "{\"id\":" + lx::detail::js_quote(match.id) + "}", result.tracks, similar_error);
+            result.tracks = different_artist_tracks(seed, std::move(result.tracks));
+            result.method = "网易云相似歌曲";
+            if (!result.tracks.empty()) return result;
+            native_error = similar_error;
+            break;
+        }
+    }
+
+    // Expand by title as a last resort, never by singer.
     result.searched = true;
-    result.method = std::string(music::source_name(source)) + "同歌手推荐";
+    result.method = std::string(music::source_name(source)) + "标题拓展";
     const auto keyword = query(seed);
     if (keyword.empty()) { result.error = "歌曲缺少可用于推荐的歌名或歌手"; return result; }
     std::string search_error;
@@ -92,13 +133,10 @@ inline Recommendations recommend(const music::Track& seed, const music::Settings
         ? music::search_bilibili(keyword, 20, 9000, search_error, page)
         : music::search_platform(source, keyword, 20, 9000, search_error, settings, page);
     result.exhausted = candidates.size() < 20;
-    const auto artists = music::text::split_artists(seed.artist);
     for (auto& candidate : candidates) {
         if (candidate.id.empty() || candidate.title.empty() || music::same_variant(variant, candidate)) continue;
-        bool same_artist = artists.empty();
-        for (const auto& artist : music::text::split_artists(candidate.artist))
-            if (!artist.empty() && std::find(artists.begin(), artists.end(), artist) != artists.end()) same_artist = true;
-        if (same_artist) result.tracks.push_back(track_from_variant(std::move(candidate)));
+        auto track = track_from_variant(std::move(candidate));
+        if (!shares_artist(seed, track)) result.tracks.push_back(std::move(track));
     }
     if (!search_error.empty()) result.error = native_error.empty() ? search_error : native_error + "；" + search_error;
     return result;

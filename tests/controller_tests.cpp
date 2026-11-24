@@ -11,6 +11,31 @@ static void check(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
 
+static void radio_recommendation_checks() {
+    music::Track seed;
+    seed.title = "Seed song"; seed.artist = "Seed artist"; seed.duration_ms = 180000;
+    music::Variant seed_variant; seed_variant.source = music::Source::Netease;
+    seed_variant.id = "seed"; seed_variant.title = seed.title; seed_variant.artist = seed.artist;
+    seed_variant.duration_ms = seed.duration_ms; seed_variant.artists = {{"seed-artist", seed.artist}};
+    seed.variants.push_back(seed_variant);
+
+    music::Track same_artist;
+    same_artist.title = "Another song"; same_artist.artist = seed.artist;
+    auto same_variant = seed_variant; same_variant.id = "same-artist"; same_variant.title = same_artist.title;
+    same_artist.variants.push_back(same_variant);
+
+    music::Track other_artist;
+    other_artist.title = "Related style"; other_artist.artist = "Other artist";
+    auto other_variant = seed_variant; other_variant.id = "other-artist"; other_variant.title = other_artist.title;
+    other_variant.artist = other_artist.artist; other_variant.artists = {{"other-id", other_artist.artist}};
+    other_artist.variants.push_back(other_variant);
+
+    const auto filtered = radio::different_artist_tracks(seed, {same_artist, other_artist});
+    check(filtered.size() == 1 && filtered.front().artist == other_artist.artist,
+        "roaming recommendations exclude the seed artist while retaining different artists");
+    check(radio::query(seed) == seed.title, "fallback radio search uses the song title instead of the singer");
+}
+
 // 不访问音乐网站，覆盖平台编码差异、译文对齐与同曲匹配的拒绝条件。
 static void lyric_checks() {
     const std::string original = "[00:01.00]First line (stay)\n[00:02.00]Another line\n[00:03.00]Last line";
@@ -116,6 +141,7 @@ static void playlist_completion_checks() {
 
 int main(int argc, char** argv) {
     try {
+        radio_recommendation_checks();
         lyric_checks();
         playlist_completion_checks();
         using namespace player;

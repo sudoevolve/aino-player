@@ -1872,6 +1872,18 @@ void toast(const std::string& text, int ms, unsigned long long undo_id) {
 
 // ---------------- 歌词 ----------------
 // 取一次就缓存住：同一个 uid 不重复请求。切歌后旧结果会被丢弃（比对 for_uid）。
+static lyr::Doc fetch_automatic_lyrics(const music::Track& track, const music::Settings& settings,
+                                       const std::string& uid, unsigned long long generation) {
+    return lyr::fetch(track, settings, 8000, [uid, generation](const lyr::Doc& partial) {
+        auto doc = std::make_shared<const lyr::Doc>(partial);
+        {
+            std::lock_guard<std::mutex> lock(g_lyr.m);
+            if (g_lyr.for_uid != uid || g_lyr.generation != generation) return;
+            g_lyr.doc = std::move(doc);
+        }
+        if (g_win) g_win->wake();
+    });
+}
 static void request_lyrics(const music::Track& track, bool force = false) {
     unsigned long long generation = 0;
     const std::string uid = track_uid(track);
@@ -1896,16 +1908,11 @@ static void request_lyrics(const music::Track& track, bool force = false) {
             return g_lyr.for_uid != uid || g_lyr.generation != generation;
         });
         lyr::Doc d;
-        if (local.empty() && !matched.empty()) { d = lyr::fetch_netease_lyric(matched, st, 8000); d.origin = "手动匹配 · " + d.origin; }
-        else if (local.empty()) d = lyr::fetch(t, st, 8000, [uid, generation](const lyr::Doc& partial) {
-            auto doc = std::make_shared<const lyr::Doc>(partial);
-            {
-                std::lock_guard<std::mutex> lock(g_lyr.m);
-                if (g_lyr.for_uid != uid || g_lyr.generation != generation) return;
-                g_lyr.doc = std::move(doc);
-            }
-            if (g_win) g_win->wake();
-        });
+        if (local.empty() && !matched.empty()) {
+            d = lyr::fetch_netease_lyric(matched, st, 8000);
+            d.origin = "手动匹配 · " + d.origin;
+            if (d.empty() && !net::cancelled()) d = fetch_automatic_lyrics(t, st, uid, generation);
+        } else if (local.empty()) d = fetch_automatic_lyrics(t, st, uid, generation);
         else {
             d.origin = "自选本地 LRC";
             const auto size = platform::file_size(local);
@@ -1919,6 +1926,7 @@ static void request_lyrics(const music::Track& track, bool force = false) {
                 d.lines = lyr::parse(text, &d.synced);
                 if (d.lines.empty()) d.error = "本地歌词没有可显示内容";
             }
+            if (d.empty() && !net::cancelled()) d = fetch_automatic_lyrics(t, st, uid, generation);
         }
         if (g_shutdown.load()) return;
         auto shared = std::make_shared<const lyr::Doc>(std::move(d));
@@ -2598,6 +2606,8 @@ struct RadioSession {
     std::unordered_set<std::string> seen;
     std::deque<std::string> seen_order;
     std::map<std::string, int> search_pages;
+    std::deque<std::string> artist_order;
+    std::map<std::string, unsigned> recent_artist_counts;
 };
 static RadioSession g_radio;
 static std::atomic<unsigned> g_radio_generation{0};
@@ -3510,7 +3520,7 @@ static void start_play_attempt(int index, bool keep_failures, PlaybackTrigger tr
     g_gapless = {};
     g_current_media = st.forced_lane < 0 ? take_preloaded(track, st) : nullptr;
     cleanup_temp(gen);
-    if (g_ui.lyrics_open || g_ui.lyric_overlay.enabled) request_lyrics(track);
+    request_lyrics(track);
     if (g_current_media && g_current_media->stream && g_pending_seek > 0) g_current_media.reset();
     if (g_current_media) {
         {
@@ -3876,7 +3886,7 @@ static void adopt_gapless_transition() {
     { std::lock_guard<std::mutex> lock(g_mu); g_as.ps = PlayState::Playing; g_as.pending_path.clear(); }
     playback_stage(gen, PlaybackStage::Playing);
     g_ui.pos_ms = float(g_player.position_ms()); g_ui.dur_ms = float(g_player.duration_ms());
-    if (g_ui.lyrics_open || g_ui.lyric_overlay.enabled) request_lyrics(track);
+    request_lyrics(track);
     queue_mark_dirty();
 }
 static void stop_playback() {
@@ -5030,6 +5040,25 @@ static void radio_remember(const std::string& uid) {
     }
 }
 
+static bool radio_artist_allowed(const music::Track& track) {
+    for (const auto& artist : radio::artist_keys(track)) {
+        const auto found = g_radio.recent_artist_counts.find(artist);
+        if (found != g_radio.recent_artist_counts.end() && found->second >= 2) return false;
+    }
+    return true;
+}
+static void radio_remember_artist(const music::Track& track) {
+    const auto artists = radio::artist_keys(track);
+    if (artists.empty()) return;
+    g_radio.artist_order.push_back(artists.front());
+    ++g_radio.recent_artist_counts[artists.front()];
+    while (g_radio.artist_order.size() > 12) {
+        const auto old = g_radio.artist_order.front();
+        g_radio.artist_order.pop_front();
+        const auto found = g_radio.recent_artist_counts.find(old);
+        if (found != g_radio.recent_artist_counts.end() && --found->second == 0) g_radio.recent_artist_counts.erase(found);
+    }
+}
 static void refill_radio() {
     constexpr int refill_threshold = 10;
     if (!g_ui.radio_active || g_radio.loading || g_shutdown.load() || platform::ticks() < g_radio.retry_at) return;
@@ -5079,8 +5108,9 @@ static void refill_radio() {
                 for (auto& track : result.tracks) {
                     if (track.variants.empty() || !music::is_platform(track.current().source)) continue;
                     const auto uid = radio::identity(track);
-                    if (g_radio.seen.count(uid) || !queued.insert(uid).second) continue;
+                    if (g_radio.seen.count(uid) || !queued.insert(uid).second || !radio_artist_allowed(track)) continue;
                     radio_remember(uid);
+                    radio_remember_artist(track);
                     g_radio.seeds.push_back(track);
                     g_as.tracks.push_back(std::move(track));
                     ++added;
@@ -5182,7 +5212,7 @@ void play_similar(const music::Track& track) {
         g_play_next.clear(); g_shuffle_remaining.clear(); g_shuffle_history.clear(); g_shuffle_cursor = -1;
     }
     cancel_preload(); g_gapless = {};
-    radio_remember(radio::identity(seed)); g_radio.seeds.push_back(seed);
+    radio_remember(radio::identity(seed)); radio_remember_artist(seed); g_radio.seeds.push_back(seed);
     queue_mark_dirty();
     if (!retained) start_play_attempt(0, false, PlaybackTrigger::QueueReplace);
     refill_radio();

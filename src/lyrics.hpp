@@ -366,6 +366,7 @@ inline Doc fetch(const music::Track& t, const music::Settings& st, int timeout_m
                  const std::function<void(const Doc&)>& publish = {}) {
     prov::ExecutionTime total_budget(std::max(1000, timeout_ms) * 3);
     prov::Host::instance().set_credentials(st.netease_cookie, st.qq_cookie);
+    std::string local_error;
     if (!t.variants.empty() && t.current().source == music::Source::Local) {
         Doc d; d.origin = "本地 LRC";
         auto path = platform::fs::u8path(t.current().id); path.replace_extension(".lrc");
@@ -376,8 +377,8 @@ inline Doc fetch(const music::Track& t, const music::Settings& st, int timeout_m
             if (text.rfind("\xef\xbb\xbf", 0) == 0) text.erase(0, 3);
             d.lines = parse(text, &d.synced);
         }
-        if (d.lines.empty()) d.error = "未找到同名 UTF-8 .lrc 歌词";
-        return d;
+        if (!d.lines.empty()) return d;
+        local_error = "未找到同名 UTF-8 .lrc 歌词";
     }
     // 顺序：当前选中的源 → 其它源。每家用自己那条曲目的 id，不去猜。
     std::vector<int> order;
@@ -388,7 +389,7 @@ inline Doc fetch(const music::Track& t, const music::Settings& st, int timeout_m
             if (i != first) order.push_back(i);
     }
 
-    std::string last_err; Doc primary; std::set<std::string> tried_netease;
+    std::string last_err = std::move(local_error); Doc primary; std::set<std::string> tried_netease;
     auto take = [&](Doc doc) {
         if (doc.empty()) { if (!doc.error.empty()) last_err = doc.origin + "：" + doc.error; return false; }
         if (primary.empty()) { primary = std::move(doc); if (publish) publish(primary); }
@@ -415,7 +416,8 @@ inline Doc fetch(const music::Track& t, const music::Settings& st, int timeout_m
             auto doc = fetch_netease_lyric(id, st, timeout_ms);
             doc.origin = "网易云（同曲匹配）";
             take(std::move(doc));
-        }
+        } else if (t.current().source == music::Source::Local && !last_err.empty())
+            last_err += "；未匹配到在线歌词版本";
     }
     if (!primary.empty()) return primary;
     primary.error = net::cancelled() ? "歌词加载已取消" : last_err.empty() ? "没有找到可用的歌词" : last_err;
